@@ -1,7 +1,7 @@
-# Spec index — cross-platform ArsClip successor (working title: `arsclip-x`)
+# Spec index — Clipmonger (cross-platform ArsClip successor)
 
-Working title only; the user MAY rename the project at any time before v1
-without affecting this spec (only identifiers/paths change).
+Project name: Clipmonger (D-021; the `arsclip-x` working title is retired).
+`APP_IDENTITY` = `clipmonger` (§5).
 
 ## 1. How to use this spec
 
@@ -20,7 +20,8 @@ without affecting this spec (only identifiers/paths change).
 
 Status = acceptance state (`Final` = user-accepted 2026-10-16 per
 plan gate 0.8; post-freeze corrections use short ADRs per §5, never
-silent edits — review L-04).
+silent edits — review L-04; ADR-001/002 + D-021/022/023 accepted 2026-10-25
+under a user-authorized reopen).
 
 | File | Content | Status |
 |---|---|---|
@@ -38,6 +39,8 @@ silent edits — review L-04).
 | `seg-11-testing-qa.md` | Unit/integration/e2e strategy, per-area tests, QA checklists, CI | Final |
 | `seg-12-build-release.md` | Cargo workspace, cross-compile, packaging, versioning | Final |
 | `plan.md` | Canonical plan (goal, approach, steps, validation, risks, sources) | Final |
+| `adr-001-plugins.md` | ADR: out-of-process IPC plugin system (D-022) | Final |
+| `adr-002-i18n.md` | ADR: string ids + community catalogs (D-023) | Final |
 
 ## 3. Decision log
 
@@ -62,6 +65,9 @@ silent edits — review L-04).
 | D-018 | Release = $0 pipeline (Q9a). GitHub Releases hosting, unsigned binaries + verified-accurate bypass docs, cargo-packager artifacts, update-check without auto-install, Flathub track v2+. Paid signing revisited on tagged user demand. | DECIDED (user, Q9) | seg-12 |
 | D-019 | Codex review fold (2026-10-16): all 52 findings verified against primary sources where upstream-factual, all ADOPTED into seg-00…seg-12 + plan.md (see `codex-clipboard-manager-review-findings.md` + `codex-plan-revised.md` at repo root). Judgment calls CONFIRMED by user (no veto): (a) Linux app floor = oldest tested LTS; (b) local data plaintext-by-default; (c) GNOME v1 matrix 46–51. | ACCEPTED (user 2026-10-16; fold is final) | this row + per-segment edits |
 | D-020 | Claude review fold (2026-10-16): 67 findings triaged against the Codex-folded spec; ~40 newly ADOPTED (arboard dropped for direct OS transfer, IPC method table completed, threat model + logging added, GNOME-50 Wayland-only noted, packaging/floor matrices corrected, config key table, hotkey grammar, v1 slice definitions), ~20 already covered (verified point-by-point), 0 rejected, 0 blocking questions. Judgment calls CONFIRMED by user at acceptance 2026-10-16: (a) update-check default ON with first-run notice; (b) Win ARM64 OUT until v3+; (c) Wayland popup = centered window + activation token (no extension-drawn UI). | ACCEPTED (user 2026-10-16; fold is final) | `claude_REVIEW-FINDINGS.md` at repo root + per-segment edits |
+| D-021 | Project name = Clipmonger (`APP_IDENTITY` = `clipmonger`); `arsclip-x` working title retired pre-v1, no migration (nothing shipped). | DECIDED (user 2026-10-25) | all segments |
+| D-022 | Plugin system = out-of-process IPC plugins, Notepad++-inspired UX (one-click admin, drop-to-install, curated list); v1 reservations, v2 host, v3+ list. | DECIDED (user 2026-10-25) | adr-001 |
+| D-023 | i18n = stable string ids + versioned community catalogs; English-only v1, translations from v2 (Slovak first, user-supplied, non-blocking). | DECIDED (user 2026-10-25) | adr-002 |
 
 ### Past decision sessions (Q1–Q9; review L-04)
 
@@ -121,10 +127,9 @@ implementation, and the seg-11 §5 release gate re-checks licenses.
   (review finding 4; gate defined in plan.md).
 - Identity (review M-17): all wire/persistence/bundle names (IPC methods,
   mDNS service, bundle IDs, profile dirs, extension UUID) derive from ONE
-  `APP_IDENTITY` constant; renaming = changing the constant + the
-  documented migration (profile copy, no re-pair). The working title may
-  change pre-v1; post-v1 renames need an ADR. Affiliation note: the final
-  name MUST NOT imply ArsClip/JoeJoe endorsement (living product).
+  `APP_IDENTITY` constant, value `clipmonger` (D-021). Post-v1 renames need
+  an ADR + the documented migration (profile copy, no re-pair). Affiliation
+  note: the name MUST NOT imply ArsClip/JoeJoe endorsement (living product).
 
 ## 6. Glossary
 
@@ -143,6 +148,10 @@ implementation, and the seg-11 §5 release gate re-checks licenses.
 - **Backend**: one per-OS/per-display-server implementation of the monitor,
   paste, hotkey, tray, and autostart traits.
 - **Daemon**: the always-on background process owning monitoring + store.
+- **Plugin**: an out-of-process program supervised by the daemon, speaking
+  the capability-gated IPC subset (F-801/802; host in v2, D-022).
+- **Locale / Catalog**: a UI language tag (BCP-47) / its versioned string
+  file; English ships in-tree, community catalogs from v2 (F-803, D-023).
 - **v1/v2/v3**: milestone slices defined in seg-01. The architecture MUST
   cover the full scope from day one; only implementation is sliced.
 
@@ -164,8 +173,8 @@ implementation, and the seg-11 §5 release gate re-checks licenses.
 
 ### Open
 
-1. Working title `arsclip-x` — user MAY rename pre-v1 (rename-safe via
-   `APP_IDENTITY`, seg-00 §5).
+1. RESOLVED (D-021, 2026-10-25): project named Clipmonger
+   (`APP_IDENTITY` = `clipmonger`); numbering of items 2–4 kept stable.
 2. Wayland "paste into active window" mechanism — seg-06 spike + honest
    fallback. Highest-risk validation item.
 3. KDE/wlroots GlobalShortcuts-portal support levels — verified during

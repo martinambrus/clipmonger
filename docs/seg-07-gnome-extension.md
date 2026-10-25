@@ -60,7 +60,7 @@ daemon flips GNOME caps without crashing.
   re-runs) re-register + resync config. Relay chunking (review M-14):
 extension→daemon payloads >256 KiB (images!) travel as `blob.put`
 chunks per seg-02 §9 — never one giant frame. Socket-path discovery via the seg-02 §1 rendezvous rule (review
-  finding 40): read `<config>/arsclipx/rendezvous.json` (default profile
+  finding 40): read `<config>/clipmonger/rendezvous.json` (default profile
   socket + protocol version; token from the 0600 token file), fall back
   to `--profile` registry for named profiles, re-resolve on every
   connect failure. NEVER bake a mutable absolute socket path into the
@@ -87,9 +87,10 @@ documented note — never a silent gap.
   `gnome-extensions enable`, restart hint) + docs. No review gate → fast
   iteration while the protocol churns.
 - EGO (extensions.gnome.org) submission starts v2 (review lead time;
-  submission/packaging rules = VERIFY task). Extension UUID shape `name@domain` under the FINAL project name
-(rename-safe until v1 ships; confirm shape against current GNOME
-extension docs at implementation — review M-14).
+  submission/packaging rules = VERIFY task). Extension UUID shape `name@domain`
+  under the final project name Clipmonger (D-021; stem `clipmonger@…`,
+  domain part confirmed against current GNOME extension docs at
+  implementation — review M-14).
 - First-run UX: daemon detects GNOME + missing protocols → offers
   one-click install attempt with logout/restart notice; prefs page
   (standard extension prefs; GTK4/libadwaita flavor VERIFY).

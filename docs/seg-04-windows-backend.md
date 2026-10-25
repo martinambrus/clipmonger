@@ -100,7 +100,7 @@ pastes/macros into a high-integrity window.
   Medium target → normal path, NO prompt, NO helper. High target →
   helper path.
 - **Spawn**: same binary, hidden subcommand
-  `arsclipx-daemon __elevated-worker <random-pipe-name>`, launched via
+  `clipmonger-daemon __elevated-worker <random-pipe-name>`, launched via
   `ShellExecuteEx` with the **`runas` verb** (MS Learn: "Launches an
   application as Administrator. UAC will prompt for consent or admin
   credentials"). Daemon shows its own "admin paste needed" notice FIRST

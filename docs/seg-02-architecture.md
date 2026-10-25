@@ -48,9 +48,9 @@ Four cooperating programs, one data owner:
   `tray-icon`; backend segments document per-OS tray RULES (main thread,
   KSNI, bundle identity), not a second host. The daemon NEVER shows UI.
 - **Launcher/attach/restart/quit (review finding 5):** the installed
-  launcher binary `arsclipx` = UI process; on start it ensures the daemon
-  runs (spawns `arsclipx-daemon` if the lock is free, else attaches over
-  IPC). Autostart launches `arsclipx --minimized` (daemon + hidden UI
+  launcher binary `clipmonger` = UI process; on start it ensures the daemon
+  runs (spawns `clipmonger-daemon` if the lock is free, else attaches over
+  IPC). Autostart launches `clipmonger --minimized` (daemon + hidden UI
   with tray only). Tray Quit stops UI AND daemon (explicit `daemon.stop`
   + lock release). Daemon crash → UI shows reconnecting + offers restart;
   UI crash → daemon keeps running (monitoring/hotkeys continue), user
@@ -62,24 +62,34 @@ Four cooperating programs, one data owner:
   skew: UI/CLI check daemon version in `hello`; mismatch → refuse with
   "restart required" (covers upgrades over a running daemon).
 - **Profile rendezvous (review finding 40):** clients discover the daemon
-  via `<config>/arsclipx/rendezvous.json` (default profile socket path,
+  via `<config>/clipmonger/rendezvous.json` (default profile socket path,
   protocol version; token stays in the 0600 token file, never here) or
   `--profile <name>` (registry file lists active profiles). Extension/
-  CLI/UI MUST re-resolve on connect failure (never bake a stale path).
+  CLI/UI/plugins MUST re-resolve on connect failure (never bake a stale path).
+- **Plugins (v2 host per ADR-001/D-022; v1 reservations only):**
+  out-of-process IPC clients like CLI/extension (one OS process per
+  plugin, supervised by the daemon). Plugins speak a CAPABILITY-GATED IPC
+  subset only (ADR-001); they MUST NOT touch the store, backends, tokens,
+  or audit internals. A plugin crash/stall degrades that plugin alone,
+  never the daemon. v1 freezes the directory (`<profile>/plugins/`),
+  manifest schema, method names, and permission names — no host runs.
 
 ## 2. Cargo workspace layout
 
 ```
-arsclip-x/                       # working title, see seg-00
+clipmonger/                       # D-021; APP_IDENTITY = `clipmonger`
   Cargo.toml                     # workspace + shared lints/versions
   crates/
     core/        # clip model, store, config, search, history policy,
-                 # macro expander (no JS engine here), sync types (v3)
+                 # macro expander (no JS engine here), sync types (v3),
+                 # plugin manifest + permission types (v2 host, frozen v1)
     platform/    # backend TRAITS + shared types + fakes (no OS code)
     ipc/         # proto (serde, no runtime) + client (std) + server (tokio)
     backend-windows/ backend-x11/ backend-wayland/ backend-macos/
-    daemon/      # tokio runtime, monitor supervisor, jobs, single lock
-    app-ui/      # eframe: popup + config + bar + tray (via tray-icon)
+    daemon/      # tokio runtime, monitor supervisor, jobs, single lock,
+                 # plugin supervisor (v2; ADR-001)
+    app-ui/      # eframe: popup + config + bar + tray (via tray-icon),
+                 # plugin management UI (v2; ADR-001)
     app-cli/     # clap CLI over ipc client
     macrolib/    # (v2) [VAR] expansion + rquickjs engine + [RUN] runner
   gnome-ext/     # (v1, TypeScript/GJS, separate build; protocol in seg-07)
@@ -88,7 +98,8 @@ arsclip-x/                       # working title, see seg-00
 
 v1 builds: core, platform, ipc, backend-windows, backend-x11,
 backend-wayland, daemon, app-ui, app-cli, gnome-ext (D-013). v2 adds
-backend-macos, macrolib. v3 extends core/ipc (sync) + daemon (jobs).
+backend-macos, macrolib, the plugin host (daemon+UI, ADR-001) and i18n
+infrastructure (ADR-002). v3 extends core/ipc (sync) + daemon (jobs).
 
 ## 3. Foundation crates (licenses verified via crates.io API / README)
 
@@ -290,7 +301,7 @@ threading: affinity violations are a code-review blocker.
 ## 9. IPC protocol (crate `ipc`, v1; rewritten per review finding 10)
 
 - Transport: Unix domain socket in the profile dir; Windows named pipe
-  `\\.\pipe\arsclipx-<profilehash>` (per-PROFILE names — portable and
+  `\\.\pipe\clipmonger-<profilehash>` (per-PROFILE names — portable and
   installed instances never collide, review H-07). Server = tokio
   built-ins (`tokio::net` UnixListener + named pipes — review C-07,
   no extra crate); clients = std. Socket paths LONGER than 100 chars
@@ -327,7 +338,14 @@ threading: affinity violations are a code-review blocker.
   (launcher path) instead of failing — so CLI/compositor bindings always
   work (review H-06/O-01). Extension↔daemon uses the same methods.
   v2 adds: `macro.run/test`, `permanent.create/update/delete/move`,
-  `group.*`, `autoswitch.state`, `bar.*`. v3 adds: `sync.*`.
+  `group.*`, `autoswitch.state`, `bar.*`,
+  `plugin.list/install/remove/enable/disable`, `plugin.permissions`
+  (management; ADR-001). Third-party plugins speak a GATED SUBSET only
+  (names frozen in v1, enforced in v2): allowlisted reads
+  (`status`, `caps.get`, `history.list/get`), gated writes
+  (`paste.execute` only with the capability + explicit user trigger),
+  and `events.subscribe` for allowlisted topics (post-policy-filter
+  events only). v3 adds: `sync.*`.
 - Auth + permissions (review finding 29): user-only socket/pipe (Unix
   0600/0700; Windows explicit current-user-SID DACL) + per-profile token
   file (same user-only rule) sent in `hello`. No network listeners v1/v2.
@@ -368,6 +386,12 @@ later (verify toolchain if pursued); Linux→macOS cross explicitly OUT.
 - T-211 `[integration]` endpoint security: pre-squatted pipe/socket →
   loud refusal; peer-image mismatch → drop; >100-char socket path →
   short-link fallback works.
+- T-212 `[unit]` (v2; types frozen v1) plugin manifest parse + permission
+  vectors (valid/invalid manifests, default-deny, unknown capability →
+  refuse).
+- T-213 `[integration]` (v2) hostile-plugin isolation: crashing/stalling/
+  over-privileged plugin degrades itself only; daemon + other clients
+  unaffected; denials audit-logged.
 
 ## 13. Verification tasks (close before/with backend code)
 
@@ -393,7 +417,10 @@ manifests + quotas per seg-10); (c) LAN observer (v3: ciphertext only);
 (d) malicious CLIPBOARD CONTENT (parsers must not panic/OOM — fuzzed
 T-305/T-1105, decode caps seg-03 §8); (e) macro/`[RUN]` abuse (confirm
 policy + audit + sandbox, seg-03 §7); (f) supply chain (locked deps,
-cargo-deny gate, checksums — seg-11/12). Trusted: the OS kernel, the
+cargo-deny gate, checksums — seg-11/12); (g) malicious or compromised
+PLUGIN (v2+: untrusted; capability-gated IPC subset, install-time
+permission prompt, no store/backend/token access, crash isolation per
+ADR-001; curated list from v3+ only). Trusted: the OS kernel, the
 user's account boundary, paired devices' operators (post-SAS).
 Residual risks: R-009 (plaintext at rest), R-010 (elevated helper),
 R-011 (extension session impact) — all explicit in plan.md.
@@ -402,10 +429,12 @@ R-011 (extension session impact) — all explicit in plan.md.
 
 One structured-logging facade + file rotation (verify selection at
 implementation against M-11 criteria; used consistently by daemon, UI,
-CLI, helper). Location: `<profile>/logs/arsclipx.log` (+ rotation
+CLI, helper). Location: `<profile>/logs/clipmonger.log` (+ rotation
 `….1..9`, 10 MB each); levels ERROR/WARN/INFO/DEBUG/TRACE with
-per-module filter (`ARSCLIPX_LOG`). RULES: never log clip payloads,
+per-module filter (`CLIPMONGER_LOG`). RULES: never log clip payloads,
 tokens, SAS codes, or full command text (hashes/metadata only, §5);
 window titles/paths allowed locally, REDACTED in shared evidence
-(seg-11). `logs.tail` IPC method serves the UI log viewer; daemon crash
-writes a final line + preserves the current file for forensics.
+(seg-11). Plugin install/enable/disable/permission-grant/denial events
+(v2, ADR-001) are audit-logged with metadata only. `logs.tail` IPC method
+serves the UI log viewer; daemon crash writes a final line + preserves
+the current file for forensics.

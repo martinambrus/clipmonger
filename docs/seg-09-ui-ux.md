@@ -27,6 +27,8 @@ Layout top→bottom: search field (F-204, focused by default, live filter)
 (newest first; F-205 previews: image thumbnails via `image`, file rows
 with icons (VERIFY icon source per OS), pinned shortcuts, headers) →
 status line (count, caps warnings, e.g. "monitoring paused").
+v2: plugins holding `ui.contribute` (ADR-001) may add items in a dedicated
+popup section (exact placement frozen at the v2 design-reopen gate).
 Behavior: hover-select + click-paste; right-click item menu
 (edit/duplicate/pin/delete); Enter pastes selected; Esc dismisses;
 Delete key = soft-delete (v1 storage; recovery UI v2 — finding 37);
@@ -47,11 +49,14 @@ forewarns the system approval dialog where binding is OS-mediated
 
 ## 4. Config window (F-601/602, D-014 MAXIMALIST)
 
-Tabs: History | Permanent Clips/Macros | Databases | About/Help (+ Sync
-in v3; tab present-but-disabled until then is FORBIDDEN — no dead UI).
+Tabs: History | Permanent Clips/Macros | Databases | About/Help (+ Plugins
+in v2 per ADR-001, + Sync in v3; a tab present-but-disabled until its
+feature lands is FORBIDDEN — no dead UI).
 v1 Databases tab shows local diagnostics (path/size/schema/health,
 compact, backup/restore, open-folder — finding 38); attach/shared
-controls arrive in v3. D-014 means implemented-features-only (finding 39).
+controls arrive in v3. The v2 Plugins tab lists installed plugins with
+install-from-folder/import, enable/disable/remove, and per-plugin
+permission display (F-802). D-014 means implemented-features-only (finding 39).
 RULE: every seg-03 §6 config key and every F-item behavior has a control
 here (implemented features only — finding 39); the ONLY file-only
 surface is env overrides. Inventory (v1 excerpt;
@@ -62,7 +67,9 @@ Popup: trigger chords, placement, preview width, dismiss rules, key map
 editor (§8), pins/headers toggles. Permanents: group manager, clip
 editor (v1 basic; macro UI in v2), per-clip hotkeys. Tray: icon set,
 menu toggles. Startup: autostart toggle (+ elevation note on Windows).
-Privacy: strict mode, denylist, audit viewer. Advanced: poll intervals,
+Privacy: strict mode, denylist, audit viewer. General (v2 addition):
+locale selector (`ui.locale`, ADR-002; hidden while English-only v1).
+Advanced: poll intervals,
 timeouts, IPC/bit toggles, profile folder + config file openers,
 backup-to-ZIP / restore, "reset to defaults" (with confirm).
 Import/export covers implemented keys only (D-014).
@@ -113,10 +120,25 @@ Screen readers: eframe AccessKit status = VERIFY (upstream notes it
 experimental); record the real level in About → Accessibility; do NOT
 claim what isn't proven. Focus-visible styling everywhere.
 
-## 11. i18n rule (English-only v1)
+## 11. i18n design (English-only v1; translations from v2 — ADR-002/D-023)
 
-ALL user strings via a `strings` module (zero inline literals in views);
-no translation in v1, but v2 translation MUST need no refactor.
+- String ids (FROZEN v1): ALL user strings via a `strings` module under
+  STABLE ids; zero inline literals in views (enforced by T-910). Ids never
+  change meaning (rename = new id + ADR note). ICU-style placeholders;
+  no sentence concatenation.
+- Catalogs (v2): one versioned file per locale (BCP-47), pinned to a
+  string-id-set version; format decided at v2 implementation (VERIFY
+  against M-11 criteria; requirements: CLDR plurals, RTL-safe layout,
+  per-key fallback). English ships in-tree.
+- Fallback chain: `ui.locale` → `ui.fallback_locale` → `en`. Missing key
+  renders English + bumps a coverage counter (never blank, never crash).
+  OS locale seeds `ui.locale` at first run; date/number formatting follows
+  the OS locale (mechanism VERIFY at v2).
+- Community flow: catalog PRs carry translator, id-set version, coverage %;
+  CI checks id-set match + placeholder consistency. No catalog ever blocks
+  a release. Expected first: Slovak (`sk`), user-supplied, best-effort.
+- Plugin strings (ADR-001): namespaced `<plugin-id>.<key>`, shipped by the
+  plugin, same fallback chain.
 
 ## 12. UI↔daemon contract
 
@@ -144,6 +166,11 @@ subscription drives refresh (no blind polling except 30 s caps check).
   a mis-paste; pairs with seg-02 T-208).
 - T-909 `[unit]` settings-coverage: every config key in seg-03 §6
   renders as a control in §4 (review H-05).
+- T-910 `[unit]` strings-module conformance: views contain zero inline
+  literals; every string id has English text (v1 rule, ADR-002).
+- T-911 `[unit]` (v2) locale fallback + plural vectors + catalog
+  conformance (id-set match, placeholder consistency; Slovak catalog
+  included when shipped).
 
 ## 14. Verification tasks
 

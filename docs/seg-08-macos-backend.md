@@ -12,7 +12,7 @@ refuse with a clear error.
 
 - CopyQ-verified pattern (`MacClipboard` source): snapshot
   `[NSPasteboard generalPasteboard] changeCount`, poll every 500 ms
-  (tolerance 5 s), fire on change. Same defaults + `ARSCLIPX_` env
+  (tolerance 5 s), fire on change. Same defaults + `CLIPMONGER_` env
   overrides (names reserved in seg-03 §6).
 - Privacy (F-104): skip when data offers
   `application/x-nspasteboard-concealed-type` (CopyQ-verified).

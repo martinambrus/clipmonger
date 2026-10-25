@@ -125,7 +125,24 @@ segment carries a completion task — implementers MUST NOT invent it.
   settings, best-effort; DATA interop, not code reuse — D-008
   unaffected). Milestone: v2 (review O-06).
 
-## 8. Non-goals (explicit)
+## 8. Plugins and localization
+
+- F-801 Out-of-process plugin host: manifest (`plugins/<id>/plugin.toml`),
+  capability-gated IPC subset, permission prompt, per-plugin isolation
+  (ADR-001, D-022). Milestone: v1 freezes reservations (directory, manifest
+  schema, method/permission names — no host); v2 ships the host + sample
+  plugin + docs.
+- F-802 Plugin install/manage UX (Notepad++-inspired): folder drop +
+  config-UI import, enable/disable/remove, permission display. Curated
+  plugin list = v3+ evaluation under the v3 design-reopen gate (must fit
+  the D-018 $0 pipeline). Milestone: v2 (list in v3+).
+- F-803 Locale selection + community translation catalogs (ADR-002, D-023):
+  stable string ids, versioned per-locale files, in-app selector, PR-based
+  community flow. Milestone: v1 English-only (ids frozen, T-910 enforced);
+  v2 infrastructure + first community catalogs (no committed language;
+  Slovak expected first, user-supplied, non-blocking).
+
+## 9. Non-goals (explicit)
 
 - N-001 Mobile clients: DROPPED per D-016 (no background-monitoring path
   on modern mobile OSs; not deferred, removed).
@@ -133,8 +150,10 @@ segment carries a completion task — implementers MUST NOT invent it.
 - N-003 Ingesting any GPL-licensed code (D-006); clean dep/port/reference
   separation per the seg-00 reuse map.
 - N-004 Browser/IDE plugins; the app is a desktop daemon + windows + CLI.
+  (This non-goal is about building plugins FOR browsers/IDEs; Clipmonger's
+  OWN plugin system is F-801/802.)
 
-## 9. Milestone exit criteria
+## 10. Milestone exit criteria
 
 - **v1 (prove the foundation cross-platform)**: F-101/102(part)/103(basic)/
   104/105, F-201–205(part), F-301(basic)/302, F-401/402/404, F-501(full Wayland
@@ -147,10 +166,14 @@ in v2. F-103(basic) = formats + max bytes + min length + denylist (no
 per-app rules until v2). F-201–205(part) = popup + search + previews +
 current-item (pins/headers/paste-modes in v2). F-301(basic) = local
 named groups + per-clip hotkeys (group sharing in v2).
+F-801/802/803 in v1 = reservations ONLY (§8: names/schemas/ids frozen, no
+host, no translations, no Plugins tab, no locale selector).
 - **v2 (parity depth)**: macOS backend, macros/JS,
-  AutoSwitch, clipboard bar, paste modes, full key customisation, export.
+  AutoSwitch, clipboard bar, paste modes, full key customisation, export,
+  plugin host + install/manage UX (F-801/802), i18n infrastructure + first
+  community catalogs (F-803; Slovak expected, user-supplied, non-blocking).
 - **v3 (sharing)**: sync (LAN + user-cloud objects), Jumplist-class
-  extras, import/export full.
+  extras, import/export full, curated plugin-list evaluation (F-802).
 
 Implementation order inside v1: core store+config → UI shell pilot
 (popup/tray/lifecycle against fakes+real IPC, so paste-target behavior is

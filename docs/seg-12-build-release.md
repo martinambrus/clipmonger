@@ -41,7 +41,12 @@ VERIFY at implementation):
   artifacts from v2 (finding 2), universal binary evaluated in v2.
 - Linux: `.deb` + `.rpm` + `.AppImage` + portable tarball.
 - GNOME extension `.zip` (seg-07 installer doubles as packager input).
-- Icons/assets per OS; bundle IDs reserved under the FINAL project name.
+- Icons/assets per OS; bundle IDs reserved under Clipmonger (D-021).
+- Locales + plugins: ship the English string catalog in-tree; per-user
+  `plugins/` dir is created at runtime by the daemon (never by the
+  installer). Community catalogs + sample plugin ride the normal release
+  artifacts from v2; the curated plugin-list feed (if any) is designed at
+  the v3 reopen gate.
 
 ## 4. Release flow (GitHub Releases, $0, verified docs)
 
@@ -64,7 +69,7 @@ silent skip.
 
 ## 6. Versioning + changelog
 
-Semver; `v1.0.0` = v1 scope per seg-01 §9. `CHANGELOG.md` with
+Semver; `v1.0.0` = v1 scope per seg-01 §10. `CHANGELOG.md` with
 Added/Changed/Fixed per release. MSRV bumps ride minor versions + note.
 
 ## 7. Flathub track (v2+, evaluate — do NOT assume)

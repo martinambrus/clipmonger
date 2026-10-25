@@ -11,7 +11,7 @@ good design.
 - Device identity = Noise static keypair (X25519); device ID = fingerprint
   of the public key. Keys at rest: file 0600 in profile dir; OS-keyring
   upgrade = VERIFY crate at v3 implementation (task §8.1).
-- Discovery: mDNS `_arsclipx._tcp` via mdns-sd 0.21 (Apache-2.0 OR MIT,
+- Discovery: mDNS `_clipmonger._tcp` via mdns-sd 0.21 (Apache-2.0 OR MIT,
   crates.io-verified; browser lifecycle + TXT-record API = VERIFY at v3
   design reopen, H-06; no async-runtime dep). TXT: device name + caps +
   protocol v1.

@@ -1,16 +1,16 @@
-# Plan — cross-platform ArsClip successor (`arsclip-x`, working title)
+# Plan — Clipmonger (cross-platform ArsClip successor)
 
 ## Goal
 
 Ship an MIT-licensed, Rust-built, ArsClip-parity clipboard manager for
 Windows, Linux (X11 + Wayland + GNOME Shell extension), and macOS —
-specified across 14 planning documents detailed enough for independent
-agents to implement, in v1/v2/v3 slices, with unit/integration/e2e/manual
-QA at every step.
+specified across the planning documents (seg-00…seg-12 + ADRs) detailed
+enough for independent agents to implement, in v1/v2/v3 slices, with
+unit/integration/e2e/manual QA at every step.
 
 ## Success Criteria
 
-1. All 14 documents internally consistent (milestones, IDs, refs,
+1. All spec documents internally consistent (milestones, IDs, refs,
    matrices pass lint + human review) and user-accepted (Draft → Final).
 2. All architecture-changing uncertainties resolved before freeze (Phase
    0 gates); remaining VERIFY items cannot change interfaces, formats,
@@ -96,17 +96,24 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   budgets) → seg-12 release (artifacts, notes, checksums, bypass docs).
 - **8. v2 (after design-reopen gate).** Re-validate extension points
   vs current deps/platforms, then: macOS backend (seg-08), macrolib JS
-  (seg-03 §7), bar/AutoSwitch/paste-modes (seg-09), export (seg-10 §4).
+  (seg-03 §7), bar/AutoSwitch/paste-modes (seg-09), export (seg-10 §4),
+  plugin host + install/manage UX (F-801/802, ADR-001), i18n
+  infrastructure + first community catalogs (F-803, ADR-002; Slovak
+  expected, user-supplied, non-blocking).
   macOS release/signoff begins here. Same gates.
 - **9. v3 (after design-reopen gate).** Re-validate trust/keys/merge/
   manifest/quota/file-list semantics, then: sync LAN (v3a) + user-cloud
-  (v3b) (seg-10), extras (seg-01 §9), Flathub evaluation (seg-12 §7).
+  (v3b) (seg-10), extras (seg-01 §10), Flathub evaluation (seg-12 §7),
+  curated plugin-list evaluation (F-802, ADR-001).
   Never open live SQLite from a synced folder. Same gates.
 
-Spec file inventory (all Final — user-accepted 2026-10-16, gate 0.8): seg-00-index, seg-01-scope,
+Spec file inventory (all Final — user-accepted 2026-10-16, gate 0.8;
+ADR-001/002 + D-021/022/023 accepted 2026-10-25 under a user-authorized
+reopen): seg-00-index, seg-01-scope,
 seg-02-architecture, seg-03-model-storage, seg-04-windows, seg-05-x11,
 seg-06-wayland, seg-07-gnome-ext, seg-08-macos, seg-09-ui, seg-10-sync,
-seg-11-testing, seg-12-release, plan.md (this file).
+seg-11-testing, seg-12-release, adr-001-plugins, adr-002-i18n,
+plan.md (this file).
 
 ## Validation Plan
 
@@ -143,8 +150,19 @@ seg-11-testing, seg-12-release, plan.md (this file).
   merge + LWW + signed manifests already spec'd (seg-10).
 - R-009 Local privacy → explicit plaintext-at-rest boundary, user-only
   permissions, safe backups/logs/evidence (seg-03 §5/§6, seg-11).
-- Open: (1) "zyq" read as Zig (D-010) — trivial confirm. (2) Working
-  title `arsclip-x` rename any time pre-v1. (3) Colleague macOS
+- R-010 Windows elevated helper → on-demand spawn from protected paths
+  only, reverse-connect pipe + mutual peer auth, input-only narrow
+  protocol + gesture tokens, self-exit on disconnect, full audit
+  (seg-04 §5; T-409/413/414).
+- R-011 GNOME extension session impact → size-capped async relay with
+  backoff, degrade-to-capture-paused on wedge (never hang the session),
+  daemon survives silence/disconnect (seg-07 §9; T-702/703).
+- R-012 Plugin supply chain (v2+) → untrusted plugins contained by
+  capability-gated IPC + install-time permission prompt + crash isolation
+  (ADR-001); residual: an installed plugin sees its permitted clips —
+  documented in the permission prompt, never silent.
+- Open: (1) "zyq" read as Zig (D-010) — trivial confirm. (2) RESOLVED
+  (D-021): named Clipmonger, `APP_IDENTITY` = `clipmonger`. (3) Colleague macOS
   availability timing for v2 planning. (4) Claude-fold judgments
   CONFIRMED at acceptance 2026-10-16: update-check default ON +
   first-run notice (M-10), Win ARM64 OUT to v3+ (M-10), pre-46 =

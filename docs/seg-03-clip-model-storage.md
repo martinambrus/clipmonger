@@ -147,6 +147,8 @@ MUST NOT be promised in v1.
 - Audit log (review H-08): append-only `<profile>/audit.log`, JSONL lines
   `{ts, kind, hashes, result}` (never payloads); rotation 10×1 MB,
   retention 90 days. Aggregate counters (`privacy_skips`) live in `meta`.
+  v2 adds plugin lifecycle entries (install/enable/disable/permission
+  grant/denial per ADR-001, metadata only).
 - O-03 decisions: NO secure-delete in v1 (SSD overwrite is theater —
   documented, not promised); lock-screen = keep running (documented);
   clear-on-exit = manual `purge-removed` CLI (M-09); SQLCipher evaluated
@@ -159,16 +161,17 @@ MUST NOT be promised in v1.
   finding 14): `#[serde(flatten)] extra: BTreeMap<String, toml::Value>`
   at EVERY config level (root + each section); comments are NOT promised
   preservation in v1 (documented). Forward-version roundtrip = T-311.
-- Env overrides: `ARSCLIPX_<SECTION>_<KEY>` (typed parse, logged).
-- Locations via `directories` crate: config = `config_dir/arsclipx/`,
-  data(DB) = `data_dir/arsclipx/`, cache(previews) = `cache_dir/arsclipx/`.
+- Env overrides: `CLIPMONGER_<SECTION>_<KEY>` (typed parse, logged).
+- Locations via `directories` crate: config = `config_dir/clipmonger/`,
+  data(DB) = `data_dir/clipmonger/`, cache(previews) = `cache_dir/clipmonger/`.
   Portable mode (marker file `portable.marker` next to binary OR running
   from removable media): ALL THREE resolve beside the binary (F-504).
 - Permissions (review finding 29): profile files user-only — Unix
   0600 files / 0700 dirs; Windows explicit current-user-SID DACL. Applies
   to config, DB+WAL, blobs, token, logs, backups, IPC endpoints.
 - v1 key TABLE (review M-04 — sole definition; T-906 walks it; UI tab
-  per key; v2/v3 groups reserved NOW: `[macros]`, `[sync]`, `[sharing]`):
+  per key; v2/v3 groups reserved NOW: `[macros]`, `[sync]`, `[sharing]`,
+  `[plugins]`, `[ui]`):
 
   | Key | Type | Default | Tab | Since |
   |---|---|---|---|---|
@@ -198,6 +201,10 @@ MUST NOT be promised in v1.
   | autostart.enabled | bool | false | General | v1 |
   | updates.check | bool | true (+first-run notice) | General | v1 (M-16) |
   | logging.level | enum | INFO | General | v1 |
+  | ui.locale | string (BCP-47) | en | General | v2 (ADR-002) |
+  | ui.fallback_locale | string (BCP-47) | en | General | v2 (ADR-002) |
+  | plugins.enabled | bool | true | Plugins | v2 (ADR-001) |
+  | plugins.<id>.enabled | bool (managed in UI) | true | Plugins | v2 (ADR-001) |
   | run.confirm_policy | enum | permanent-only | Permanents | v2 (macros) |
 - Backup/restore ZIP (F-602): `manifest.toml` + `config.toml` +
   `clipstore.sqlite3` (via backup API) + `blobs/` + schema versions.

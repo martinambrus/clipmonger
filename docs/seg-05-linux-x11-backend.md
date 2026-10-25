@@ -84,7 +84,7 @@ behavior only. Menu = seg-09 §7 (sole definition, review M-06).
 
 ## 6. Autostart — `AutostartManager`
 
-- Write `~/.config/autostart/arsclipx.desktop`:
+- Write `~/.config/autostart/clipmonger.desktop`:
   `[Desktop Entry] / Type=Application / Name=... / Exec=<quoted exe>
   --minimized / Hidden=<bool> / Terminal=false`.
   (Format verified against this machine's `/etc/xdg/autostart` + CopyQ's
