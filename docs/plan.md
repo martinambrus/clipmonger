@@ -73,9 +73,17 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
 - **0.8 User acceptance (DONE 2026-10-16).** User accepted the full
   spec + Claude-fold edits; status flipped Draft → Final. Delivers:
   BUILD AUTHORIZATION — Phase 0 proofs + v1 implementation may proceed.
-- **1. Foundation.** Workspace + core (model/store/config/policy) +
+- **1. Foundation. (DONE 2026-10-26, WSL; commits b7c937d…332dc02)**
+  Workspace + core (model/store/config/policy) +
   platform traits + fakes + IPC + daemon skeleton + CLI skeleton.
   Seg-02/03. Tests: T-201…210, T-301…308, T-310…314. Unlocks everything.
+  Evidence: 124 tests green (core 48, platform 19, ipc 48, daemon/cli 8+1);
+  fmt + clippy -D warnings clean; windows-gnu check + PE build green;
+  CLI daemon-down path run on the Windows host via WSL interop.
+  Deferred inside step: T-304 (v2 macrolib, D-F6), T-209 full lifecycle
+  matrix + T-205/T-211 Windows legs (native runner, Step 2), image
+  pixel-decode hashing (D-F4 note). Freeze decisions D-F1…F23 in
+  `.agents/tmp/foundation-v1/ledger.md`.
 - **1b. UI shell pilot.** Popup/tray/lifecycle against fakes + real IPC
   (validates paste-target behavior before backend paste exists). Seg-09
   subset. Then backends (steps 2–5 as listed).
