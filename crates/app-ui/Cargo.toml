@@ -1,0 +1,31 @@
+[package]
+name = "clipmonger-app-ui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+
+[lib]
+name = "clipmonger_app_ui"
+
+[[bin]]
+name = "clipmonger"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui"]
+
+[dependencies]
+clipmonger-core = { path = "../core" }
+clipmonger-platform = { path = "../platform" }
+clipmonger-ipc = { path = "../ipc" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
+uuid = { version = "1.28", features = ["v7", "serde"] }
+eframe = { version = "0.37", optional = true, default-features = false, features = ["glow", "x11", "wayland"] }
+egui = { version = "0.37", optional = true }
+
+[lints]
+workspace = true
