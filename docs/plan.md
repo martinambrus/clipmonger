@@ -94,6 +94,9 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   Deferred: T-905 window matrix (needs real displays), wgpu renderer
   (glow pilot, U-F2), tray Paused variant (U-F5), daemon search wiring
   (U-F8) — all Step 6 / backend steps.
+  Manual evidence 2026-10-26: Windows window-open test PASSED (user-run
+  clipmonger.exe on Win host: opens, stays, renders empty popup; offline
+  fix f58987f after first run exited pre-window).
 - **2. Windows backend.** Seg-04 (listener, transfer, hotkeys, enigo
   paste, on-demand elevated helper, tray, autostart). Tests T-401…410
   incl. the UAC manual matrix.
