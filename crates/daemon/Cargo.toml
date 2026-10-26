@@ -12,7 +12,7 @@ path = "src/main.rs"
 [features]
 default = []
 backend-windows = ["dep:clipmonger-backend-windows"]
-backend-x11 = []
+backend-x11 = ["dep:clipmonger-backend-x11"]
 backend-wayland = []
 backend-macos = []
 minimal = []
@@ -28,6 +28,9 @@ tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 clipmonger-backend-windows = { path = "../backend-windows", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+clipmonger-backend-x11 = { path = "../backend-x11", optional = true }
 
 [lints]
 workspace = true

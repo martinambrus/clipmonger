@@ -81,7 +81,10 @@ fn write_token(profile: &Path) -> Result<String, String> {
 ///
 /// Config uses canonical names (`text/plain;charset=utf-8` and `text/plain`
 /// both); transfer offers use the short form.
-#[cfg(all(windows, feature = "backend-windows"))]
+#[cfg(any(
+    all(windows, feature = "backend-windows"),
+    all(unix, feature = "backend-x11")
+))]
 fn wanted_format(mime: &str, formats: &[String]) -> bool {
     formats.iter().any(|format| {
         format == mime
@@ -214,6 +217,166 @@ fn setup_windows_backend(
             }
         }
     });
+}
+
+/// Construct the live X11 backend: typed caps, monitor thread (real
+/// payloads via transfer honoring the denylist + privacy counter), and
+/// the popup-hotkey listener (daemon-event only, like Windows).
+#[cfg(all(unix, feature = "backend-x11"))]
+#[allow(clippy::too_many_lines)]
+fn setup_x11_backend(
+    profile: &Path,
+    state: &Arc<DaemonState>,
+    config: &Config,
+    shutdown: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    use clipmonger_backend_x11::{
+        caps as backend_caps, MonitorOpts, X11Autostart, X11Hotkeys, X11Monitor, X11Transfer,
+    };
+    use clipmonger_platform::traits::{
+        AutostartManager, ClipboardMonitor, ClipboardTransfer, HotkeyManager,
+    };
+    use clipmonger_platform::types::{HotkeyId, Level, SubscribeKind};
+
+    let transfer = match X11Transfer::connect(None) {
+        Ok(transfer) => Some(Arc::new(transfer)),
+        Err(e) => {
+            eprintln!("daemon: x11 transfer unavailable: {e}");
+            None
+        }
+    };
+
+    let mut denylist = config.monitor.ignores.clone();
+    denylist.extend(config.privacy.denylist.iter().cloned());
+    let mut monitor_ok = transfer.is_some();
+    let monitor = match X11Monitor::connect(
+        None,
+        MonitorOpts {
+            capture_primary: config.monitor.capture_primary,
+            debounce_ms: config.monitor.primary_debounce_ms,
+            denylist,
+            max_bytes: config.monitor.max_bytes,
+        },
+    ) {
+        Ok(mut monitor) => {
+            let mut kinds = vec![SubscribeKind::Clipboard];
+            if config.monitor.capture_primary {
+                kinds.push(SubscribeKind::Primary);
+            }
+            if monitor.subscribe(&kinds).is_err() {
+                monitor_ok = false;
+            }
+            Some(monitor)
+        }
+        Err(e) => {
+            eprintln!("daemon: x11 monitor unavailable: {e}");
+            monitor_ok = false;
+            None
+        }
+    };
+
+    let mut hotkeys = match X11Hotkeys::connect(None) {
+        Ok(hotkeys) => Some(hotkeys),
+        Err(e) => {
+            eprintln!("daemon: x11 hotkeys unavailable: {e}");
+            None
+        }
+    };
+    let mut hotkey_conflict = false;
+    if let Some(hotkeys) = hotkeys.as_mut() {
+        if let Err(e) = hotkeys.register(HotkeyId(1), &config.popup.hotkey) {
+            eprintln!("daemon: popup hotkey unavailable: {e}");
+            hotkey_conflict = true;
+        }
+    } else {
+        hotkey_conflict = true;
+    }
+
+    // Autostart handle for future UI wiring; never enabled at startup.
+    // Portable when the profile lives beside the daemon binary.
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
+    let exe_dir = exe
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let home = std::env::var_os("HOME").map_or_else(|| profile.to_path_buf(), PathBuf::from);
+    let autostart = X11Autostart::new(exe, home.join(".config"), profile.starts_with(&exe_dir));
+    let _ = autostart.is_enabled();
+
+    let display = std::env::var("DISPLAY").ok().filter(|d| !d.is_empty());
+    let mut caps = backend_caps(display.as_deref());
+    if hotkey_conflict {
+        caps.hotkey = Level::Degraded;
+        caps.notes
+            .push("hotkey Degraded: popup chord already registered".to_string());
+    }
+    if !monitor_ok {
+        caps.monitor = Level::Degraded;
+        caps.notes
+            .push("monitor Degraded: X session clipboard unavailable".to_string());
+    }
+    state.register_backend("x11", caps);
+
+    if let (Some(mut monitor), Some(transfer)) = (monitor, transfer) {
+        let state = Arc::clone(state);
+        let formats: Vec<String> = config.monitor.formats.clone();
+        let max_bytes = config.monitor.max_bytes;
+        let poll_ms = config.monitor.poll_ms;
+        let shutdown = Arc::clone(shutdown);
+        std::thread::spawn(move || {
+            let poll_timeout = std::time::Duration::from_millis(poll_ms.clamp(50, 5000));
+            while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                let events = match monitor.poll(poll_timeout) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        eprintln!("daemon: monitor poll failed: {e}");
+                        break;
+                    }
+                };
+                for event in &events {
+                    if event.sensitive {
+                        state.ingest_capture("x11", true, &[]);
+                        continue;
+                    }
+                    let mut payloads = Vec::new();
+                    for offer in &event.offers {
+                        if !wanted_format(&offer.mime, &formats) {
+                            continue;
+                        }
+                        match transfer.read(&offer.mime, max_bytes) {
+                            Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
+                            Err(e) => {
+                                eprintln!("daemon: payload read skipped ({}): {e}", offer.mime);
+                            }
+                        }
+                    }
+                    if !payloads.is_empty() {
+                        state.ingest_capture("x11", false, &payloads);
+                    }
+                }
+            }
+        });
+    }
+
+    if let Some(mut hotkeys) = hotkeys {
+        let shutdown = Arc::clone(shutdown);
+        let state = Arc::clone(state);
+        std::thread::spawn(move || {
+            while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                match hotkeys.poll(std::time::Duration::from_millis(200)) {
+                    Ok(ids) => {
+                        for id in ids {
+                            state.mint_gesture_token();
+                            eprintln!("daemon: hotkey fired id={} (daemon-event only)", id.0);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("daemon: hotkey poll failed: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
 }
 
 #[cfg(unix)]
@@ -422,6 +585,8 @@ async fn main() {
     let backend_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     #[cfg(all(windows, feature = "backend-windows"))]
     setup_windows_backend(&profile, &state, &config, &backend_shutdown);
+    #[cfg(all(unix, feature = "backend-x11"))]
+    setup_x11_backend(&profile, &state, &config, &backend_shutdown);
     let stop: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
     let stop_handler = Arc::clone(&stop);
     let backend_stop = Arc::clone(&backend_shutdown);

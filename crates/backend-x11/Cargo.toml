@@ -11,6 +11,14 @@ clipmonger-platform = { path = "../platform" }
 serde.workspace = true
 serde_json.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+x11rb14 = { package = "x11rb", version = "0.14", features = ["xfixes", "xtest", "xinput"] }
+enigo = "0.6"
+
+[dev-dependencies]
+x11rb = { version = "0.13", features = ["xtest"] }
+uuid = { workspace = true }
+
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
