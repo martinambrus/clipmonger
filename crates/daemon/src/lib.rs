@@ -19,6 +19,9 @@ use serde_json::Value;
 /// Protocol tag written to the rendezvous file.
 pub const PROTOCOL: &str = "ipc/v1";
 /// Daemon crate version reported by `status`.
+#[cfg(all(unix, feature = "backend-wayland"))]
+pub mod portal;
+
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Note carried by every skeleton capability snapshot.
 pub const SKELETON_NOTE: &str = "no backends in foundation skeleton";
@@ -539,14 +542,15 @@ fn helper_ipc_error(
 ///
 /// A live backend registers its typed [`BackendCaps`] via `register_backend`
 /// (WIN-F3); the string `register` API is kept for non-platform reporters.
-/// Once a typed snapshot is present the skeleton levels are replaced by it.
+/// Once typed snapshots are present the skeleton levels are replaced by the
+/// merged multi-backend view (seg-06 S8 dual-backend).
 pub struct CapsAggregator {
     /// Backend snapshots by name, kept for future aggregation.
     registered: Mutex<HashMap<String, String>>,
     /// GNOME extension link state.
     extension_connected: Mutex<bool>,
-    /// Live typed backend snapshot (single backend in v1).
-    backend: Mutex<Option<(String, BackendCaps)>>,
+    /// Live typed backend snapshots by name (`windows`, `x11`, `wayland`).
+    backends: Mutex<HashMap<String, BackendCaps>>,
 }
 
 /// Render a [`Level`] as the lowercase status string.
@@ -577,7 +581,7 @@ impl CapsAggregator {
         Self {
             registered: Mutex::new(HashMap::new()),
             extension_connected: Mutex::new(true),
-            backend: Mutex::new(None),
+            backends: Mutex::new(HashMap::new()),
         }
     }
 
@@ -589,9 +593,12 @@ impl CapsAggregator {
     }
 
     /// Register one backend's typed capability snapshot under `name`.
+    ///
+    /// Re-registering the same name replaces that backend's entry only;
+    /// other backends are untouched (dual-backend merge, seg-06 S8).
     pub fn register_backend(&self, name: &str, caps: BackendCaps) {
-        if let Ok(mut slot) = self.backend.lock() {
-            *slot = Some((name.to_string(), caps));
+        if let Ok(mut backends) = self.backends.lock() {
+            backends.insert(name.to_string(), caps);
         }
     }
 
@@ -603,11 +610,20 @@ impl CapsAggregator {
     }
 
     /// Aggregate snapshot as JSON (levels as lowercase strings).
+    ///
+    /// With live backends the top-level keys keep their existing shape with
+    /// best-of levels, and a per-backend breakdown rides in the additive
+    /// `backends` map.
     #[must_use]
     pub fn snapshot(&self) -> Value {
         let extension_up = self.extension_connected.lock().map_or(true, |f| *f);
-        if let Some(typed) = self.backend.lock().ok().and_then(|slot| slot.clone()) {
-            return Self::typed_snapshot(&typed.1, extension_up);
+        let backends = self
+            .backends
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_default();
+        if !backends.is_empty() {
+            return Self::merged_snapshot(&backends, extension_up);
         }
         let mut notes = vec![Value::from(SKELETON_NOTE)];
         if !extension_up {
@@ -662,6 +678,66 @@ impl CapsAggregator {
             "extension_connected": extension_up,
             "notes": notes,
         })
+    }
+
+    /// Rank a level for best-of merging (Full > Degraded > Unavailable).
+    fn rank(level: Level) -> u8 {
+        match level {
+            Level::Full => 2,
+            Level::Degraded => 1,
+            Level::Unavailable => 0,
+        }
+    }
+
+    /// Merge per-backend snapshots: top-level keys keep their shape with
+    /// best-of levels, notes carry `[name]` prefixes, and the per-backend
+    /// breakdown rides in the additive `backends` map.
+    fn merged_snapshot(backends: &HashMap<String, BackendCaps>, extension_up: bool) -> Value {
+        let mut names: Vec<&String> = backends.keys().collect();
+        names.sort();
+        let pick = |level: fn(&BackendCaps) -> Level| {
+            names
+                .iter()
+                .map(|name| level(&backends[*name]))
+                .max_by_key(|level| Self::rank(*level))
+                .unwrap_or(Level::Unavailable)
+        };
+        let paste = names
+            .iter()
+            .map(|name| &backends[*name].paste)
+            .max_by_key(|paste| Self::rank(paste.level));
+        let mut prefixed_notes = Vec::new();
+        for name in &names {
+            for note in &backends[*name].notes {
+                prefixed_notes.push(format!("[{name}] {note}"));
+            }
+        }
+        let merged = BackendCaps {
+            monitor: pick(|caps| caps.monitor),
+            transfer: pick(|caps| caps.transfer),
+            hotkey: pick(|caps| caps.hotkey),
+            paste: paste
+                .cloned()
+                .unwrap_or(clipmonger_platform::types::PasteCaps {
+                    level: Level::Unavailable,
+                    strategy: PasteStrategy::Unavailable,
+                    reason: String::new(),
+                }),
+            tray: pick(|caps| caps.tray),
+            autostart: names.iter().any(|name| backends[*name].autostart),
+            primary_selection: names.iter().any(|name| backends[*name].primary_selection),
+            notes: prefixed_notes,
+        };
+        let mut snapshot = Self::typed_snapshot(&merged, extension_up);
+        let mut breakdown = serde_json::Map::new();
+        for name in names {
+            breakdown.insert(
+                (*name).clone(),
+                Self::typed_snapshot(&backends[name], extension_up),
+            );
+        }
+        snapshot["backends"] = Value::Object(breakdown);
+        snapshot
     }
 }
 
@@ -879,6 +955,11 @@ pub struct DaemonState {
     elevation_refused: Mutex<bool>,
     /// Elevated-helper supervisor (Windows runas thread; idle elsewhere).
     helper: Mutex<HelperSupervisor>,
+    /// Portal shortcut bind outstanding (system dialog may be showing).
+    portal_bind_pending: Mutex<bool>,
+    /// Dual-backend merge window state (seg-06 S8, W-F5: 2000 ms).
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    merger: Mutex<clipmonger_backend_wayland::merge::Merger>,
 }
 
 impl DaemonState {
@@ -895,6 +976,9 @@ impl DaemonState {
             gesture_counter: Mutex::new(0),
             elevation_refused: Mutex::new(false),
             helper: Mutex::new(HelperSupervisor::new()),
+            portal_bind_pending: Mutex::new(false),
+            #[cfg(all(unix, feature = "backend-wayland"))]
+            merger: Mutex::new(clipmonger_backend_wayland::merge::Merger::new(2000)),
         }
     }
 
@@ -1043,9 +1127,24 @@ impl DaemonState {
             .map_or((65536, 1000), |limits| *limits)
     }
 
+    /// Mark a portal shortcut bind as outstanding or settled (W-F4).
+    pub fn set_portal_bind_pending(&self, pending: bool) {
+        if let Ok(mut flag) = self.portal_bind_pending.lock() {
+            *flag = pending;
+        }
+    }
+
+    /// Whether a portal shortcut bind is outstanding.
+    #[must_use]
+    pub fn portal_bind_pending(&self) -> bool {
+        self.portal_bind_pending.lock().is_ok_and(|flag| *flag)
+    }
+
     /// Ingest one live monitor observation with already-read `payloads`.
     ///
     /// Sensitive observations only bump `privacy_skips` and store nothing.
+    /// With the wayland feature, bridged X11↔Wayland duplicates inside the
+    /// merge window are suppressed (first delivery wins, seg-06 S8 W-F5).
     /// Returns whether a row was stored.
     pub fn ingest_capture(
         &self,
@@ -1053,6 +1152,21 @@ impl DaemonState {
         sensitive: bool,
         payloads: &[(String, Vec<u8>)],
     ) -> bool {
+        #[cfg(all(unix, feature = "backend-wayland"))]
+        {
+            if !sensitive && !payloads.is_empty() {
+                let key = clipmonger_backend_wayland::merge::MergeKey::of(&payloads.to_vec());
+                let mimes: Vec<String> = payloads.iter().map(|(mime, _)| mime.clone()).collect();
+                let at_ms = u64::try_from(now_ms().max(0)).unwrap_or_default();
+                let duplicate = self.merger.lock().is_ok_and(|mut merger| {
+                    merger.offer(origin, &key, &mimes, at_ms)
+                        == clipmonger_backend_wayland::merge::MergeDecision::SuppressDuplicate
+                });
+                if duplicate {
+                    return false;
+                }
+            }
+        }
         let seed = u64::try_from(now_ms().max(0)).unwrap_or_default();
         matches!(
             store_payloads(&self.store, origin, sensitive, payloads, seed),
@@ -1062,10 +1176,9 @@ impl DaemonState {
 
     /// Find a stored clip id by its string form without naming the id type.
     fn find_clip(&self, id: &str) -> Option<clipmonger_core::model::Clip> {
-        let clips = self
-            .store
-            .list_history(u64::MAX, 0, true)
-            .unwrap_or_default();
+        // Bounded scan window: `u64::MAX` overflows the SQL `LIMIT` cast
+        // and silently yields no rows (every get/paste misses).
+        let clips = self.store.list_history(10_000, 0, true).unwrap_or_default();
         clips.into_iter().find(|c| c.id.to_string() == id)
     }
 
@@ -1236,7 +1349,34 @@ impl DaemonState {
                 })?;
             Ok(serde_json::json!({"pasted": true}))
         }
-        #[cfg(not(all(windows, feature = "backend-windows")))]
+        #[cfg(all(unix, feature = "backend-wayland"))]
+        {
+            use clipmonger_backend_wayland::{probe_current, WlPaste};
+            let found = self.requested_clip(params).ok_or_else(|| {
+                IpcError::new("backend", "paste.execute: unknown clip".to_string())
+            })?;
+            let payloads = self
+                .store
+                .get_clip(found.id)
+                .map_err(|e| IpcError::new("backend", e.to_string()))?
+                .map(|(_, payloads)| payloads)
+                .unwrap_or_default();
+            let has_data =
+                probe_current().protocol != clipmonger_backend_wayland::probe::Protocol::None;
+            let paste = WlPaste::new(has_data);
+            let outcome = paste
+                .paste_payloads(&payloads)
+                .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
+            let mut result = serde_json::json!({"pasted": true});
+            if let Some(toast) = outcome.toast {
+                result["toast"] = Value::from(toast);
+            }
+            Ok(result)
+        }
+        #[cfg(not(any(
+            all(windows, feature = "backend-windows"),
+            all(unix, feature = "backend-wayland")
+        )))]
         {
             let _ = (self, params);
             Err(IpcError::new(
@@ -1344,6 +1484,7 @@ impl DaemonState {
             "status" => Ok(serde_json::json!({
                 "caps": self.caps_snapshot(),
                 "helper": self.helper_route_state(),
+                "portal_bind_pending": self.portal_bind_pending(),
                 "up": true,
                 "running": true,
                 "version": DAEMON_VERSION,

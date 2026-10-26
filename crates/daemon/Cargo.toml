@@ -13,7 +13,7 @@ path = "src/main.rs"
 default = []
 backend-windows = ["dep:clipmonger-backend-windows"]
 backend-x11 = ["dep:clipmonger-backend-x11"]
-backend-wayland = []
+backend-wayland = ["dep:clipmonger-backend-wayland", "dep:ashpd", "dep:futures-util"]
 backend-macos = []
 minimal = []
 
@@ -31,6 +31,9 @@ clipmonger-backend-windows = { path = "../backend-windows", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 clipmonger-backend-x11 = { path = "../backend-x11", optional = true }
+clipmonger-backend-wayland = { path = "../backend-wayland", optional = true }
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "global_shortcuts"], optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [lints]
 workspace = true

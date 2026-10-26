@@ -83,7 +83,8 @@ fn write_token(profile: &Path) -> Result<String, String> {
 /// both); transfer offers use the short form.
 #[cfg(any(
     all(windows, feature = "backend-windows"),
-    all(unix, feature = "backend-x11")
+    all(unix, feature = "backend-x11"),
+    all(unix, feature = "backend-wayland")
 ))]
 fn wanted_format(mime: &str, formats: &[String]) -> bool {
     formats.iter().any(|format| {
@@ -379,6 +380,168 @@ fn setup_x11_backend(
     }
 }
 
+/// Which session backends to start: X11 when `DISPLAY` is set, Wayland
+/// when `WAYLAND_DISPLAY` is set (seg-06 S8 coexistence: both at once).
+/// Neither set means offline mode still serves history.
+#[cfg(any(
+    all(unix, feature = "backend-x11"),
+    all(unix, feature = "backend-wayland")
+))]
+fn want_backends(display: Option<&str>, wayland_display: Option<&str>) -> (bool, bool) {
+    let want_x11 = display.is_some_and(|d| !d.is_empty());
+    let want_wayland = wayland_display.is_some_and(|d| !d.is_empty());
+    (want_x11, want_wayland)
+}
+
+/// Construct the live Wayland backend: probe-driven caps, monitor thread
+/// (real payloads via transfer honoring the config formats), and the
+/// `GlobalShortcuts` portal session for the popup hotkey (daemon-event only,
+/// like X11/Windows). A missing compositor only degrades caps; the daemon
+/// keeps running (offline rule, seg-02 S7).
+#[cfg(all(unix, feature = "backend-wayland"))]
+#[allow(clippy::too_many_lines)]
+fn setup_wayland_backend(
+    state: &Arc<DaemonState>,
+    config: &Config,
+    shutdown: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    use clipmonger_backend_wayland::{
+        caps as backend_caps, probe_current, WlMonitor, WlMonitorOpts, WlTransfer,
+    };
+    use clipmonger_platform::traits::{ClipboardMonitor, ClipboardTransfer};
+
+    let capture_primary = config.monitor.capture_primary;
+    let probe = probe_current();
+    let caps = backend_caps::caps_for(&probe, capture_primary, false);
+
+    let transfer = match WlTransfer::connect() {
+        Ok(transfer) => Some(Arc::new(transfer)),
+        Err(e) => {
+            eprintln!("daemon: wayland transfer unavailable: {e}");
+            None
+        }
+    };
+
+    let mut monitor_ok = transfer.is_some();
+    let monitor = match WlMonitor::connect(WlMonitorOpts {
+        primary: capture_primary,
+        debounce_ms: config.monitor.primary_debounce_ms,
+        // No core config knob (core is frozen); W-F6 fixes min_len 3.
+        min_len: 3,
+        capture_primary,
+    }) {
+        Ok(mut monitor) => {
+            let mut kinds = vec![clipmonger_platform::types::SubscribeKind::Clipboard];
+            if capture_primary {
+                kinds.push(clipmonger_platform::types::SubscribeKind::Primary);
+            }
+            if monitor.subscribe(&kinds).is_err() {
+                monitor_ok = false;
+            }
+            Some(monitor)
+        }
+        Err(e) => {
+            eprintln!("daemon: wayland monitor unavailable: {e}");
+            monitor_ok = false;
+            None
+        }
+    };
+
+    let mut caps = caps;
+    if !monitor_ok {
+        caps.monitor = clipmonger_platform::types::Level::Degraded;
+        caps.notes
+            .push("monitor Degraded: Wayland session clipboard unavailable".to_string());
+    }
+    state.register_backend("wayland", caps);
+
+    if let (Some(mut monitor), Some(transfer)) = (monitor, transfer) {
+        let state = Arc::clone(state);
+        let formats: Vec<String> = config.monitor.formats.clone();
+        let max_bytes = config.monitor.max_bytes;
+        let poll_ms = config.monitor.poll_ms;
+        let shutdown = Arc::clone(shutdown);
+        std::thread::spawn(move || {
+            let poll_timeout = std::time::Duration::from_millis(poll_ms.clamp(50, 5000));
+            while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                let events = match monitor.poll(poll_timeout) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        eprintln!("daemon: wayland monitor poll failed: {e}");
+                        break;
+                    }
+                };
+                for event in &events {
+                    if event.sensitive {
+                        state.ingest_capture("wayland", true, &[]);
+                        continue;
+                    }
+                    let mut payloads = Vec::new();
+                    for offer in &event.offers {
+                        if !wanted_format(&offer.mime, &formats) {
+                            continue;
+                        }
+                        match transfer.read(&offer.mime, max_bytes) {
+                            Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
+                            Err(e) => {
+                                eprintln!(
+                                    "daemon: wayland payload read skipped ({}): {e}",
+                                    offer.mime
+                                );
+                            }
+                        }
+                    }
+                    if !payloads.is_empty() {
+                        state.ingest_capture("wayland", false, &payloads);
+                    }
+                }
+            }
+        });
+    }
+
+    // Portal session owns the popup hotkey (first bind may show a system
+    // dialog; `status.portal_bind_pending` forewarns the UI per W-F4).
+    clipmonger_daemon::portal::spawn_portal_session(
+        Arc::clone(state),
+        config.popup.hotkey.clone(),
+        capture_primary,
+    );
+}
+
+/// Start the session backends selected by `want_backends` (X11 and/or
+/// Wayland on Linux; Windows keeps its single-backend path). With neither
+/// display set this is a no-op and the daemon serves history offline.
+fn setup_session_backends(
+    profile: &Path,
+    state: &Arc<DaemonState>,
+    config: &Config,
+    backend_shutdown: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    #[cfg(all(windows, feature = "backend-windows"))]
+    setup_windows_backend(profile, state, config, backend_shutdown);
+    #[cfg(all(unix, feature = "backend-x11"))]
+    {
+        let (want_x11, _) = want_backends(
+            std::env::var("DISPLAY").ok().as_deref(),
+            std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        );
+        if want_x11 {
+            setup_x11_backend(profile, state, config, backend_shutdown);
+        }
+    }
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    {
+        let (_, want_wayland) = want_backends(
+            std::env::var("DISPLAY").ok().as_deref(),
+            std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        );
+        if want_wayland {
+            setup_wayland_backend(state, config, backend_shutdown);
+        }
+    }
+    let _ = (profile, state, config, backend_shutdown);
+}
+
 #[cfg(unix)]
 fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from)
@@ -583,10 +746,7 @@ async fn main() {
     state.set_profile_dir(&profile);
     state.set_paste_limits(config.popup.unicode_limit, config.popup.delivery_dwell_ms);
     let backend_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    #[cfg(all(windows, feature = "backend-windows"))]
-    setup_windows_backend(&profile, &state, &config, &backend_shutdown);
-    #[cfg(all(unix, feature = "backend-x11"))]
-    setup_x11_backend(&profile, &state, &config, &backend_shutdown);
+    setup_session_backends(&profile, &state, &config, &backend_shutdown);
     let stop: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
     let stop_handler = Arc::clone(&stop);
     let backend_stop = Arc::clone(&backend_shutdown);

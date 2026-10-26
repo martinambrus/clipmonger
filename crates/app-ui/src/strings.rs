@@ -15,6 +15,10 @@ const ENTRIES: &[(&str, &str)] = &[
     ),
     ("popup.paste_ok", "Pasted"),
     ("popup.paste_blocked", "Paste is not available right now"),
+    (
+        "paste.press_ctrl_v",
+        "Copied to clipboard. Press Ctrl+V to paste.",
+    ),
     ("popup.delete_confirm", "Delete this entry?"),
     ("popup.pin", "Pin entry"),
     ("popup.unpin", "Unpin entry"),
@@ -45,6 +49,7 @@ pub const IDS: &[&str] = &[
     "popup.stale_target",
     "popup.paste_ok",
     "popup.paste_blocked",
+    "paste.press_ctrl_v",
     "popup.delete_confirm",
     "popup.pin",
     "popup.unpin",
