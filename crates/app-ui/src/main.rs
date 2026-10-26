@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use clipmonger_app_ui::{ipc_bridge, keymap, placement, popup, strings, tray_logic};
+use clipmonger_app_ui::{ipc_bridge, keymap, lifecycle, placement, popup, strings, tray_logic};
 use clipmonger_core::config::Config;
 use clipmonger_ipc::client::Client;
 use clipmonger_ipc::framing;
@@ -32,6 +32,21 @@ struct ClientTransport {
 impl ipc_bridge::Transport for ClientTransport {
     fn call(&mut self, method: &str, params: &Value) -> Result<Value, IpcError> {
         self.client.call(method, params.clone())
+    }
+}
+
+/// Transport used when no daemon is reachable: every call fails as
+/// unavailable so the window opens offline instead of exiting.
+struct OfflineTransport;
+
+impl ipc_bridge::Transport for OfflineTransport {
+    fn call(&mut self, _method: &str, _params: &Value) -> Result<Value, IpcError> {
+        Err(IpcError {
+            code: "unavailable".to_string(),
+            message: "daemon not running".to_string(),
+            retryable: true,
+            backend: Option::None,
+        })
     }
 }
 
@@ -337,11 +352,13 @@ fn main() -> ExitCode {
             Option::None
         }
     });
-    let Some(client) = client else {
-        eprintln!("daemon not running");
-        return ExitCode::from(1);
+    let mode = lifecycle::start_mode(client.is_some());
+    let transport: Box<dyn ipc_bridge::Transport> = match client {
+        Some(client) => Box::new(ClientTransport { client }),
+        Option::None => Box::new(OfflineTransport),
     };
-    let (cmds, events) = ipc_bridge::Bridge::spawn(Box::new(ClientTransport { client }));
+    let online = mode == lifecycle::StartMode::Attached;
+    let (cmds, events) = ipc_bridge::Bridge::spawn(transport);
     let _ = cmds.send(ipc_bridge::UiCmd::Status);
     let _ = cmds.send(ipc_bridge::UiCmd::ListHistory);
     let monitor = placement::Rect {
@@ -357,8 +374,10 @@ fn main() -> ExitCode {
             .with_position(egui::pos2(px as f32, py as f32)),
         ..Default::default()
     };
+    let mut vm = popup::PopupVm::new();
+    vm.set_offline(!online);
     let app = ShellApp {
-        vm: popup::PopupVm::new(),
+        vm,
         cmds,
         events,
         tray: tray_logic::TrayLogic::new(),
@@ -366,7 +385,7 @@ fn main() -> ExitCode {
         inputs: tray_logic::TrayInputs {
             paused: false,
             degraded: false,
-            attached: true,
+            attached: online,
         },
         open: !minimized,
         error: String::new(),

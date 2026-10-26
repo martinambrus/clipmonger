@@ -121,3 +121,34 @@ pub fn next_backoff(attempt: u32) -> Duration {
     let doubled = BACKOFF_FIRST_MS.saturating_mul(1_u64 << attempt.min(8));
     Duration::from_millis(doubled.min(BACKOFF_MAX_MS))
 }
+
+/// How the shell starts, given whether a daemon link came up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartMode {
+    /// Daemon linked: normal attached start.
+    Attached,
+    /// No daemon: the window still opens, offline (seg-09 S2/S12).
+    Offline,
+}
+
+/// Start mode for a connect outcome. No daemon is never a reason to exit
+/// before the window opens.
+#[must_use]
+pub fn start_mode(connected: bool) -> StartMode {
+    if connected {
+        StartMode::Attached
+    } else {
+        StartMode::Offline
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{start_mode, StartMode};
+
+    #[test]
+    fn no_daemon_still_opens_window_offline() {
+        assert_eq!(start_mode(false), StartMode::Offline);
+        assert_eq!(start_mode(true), StartMode::Attached);
+    }
+}
