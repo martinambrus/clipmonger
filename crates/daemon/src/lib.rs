@@ -931,6 +931,28 @@ impl DaemonState {
         token
     }
 
+    /// Consume the newest unexpired trigger token (daemon-side spend: the
+    /// popup presents no token in v1, so a paste within the trigger window
+    /// spends the trigger's token once; generic callers still cannot mint).
+    #[cfg_attr(not(all(windows, feature = "backend-windows")), allow(dead_code))]
+    fn consume_trigger_token(&self, at_ms: i64) -> bool {
+        let Ok(mut tokens) = self.gesture_tokens.lock() else {
+            return false;
+        };
+        let newest = tokens
+            .iter()
+            .filter(|(_, minted)| at_ms >= **minted && at_ms - **minted <= GESTURE_TTL_MS)
+            .max_by_key(|(_, minted)| **minted)
+            .map(|(token, _)| *token);
+        match newest {
+            Some(token) => {
+                tokens.remove(&token);
+                true
+            }
+            Option::None => false,
+        }
+    }
+
     /// Consume one gesture token: true exactly once while unexpired.
     #[cfg_attr(not(all(windows, feature = "backend-windows")), allow(dead_code))]
     fn consume_gesture_token(&self, token: u64, at_ms: i64) -> bool {
@@ -1191,7 +1213,9 @@ impl DaemonState {
                 .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
             if clipmonger_backend_windows::target_integrity(&target.handle) == Integrity::High {
                 let token = params.get("gesture").and_then(Value::as_u64);
-                if token.is_none_or(|token| !self.consume_gesture_token(token, now_ms())) {
+                let token_ok = token.is_some_and(|t| self.consume_gesture_token(t, now_ms()))
+                    || self.consume_trigger_token(now_ms());
+                if !token_ok {
                     self.note_elevation_refused("missing or invalid gesture token");
                     return Err(IpcError::new(
                         "denied",
@@ -1340,7 +1364,24 @@ impl DaemonState {
 mod tests {
     use serde_json::Value;
 
-    use super::CapsAggregator;
+    use super::{now_ms, CapsAggregator, DaemonState};
+
+    #[test]
+    fn trigger_token_spends_once_daemon_side() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        assert!(
+            !state.consume_trigger_token(now_ms()),
+            "no trigger, no spend"
+        );
+        state.mint_gesture_token();
+        assert!(
+            state.consume_trigger_token(now_ms()),
+            "trigger token spends"
+        );
+        assert!(!state.consume_trigger_token(now_ms()), "single use only");
+    }
 
     #[test]
     fn caps_extension_flip_marks_gnome_unavailable() {
