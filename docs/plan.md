@@ -121,9 +121,17 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   Open: T-508 real-DE manual pass (Ubuntu box), t507 keystroke leg
   under a real WM, reboot leg. Note: this box needed /tmp/.X11-unix
   remounted rw for Xvfb.
-- **4. Wayland backend.** Seg-06: paste SPIKE first (§7 exit criteria),
+- **4. Wayland backend. (DONE 2026-10-26, WSL + nested sway)** Seg-06: paste SPIKE first (§7 exit criteria),
   then data-control backends, portal hotkeys + fallbacks, dual-backend
   merge. Tests T-601…607.
+  Evidence: spike verdicts (WSLg no data-control = expected negative;
+  sway zwlr v2 watcher ok); pure T-601/602/603/608 (21 tests); sway
+  harness 8/8 (capture/readback, password-hint, clear, kill-owner,
+  primary policy legs, fallback live); dual X11+Wayland smoke merges
+  to one entry; paste = write+toast fallback (W-F7). Open: T-606/607
+  per-compositor manual matrix + real injection (Ubuntu GNOME/KDE
+  box), t609 primary positive legs (needs primary-capable peer),
+  X11-on-local-Xvfb connect hang noted in smoke (WSLg :0 used).
 - **5. GNOME extension (parallel with 4 after IPC freeze).** Seg-07
   (relay, keybindings, IPC, matrix, packaging). Tests T-701…704.
 - **6. UI v1.** Seg-09 (popup, tray, maximalist config for v1 scope,
