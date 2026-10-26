@@ -97,9 +97,19 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   Manual evidence 2026-10-26: Windows window-open test PASSED (user-run
   clipmonger.exe on Win host: opens, stays, renders empty popup; offline
   fix f58987f after first run exited pre-window).
-- **2. Windows backend.** Seg-04 (listener, transfer, hotkeys, enigo
+- **2. Windows backend. (CODE DONE 2026-10-26, WSL+Win host; T-409 manual pending)**
+  Seg-04 (listener, transfer, hotkeys, enigo
   paste, on-demand elevated helper, tray, autostart). Tests T-401…410
   incl. the UAC manual matrix.
+  Evidence: named-pipe IPC 8/8 on Win host; pure logic T-401/402 (37
+  tests); session harness 8/8 serial on Win host (monitor/transfer/
+  hotkeys/integrity/guarded-restore/autostart/caps); helper protocol
+  T-403/413-unit/414 (12 tests); daemon live-ingest + caps proven via
+  CLI. Coexistence with ArsClip + RustDesk/ScreenConnect verified by
+  design (passive listener; sync tools paused only for clean test
+  runs). Open: T-409 UAC matrix (user manual QA, needs Program Files
+  install), T-410 reboot leg, popup gesture-token handoff, tray icon
+  (app-ui Step 6), PNG/DIB conversion, explicit pipe DACL.
 - **3. X11 backend.** Seg-05 (XFixes + manager role, transfer+INCR,
   hotkeys, enigo paste, KSNI tray, .desktop autostart). Tests T-501…508
   (Xvfb headless).
