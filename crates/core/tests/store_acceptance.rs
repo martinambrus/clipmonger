@@ -180,7 +180,7 @@ fn t302_schema_reopen_preserves_rows() {
     drop(store);
     let store2 = Store::open(&profile).expect("reopen");
     assert_eq!(history_ids(&store2), vec![clip.id]);
-    assert!(corrupt_asides(&profile).is_empty());
+    assert_eq!(corrupt_asides(&profile), [] as [PathBuf; 0]);
 }
 
 // ---- T-303: open-path matrix + integrity ----
@@ -245,8 +245,8 @@ fn t303_true_corruption_preserved_aside() {
     // True corruption (unreadable header): open fails, the bytes are
     // preserved aside as clipstore.corrupt-*, and the error surfaces it.
     let profile = unique_dir("t303-corrupt");
-    let _store = Store::open(&profile).expect("open");
-    drop(_store);
+    let store = Store::open(&profile).expect("open");
+    drop(store);
     let path = db_path(&profile);
     std::fs::write(&path, vec![0xFFu8; 4096]).unwrap();
 
@@ -299,12 +299,14 @@ fn t314_downgrade_refused_and_byte_unchanged() {
         other => panic!("expected DowngradeRefused, got {other:?}"),
     }
     assert_eq!(read_bytes(&path), before, "refused open must not write");
-    assert!(corrupt_asides(&profile).is_empty());
+    assert_eq!(corrupt_asides(&profile), [] as [PathBuf; 0]);
 }
 
 // ---- T-305 (store side): blob boundary, dedupe, retention, privacy ----
 
 const KIB256: usize = 256 * 1024;
+
+type Payloads = Vec<(String, Vec<u8>)>;
 
 fn payload_row_external(path: &Path, mime: &str) -> Option<(i64, Option<String>)> {
     let conn = rusqlite::Connection::open(path).unwrap();
@@ -403,9 +405,8 @@ fn t305_store_dedupe_move_to_top() {
     // Same bytes again: no duplicate, existing row moves to top.
     let dupe = sample_clip(Uuid::now_v7(), "first", "same-content", 1_700_000_002_002);
     let outcome = store.insert_clip(&dupe, &payloads).expect("dupe insert");
-    let hit = match outcome {
-        InsertOutcome::MovedToTop(id) => id,
-        _ => panic!("expected MovedToTop for duplicate content"),
+    let InsertOutcome::MovedToTop(hit) = outcome else {
+        panic!("expected MovedToTop for duplicate content")
     };
     assert_eq!(hit, first.id);
     let ids = history_ids(&store);
@@ -557,7 +558,7 @@ fn t305_store_privacy_skip_creates_no_row() {
 
 // ---- T-307: backup/restore roundtrip ----
 
-fn seed_profile(profile: &Path) -> (Store, Vec<(Clip, Vec<(String, Vec<u8>)>)>) {
+fn seed_profile(profile: &Path) -> (Store, Vec<(Clip, Payloads)>) {
     let store = Store::open(profile).expect("open");
     let mut clips = Vec::new();
     let inline = sample_clip(Uuid::now_v7(), "inline", "inline backup", 1_700_000_006_000);
@@ -574,9 +575,9 @@ fn seed_profile(profile: &Path) -> (Store, Vec<(Clip, Vec<(String, Vec<u8>)>)>) 
 #[test]
 fn t307_backup_restore_roundtrip_with_external_blob() {
     let src = unique_dir("t307-src");
-    let (_store, clips) = seed_profile(&src);
+    let (store, clips) = seed_profile(&src);
     let zip_path = src.join("backup.zip");
-    _store.backup_zip(&zip_path).expect("backup");
+    store.backup_zip(&zip_path).expect("backup");
     assert!(zip_path.exists());
 
     let dst = unique_dir("t307-dst");
@@ -595,7 +596,7 @@ fn t307_backup_restore_roundtrip_with_external_blob() {
         }
     }
     // Source profile untouched by the backup read path.
-    assert_eq!(history_ids(&_store).len(), clips.len());
+    assert_eq!(history_ids(&store).len(), clips.len());
 }
 
 // ---- T-308: WAL read-during-write, barrier-paced, no sleeps ----
@@ -621,7 +622,7 @@ fn t308_wal_read_during_write_burst() {
                         Uuid::now_v7(),
                         &text,
                         &text,
-                        1_700_000_007_000 + (w * per_writer + i) as i64,
+                        1_700_000_007_000 + i64::try_from(w * per_writer + i).unwrap(),
                     );
                     store
                         .insert_clip(&clip, &text_payloads(&text))
@@ -637,9 +638,9 @@ fn t308_wal_read_during_write_burst() {
                 let store = Store::open(profile).expect("reader open");
                 let mut last = 0usize;
                 for _ in 0..(writers * per_writer) {
-                    let list = store.list_history(10_000, 0, false).expect("read");
-                    assert!(list.len() >= last, "reads must see monotonic snapshots");
-                    last = list.len();
+                    let snapshot = store.list_history(10_000, 0, false).expect("read");
+                    assert!(snapshot.len() >= last, "reads must see monotonic snapshots");
+                    last = snapshot.len();
                     if last == writers * per_writer {
                         break;
                     }
@@ -734,7 +735,7 @@ fn write_zip(path: &Path, f: impl FnOnce(&mut zip::ZipWriter<std::fs::File>)) {
     w.finish().unwrap();
 }
 
-fn snapshot_content(store: &Store) -> Vec<(Uuid, Vec<(String, Vec<u8>)>)> {
+fn snapshot_content(store: &Store) -> Vec<(Uuid, Payloads)> {
     store
         .list_history(10_000, 0, true)
         .expect("list")
@@ -767,7 +768,7 @@ fn t312_restore_rejects_traversal_and_leaves_profile_untouched() {
     });
 
     let err = Store::restore_zip(&evil, &profile).expect_err("traversal must fail");
-    assert!(!format!("{err}").is_empty());
+    assert_ne!(format!("{err}"), "");
     let store2 = Store::open(&profile).expect("profile still opens");
     assert_eq!(snapshot_content(&store2).len(), before.len());
     assert_eq!(history_ids(&store2), vec![clip.id]);
@@ -859,7 +860,7 @@ fn t313_fts_like_parity_at_multiple_preview_widths() {
             Uuid::now_v7(),
             &preview,
             &row_body,
-            1_700_000_010_000 + i as i64,
+            1_700_000_010_000 + i64::try_from(i).unwrap(),
         );
         let _ = store
             .insert_clip(&clip, &text_payloads(&row_body))
