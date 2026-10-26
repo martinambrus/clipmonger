@@ -1,0 +1,20 @@
+[package]
+name = "clipmonger-backend-wayland"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clipmonger-core = { path = "../core" }
+clipmonger-platform = { path = "../platform" }
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+wl-clipboard-rs.workspace = true
+wayland-client.workspace = true
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

@@ -385,6 +385,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipmonger-backend-wayland"
+version = "0.1.0"
+dependencies = [
+ "clipmonger-core",
+ "clipmonger-platform",
+ "serde",
+ "serde_json",
+ "wayland-client",
+ "wl-clipboard-rs",
+]
+
+[[package]]
 name = "clipmonger-backend-windows"
 version = "0.1.0"
 dependencies = [

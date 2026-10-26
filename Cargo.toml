@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/platform", "crates/ipc", "crates/daemon", "crates/app-cli", "crates/app-ui", "crates/backend-windows", "crates/backend-x11"]
+members = ["crates/core", "crates/platform", "crates/ipc", "crates/daemon", "crates/app-cli", "crates/app-ui", "crates/backend-windows", "crates/backend-x11", "crates/backend-wayland"]
 
 [workspace.package]
 edition = "2021"
@@ -17,6 +17,8 @@ toml = "1.1"
 directories = "6.0"
 rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "signal", "process", "macros", "net", "io-util"] }
+wl-clipboard-rs = "0.9"
+wayland-client = "0.31"
 clap = { version = "4.6", features = ["derive"] }
 zip = { version = "4", default-features = false, features = ["deflate"] }
 
