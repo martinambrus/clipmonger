@@ -110,9 +110,17 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   runs). Open: T-409 UAC matrix (user manual QA, needs Program Files
   install), T-410 reboot leg, popup gesture-token handoff, tray icon
   (app-ui Step 6), PNG/DIB conversion, explicit pipe DACL.
-- **3. X11 backend.** Seg-05 (XFixes + manager role, transfer+INCR,
+- **3. X11 backend. (DONE 2026-10-26, WSL Xvfb)** Seg-05 (XFixes + manager role, transfer+INCR,
   hotkeys, enigo paste, KSNI tray, .desktop autostart). Tests T-501…508
   (Xvfb headless).
+  Evidence: pure logic 38 tests (T-501/502/503/504/510); Xvfb serial
+  harness 10/10 (capture/readback, 5MiB INCR, owner timeout,
+  SAVE_TARGETS dying-owner, manager coexistence capture-only,
+  primary policy, hotkey conflict+fire, paste transfer/restore,
+  autostart, caps); daemon smoke under Xvfb ingests with x11 caps.
+  Open: T-508 real-DE manual pass (Ubuntu box), t507 keystroke leg
+  under a real WM, reboot leg. Note: this box needed /tmp/.X11-unix
+  remounted rw for Xvfb.
 - **4. Wayland backend.** Seg-06: paste SPIKE first (§7 exit criteria),
   then data-control backends, portal hotkeys + fallbacks, dual-backend
   merge. Tests T-601…607.
