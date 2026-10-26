@@ -6,8 +6,10 @@ pub mod error;
 pub mod hash;
 pub mod model;
 pub mod policy;
+pub mod store;
 
 pub use config::{AppPaths, Config};
 pub use error::{BackendKind, CoreError};
+pub use store::{GcReport, InsertOutcome, Store};
 
 pub const APP_IDENTITY: &str = "clipmonger";

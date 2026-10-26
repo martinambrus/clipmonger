@@ -29,6 +29,17 @@ pub fn needs_stub(largest_payload_bytes: u64, max_bytes: u64) -> bool {
     largest_payload_bytes > max_bytes
 }
 
+/// Retention caps (mirrors `HistoryConfig`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Max live clips kept (pinned exempt).
+    pub max_items: u64,
+    /// Max logical bytes kept (pinned exempt from deletion).
+    pub max_store_bytes: u64,
+    /// Max clip age in days (0 = off).
+    pub max_age_days: u64,
+}
+
 /// Minimal candidate view for the dedupe window scan.
 pub struct DedupeCandidate {
     pub id: Uuid,
