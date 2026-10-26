@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/platform", "crates/ipc", "crates/daemon", "crates/app-cli"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["std"] }
+uuid = { version = "1.28", features = ["v7", "serde"] }
+thiserror = "2.0"
+sha2 = "0.11"
+toml = "1.1"
+directories = "6.0"
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "signal", "process", "macros", "net", "io-util"] }
+clap = { version = "4.6", features = ["derive"] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
