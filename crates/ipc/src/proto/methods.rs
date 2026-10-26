@@ -1,6 +1,6 @@
 //! Method Params/Result pairs for every v1 IPC method.
 
-use clipmonger_core::model::Clip;
+use clipmonger_core::model::{Clip, PermanentClip};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -281,6 +281,88 @@ pub struct PermanentExecParams {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermanentExecResult {
     pub ok: bool,
+}
+/// List filter for `permanent.list`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+/// Permanent page for `permanent.list`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentListResult {
+    #[serde(default)]
+    pub permanents: Vec<PermanentClip>,
+}
+/// Create request for `permanent.create` (id/kind/js/rev are server-owned).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentCreateParams {
+    pub group: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotkey: Option<String>,
+    pub body: String,
+}
+/// Create output for `permanent.create`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentCreateResult {
+    pub permanent: PermanentClip,
+}
+/// Update request for `permanent.update` (full edited clip).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentUpdateParams {
+    pub permanent: PermanentClip,
+}
+/// Update output for `permanent.update`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentUpdateResult {
+    pub updated: bool,
+}
+/// Delete request for `permanent.delete`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentDeleteParams {
+    pub id: Uuid,
+}
+/// Delete output for `permanent.delete`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentDeleteResult {
+    pub deleted: bool,
+}
+/// Empty params for `permanent.groups`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentGroupsParams {}
+/// One group row for `permanent.groups`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentGroupInfo {
+    pub name: String,
+    pub system: bool,
+    pub count: u64,
+}
+/// Groups output for `permanent.groups`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentGroupsResult {
+    #[serde(default)]
+    pub groups: Vec<PermanentGroupInfo>,
+}
+/// Group create for `permanent.group_create`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentGroupCreateParams {
+    pub name: String,
+}
+/// Group create output for `permanent.group_create`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentGroupCreateResult {
+    pub created: bool,
+}
+/// Group delete for `permanent.group_delete`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentGroupDeleteParams {
+    pub name: String,
+}
+/// Group delete output for `permanent.group_delete`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermanentGroupDeleteResult {
+    pub deleted: bool,
 }
 /// Empty params for `history.purge_removed`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use clipmonger_app_ui::{
-    config_model, ipc_bridge, keymap, lifecycle, placement, popup, strings, tray_logic,
+    config_model, ipc_bridge, keymap, lifecycle, permanents, placement, popup, strings, tray_logic,
 };
 use clipmonger_core::config::Config;
 use clipmonger_ipc::client::Client;
@@ -218,6 +218,10 @@ struct ShellApp {
     font_scale: f32,
     pause_deadline: Option<Instant>,
     pending_apply: Vec<String>,
+    perm_vm: permanents::PermanentsVm,
+    perm_source: Option<usize>,
+    perm_group_new: String,
+    perm_confirm_delete: Option<uuid::Uuid>,
     #[cfg(any(windows, target_os = "macos"))]
     real_tray: Option<RealTray>,
 }
@@ -355,6 +359,27 @@ impl ShellApp {
                         self.pause_deadline = None;
                     }
                 }
+                ipc_bridge::UiEvent::Permanents(body) => {
+                    self.perm_vm.apply_list(&body);
+                }
+                ipc_bridge::UiEvent::PermGroups(body) => {
+                    self.perm_vm.apply_groups(&body);
+                }
+                ipc_bridge::UiEvent::PermanentSaved => {
+                    self.perm_vm.draft = None;
+                    self.send(ipc_bridge::UiCmd::ListPermanents);
+                    self.send(ipc_bridge::UiCmd::PermGroups);
+                }
+                ipc_bridge::UiEvent::PermanentDeleted(id) => {
+                    self.perm_vm.remove_confirmed(id);
+                    self.perm_confirm_delete = None;
+                    self.send(ipc_bridge::UiCmd::PermGroups);
+                }
+                ipc_bridge::UiEvent::PermGroupsChanged => {
+                    self.perm_group_new.clear();
+                    self.send(ipc_bridge::UiCmd::ListPermanents);
+                    self.send(ipc_bridge::UiCmd::PermGroups);
+                }
                 ipc_bridge::UiEvent::Purged(_) => {}
                 ipc_bridge::UiEvent::Error(message) => {
                     self.error = message.clone();
@@ -380,6 +405,13 @@ impl ShellApp {
                 self.send(ipc_bridge::UiCmd::PinClip(id, pinned));
             }
             popup::VmEffect::Refresh => self.send(ipc_bridge::UiCmd::ListHistory),
+            popup::VmEffect::GroupTab(n) => {
+                self.perm_vm.select_group(usize::from(n.saturating_sub(1)));
+                self.perm_source = Some(self.perm_vm.active_group);
+            }
+            popup::VmEffect::ExecPermanent(id) => {
+                self.send(ipc_bridge::UiCmd::ExecPermanent(id));
+            }
         }
     }
 
@@ -391,6 +423,8 @@ impl ShellApp {
                 self.open = true;
                 self.vm.target_session.show();
                 self.send(ipc_bridge::UiCmd::ListHistory);
+                self.send(ipc_bridge::UiCmd::ListPermanents);
+                self.send(ipc_bridge::UiCmd::PermGroups);
             }
             tray_logic::TrayAction::TogglePause => {
                 self.pause_deadline = None;
@@ -407,6 +441,8 @@ impl ShellApp {
                 self.config_open = true;
                 self.send(ipc_bridge::UiCmd::ConfigGet);
                 self.send(ipc_bridge::UiCmd::CapsGet);
+                self.send(ipc_bridge::UiCmd::ListPermanents);
+                self.send(ipc_bridge::UiCmd::PermGroups);
             }
             tray_logic::TrayAction::About => {
                 self.config_open = true;
@@ -450,6 +486,15 @@ impl ShellApp {
                 (egui::Key::F5, "F5"),
                 (egui::Key::P, "p"),
                 (egui::Key::E, "e"),
+                (egui::Key::Num1, "1"),
+                (egui::Key::Num2, "2"),
+                (egui::Key::Num3, "3"),
+                (egui::Key::Num4, "4"),
+                (egui::Key::Num5, "5"),
+                (egui::Key::Num6, "6"),
+                (egui::Key::Num7, "7"),
+                (egui::Key::Num8, "8"),
+                (egui::Key::Num9, "9"),
             ];
             for (key, name) in pairs {
                 if input.key_pressed(key) {
@@ -481,6 +526,13 @@ impl ShellApp {
         let mut do_purge = false;
         let mut stage_edits: Vec<(String, Value)> = Vec::new();
         let mut theme_changed = false;
+        let mut perm_send: Vec<ipc_bridge::UiCmd> = Vec::new();
+        let mut perm_save = false;
+        let mut perm_cancel = false;
+        let mut perm_begin_new = false;
+        let mut perm_begin_edit: Option<uuid::Uuid> = None;
+        let mut perm_select: Option<usize> = None;
+        let mut perm_confirm: Option<uuid::Uuid> = None;
         egui::Window::new(strings::text("config.title"))
             .open(&mut open)
             .show(ctx, |ui| {
@@ -538,7 +590,105 @@ impl ShellApp {
                     }
                     ui.label(strings::text("config.non_atomic_note"));
                     if self.config_tab == "PermanentClips" {
-                        ui.label(strings::text("config.permanents_note"));
+                        ui.label(strings::text("perm.immediate_note"));
+                        ui.label(strings::text("perm.hotkey_note"));
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.perm_group_new));
+                            if ui.button(strings::text("perm.new_group")).clicked() {
+                                perm_send.push(ipc_bridge::UiCmd::PermGroupCreate(
+                                    self.perm_group_new.clone(),
+                                ));
+                            }
+                        });
+                        let group_names = self.perm_vm.group_names();
+                        for (index, name) in group_names.iter().enumerate() {
+                            if ui
+                                .selectable_label(self.perm_vm.active_group == index, name)
+                                .clicked()
+                            {
+                                perm_select = Some(index);
+                            }
+                        }
+                        let active_count = self
+                            .perm_vm
+                            .group_infos()
+                            .iter()
+                            .find(|g| group_names.get(self.perm_vm.active_group) == Some(&g.name))
+                            .map_or(0, |g| g.count);
+                        if active_count > 0 {
+                            ui.label(strings::text("perm.group_not_empty"));
+                        }
+                        if let Some(name) = group_names.get(self.perm_vm.active_group).cloned() {
+                            if ui
+                                .add_enabled(
+                                    active_count == 0,
+                                    egui::Button::new(strings::text("perm.delete_group")),
+                                )
+                                .clicked()
+                            {
+                                perm_send.push(ipc_bridge::UiCmd::PermGroupDelete(name));
+                            }
+                        }
+                        let visible_rows: Vec<(uuid::Uuid, String, String)> = self
+                            .perm_vm
+                            .visible("")
+                            .iter()
+                            .map(|&i| {
+                                let clip = &self.perm_vm.permanents[i];
+                                (
+                                    clip.id,
+                                    clip.name.clone(),
+                                    clip.hotkey.clone().unwrap_or_default(),
+                                )
+                            })
+                            .collect();
+                        if visible_rows.is_empty() {
+                            ui.label(strings::text("perm.empty_group"));
+                        }
+                        for (row, (id, name, hotkey)) in visible_rows.iter().enumerate() {
+                            let label = if hotkey.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("{name} {hotkey}")
+                            };
+                            if ui
+                                .selectable_label(self.perm_vm.selected == row, label)
+                                .clicked()
+                            {
+                                self.perm_vm.selected = row;
+                                perm_begin_edit = Some(*id);
+                            }
+                        }
+                        if ui.button(strings::text("perm.new_clip")).clicked() {
+                            perm_begin_new = true;
+                        }
+                        if let Some(id) = self.perm_vm.activate_selected() {
+                            if ui.button(strings::text("perm.delete_clip")).clicked() {
+                                perm_confirm = Some(id);
+                            }
+                            if self.perm_confirm_delete == Some(id) {
+                                ui.label(strings::text("perm.delete_confirm"));
+                                if ui.button(strings::text("perm.delete_clip")).clicked() {
+                                    perm_send.push(ipc_bridge::UiCmd::PermDelete(id));
+                                }
+                            }
+                        }
+                        if let Some(draft) = &mut self.perm_vm.draft {
+                            ui.label(strings::text("perm.name"));
+                            ui.add(egui::TextEdit::singleline(&mut draft.name));
+                            ui.label(strings::text("perm.group"));
+                            ui.add(egui::TextEdit::singleline(&mut draft.group));
+                            ui.label(strings::text("perm.hotkey"));
+                            ui.add(egui::TextEdit::singleline(&mut draft.hotkey));
+                            ui.label(strings::text("perm.body"));
+                            ui.add(egui::TextEdit::multiline(&mut draft.body));
+                            if ui.button(strings::text("perm.save")).clicked() {
+                                perm_save = true;
+                            }
+                            if ui.button(strings::text("perm.cancel_edit")).clicked() {
+                                perm_cancel = true;
+                            }
+                        }
                     }
                     let Some(doc) = &self.config_doc else {
                         ui.label(strings::text("popup.offline"));
@@ -550,6 +700,9 @@ impl ShellApp {
                     for index in filtered {
                         let row = config_model::ROWS[index];
                         if format!("{:?}", row.tab) != self.config_tab {
+                            continue;
+                        }
+                        if self.config_tab == "PermanentClips" && row.key == "permanents.groups" {
                             continue;
                         }
                         let saved = doc.get(row.key);
@@ -617,6 +770,46 @@ impl ShellApp {
                 if theme_changed { /* handled after the window */ }
             });
         self.config_open = open;
+        if let Some(index) = perm_select {
+            self.perm_vm.select_group(index);
+        }
+        if perm_begin_new {
+            self.perm_vm.begin_new();
+        }
+        if let Some(id) = perm_begin_edit {
+            self.perm_vm.begin_edit(id);
+        }
+        if let Some(id) = perm_confirm {
+            self.perm_confirm_delete = Some(id);
+        }
+        if perm_cancel {
+            self.perm_vm.draft = None;
+        }
+        if perm_save {
+            match self.perm_vm.validate_draft() {
+                Ok(params) => {
+                    self.config_error.clear();
+                    let draft_id = self.perm_vm.draft.as_ref().and_then(|d| d.id);
+                    if let Some(id) = draft_id {
+                        if let Some(mut clip) =
+                            self.perm_vm.permanents.iter().find(|c| c.id == id).cloned()
+                        {
+                            clip.group = params.group;
+                            clip.name = params.name;
+                            clip.hotkey = params.hotkey;
+                            clip.body = params.body;
+                            self.send(ipc_bridge::UiCmd::PermUpdate(clip));
+                        }
+                    } else {
+                        self.send(ipc_bridge::UiCmd::PermCreate(params));
+                    }
+                }
+                Err(id) => self.config_error = strings::text(id).to_string(),
+            }
+        }
+        for cmd in perm_send {
+            self.send(cmd);
+        }
         if theme_changed {
             let mode = if self.dark { "dark" } else { "light" };
             self.send(ipc_bridge::UiCmd::ConfigSet(
@@ -659,9 +852,12 @@ impl ShellApp {
     }
 
     /// Render the popup window contents.
+    #[allow(clippy::too_many_lines)]
     fn render(&mut self, ui: &mut egui::Ui) {
         let mut query = self.vm.query.clone();
         let mut clicked_row: Option<usize> = Option::None;
+        let mut clicked_perm_row: Option<usize> = Option::None;
+        let mut perm_tab_click: Option<Option<usize>> = None;
         let mut pin_row: Option<usize> = Option::None;
         let mut delete_row: Option<usize> = Option::None;
         let mut search_focused = false;
@@ -676,39 +872,79 @@ impl ShellApp {
                 ui.label(strings::text(popup::preview_kind(current)));
                 ui.label(&current.preview);
             }
-            let count = self.vm.visible().len();
-            if count == 0 {
-                ui.label(strings::text("popup.empty"));
-            }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for row in 0..count {
-                    let Some(clip) = self.vm.clip_at(row) else {
-                        continue;
-                    };
-                    let clip_id = clip.id;
-                    let pinned = clip.pinned;
-                    let response = ui.selectable_label(self.vm.selected == row, &clip.preview);
-                    if response.clicked() {
-                        clicked_row = Some(row);
+            let group_names = self.perm_vm.group_names();
+            if !group_names.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .selectable_label(
+                            self.perm_source.is_none(),
+                            strings::text("perm.tab_history"),
+                        )
+                        .clicked()
+                    {
+                        perm_tab_click = Some(None);
                     }
-                    response.context_menu(|ui| {
-                        let pin_label = if pinned {
-                            strings::text("popup.unpin")
-                        } else {
-                            strings::text("popup.pin")
-                        };
-                        if ui.button(pin_label).clicked() {
-                            pin_row = Some(row);
-                            ui.close();
+                    for (index, name) in group_names.iter().enumerate() {
+                        if ui
+                            .selectable_label(self.perm_source == Some(index), name)
+                            .clicked()
+                        {
+                            perm_tab_click = Some(Some(index));
                         }
-                        if ui.button(strings::text("popup.delete")).clicked() {
-                            delete_row = Some(row);
-                            ui.close();
-                        }
-                        let _ = clip_id;
-                    });
+                    }
+                });
+            }
+            if self.perm_source.is_some() && !group_names.is_empty() {
+                let rows = self.perm_vm.visible(&query);
+                if rows.is_empty() {
+                    ui.label(strings::text("popup.empty"));
                 }
-            });
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (row, index) in rows.iter().enumerate() {
+                        let clip = &self.perm_vm.permanents[*index];
+                        if ui
+                            .selectable_label(self.perm_vm.selected == row, &clip.name)
+                            .clicked()
+                        {
+                            clicked_perm_row = Some(row);
+                        }
+                    }
+                });
+            } else {
+                let count = self.vm.visible().len();
+                if count == 0 {
+                    ui.label(strings::text("popup.empty"));
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for row in 0..count {
+                        let Some(clip) = self.vm.clip_at(row) else {
+                            continue;
+                        };
+                        let clip_id = clip.id;
+                        let pinned = clip.pinned;
+                        let response = ui.selectable_label(self.vm.selected == row, &clip.preview);
+                        if response.clicked() {
+                            clicked_row = Some(row);
+                        }
+                        response.context_menu(|ui| {
+                            let pin_label = if pinned {
+                                strings::text("popup.unpin")
+                            } else {
+                                strings::text("popup.pin")
+                            };
+                            if ui.button(pin_label).clicked() {
+                                pin_row = Some(row);
+                                ui.close();
+                            }
+                            if ui.button(strings::text("popup.delete")).clicked() {
+                                delete_row = Some(row);
+                                ui.close();
+                            }
+                            let _ = clip_id;
+                        });
+                    }
+                });
+            }
             if !self.vm.banner().is_empty() {
                 ui.label(self.vm.banner());
             }
@@ -720,6 +956,24 @@ impl ShellApp {
         if query != self.vm.query {
             self.vm.query = query;
             self.vm.selected = 0;
+        }
+        if let Some(tab) = perm_tab_click {
+            match tab {
+                None => self.perm_source = None,
+                Some(index) => {
+                    self.perm_vm.select_group(index);
+                    self.perm_source = Some(self.perm_vm.active_group);
+                }
+            }
+        }
+        if let Some(row) = clicked_perm_row {
+            if row == self.perm_vm.selected {
+                if let Some(id) = self.perm_vm.activate_selected() {
+                    self.apply_effect(popup::VmEffect::ExecPermanent(id));
+                }
+            } else {
+                self.perm_vm.selected = row;
+            }
         }
         if let Some(row) = pin_row {
             if let Some(clip) = self.vm.clip_at(row) {
@@ -792,10 +1046,14 @@ impl eframe::App for ShellApp {
                 self.config_open = true;
                 self.send(ipc_bridge::UiCmd::ConfigGet);
                 self.send(ipc_bridge::UiCmd::CapsGet);
+                self.send(ipc_bridge::UiCmd::ListPermanents);
+                self.send(ipc_bridge::UiCmd::PermGroups);
             }
             if reopen {
                 self.open = true;
                 self.send(ipc_bridge::UiCmd::ListHistory);
+                self.send(ipc_bridge::UiCmd::ListPermanents);
+                self.send(ipc_bridge::UiCmd::PermGroups);
             }
         }
         ui.ctx().request_repaint_after(Duration::from_millis(500));
@@ -822,6 +1080,8 @@ fn main() -> ExitCode {
     let (cmds, events) = ipc_bridge::Bridge::spawn(transport);
     let _ = cmds.send(ipc_bridge::UiCmd::Status);
     let _ = cmds.send(ipc_bridge::UiCmd::ListHistory);
+    let _ = cmds.send(ipc_bridge::UiCmd::ListPermanents);
+    let _ = cmds.send(ipc_bridge::UiCmd::PermGroups);
     let monitor = placement::Rect {
         x: 0,
         y: 0,
@@ -864,6 +1124,10 @@ fn main() -> ExitCode {
         font_scale: 1.0,
         pause_deadline: None,
         pending_apply: Vec::new(),
+        perm_vm: permanents::PermanentsVm::new(),
+        perm_source: None,
+        perm_group_new: String::new(),
+        perm_confirm_delete: None,
         #[cfg(any(windows, target_os = "macos"))]
         real_tray: match RealTray::create(&tray_logic::TrayInputs::default()) {
             Some(tray) => Some(tray),

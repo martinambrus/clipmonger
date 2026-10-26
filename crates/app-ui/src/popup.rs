@@ -21,6 +21,10 @@ pub enum VmEffect {
     Pin(Uuid),
     /// Re-fetch the list.
     Refresh,
+    /// Switch to permanent group tab `1..=9`.
+    GroupTab(u8),
+    /// Execute this permanent clip.
+    ExecPermanent(Uuid),
 }
 
 /// Preview-kind string id for one clip, from its MIME formats.
@@ -294,9 +298,8 @@ impl PopupVm {
                 .and_then(|index| self.clips.get(*index))
                 .map_or(VmEffect::None, |clip| VmEffect::Pin(clip.id)),
             keymap::Action::Refresh => VmEffect::Refresh,
-            keymap::Action::Edit | keymap::Action::GroupTab(_) | keymap::Action::None => {
-                VmEffect::None
-            }
+            keymap::Action::GroupTab(n) => VmEffect::GroupTab(n),
+            keymap::Action::Edit | keymap::Action::None => VmEffect::None,
         }
     }
 }

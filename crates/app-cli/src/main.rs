@@ -47,6 +47,22 @@ enum Cmd {
         /// Permanent clip id.
         id: String,
     },
+    /// List permanent clips as JSON.
+    #[command(name = "permanent-list")]
+    PermanentList,
+    /// Create a permanent clip.
+    #[command(name = "permanent-create")]
+    PermanentCreate {
+        /// Group name.
+        group: String,
+        /// Clip name.
+        name: String,
+        /// Text to paste.
+        body: String,
+        /// Optional per-clip hotkey chord.
+        #[arg(long)]
+        hotkey: Option<String>,
+    },
     /// Purge soft-deleted clips.
     #[command(name = "purge-removed")]
     PurgeRemoved,
@@ -142,6 +158,22 @@ fn main() -> ExitCode {
         Cmd::ShowPopup => ("ui.show_popup", serde_json::json!({}), false),
         Cmd::ToggleMonitor => ("monitor.set", serde_json::json!({"toggle": true}), false),
         Cmd::ExecPermanent { id } => ("permanent.exec", serde_json::json!({"id": id}), false),
+        Cmd::PermanentList => ("permanent.list", serde_json::json!({}), false),
+        Cmd::PermanentCreate {
+            group,
+            name,
+            body,
+            hotkey,
+        } => (
+            "permanent.create",
+            match hotkey {
+                Some(hotkey) => {
+                    serde_json::json!({"group": group, "name": name, "body": body, "hotkey": hotkey})
+                }
+                None => serde_json::json!({"group": group, "name": name, "body": body}),
+            },
+            false,
+        ),
         Cmd::PurgeRemoved => ("history.purge_removed", serde_json::json!({}), false),
         Cmd::Stop => ("daemon.stop", serde_json::json!({}), true),
     };

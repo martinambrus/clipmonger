@@ -558,10 +558,12 @@ dependencies = [
  "clipmonger-ipc",
  "clipmonger-platform",
  "futures-util",
+ "rusqlite",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

@@ -10,6 +10,6 @@ pub mod store;
 
 pub use config::{AppPaths, Config};
 pub use error::{BackendKind, CoreError};
-pub use store::{GcReport, InsertOutcome, Store};
+pub use store::{GcReport, InsertOutcome, PermGroup, Store};
 
 pub const APP_IDENTITY: &str = "clipmonger";

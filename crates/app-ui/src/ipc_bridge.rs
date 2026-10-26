@@ -3,6 +3,8 @@
 use std::sync::mpsc;
 use std::thread;
 
+use clipmonger_core::model::PermanentClip;
+use clipmonger_ipc::proto::methods::PermanentCreateParams;
 use clipmonger_ipc::proto::IpcError;
 use serde_json::Value;
 use uuid::Uuid;
@@ -44,6 +46,22 @@ pub enum UiCmd {
     HistoryGet(Uuid),
     /// Purge removed clips.
     PurgeRemoved,
+    /// Fetch all permanents.
+    ListPermanents,
+    /// Create one permanent.
+    PermCreate(PermanentCreateParams),
+    /// Update one permanent.
+    PermUpdate(PermanentClip),
+    /// Delete one permanent.
+    PermDelete(Uuid),
+    /// Fetch permanent groups.
+    PermGroups,
+    /// Create one permanent group.
+    PermGroupCreate(String),
+    /// Delete one permanent group.
+    PermGroupDelete(String),
+    /// Execute one permanent.
+    ExecPermanent(Uuid),
 }
 
 /// Event delivered from the bridge thread to the shell.
@@ -77,6 +95,16 @@ pub enum UiEvent {
     MonitorPaused(bool),
     /// Removed clips purged.
     Purged(u64),
+    /// Permanents-list reply body.
+    Permanents(Value),
+    /// Permanent create/update confirmed.
+    PermanentSaved,
+    /// Server-confirmed permanent delete.
+    PermanentDeleted(Uuid),
+    /// Permanent-groups reply body.
+    PermGroups(Value),
+    /// Permanent group set changed.
+    PermGroupsChanged,
 }
 
 /// Bridge handle spawner; the thread owns the transport alone.
@@ -116,6 +144,14 @@ pub fn method_for(cmd: &UiCmd) -> &'static str {
         UiCmd::MonitorToggle => "monitor.set",
         UiCmd::HistoryGet(_) => "history.get",
         UiCmd::PurgeRemoved => "history.purge_removed",
+        UiCmd::ListPermanents => "permanent.list",
+        UiCmd::PermCreate(_) => "permanent.create",
+        UiCmd::PermUpdate(_) => "permanent.update",
+        UiCmd::PermDelete(_) => "permanent.delete",
+        UiCmd::PermGroups => "permanent.groups",
+        UiCmd::PermGroupCreate(_) => "permanent.group_create",
+        UiCmd::PermGroupDelete(_) => "permanent.group_delete",
+        UiCmd::ExecPermanent(_) => "permanent.exec",
     }
 }
 
@@ -128,12 +164,24 @@ pub fn params_for(cmd: &UiCmd) -> Value {
         | UiCmd::Stop
         | UiCmd::ConfigGet
         | UiCmd::CapsGet
-        | UiCmd::PurgeRemoved => serde_json::json!({}),
+        | UiCmd::PurgeRemoved
+        | UiCmd::ListPermanents
+        | UiCmd::PermGroups => serde_json::json!({}),
         UiCmd::ConfigSet(key, value) => serde_json::json!({ "key": key, "value": value }),
         UiCmd::MonitorToggle => serde_json::json!({ "toggle": true }),
         UiCmd::HistoryGet(id) => serde_json::json!({ "clip": id.to_string() }),
         UiCmd::DeleteClip(id) | UiCmd::PasteClip(id) => {
             serde_json::json!({ "clip": id.to_string() })
+        }
+        UiCmd::PermDelete(id) | UiCmd::ExecPermanent(id) => {
+            serde_json::json!({ "id": id.to_string() })
+        }
+        UiCmd::PermCreate(params) => serde_json::to_value(params).unwrap_or(Value::Null),
+        UiCmd::PermUpdate(clip) => {
+            serde_json::json!({ "permanent": serde_json::to_value(clip).unwrap_or(Value::Null) })
+        }
+        UiCmd::PermGroupCreate(name) | UiCmd::PermGroupDelete(name) => {
+            serde_json::json!({ "name": name })
         }
         UiCmd::PinClip(id, pinned) => {
             serde_json::json!({ "clip": id.to_string(), "pinned": pinned })
@@ -167,6 +215,32 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
         (UiCmd::PinClip(id, _), Err(error)) => {
             UiEvent::Error(format!("pin failed for {id}: {}", error.message))
         }
+        (UiCmd::ListPermanents, Ok(body)) => UiEvent::Permanents(body),
+        (UiCmd::PermGroups, Ok(body)) => UiEvent::PermGroups(body),
+        (UiCmd::PermCreate(_), Ok(_)) => UiEvent::PermanentSaved,
+        (UiCmd::PermUpdate(_), Ok(body)) => {
+            if body.get("updated").and_then(Value::as_bool) == Some(true) {
+                UiEvent::PermanentSaved
+            } else {
+                UiEvent::Error("unconfirmed permanent update".to_string())
+            }
+        }
+        (UiCmd::PermDelete(id), Ok(body)) => {
+            if body.get("deleted").and_then(Value::as_bool) == Some(true) {
+                UiEvent::PermanentDeleted(id)
+            } else {
+                UiEvent::Error(format!("unconfirmed permanent delete for {id}"))
+            }
+        }
+        (UiCmd::PermGroupCreate(_), Ok(_)) => UiEvent::PermGroupsChanged,
+        (UiCmd::PermGroupDelete(_), Ok(body)) => {
+            if body.get("deleted").and_then(Value::as_bool) == Some(true) {
+                UiEvent::PermGroupsChanged
+            } else {
+                UiEvent::Error("unconfirmed permanent group delete".to_string())
+            }
+        }
+        (UiCmd::ExecPermanent(id), Ok(_)) => UiEvent::PasteDone(id),
         (UiCmd::PasteClip(id), Ok(_)) => UiEvent::PasteDone(id),
         (UiCmd::Stop, Ok(_)) => UiEvent::Stopped,
         (UiCmd::ConfigGet, Ok(body)) => UiEvent::Config(body),
@@ -193,17 +267,25 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
             | UiCmd::HistoryGet(_)
             | UiCmd::ConfigSet(_, _)
             | UiCmd::MonitorToggle
-            | UiCmd::PurgeRemoved,
+            | UiCmd::PurgeRemoved
+            | UiCmd::ListPermanents
+            | UiCmd::PermGroups
+            | UiCmd::PermCreate(_)
+            | UiCmd::PermUpdate(_)
+            | UiCmd::PermDelete(_)
+            | UiCmd::PermGroupCreate(_)
+            | UiCmd::PermGroupDelete(_),
             Err(error),
         ) => UiEvent::Error(error.message),
         (UiCmd::Status | UiCmd::ListHistory | UiCmd::Stop, Err(error)) => {
             UiEvent::Error(error.message)
         }
-        (UiCmd::PasteClip(_), Err(error))
+        (UiCmd::PasteClip(_) | UiCmd::ExecPermanent(_), Err(error))
             if error.code == "unavailable" || error.code == "denied" =>
         {
             UiEvent::PasteUnavailable
         }
         (UiCmd::PasteClip(_), Err(error)) => UiEvent::Error(error.message),
+        (UiCmd::ExecPermanent(_), Err(error)) => UiEvent::Error(error.message),
     }
 }

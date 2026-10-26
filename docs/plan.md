@@ -157,8 +157,12 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   {id}, daemon expects {clip}. Daemon honesty: unknown methods
   (incl. history.*) return unknown_method, never purge. Open:
   T-905…908 manual matrix, T-409 UAC matrix (Step 2 deferral),
-  permanents store+IPC (follow-up step; config tab ships groups
-  control only), Linux ksni tray, backup/logs daemon arms.
+  Linux ksni tray, backup/logs daemon arms.
+  Permanents follow-up (DONE 2026-10-27): store CRUD + groups
+  (perm_groups authoritative, no migration), permanent.* IPC +
+  exec (Paste kind, shared paste path; X11 honest unavailable),
+  config-window editor + popup group tabs. Rulers C/I/D/U 13/2/7/10
+  green. Per-clip hotkeys stored, not yet registered live.
 - **7. v1 hardening + release.** Seg-11 gates (matrix, goldens, signoffs,
   budgets) → seg-12 release (artifacts, notes, checksums, bypass docs).
 - **8. v2 (after design-reopen gate).** Re-validate extension points

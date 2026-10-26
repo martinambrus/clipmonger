@@ -1747,19 +1747,130 @@ impl DaemonState {
         Ok(serde_json::json!({"ok": true}))
     }
 
+    /// Dispatch one `permanent.*` method (perm.md §2).
+    fn handle_permanent(&self, method: &str, params: &Value) -> Result<Value, IpcError> {
+        let perm_err = |e: CoreError| IpcError::new(e.code(), e.to_string());
+        match method {
+            "permanent.list" => {
+                let group = params.get("group").and_then(Value::as_str);
+                let permanents = self.store.list_permanents(group).map_err(perm_err)?;
+                Ok(serde_json::json!({"permanents": permanents}))
+            }
+            "permanent.create" => {
+                let created = self
+                    .store
+                    .create_permanent(
+                        params.get("group").and_then(Value::as_str).unwrap_or(""),
+                        params.get("name").and_then(Value::as_str).unwrap_or(""),
+                        params.get("hotkey").and_then(Value::as_str),
+                        params.get("body").and_then(Value::as_str).unwrap_or(""),
+                    )
+                    .map_err(perm_err)?;
+                Ok(serde_json::json!({"permanent": created}))
+            }
+            "permanent.update" => {
+                let Some(raw) = params.get("permanent") else {
+                    return Err(IpcError::new(
+                        "backend",
+                        "permanent.update: permanent required".to_string(),
+                    ));
+                };
+                let clip: clipmonger_core::model::PermanentClip =
+                    serde_json::from_value(raw.clone())
+                        .map_err(|e| IpcError::new("backend", format!("permanent.update: {e}")))?;
+                let updated = self.store.update_permanent(&clip).map_err(perm_err)?;
+                Ok(serde_json::json!({"updated": updated}))
+            }
+            "permanent.delete" => {
+                let id = params
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse::<uuid::Uuid>().ok())
+                    .ok_or_else(|| {
+                        IpcError::new("backend", "permanent.delete: id required".to_string())
+                    })?;
+                let deleted = self.store.delete_permanent(id).map_err(perm_err)?;
+                Ok(serde_json::json!({"deleted": deleted}))
+            }
+            "permanent.groups" => {
+                let groups = self.store.list_perm_groups().map_err(perm_err)?;
+                let list: Vec<Value> = groups
+                    .iter()
+                    .map(|g| {
+                        serde_json::json!({"name": g.name, "system": g.system, "count": g.count})
+                    })
+                    .collect();
+                Ok(serde_json::json!({"groups": list}))
+            }
+            "permanent.group_create" => {
+                let created = self
+                    .store
+                    .create_perm_group(params.get("name").and_then(Value::as_str).unwrap_or(""))
+                    .map_err(perm_err)?;
+                Ok(serde_json::json!({"created": created}))
+            }
+            "permanent.group_delete" => {
+                let deleted = self
+                    .store
+                    .delete_perm_group(params.get("name").and_then(Value::as_str).unwrap_or(""))
+                    .map_err(perm_err)?;
+                Ok(serde_json::json!({"deleted": deleted}))
+            }
+            "permanent.exec" => self.handle_permanent_exec(params),
+            other => Err(IpcError::new(
+                "unknown_method",
+                format!("unknown method: {other}"),
+            )),
+        }
+    }
+
+    /// Execute one Paste permanent through the shared paste path.
+    fn handle_permanent_exec(&self, params: &Value) -> Result<Value, IpcError> {
+        let perm_err = |e: CoreError| IpcError::new(e.code(), e.to_string());
+        let id = params
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<uuid::Uuid>().ok());
+        let Some(id) = id else {
+            return Err(IpcError::new(
+                "backend",
+                "permanent.exec: unknown permanent".to_string(),
+            ));
+        };
+        let perm = self
+            .store
+            .get_permanent(id)
+            .map_err(perm_err)?
+            .ok_or_else(|| {
+                IpcError::new("backend", "permanent.exec: unknown permanent".to_string())
+            })?;
+        if perm.kind != clipmonger_core::model::PermanentKind::Paste {
+            return Err(IpcError::new(
+                "unsupported",
+                "permanent.exec: kind is v2".to_string(),
+            ));
+        }
+        let payloads: Vec<(String, Vec<u8>)> = vec![(
+            "text/plain;charset=utf-8".to_string(),
+            perm.body.as_bytes().to_vec(),
+        )];
+        self.paste_payloads(
+            clipmonger_platform::types::ClipRef(perm.id),
+            &payloads,
+            params,
+        )?;
+        Ok(serde_json::json!({"ok": true}))
+    }
+
     /// Dispatch `paste.execute` through the live Windows backend, or refuse
     /// with `unavailable` when no live backend is compiled in.
-    ///
-    /// High-integrity targets take the elevated-helper route ONLY, gated on
-    /// a fresh single-use gesture token (`gesture` param). Generic IPC
-    /// callers cannot mint tokens, so tokenless elevated requests are
-    /// refused without ever spawning.
+    #[allow(clippy::unused_self)] // self used only in backend cfg branches
     fn handle_paste_execute(&self, params: &Value) -> Result<Value, IpcError> {
-        #[cfg(all(windows, feature = "backend-windows"))]
+        #[cfg(any(
+            all(windows, feature = "backend-windows"),
+            all(unix, feature = "backend-wayland")
+        ))]
         {
-            use clipmonger_backend_windows::Integrity;
-            use clipmonger_platform::traits::PasteEngine as _;
-            use clipmonger_platform::types::ClipRef;
             let found = self.requested_clip(params).ok_or_else(|| {
                 IpcError::new("backend", "paste.execute: unknown clip".to_string())
             })?;
@@ -1769,6 +1880,43 @@ impl DaemonState {
                 .map_err(|e| IpcError::new("backend", e.to_string()))?
                 .map(|(_, payloads)| payloads)
                 .unwrap_or_default();
+            self.paste_payloads(
+                clipmonger_platform::types::ClipRef(found.id),
+                &payloads,
+                params,
+            )
+        }
+        #[cfg(not(any(
+            all(windows, feature = "backend-windows"),
+            all(unix, feature = "backend-wayland")
+        )))]
+        {
+            let _ = params;
+            Err(IpcError::new(
+                "unavailable",
+                format!("paste unavailable: {SKELETON_NOTE}"),
+            ))
+        }
+    }
+
+    /// Deliver already-resolved payloads through the live backend.
+    ///
+    /// High-integrity targets take the elevated-helper route ONLY, gated on
+    /// a fresh single-use gesture token (`gesture` param). Generic IPC
+    /// callers cannot mint tokens, so tokenless elevated requests are
+    /// refused without ever spawning.
+    // `self` is only used by the Windows arm; other backends are stateless.
+    #[allow(clippy::unused_self)]
+    fn paste_payloads(
+        &self,
+        clip: clipmonger_platform::types::ClipRef,
+        payloads: &[(String, Vec<u8>)],
+        params: &Value,
+    ) -> Result<Value, IpcError> {
+        #[cfg(all(windows, feature = "backend-windows"))]
+        {
+            use clipmonger_backend_windows::Integrity;
+            use clipmonger_platform::traits::PasteEngine as _;
             let (unicode_limit, dwell_ms) = self.paste_budget();
             let paste = clipmonger_backend_windows::WinPaste::new(
                 usize::try_from(unicode_limit).unwrap_or(65536),
@@ -1788,10 +1936,10 @@ impl DaemonState {
                         "paste.execute: elevation refused (gesture required)".to_string(),
                     ));
                 }
-                return self.paste_via_helper(&target, &payloads);
+                return self.paste_via_helper(&target, payloads);
             }
             paste
-                .paste_payloads(&target, &ClipRef(found.id), &payloads)
+                .paste_payloads(&target, &clip, payloads)
                 .map_err(|e| {
                     let message = e.to_string();
                     if message.starts_with("denied") || message.contains("refused") {
@@ -1805,20 +1953,12 @@ impl DaemonState {
         #[cfg(all(unix, feature = "backend-wayland"))]
         {
             use clipmonger_backend_wayland::{probe_current, WlPaste};
-            let found = self.requested_clip(params).ok_or_else(|| {
-                IpcError::new("backend", "paste.execute: unknown clip".to_string())
-            })?;
-            let payloads = self
-                .store
-                .get_clip(found.id)
-                .map_err(|e| IpcError::new("backend", e.to_string()))?
-                .map(|(_, payloads)| payloads)
-                .unwrap_or_default();
+            let _ = (clip, params);
             let has_data =
                 probe_current().protocol != clipmonger_backend_wayland::probe::Protocol::None;
             let paste = WlPaste::new(has_data);
             let outcome = paste
-                .paste_payloads(&payloads)
+                .paste_payloads(&payloads.to_vec())
                 .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
             let mut result = serde_json::json!({"pasted": true});
             if let Some(toast) = outcome.toast {
@@ -1831,7 +1971,7 @@ impl DaemonState {
             all(unix, feature = "backend-wayland")
         )))]
         {
-            let _ = (self, params);
+            let _ = (self, clip, payloads, params);
             Err(IpcError::new(
                 "unavailable",
                 format!("paste unavailable: {SKELETON_NOTE}"),
@@ -1947,6 +2087,7 @@ impl DaemonState {
             "ping" => Ok(serde_json::json!({"pong": true})),
             "paste.execute" => self.handle_paste_execute(params),
             method if method.starts_with("history.") => self.handle_history(method, params),
+            method if method.starts_with("permanent.") => self.handle_permanent(method, params),
             "monitor.set" => self.handle_monitor(params),
             "capture.report" => Ok(self.handle_capture(params)),
             "blob.put" => self.handle_blob_put(params),
@@ -2196,7 +2337,7 @@ mod tests {
         for method in [
             "ui.show_popup",
             "events.subscribe",
-            "permanent.exec",
+            "permanent.bogus",
             "backup.create",
             "logs.tail",
             "hotkey.register",
@@ -2207,6 +2348,34 @@ mod tests {
                 .expect_err("unknown method must fail");
             assert_eq!(err.code, "unknown_method", "{method}");
         }
+    }
+
+    #[test]
+    fn permanent_exec_refuses_hand_seeded_macro_row() {
+        let (dir, state) = fresh_state("perm-macro-exec");
+        let macro_id = uuid::Uuid::now_v7();
+        let conn = rusqlite::Connection::open(dir.join("clipstore.sqlite3")).expect("raw db");
+        conn.execute_batch("INSERT OR IGNORE INTO perm_groups(name, system) VALUES('Work', 0);")
+            .expect("seed group");
+        conn.execute(
+            "INSERT INTO permanents(id, grp, name, hotkey, kind, body, js, rev_ms, rev_dev, rev_ctr) \
+             VALUES(?1, 'Work', 'OldMacro', NULL, 'Macro', 'MACRO-BODY-SECRET', NULL, 1, 'dev', 0)",
+            [macro_id.to_string()],
+        )
+        .expect("seed macro row");
+        drop(conn);
+        let err = state
+            .handle(
+                "permanent.exec",
+                &serde_json::json!({"id": macro_id.to_string()}),
+            )
+            .expect_err("Macro exec must be refused in v1");
+        assert_eq!(err.code, "unsupported", "got {err:?}");
+        assert!(
+            !err.message.contains("MACRO-BODY-SECRET"),
+            "stored body must never appear in error text: {}",
+            err.message
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::error::{BackendKind, CoreError};
 use crate::hash::content_hash;
-use crate::model::{Clip, Rev};
+use crate::model::{Clip, PermanentClip, PermanentKind, Rev};
 use crate::policy::{self, DedupeCandidate, Limits};
 
 /// Schema version this code reads and writes (D-F1).
@@ -92,6 +92,100 @@ pub struct GcReport {
     pub dangling_blobs: u64,
     /// Directory orphans were moved to.
     pub quarantine_dir: PathBuf,
+}
+
+/// One named permanent group (row of `perm_groups` + live clip count).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermGroup {
+    /// Group name (primary key).
+    pub name: String,
+    /// System groups are hidden from popup tabs.
+    pub system: bool,
+    /// Number of permanents in the group.
+    pub count: u64,
+}
+
+/// Columns selected for a permanent row, in order.
+const PERM_COLS: &str = "id, grp, name, hotkey, kind, body, js, rev_ms, rev_dev, rev_ctr";
+
+/// Raw permanent row tuple over [`PERM_COLS`].
+type PermRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    i64,
+    String,
+    i64,
+);
+
+/// Convert one raw permanent row, rejecting unknown kind text as corrupt.
+fn perm_from_row(row: PermRow) -> Result<PermanentClip, CoreError> {
+    let (id, group, name, hotkey, kind, body, js, wall_ms, dev, ctr) = row;
+    let kind = match kind.as_str() {
+        "Paste" => PermanentKind::Paste,
+        "Macro" => PermanentKind::Macro,
+        "System" => PermanentKind::System,
+        other => {
+            return Err(CoreError::Corrupt {
+                message: format!("unknown permanent kind {other}"),
+            })
+        }
+    };
+    let id = id.parse::<Uuid>().map_err(|e| CoreError::Corrupt {
+        message: format!("bad permanent id: {e}"),
+    })?;
+    Ok(PermanentClip {
+        id,
+        group,
+        name,
+        hotkey,
+        kind,
+        body,
+        js,
+        rev: Rev {
+            wall_ms,
+            dev,
+            ctr: u64::try_from(ctr.max(0)).unwrap_or(u64::MAX),
+        },
+    })
+}
+
+/// Validate and trim permanent group/name/body; body stays verbatim.
+fn validate_perm_fields(
+    group: &str,
+    name: &str,
+    body: &str,
+) -> Result<(String, String), CoreError> {
+    let group = group.trim();
+    let name = name.trim();
+    if group.is_empty() || group.chars().any(char::is_control) {
+        return Err(CoreError::Config {
+            message: "permanent group must be non-empty without control characters".to_string(),
+        });
+    }
+    if name.is_empty() {
+        return Err(CoreError::Config {
+            message: "permanent name must be non-empty".to_string(),
+        });
+    }
+    if body.is_empty() {
+        return Err(CoreError::Config {
+            message: "permanent body must be non-empty".to_string(),
+        });
+    }
+    Ok((group.to_string(), name.to_string()))
+}
+
+/// Normalise an optional hotkey: trimmed, empty becomes `None`.
+fn norm_hotkey(hotkey: Option<&str>) -> Option<String> {
+    hotkey
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(ToString::to_string)
 }
 
 /// SQLite-backed clip store.
@@ -761,6 +855,353 @@ impl Store {
         }
         clip.formats = out.iter().map(|(m, _)| m.clone()).collect();
         Ok(Some((clip.clone(), out)))
+    }
+
+    /// Create a Paste permanent, minting its v7 id and implicit group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Config`] for invalid fields or a duplicate
+    /// hotkey, [`CoreError::Unsupported`] on a recovery handle, or a
+    /// backend error when the write fails.
+    pub fn create_permanent(
+        &self,
+        group: &str,
+        name: &str,
+        hotkey: Option<&str>,
+        body: &str,
+    ) -> Result<PermanentClip, CoreError> {
+        if self.read_only {
+            return Err(readonly_err());
+        }
+        let (group, name) = validate_perm_fields(group, name, body)?;
+        let hotkey = norm_hotkey(hotkey);
+        let clip = PermanentClip {
+            id: Uuid::now_v7(),
+            group,
+            name,
+            hotkey,
+            kind: PermanentKind::Paste,
+            body: body.to_string(),
+            js: None,
+            rev: Rev {
+                wall_ms: now_ms(),
+                dev: machine_name(),
+                ctr: 0,
+            },
+        };
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|e| db_err(&e))?;
+        if let Some(hk) = &clip.hotkey {
+            let dup: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM permanents WHERE hotkey=?1)",
+                    params![hk],
+                    |r| r.get(0),
+                )
+                .map_err(|e| db_err(&e))?;
+            if dup {
+                return Err(CoreError::Config {
+                    message: "permanent hotkey already in use".to_string(),
+                });
+            }
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO perm_groups(name, system) VALUES(?1, 0)",
+            params![clip.group],
+        )
+        .map_err(|e| db_err(&e))?;
+        tx.execute(
+            "INSERT INTO permanents(id, grp, name, hotkey, kind, body, js, rev_ms, rev_dev, rev_ctr) \
+             VALUES(?1,?2,?3,?4,'Paste',?5,NULL,?6,?7,0)",
+            params![
+                clip.id.to_string(),
+                clip.group,
+                clip.name,
+                clip.hotkey,
+                clip.body,
+                clip.rev.wall_ms,
+                clip.rev.dev
+            ],
+        )
+        .map_err(|e| db_err(&e))?;
+        tx.commit().map_err(|e| db_err(&e))?;
+        Ok(clip)
+    }
+
+    /// Fetch one permanent by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Corrupt`] for unknown kind text, or a backend
+    /// error when the read fails.
+    pub fn get_permanent(&self, id: Uuid) -> Result<Option<PermanentClip>, CoreError> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!("SELECT {PERM_COLS} FROM permanents WHERE id=?1"))
+            .map_err(|e| db_err(&e))?;
+        let rows: Vec<PermRow> = stmt
+            .query_map(params![id.to_string()], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            })
+            .map_err(|e| db_err(&e))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| db_err(&e))?;
+        drop(stmt);
+        rows.into_iter().next().map(perm_from_row).transpose()
+    }
+
+    /// List permanents ordered by group, name, id; optionally one group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Corrupt`] for unknown kind text, or a backend
+    /// error when the read fails.
+    pub fn list_permanents(&self, group: Option<&str>) -> Result<Vec<PermanentClip>, CoreError> {
+        let conn = self.lock();
+        let rows: Vec<PermRow> = if let Some(g) = group {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {PERM_COLS} FROM permanents WHERE grp=?1 ORDER BY grp ASC, name ASC, id ASC"
+                ))
+                .map_err(|e| db_err(&e))?;
+            let rows = stmt
+                .query_map(params![g], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                    ))
+                })
+                .map_err(|e| db_err(&e))?
+                .collect::<Result<_, _>>()
+                .map_err(|e| db_err(&e))?;
+            rows
+        } else {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {PERM_COLS} FROM permanents ORDER BY grp ASC, name ASC, id ASC"
+                ))
+                .map_err(|e| db_err(&e))?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                    ))
+                })
+                .map_err(|e| db_err(&e))?
+                .collect::<Result<_, _>>()
+                .map_err(|e| db_err(&e))?;
+            rows
+        };
+        rows.into_iter().map(perm_from_row).collect()
+    }
+
+    /// Replace editable fields of one permanent, bumping `rev.ctr`.
+    /// Returns `false` when no such id exists (never an upsert).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Config`] for non-Paste kinds, invalid fields
+    /// or a duplicate hotkey, [`CoreError::Unsupported`] on a recovery
+    /// handle, or a backend error when the write fails.
+    pub fn update_permanent(&self, clip: &PermanentClip) -> Result<bool, CoreError> {
+        if self.read_only {
+            return Err(readonly_err());
+        }
+        if clip.kind != PermanentKind::Paste {
+            return Err(CoreError::Config {
+                message: "permanent kind is v2 in this build".to_string(),
+            });
+        }
+        let (group, name) = validate_perm_fields(&clip.group, &clip.name, &clip.body)?;
+        let hotkey = norm_hotkey(clip.hotkey.as_deref());
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|e| db_err(&e))?;
+        let existing: Option<(String, i64)> = {
+            let mut stmt = tx
+                .prepare("SELECT rev_dev, rev_ctr FROM permanents WHERE id=?1")
+                .map_err(|e| db_err(&e))?;
+            let rows: Vec<(String, i64)> = stmt
+                .query_map(params![clip.id.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| db_err(&e))?
+                .collect::<Result<_, _>>()
+                .map_err(|e| db_err(&e))?;
+            rows.into_iter().next()
+        };
+        let Some((dev, ctr)) = existing else {
+            return Ok(false);
+        };
+        if let Some(hk) = &hotkey {
+            let dup: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM permanents WHERE hotkey=?1 AND id!=?2)",
+                    params![hk, clip.id.to_string()],
+                    |r| r.get(0),
+                )
+                .map_err(|e| db_err(&e))?;
+            if dup {
+                return Err(CoreError::Config {
+                    message: "permanent hotkey already in use".to_string(),
+                });
+            }
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO perm_groups(name, system) VALUES(?1, 0)",
+            params![group],
+        )
+        .map_err(|e| db_err(&e))?;
+        let new_ctr = ctr.saturating_add(1);
+        tx.execute(
+            "UPDATE permanents SET grp=?1, name=?2, hotkey=?3, kind='Paste', body=?4, js=?5, \
+             rev_ms=?6, rev_dev=?7, rev_ctr=?8 WHERE id=?9",
+            params![
+                group,
+                name,
+                hotkey,
+                clip.body,
+                clip.js,
+                now_ms(),
+                dev,
+                new_ctr,
+                clip.id.to_string()
+            ],
+        )
+        .map_err(|e| db_err(&e))?;
+        tx.commit().map_err(|e| db_err(&e))?;
+        Ok(true)
+    }
+
+    /// Hard-delete one permanent; `false` when no such id exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Unsupported`] on a recovery handle, or a
+    /// backend error when the write fails.
+    pub fn delete_permanent(&self, id: Uuid) -> Result<bool, CoreError> {
+        if self.read_only {
+            return Err(readonly_err());
+        }
+        let n = self
+            .lock()
+            .execute(
+                "DELETE FROM permanents WHERE id=?1",
+                params![id.to_string()],
+            )
+            .map_err(|e| db_err(&e))?;
+        Ok(n > 0)
+    }
+
+    /// List groups with live clip counts, ordered by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error when the read fails.
+    pub fn list_perm_groups(&self) -> Result<Vec<PermGroup>, CoreError> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT g.name, g.system, COUNT(p.id) FROM perm_groups g \
+                 LEFT JOIN permanents p ON p.grp=g.name GROUP BY g.name ORDER BY g.name ASC",
+            )
+            .map_err(|e| db_err(&e))?;
+        let groups: Vec<PermGroup> = stmt
+            .query_map([], |r| {
+                let system: i64 = r.get(1)?;
+                let count: i64 = r.get(2)?;
+                Ok(PermGroup {
+                    name: r.get(0)?,
+                    system: system != 0,
+                    count: u64::try_from(count.max(0)).unwrap_or(u64::MAX),
+                })
+            })
+            .map_err(|e| db_err(&e))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| db_err(&e))?;
+        Ok(groups)
+    }
+
+    /// Create an empty group; `false` when it already exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Config`] for a blank/control-char name,
+    /// [`CoreError::Unsupported`] on a recovery handle, or a backend error.
+    pub fn create_perm_group(&self, name: &str) -> Result<bool, CoreError> {
+        if self.read_only {
+            return Err(readonly_err());
+        }
+        let name = name.trim();
+        if name.is_empty() || name.chars().any(char::is_control) {
+            return Err(CoreError::Config {
+                message: "permanent group must be non-empty without control characters".to_string(),
+            });
+        }
+        let n = self
+            .lock()
+            .execute(
+                "INSERT OR IGNORE INTO perm_groups(name, system) VALUES(?1, 0)",
+                params![name],
+            )
+            .map_err(|e| db_err(&e))?;
+        Ok(n > 0)
+    }
+
+    /// Delete an empty group; `false` when missing or non-empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Unsupported`] on a recovery handle, or a
+    /// backend error when the write fails.
+    pub fn delete_perm_group(&self, name: &str) -> Result<bool, CoreError> {
+        if self.read_only {
+            return Err(readonly_err());
+        }
+        let name = name.trim();
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|e| db_err(&e))?;
+        let count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM permanents WHERE grp=?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .map_err(|e| db_err(&e))?;
+        if count > 0 {
+            return Ok(false);
+        }
+        let n = tx
+            .execute("DELETE FROM perm_groups WHERE name=?1", params![name])
+            .map_err(|e| db_err(&e))?;
+        tx.commit().map_err(|e| db_err(&e))?;
+        Ok(n > 0)
     }
 
     /// List clips newest-first with formats derived from payload rows.

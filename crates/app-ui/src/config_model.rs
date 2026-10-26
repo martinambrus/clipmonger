@@ -221,6 +221,27 @@ pub const ROWS: &[Row] = &[
     },
 ];
 
+/// Row indices the config window renders for `tab` (P-F1): the
+/// Permanent Clips tab excludes the legacy `permanents.groups` row,
+/// which stays in [`ROWS`] and renders under General so every row
+/// still belongs to exactly one visible tab.
+#[must_use]
+pub fn visible_rows(tab: Tab) -> Vec<usize> {
+    ROWS.iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            if tab == Tab::PermanentClips && row.key == "permanents.groups" {
+                return false;
+            }
+            if tab == Tab::General && row.key == "permanents.groups" {
+                return true;
+            }
+            row.tab == tab
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 fn row_for(key: &str) -> Option<&'static Row> {
     ROWS.iter().find(|row| row.key == key)
 }
