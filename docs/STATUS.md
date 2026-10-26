@@ -1,0 +1,18 @@
+# Docs status
+- `README.md` — Plan (source of truth)
+- `adr-001-plugins.md` — ADR-001 — Out-of-process IPC plugin system (Notepad++-inspired UX)
+- `adr-002-i18n.md` — ADR-002 — Internationalization: string ids + community catalogs
+- `plan.md` — Plan — Clipmonger (cross-platform ArsClip successor)
+- `seg-00-index.md` — Spec index — Clipmonger (cross-platform ArsClip successor)
+- `seg-01-product-scope.md` — Product scope — full ArsClip parity + milestone slices
+- `seg-02-architecture.md` — Architecture — processes, crates, traits, flows
+- `seg-03-clip-model-storage.md` — Clip model, formats, storage, config, macros
+- `seg-04-windows-backend.md` — Windows backend (crate `backend-windows`)
+- `seg-05-linux-x11-backend.md` — Linux X11 backend (crate `backend-x11`)
+- `seg-06-linux-wayland-backend.md` — Linux Wayland backend (crate `backend-wayland`, v1)
+- `seg-07-gnome-extension.md` — GNOME Shell extension (dir `gnome-ext/`, v1 per D-013)
+- `seg-08-macos-backend.md` — macOS backend (crate `backend-macos`, v2)
+- `seg-09-ui-ux.md` — UI/UX — popup, config (maximalist), bar, tray, keys (crate `app-ui`)
+- `seg-10-sync-sharing.md` — Sync, sharing, portability (v3; F-701/702/703)
+- `seg-11-testing-qa.md` — Testing + QA (process owner: the human QA lead, D-017)
+- `seg-12-build-release.md` — Build + release ($0 pipeline per D-018)
