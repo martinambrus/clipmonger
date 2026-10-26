@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clipmonger_core::{CoreError, Store};
 use clipmonger_ipc::proto::IpcError;
+use clipmonger_platform::types::{BackendCaps, Level, PasteStrategy};
 use serde_json::Value;
 
 /// Protocol tag written to the rendezvous file.
@@ -99,11 +100,38 @@ pub fn read_rendezvous(profile_dir: &Path) -> Result<(PathBuf, String), CoreErro
 /// store-backed monitor as degraded and everything else unavailable with a
 /// skeleton note. `set_extension_connected(false)` marks the (future) GNOME
 /// entry unavailable via an extra note.
+///
+/// A live backend registers its typed [`BackendCaps`] via `register_backend`
+/// (WIN-F3); the string `register` API is kept for non-platform reporters.
+/// Once a typed snapshot is present the skeleton levels are replaced by it.
 pub struct CapsAggregator {
     /// Backend snapshots by name, kept for future aggregation.
     registered: Mutex<HashMap<String, String>>,
     /// GNOME extension link state.
     extension_connected: Mutex<bool>,
+    /// Live typed backend snapshot (single backend in v1).
+    backend: Mutex<Option<(String, BackendCaps)>>,
+}
+
+/// Render a [`Level`] as the lowercase status string.
+fn level_str(level: Level) -> &'static str {
+    match level {
+        Level::Full => "full",
+        Level::Degraded => "degraded",
+        Level::Unavailable => "unavailable",
+    }
+}
+
+/// Render a [`PasteStrategy`] as the lowercase status string.
+fn strategy_str(strategy: PasteStrategy) -> &'static str {
+    match strategy {
+        PasteStrategy::UnicodeInject => "unicode_inject",
+        PasteStrategy::ClipboardRestore => "clipboard_restore",
+        PasteStrategy::ElevatedRoute => "elevated_route",
+        PasteStrategy::WriteAndToast => "write_and_toast",
+        PasteStrategy::ExtensionAssisted => "extension_assisted",
+        PasteStrategy::Unavailable => "unavailable",
+    }
 }
 
 impl CapsAggregator {
@@ -113,6 +141,7 @@ impl CapsAggregator {
         Self {
             registered: Mutex::new(HashMap::new()),
             extension_connected: Mutex::new(true),
+            backend: Mutex::new(None),
         }
     }
 
@@ -120,6 +149,13 @@ impl CapsAggregator {
     pub fn register(&self, name: String, summary: String) {
         if let Ok(mut map) = self.registered.lock() {
             map.insert(name, summary);
+        }
+    }
+
+    /// Register one backend's typed capability snapshot under `name`.
+    pub fn register_backend(&self, name: &str, caps: BackendCaps) {
+        if let Ok(mut slot) = self.backend.lock() {
+            *slot = Some((name.to_string(), caps));
         }
     }
 
@@ -134,6 +170,9 @@ impl CapsAggregator {
     #[must_use]
     pub fn snapshot(&self) -> Value {
         let extension_up = self.extension_connected.lock().map_or(true, |f| *f);
+        if let Some(typed) = self.backend.lock().ok().and_then(|slot| slot.clone()) {
+            return Self::typed_snapshot(&typed.1, extension_up);
+        }
         let mut notes = vec![Value::from(SKELETON_NOTE)];
         if !extension_up {
             notes.push(Value::from(
@@ -148,6 +187,42 @@ impl CapsAggregator {
             "tray": {"level": "unavailable", "reason": SKELETON_NOTE},
             "autostart": false,
             "primary_selection": false,
+            "extension_connected": extension_up,
+            "notes": notes,
+        })
+    }
+
+    /// Render a typed backend snapshot into the status JSON shape.
+    fn typed_snapshot(caps: &BackendCaps, extension_up: bool) -> Value {
+        let mut notes: Vec<Value> = caps
+            .notes
+            .iter()
+            .map(|note| Value::from(note.as_str()))
+            .collect();
+        if !extension_up {
+            notes.push(Value::from(
+                "gnome extension disconnected: paste unavailable",
+            ));
+        }
+        let reason = |level: Level| {
+            if level == Level::Full {
+                String::new()
+            } else {
+                caps.notes.join("; ")
+            }
+        };
+        serde_json::json!({
+            "monitor": {"level": level_str(caps.monitor), "reason": reason(caps.monitor)},
+            "transfer": {"level": level_str(caps.transfer), "reason": reason(caps.transfer)},
+            "hotkey": {"level": level_str(caps.hotkey), "reason": reason(caps.hotkey)},
+            "paste": {
+                "level": level_str(caps.paste.level),
+                "strategy": strategy_str(caps.paste.strategy),
+                "reason": caps.paste.reason.clone(),
+            },
+            "tray": {"level": level_str(caps.tray), "reason": reason(caps.tray)},
+            "autostart": caps.autostart,
+            "primary_selection": caps.primary_selection,
             "extension_connected": extension_up,
             "notes": notes,
         })
@@ -191,7 +266,84 @@ fn fnv_hex(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-/// Store one capture event; returns the JSON report line for it.
+/// Outcome of storing real monitor payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreDecision {
+    /// Stored (or dedupe-moved) a row.
+    Stored,
+    /// Sensitive: counted in `privacy_skips`, no row written.
+    Sensitive,
+    /// Store write failed; carries metadata only, never payloads.
+    Failed,
+}
+
+/// Store real monitor payloads: sensitive events only bump `privacy_skips`,
+/// everything else becomes a clip row. `origin` names the capture backend
+/// (`windows`, `x11`, ...); `id_seed` feeds id generation.
+fn store_payloads(
+    store: &Store,
+    origin: &str,
+    sensitive: bool,
+    payloads: &[(String, Vec<u8>)],
+    id_seed: u64,
+) -> (StoreDecision, Option<String>) {
+    if sensitive {
+        let _ = store.record_privacy_skip();
+        return (StoreDecision::Sensitive, None);
+    }
+    if payloads.is_empty() {
+        return (
+            StoreDecision::Failed,
+            Some("no readable payload".to_string()),
+        );
+    }
+    let now = now_ms();
+    let text = payloads
+        .iter()
+        .find(|(mime, _)| mime == "text/plain")
+        .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned());
+    let preview = text
+        .as_deref()
+        .map(|t| t.chars().take(200).collect::<String>())
+        .unwrap_or_default();
+    let formats: Vec<String> = payloads.iter().map(|(mime, _)| mime.clone()).collect();
+    let bytes_total: u64 = payloads.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+    let mut fingerprint = Vec::new();
+    for (_, bytes) in payloads {
+        fingerprint.extend_from_slice(bytes);
+    }
+    let clip_json = serde_json::json!({
+        "id": new_id(id_seed),
+        "created_ms": now,
+        "source_os": origin,
+        "pinned": false,
+        "removed": false,
+        "preview": preview,
+        "search_text": text.unwrap_or_default(),
+        "formats": formats,
+        "bytes_total": bytes_total,
+        "content_hash": fnv_hex(&fingerprint),
+        "rev": {"wall_ms": now, "dev": "daemon", "ctr": 0},
+        "last_used_ms": now,
+        "origin_dev": "daemon",
+        "origin": origin,
+    });
+    let clip: clipmonger_core::model::Clip = match serde_json::from_value(clip_json) {
+        Ok(clip) => clip,
+        Err(e) => {
+            return (
+                StoreDecision::Failed,
+                Some(format!("clip build failed: {e}")),
+            );
+        }
+    };
+    match store.insert_clip(&clip, payloads) {
+        Ok(_) => (StoreDecision::Stored, None),
+        Err(e) => (StoreDecision::Failed, Some(format!("store failed: {e}"))),
+    }
+}
+
+/// Store one headless replay line; returns the JSON report line for it.
 fn process_capture(store: &Store, line: &str, index: u64) -> String {
     let event: Value = match serde_json::from_str(line) {
         Ok(event) => event,
@@ -204,6 +356,7 @@ fn process_capture(store: &Store, line: &str, index: u64) -> String {
         }
     };
     if event.get("sensitive").and_then(Value::as_bool) == Some(true) {
+        let _ = store.record_privacy_skip();
         return serde_json::json!({
             "accepted": false, "stored": false,
             "reason": "sensitive", "index": index,
@@ -278,6 +431,8 @@ pub struct DaemonState {
     caps: CapsAggregator,
     /// Monitor pause flag toggled by `monitor.set`.
     monitoring_paused: Mutex<bool>,
+    /// Paste delivery budget (`popup.unicode_limit`, `popup.delivery_dwell_ms`).
+    paste_limits: Mutex<(u64, u64)>,
 }
 
 impl DaemonState {
@@ -288,6 +443,7 @@ impl DaemonState {
             store,
             caps: CapsAggregator::new(),
             monitoring_paused: Mutex::new(false),
+            paste_limits: Mutex::new((65536, 1000)),
         }
     }
 
@@ -295,6 +451,43 @@ impl DaemonState {
     #[must_use]
     pub fn caps_snapshot(&self) -> Value {
         self.caps.snapshot()
+    }
+
+    /// Typed backend snapshot for live backends (WIN-F3).
+    pub fn register_backend(&self, name: &str, caps: BackendCaps) {
+        self.caps.register_backend(name, caps);
+    }
+
+    /// Override the paste delivery budget from config.
+    pub fn set_paste_limits(&self, unicode_limit: u64, dwell_ms: u64) {
+        if let Ok(mut limits) = self.paste_limits.lock() {
+            *limits = (unicode_limit, dwell_ms);
+        }
+    }
+
+    /// Current paste delivery budget.
+    #[cfg_attr(not(all(windows, feature = "backend-windows")), allow(dead_code))]
+    fn paste_budget(&self) -> (u64, u64) {
+        self.paste_limits
+            .lock()
+            .map_or((65536, 1000), |limits| *limits)
+    }
+
+    /// Ingest one live monitor observation with already-read `payloads`.
+    ///
+    /// Sensitive observations only bump `privacy_skips` and store nothing.
+    /// Returns whether a row was stored.
+    pub fn ingest_capture(
+        &self,
+        origin: &str,
+        sensitive: bool,
+        payloads: &[(String, Vec<u8>)],
+    ) -> bool {
+        let seed = u64::try_from(now_ms().max(0)).unwrap_or_default();
+        matches!(
+            store_payloads(&self.store, origin, sensitive, payloads, seed),
+            (StoreDecision::Stored, _)
+        )
     }
 
     /// Find a stored clip id by its string form without naming the id type.
@@ -418,12 +611,58 @@ impl DaemonState {
         serde_json::json!({"accepted": accepted})
     }
 
+    /// Dispatch `paste.execute` through the live Windows backend, or refuse
+    /// with `unavailable` when no live backend is compiled in.
+    fn handle_paste_execute(&self, params: &Value) -> Result<Value, IpcError> {
+        #[cfg(all(windows, feature = "backend-windows"))]
+        {
+            use clipmonger_platform::traits::PasteEngine as _;
+            use clipmonger_platform::types::ClipRef;
+            let found = self.requested_clip(params).ok_or_else(|| {
+                IpcError::new("backend", "paste.execute: unknown clip".to_string())
+            })?;
+            let payloads = self
+                .store
+                .get_clip(found.id)
+                .map_err(|e| IpcError::new("backend", e.to_string()))?
+                .map(|(_, payloads)| payloads)
+                .unwrap_or_default();
+            let (unicode_limit, dwell_ms) = self.paste_budget();
+            let paste = clipmonger_backend_windows::WinPaste::new(
+                usize::try_from(unicode_limit).unwrap_or(65536),
+            )
+            .with_dwell_ms(dwell_ms);
+            let target = paste
+                .capture_target()
+                .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
+            paste
+                .paste_payloads(&target, &ClipRef(found.id), &payloads)
+                .map_err(|e| {
+                    let message = e.to_string();
+                    if message.starts_with("denied") || message.contains("refused") {
+                        IpcError::new("denied", format!("paste.execute: {e}"))
+                    } else {
+                        IpcError::new("backend", format!("paste.execute: {e}"))
+                    }
+                })?;
+            Ok(serde_json::json!({"pasted": true}))
+        }
+        #[cfg(not(all(windows, feature = "backend-windows")))]
+        {
+            let _ = (self, params);
+            Err(IpcError::new(
+                "unavailable",
+                format!("paste unavailable: {SKELETON_NOTE}"),
+            ))
+        }
+    }
+
     /// Dispatch one IPC method to a JSON result or typed wire error.
     ///
     /// # Errors
     ///
     /// Returns the store's error for failing history methods, or the
-    /// skeleton `unavailable` error for `paste.execute`.
+    /// skeleton `unavailable` error for `paste.execute` without a backend.
     pub fn handle(&self, method: &str, params: &Value) -> Result<Value, IpcError> {
         match method {
             "status" => Ok(serde_json::json!({
@@ -435,10 +674,7 @@ impl DaemonState {
             })),
             "caps.get" | "caps.refresh" => Ok(self.caps.snapshot()),
             "ping" => Ok(serde_json::json!({"pong": true})),
-            "paste.execute" => Err(IpcError::new(
-                "unavailable",
-                format!("paste unavailable: {SKELETON_NOTE}"),
-            )),
+            "paste.execute" => self.handle_paste_execute(params),
             method if method.starts_with("history.") => self.handle_history(method, params),
             "monitor.set" => self.handle_monitor(params),
             "capture.report" => Ok(self.handle_capture(params)),

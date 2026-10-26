@@ -15,6 +15,16 @@ pub fn should_skip(offers: &[(String, Option<String>)]) -> bool {
     skip_reason(offers).is_some()
 }
 
+/// Report whether `name` is a privacy opt-out format (never advertised
+/// in transfer format lists and never stored).
+#[must_use]
+pub fn is_optout_name(name: &str) -> bool {
+    matches!(
+        name,
+        EXCLUDE_FORMAT | HISTORY_OPT_OUT | CLOUD_OPT_OUT | VIEWER_IGNORE
+    )
+}
+
 /// Name the matched opt-out format, if any.
 #[must_use]
 pub fn skip_reason(offers: &[(String, Option<String>)]) -> Option<&'static str> {

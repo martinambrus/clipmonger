@@ -3,6 +3,10 @@
 use clipmonger_platform::types::{BackendCaps, Level, PasteCaps, PasteStrategy};
 
 /// Full capabilities for a healthy Windows backend.
+///
+/// Note (FNF): `image/png` is a PNG-format passthrough with best-effort raw
+/// `CF_DIB` reads; there is no DIB decode/encode yet. Every constructor here
+/// carries the note so daemon-registered snapshots report it too.
 #[must_use]
 pub fn normal_caps() -> BackendCaps {
     BackendCaps {
@@ -17,7 +21,7 @@ pub fn normal_caps() -> BackendCaps {
         tray: Level::Full,
         autostart: true,
         primary_selection: false,
-        notes: Vec::new(),
+        notes: vec!["image/png: PNG passthrough + CF_DIB best-effort, no DIB decode".to_string()],
     }
 }
 

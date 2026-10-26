@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use clipmonger_core::Config;
 use clipmonger_daemon::{replay_script, write_rendezvous, DaemonLock, DaemonState};
 #[cfg(windows)]
 use clipmonger_ipc::framing::pipe_name_for;
@@ -74,6 +75,139 @@ fn write_token(profile: &Path) -> Result<String, String> {
         fs::set_permissions(&path, p).map_err(|e| format!("token chmod failed: {e}"))?;
     }
     Ok(token)
+}
+
+/// Whether a config format entry selects `mime`.
+///
+/// Config uses canonical names (`text/plain;charset=utf-8` and `text/plain`
+/// both); transfer offers use the short form.
+#[cfg(all(windows, feature = "backend-windows"))]
+fn wanted_format(mime: &str, formats: &[String]) -> bool {
+    formats.iter().any(|format| {
+        format == mime
+            || (mime == "text/plain" && format == "text/plain;charset=utf-8")
+            || (format == "text/plain" && mime == "text/plain;charset=utf-8")
+    })
+}
+
+/// Construct the live Windows backend: typed caps, monitor thread (real
+/// payloads via transfer honoring opt-out + privacy counter), and the
+/// popup-hotkey listener (daemon-event only: no UI push channel in v1).
+#[cfg(all(windows, feature = "backend-windows"))]
+#[allow(clippy::too_many_lines)]
+fn setup_windows_backend(
+    profile: &Path,
+    state: &Arc<DaemonState>,
+    config: &Config,
+    shutdown: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    use clipmonger_backend_windows::{
+        caps as backend_caps, WinAutostart, WinHotkeys, WinMonitor, WinTransfer,
+    };
+    use clipmonger_platform::traits::{
+        AutostartManager, ClipboardMonitor, ClipboardTransfer, HotkeyManager,
+    };
+    use clipmonger_platform::types::{HotkeyId, Level, SubscribeKind};
+
+    let transfer = Arc::new(WinTransfer::new());
+
+    let mut monitor_ok = true;
+    let monitor = match WinMonitor::new() {
+        Ok(mut monitor) => {
+            if monitor.subscribe(&[SubscribeKind::Clipboard]).is_err() {
+                monitor_ok = false;
+            }
+            Some(monitor)
+        }
+        Err(e) => {
+            eprintln!("daemon: windows monitor unavailable: {e}");
+            monitor_ok = false;
+            None
+        }
+    };
+
+    let mut hotkeys = WinHotkeys::new();
+    let mut hotkey_conflict = false;
+    if let Err(e) = hotkeys.register(HotkeyId(1), &config.popup.hotkey) {
+        eprintln!("daemon: popup hotkey unavailable: {e}");
+        hotkey_conflict = true;
+    }
+
+    // Autostart handle for future UI wiring; never enabled at startup.
+    // Portable when the profile lives beside the daemon binary.
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
+    let exe_dir = exe
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let autostart = WinAutostart::new(exe, profile.starts_with(&exe_dir));
+    let _ = autostart.is_enabled();
+
+    let mut caps = backend_caps::caps_for(hotkey_conflict, false);
+    if !monitor_ok {
+        caps.monitor = Level::Degraded;
+        caps.notes
+            .push("monitor Degraded: session clipboard unavailable".to_string());
+    }
+    state.register_backend("windows", caps);
+
+    if let Some(mut monitor) = monitor {
+        let state = Arc::clone(state);
+        let transfer = Arc::clone(&transfer);
+        let formats: Vec<String> = config.monitor.formats.clone();
+        let max_bytes = config.monitor.max_bytes;
+        let poll_ms = config.monitor.poll_ms;
+        let shutdown = Arc::clone(shutdown);
+        std::thread::spawn(move || {
+            let poll_timeout = std::time::Duration::from_millis(poll_ms.clamp(50, 5000));
+            while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                let events = match monitor.poll(poll_timeout) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        eprintln!("daemon: monitor poll failed: {e}");
+                        break;
+                    }
+                };
+                for event in &events {
+                    if event.sensitive {
+                        state.ingest_capture("windows", true, &[]);
+                        continue;
+                    }
+                    let mut payloads = Vec::new();
+                    for offer in &event.offers {
+                        if !wanted_format(&offer.mime, &formats) {
+                            continue;
+                        }
+                        match transfer.read(&offer.mime, max_bytes) {
+                            Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
+                            Err(e) => {
+                                eprintln!("daemon: payload read skipped ({}): {e}", offer.mime);
+                            }
+                        }
+                    }
+                    if !payloads.is_empty() {
+                        state.ingest_capture("windows", false, &payloads);
+                    }
+                }
+            }
+        });
+    }
+
+    let shutdown = Arc::clone(shutdown);
+    std::thread::spawn(move || {
+        while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            match hotkeys.poll(std::time::Duration::from_millis(200)) {
+                Ok(ids) => {
+                    for id in ids {
+                        eprintln!("daemon: hotkey fired id={} (daemon-event only)", id.0);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("daemon: hotkey poll failed: {e}");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 #[cfg(unix)]
@@ -149,11 +283,21 @@ async fn main() {
         }
     }
 
+    // WIN-F2: load `<profile>/config.toml`, defaults when missing. The popup
+    // hotkey and paste budget below are wired from it on Windows.
+    let config = Config::load(&profile.join("config.toml")).unwrap_or_default();
+
     let state = Arc::new(DaemonState::new(store));
+    state.set_paste_limits(config.popup.unicode_limit, config.popup.delivery_dwell_ms);
+    let backend_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(all(windows, feature = "backend-windows"))]
+    setup_windows_backend(&profile, &state, &config, &backend_shutdown);
     let stop: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
     let stop_handler = Arc::clone(&stop);
+    let backend_stop = Arc::clone(&backend_shutdown);
     let handler: clipmonger_ipc::server::Handler = Arc::new(move |method, params| {
         if method == "daemon.stop" {
+            backend_stop.store(true, std::sync::atomic::Ordering::Relaxed);
             stop_handler.notify_one();
             return Ok(serde_json::json!({"ok": true}));
         }

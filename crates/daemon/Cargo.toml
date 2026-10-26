@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-backend-windows = []
+backend-windows = ["dep:clipmonger-backend-windows"]
 backend-x11 = []
 backend-wayland = []
 backend-macos = []
@@ -25,6 +25,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+clipmonger-backend-windows = { path = "../backend-windows", optional = true }
 
 [lints]
 workspace = true

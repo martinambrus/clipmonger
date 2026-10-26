@@ -1,0 +1,563 @@
+//! Raw Win32 helpers. This is the only module in the crate that may use
+//! `unsafe`; every `unsafe` block carries a one-line safety note.
+//!
+//! Compiled only on Windows; on other systems this module is empty.
+
+#![cfg(windows)]
+#![allow(unsafe_code)]
+
+use std::ffi::{c_void, OsString};
+use std::os::windows::ffi::OsStringExt;
+use std::sync::mpsc::Sender;
+
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, HWND};
+use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_QUERY};
+use windows_sys::Win32::System::DataExchange::{
+    AddClipboardFormatListener, RemoveClipboardFormatListener,
+};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegQueryValueExW, RegSetValueExW,
+    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
+    GetWindowThreadProcessId, PostMessageW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_MESSAGE, MSG, WM_CLIPBOARDUPDATE,
+    WM_CLOSE, WM_CREATE, WM_DESTROY, WNDCLASSEXW,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowTextW, SetForegroundWindow,
+};
+
+/// Last Win32 error as a short string.
+pub(crate) fn last_error() -> String {
+    // Safety: GetLastError only reads the calling thread's error slot.
+    let code = unsafe { GetLastError() };
+    format!("win32 error {code}")
+}
+
+/// Encode as nul-terminated UTF-16 for Win32 `*W` calls.
+fn to_wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Message-only monitor pump
+// ---------------------------------------------------------------------------
+
+/// The global-hotkey manager owns a raw HWND, so it is not auto-`Send`.
+// Safety: every `WinHotkeys` is created and used from its owning pump
+// thread only (the daemon keeps one manager on the backend thread); the
+// handle is never touched concurrently.
+unsafe impl Send for crate::hotkeys::WinHotkeys {}
+
+/// RAII handle for the hidden-window clipboard listener thread.
+///
+/// The HWND is stored as `usize` (handle values round-trip losslessly) so
+/// this handle stays `Send`; the pump thread reconstitutes it locally.
+pub(crate) struct PumpHandle {
+    hwnd: usize,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PumpHandle {
+    /// Ask the pump thread to exit and wait for it.
+    pub(crate) fn stop(&mut self) {
+        // Safety: hwnd names a live message-only window owned by the pump thread.
+        unsafe {
+            PostMessageW(self.hwnd as HWND, WM_CLOSE, 0, 0);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Window procedure: forwards `WM_CLIPBOARDUPDATE` wakes to the channel.
+unsafe extern "system" fn monitor_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    match msg {
+        WM_CREATE => {
+            // Safety: lParam is the CREATESTRUCT passed by CreateWindowExW below.
+            let create = unsafe {
+                &*(lparam as *const windows_sys::Win32::UI::WindowsAndMessaging::CREATESTRUCTW)
+            };
+            // Safety: lpCreateParams is the Box<Sender> pointer handed to CreateWindowExW.
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+            }
+            0
+        }
+        WM_CLIPBOARDUPDATE => {
+            // Safety: USERDATA holds the Sender installed at WM_CREATE for this window.
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Sender<()>;
+            if !ptr.is_null() {
+                // Safety: pointer is valid until WM_DESTROY reclaims the Box.
+                let _ = unsafe { &*ptr }.send(());
+            }
+            0
+        }
+        WM_DESTROY => {
+            // Safety: reclaim the Box<Sender> installed at WM_CREATE; no further messages use it.
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Sender<()>;
+            if !ptr.is_null() {
+                drop(unsafe { Box::from_raw(ptr) });
+                // Safety: clearing USERDATA after reclaiming; window is being destroyed.
+                unsafe {
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                }
+            }
+            // Safety: no preconditions beyond calling on the window's thread.
+            unsafe {
+                PostQuitMessage(0);
+            }
+            0
+        }
+        _ => {
+            // Safety: default handler for unhandled messages; hwnd is valid during dispatch.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+    }
+}
+
+/// Spawn the pump thread: hidden `HWND_MESSAGE` window plus
+/// `AddClipboardFormatListener`; `WM_CLIPBOARDUPDATE` posts `()` to `wakes`.
+///
+/// The window is created on the pump thread itself: Win32 delivers a
+/// window's messages to the thread that created it, so creating it on the
+/// caller and pumping elsewhere would starve the pump (no wakes) and wedge
+/// `stop` (the `WM_CLOSE` wake would sit in the caller's queue while the
+/// pump's `join` waits forever).
+pub(crate) fn start_pump(wakes: Sender<()>) -> Result<PumpHandle, String> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<usize, String>>();
+    let thread = std::thread::spawn(move || {
+        let class: Vec<u16> = to_wide("ClipmongerMonitor");
+        // Safety: GetModuleHandleW(null) returns the current module handle or fails.
+        let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+        if instance.is_null() {
+            let _ = ready_tx.send(Err(format!("GetModuleHandleW failed: {}", last_error())));
+            return;
+        }
+        let mut class_info = WNDCLASSEXW {
+            cbSize: u32::try_from(std::mem::size_of::<WNDCLASSEXW>()).unwrap_or(u32::MAX),
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(monitor_wndproc),
+            hInstance: instance,
+            lpszClassName: class.as_ptr(),
+            ..Default::default()
+        };
+        // Safety: class struct is fully initialised; Atom 0 means failure or already-registered.
+        let atom = unsafe { RegisterClassExW(&raw mut class_info) };
+        if atom == 0 {
+            // Safety: reading the thread error slot after a failed call.
+            let code = unsafe { GetLastError() };
+            if code != ERROR_CLASS_ALREADY_EXISTS {
+                let _ = ready_tx.send(Err(format!("RegisterClassExW failed: win32 error {code}")));
+                return;
+            }
+        }
+        let boxed: Box<Sender<()>> = Box::new(wakes);
+        let param = Box::into_raw(boxed).cast::<c_void>();
+        // Safety: class is registered, strings are nul-terminated, param is reclaimed at WM_DESTROY.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                0,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                HWND_MESSAGE,
+                std::ptr::null_mut(),
+                instance,
+                param,
+            )
+        };
+        if hwnd.is_null() {
+            drop(unsafe { Box::from_raw(param.cast::<Sender<()>>()) });
+            let _ = ready_tx.send(Err(format!("CreateWindowExW failed: {}", last_error())));
+            return;
+        }
+        // Safety: hwnd names a live window created above on this thread.
+        let added = unsafe { AddClipboardFormatListener(hwnd) };
+        if added == 0 {
+            let err = format!("AddClipboardFormatListener refused: {}", last_error());
+            // Safety: listener never attached; tearing down the window created above.
+            // (DestroyWindow runs WM_DESTROY synchronously, which reclaims
+            // the boxed sender, so it must not be reclaimed again here.)
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+            }
+            let _ = ready_tx.send(Err(err));
+            return;
+        }
+        let _ = ready_tx.send(Ok(hwnd as usize));
+        // Safety: standard pump; GetMessageW returns 0 only on WM_QUIT.
+        // WM_CLOSE (posted by `stop`) falls through to DefWindowProc, which
+        // destroys the window; WM_DESTROY posts the quit that ends this loop,
+        // so the `join` in `stop` cannot wait forever.
+        unsafe {
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                DispatchMessageW(&raw const msg);
+            }
+        }
+        // Safety: listener was added; removing before thread exit.
+        unsafe {
+            RemoveClipboardFormatListener(hwnd);
+        }
+    });
+    // Wait (bounded) for the pump thread to install the listener.
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(hwnd)) => Ok(PumpHandle {
+            hwnd,
+            thread: Some(thread),
+        }),
+        Ok(Err(e)) => {
+            let _ = thread.join();
+            Err(e)
+        }
+        Err(_) => Err("monitor pump thread exited during startup".to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Foreground window + integrity
+// ---------------------------------------------------------------------------
+
+/// Foreground window handle, or `None` when there is none.
+pub(crate) fn foreground_hwnd() -> Option<HWND> {
+    // Safety: GetForegroundWindow takes no arguments and has no preconditions.
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        None
+    } else {
+        Some(hwnd)
+    }
+}
+
+/// Best-effort re-focus of `hwnd`; returns whether the call was accepted.
+pub(crate) fn focus_hwnd(hwnd: HWND) -> bool {
+    // Safety: hwnd names a top-level window; failure only means focus was refused.
+    unsafe { SetForegroundWindow(hwnd) != 0 }
+}
+
+/// Owning process id of `hwnd`, or `None` when it cannot be determined.
+pub(crate) fn window_pid(hwnd: HWND) -> Option<u32> {
+    let mut pid: u32 = 0;
+    // Safety: pid pointer is valid for the call; return value is the thread id.
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &raw mut pid);
+    }
+    if pid == 0 {
+        None
+    } else {
+        Some(pid)
+    }
+}
+
+/// Lowercased exe basename for `pid`, or `None` when it cannot be determined.
+pub(crate) fn process_basename(pid: u32) -> Option<String> {
+    // Safety: OpenProcess with a query flag; handle closed below on all paths.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut len: u32 = 1024;
+    let mut buf = vec![0u16; len as usize];
+    // Safety: buffer and length pointer are valid; handle has query rights.
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &raw mut len) };
+    // Safety: handle came from OpenProcess and is still open here.
+    unsafe {
+        CloseHandle(handle);
+    }
+    if ok == 0 {
+        return None;
+    }
+    buf.truncate(len as usize);
+    let path = OsString::from_wide(&buf).to_string_lossy().into_owned();
+    let base = path.rsplit(['\\', '/']).next().unwrap_or(&path);
+    Some(base.to_ascii_lowercase())
+}
+
+/// FNV-1a hash of the window title; 0 when the title is unavailable.
+pub(crate) fn window_title_hash(hwnd: HWND) -> u64 {
+    // Safety: length query first; hwnd names a window readable by this process.
+    let len = unsafe { GetWindowTextW(hwnd, std::ptr::null_mut(), 0) };
+    if len <= 0 {
+        return 0;
+    }
+    let mut buf = vec![0u16; usize::try_from(len).unwrap_or(0) + 1];
+    // Safety: buffer sized len+1 from the length query on the same window.
+    let got = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), len + 1) };
+    if got <= 0 {
+        return 0;
+    }
+    buf.truncate(usize::try_from(got).unwrap_or(0));
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for unit in buf {
+        hash ^= u64::from(unit);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// Whether `pid` runs elevated, or `None` when it cannot be determined.
+pub(crate) fn process_elevated(pid: u32) -> Option<bool> {
+    // Safety: OpenProcess with a query flag; handle closed below on all paths.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let elevated = token_elevated(handle);
+    // Safety: handle came from OpenProcess and is still open here.
+    unsafe {
+        CloseHandle(handle);
+    }
+    elevated
+}
+
+/// Whether the current process runs elevated.
+pub(crate) fn current_process_elevated() -> Option<bool> {
+    // Safety: GetCurrentProcess returns a pseudo-handle needing no close.
+    let pseudo: HANDLE = unsafe { GetCurrentProcess() };
+    token_elevated(pseudo)
+}
+
+/// Read `TokenElevation` for a process or pseudo-handle; never closes it.
+fn token_elevated(process: HANDLE) -> Option<bool> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // Safety: token pointer is valid; handle has query rights (or is the pseudo-handle).
+    let ok = unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) };
+    if ok == 0 || token.is_null() {
+        return None;
+    }
+    let mut elevated: u32 = 0;
+    let mut returned: u32 = 0;
+    // Safety: output slot sized for a u32 elevation flag; token closed below.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevated).cast::<c_void>(),
+            u32::try_from(std::mem::size_of::<u32>()).unwrap_or(u32::MAX),
+            &raw mut returned,
+        )
+    };
+    // Safety: token came from OpenProcessToken and is still open here.
+    unsafe {
+        CloseHandle(token);
+    }
+    if ok == 0 {
+        None
+    } else {
+        Some(elevated != 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Autostart registry
+// ---------------------------------------------------------------------------
+
+/// HKCU subkey holding per-user Run values.
+const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+/// HKCU subkey holding `StartupApproved` overrides.
+const APPROVED_SUBKEY: &str =
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
+/// This daemon's Run value name.
+pub(crate) const RUN_VALUE_NAME: &str = "clipmonger";
+/// `RegCreateKeyExW` conflict: the window class is already registered.
+const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
+/// `RegDeleteValueW`/`RegQueryValueExW` missing value.
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+
+/// Open (creating if needed) a HKCU subkey; caller must `RegCloseKey`.
+fn open_key(
+    subkey: &str,
+    write: bool,
+) -> Result<windows_sys::Win32::System::Registry::HKEY, String> {
+    let wide = to_wide(subkey);
+    let mut key: windows_sys::Win32::System::Registry::HKEY = std::ptr::null_mut();
+    let access = if write {
+        KEY_SET_VALUE
+    } else {
+        KEY_QUERY_VALUE
+    };
+    // Safety: subkey string is nul-terminated; key slot receives the opened handle.
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            wide.as_ptr(),
+            0,
+            std::ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            access,
+            std::ptr::null(),
+            &raw mut key,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(format!("RegCreateKeyExW({subkey}) failed: status {status}"));
+    }
+    Ok(key)
+}
+
+/// Read this daemon's Run command line, or `None` when absent.
+pub(crate) fn run_value_get() -> Result<Option<String>, String> {
+    let key = open_key(RUN_SUBKEY, false)?;
+    let name = to_wide(RUN_VALUE_NAME);
+    let mut kind: u32 = 0;
+    let mut len: u32 = 0;
+    // Safety: length query with null data; key was just opened for query.
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &raw mut kind,
+            std::ptr::null_mut(),
+            &raw mut len,
+        )
+    };
+    if status != 0 {
+        // Safety: key came from open_key and is still open here.
+        unsafe {
+            RegCloseKey(key);
+        }
+        return Ok(None);
+    }
+    let mut buf = vec![0u16; len as usize / 2 + 1];
+    let mut actual: u32 = u32::try_from(buf.len())
+        .unwrap_or(u32::MAX)
+        .saturating_mul(2);
+    // Safety: buffer sized from the length query on the same value.
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &raw mut kind,
+            buf.as_mut_ptr().cast::<u8>(),
+            &raw mut actual,
+        )
+    };
+    // Safety: key came from open_key and is still open here.
+    unsafe {
+        RegCloseKey(key);
+    }
+    if status != 0 || kind != REG_SZ {
+        return Ok(None);
+    }
+    let units = (actual as usize / 2).min(buf.len());
+    let mut wide = buf[..units].to_vec();
+    while wide.last() == Some(&0) {
+        wide.pop();
+    }
+    Ok(Some(
+        OsString::from_wide(&wide).to_string_lossy().into_owned(),
+    ))
+}
+
+/// Write this daemon's Run command line (`REG_SZ`).
+pub(crate) fn run_value_set(command: &str) -> Result<(), String> {
+    let key = open_key(RUN_SUBKEY, true)?;
+    let name = to_wide(RUN_VALUE_NAME);
+    let value = to_wide(command);
+    let bytes = u32::try_from(value.len())
+        .unwrap_or(u32::MAX)
+        .saturating_mul(2);
+    // Safety: name and value buffers are nul-terminated; key opened for set.
+    let status = unsafe {
+        RegSetValueExW(
+            key,
+            name.as_ptr(),
+            0,
+            REG_SZ,
+            value.as_ptr().cast::<u8>(),
+            bytes,
+        )
+    };
+    // Safety: key came from open_key and is still open here.
+    unsafe {
+        RegCloseKey(key);
+    }
+    if status != 0 {
+        return Err(format!("RegSetValueExW failed: status {status}"));
+    }
+    Ok(())
+}
+
+/// Delete this daemon's Run value; missing values are success.
+pub(crate) fn run_value_delete() -> Result<(), String> {
+    let key = open_key(RUN_SUBKEY, true)?;
+    let name = to_wide(RUN_VALUE_NAME);
+    // Safety: name is nul-terminated; key opened for set; missing value (2) is success.
+    let status = unsafe { RegDeleteValueW(key, name.as_ptr()) };
+    // Safety: key came from open_key and is still open here.
+    unsafe {
+        RegCloseKey(key);
+    }
+    if status != 0 && status as u32 != ERROR_FILE_NOT_FOUND {
+        return Err(format!("RegDeleteValueW failed: status {status}"));
+    }
+    Ok(())
+}
+
+/// Raw `StartupApproved` override blob for this daemon's value, if present.
+pub(crate) fn startup_approved_blob() -> Option<Vec<u8>> {
+    let key = open_key(APPROVED_SUBKEY, false).ok()?;
+    let name = to_wide(RUN_VALUE_NAME);
+    let mut kind: u32 = 0;
+    let mut len: u32 = 0;
+    // Safety: length query with null data; key was just opened for query.
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &raw mut kind,
+            std::ptr::null_mut(),
+            &raw mut len,
+        )
+    };
+    if status != 0 || len == 0 || len > 1 << 20 {
+        // Safety: key came from open_key and is still open here.
+        unsafe {
+            RegCloseKey(key);
+        }
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    // Safety: buffer sized from the length query on the same value.
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &raw mut kind,
+            buf.as_mut_ptr(),
+            &raw mut len,
+        )
+    };
+    // Safety: key came from open_key and is still open here.
+    unsafe {
+        RegCloseKey(key);
+    }
+    if status != 0 {
+        return None;
+    }
+    buf.truncate(len as usize);
+    Some(buf)
+}
