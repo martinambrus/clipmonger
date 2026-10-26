@@ -127,6 +127,40 @@ impl Keymap {
         map
     }
 
+    /// Build defaults plus `popup.keys.*` overrides (action name to
+    /// chord text). Unknown action names error, never panic.
+    ///
+    /// # Errors
+    /// Returns a message for an unknown action, bad chord, or conflict.
+    pub fn from_config_keys(
+        keys: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        let mut map = Self::defaults();
+        for (name, chord_text) in keys {
+            let action = match name.as_str() {
+                "paste" => Action::Paste,
+                "paste_into" => Action::PasteInto,
+                "dismiss" => Action::Dismiss,
+                "remove" => Action::Remove,
+                "edit" => Action::Edit,
+                "pin" => Action::Pin,
+                "refresh" => Action::Refresh,
+                "navigate_up" => Action::NavigateUp,
+                "navigate_down" => Action::NavigateDown,
+                "page_up" => Action::PageUp,
+                "page_down" => Action::PageDown,
+                "home" => Action::Home,
+                "end" => Action::End,
+                other => return Err(format!("unknown popup action {other}")),
+            };
+            let event = crate::chord::parse_chord(chord_text).map_err(|error| error.to_string())?;
+            // Replace any existing binding for this action, then bind.
+            map.bindings.retain(|_, bound| *bound != action);
+            map.bind(action, event)?;
+        }
+        Ok(map)
+    }
+
     /// Resolve an event to its action, falling back to typing.
     #[must_use]
     pub fn action_for(&self, event: &KeyEvent) -> Option<Action> {

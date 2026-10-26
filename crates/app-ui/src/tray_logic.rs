@@ -5,7 +5,7 @@ use clipmonger_platform::types::{TrayEvent, TrayState};
 
 use crate::strings;
 
-/// Local tray presentation state (platform enum stays two-variant).
+/// Local tray presentation state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrayUiState {
     /// Monitoring running, link healthy.
@@ -28,12 +28,54 @@ pub enum TrayAction {
     PauseFor1h,
     /// Open the settings window.
     OpenConfig,
+    /// Show the About view.
+    About,
     /// Stop the daemon and exit.
     Quit,
 }
 
+/// One tray menu entry: a labelled item or a separator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuEntry {
+    /// Item carrying a strings-module id.
+    Item(&'static str),
+    /// Visual separator.
+    Separator,
+}
+
+impl Default for TrayInputs {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            degraded: false,
+            attached: true,
+        }
+    }
+}
+
+/// Menu entries for the current inputs (seg-09 S7 sole definition).
+#[must_use]
+pub fn menu_entries(inputs: &TrayInputs) -> Vec<MenuEntry> {
+    let pause = if inputs.paused {
+        "tray.resume"
+    } else {
+        "tray.pause"
+    };
+    vec![
+        MenuEntry::Item("tray.show"),
+        MenuEntry::Separator,
+        MenuEntry::Item(pause),
+        MenuEntry::Item("tray.pause_1h"),
+        MenuEntry::Separator,
+        MenuEntry::Item("tray.config"),
+        MenuEntry::Separator,
+        MenuEntry::Item("tray.about"),
+        MenuEntry::Item("tray.quit"),
+    ]
+}
+
 /// Inputs driving one tray sync.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrayInputs {
     /// Monitoring paused flag.
     pub paused: bool,
@@ -46,22 +88,13 @@ pub struct TrayInputs {
 /// Menu labels for the current inputs, all from the string catalog.
 #[must_use]
 pub fn menu_model(inputs: &TrayInputs) -> Vec<String> {
-    let pause = if inputs.paused {
-        strings::text("tray.resume")
-    } else {
-        strings::text("tray.pause")
-    };
-    [
-        strings::text("tray.show"),
-        pause,
-        strings::text("tray.pause_1h"),
-        strings::text("tray.config"),
-        strings::text("tray.about"),
-        strings::text("tray.quit"),
-    ]
-    .iter()
-    .map(ToString::to_string)
-    .collect()
+    menu_entries(inputs)
+        .iter()
+        .filter_map(|entry| match entry {
+            MenuEntry::Item(id) => Some(strings::text(id).to_string()),
+            MenuEntry::Separator => None,
+        })
+        .collect()
 }
 
 /// Pure tray mapping driven by tests and the shell.
@@ -93,7 +126,8 @@ impl TrayLogic {
             TrayUiState::Normal
         };
         tray.set_state(match self.ui {
-            TrayUiState::Normal | TrayUiState::Paused => TrayState::Idle,
+            TrayUiState::Normal => TrayState::Idle,
+            TrayUiState::Paused => TrayState::Paused,
             TrayUiState::Attention => TrayState::Attention,
         });
         tray.set_tooltip(if inputs.paused {
@@ -121,6 +155,8 @@ impl TrayLogic {
                         TrayAction::PauseFor1h
                     } else if label == strings::text("tray.config") {
                         TrayAction::OpenConfig
+                    } else if label == strings::text("tray.about") {
+                        TrayAction::About
                     } else {
                         TrayAction::Quit
                     }

@@ -5,7 +5,9 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use clipmonger_app_ui::{ipc_bridge, keymap, lifecycle, placement, popup, strings, tray_logic};
+use clipmonger_app_ui::{
+    config_model, ipc_bridge, keymap, lifecycle, placement, popup, strings, tray_logic,
+};
 use clipmonger_core::config::Config;
 use clipmonger_ipc::client::Client;
 use clipmonger_ipc::framing;
@@ -134,6 +136,64 @@ fn default_profile() -> PathBuf {
     Config::resolve_paths(false, &dir).data_dir
 }
 
+/// Real OS tray (Windows/macOS via tray-icon); creation failure is
+/// degraded, never fatal.
+#[cfg(any(windows, target_os = "macos"))]
+struct RealTray {
+    _tray: tray_icon::TrayIcon,
+    ids: std::collections::HashMap<String, tray_logic::TrayAction>,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl RealTray {
+    fn create(inputs: &tray_logic::TrayInputs) -> Option<Self> {
+        use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
+        let menu = Menu::new();
+        let mut ids = std::collections::HashMap::new();
+        for entry in tray_logic::menu_entries(inputs) {
+            match entry {
+                tray_logic::MenuEntry::Separator => {
+                    let _ = menu.append(&PredefinedMenuItem::separator());
+                }
+                tray_logic::MenuEntry::Item(id) => {
+                    let item = MenuItem::new(strings::text(id), true, None);
+                    let action = match id {
+                        "tray.show" => tray_logic::TrayAction::OpenPopup,
+                        "tray.pause" | "tray.resume" => tray_logic::TrayAction::TogglePause,
+                        "tray.pause_1h" => tray_logic::TrayAction::PauseFor1h,
+                        "tray.config" => tray_logic::TrayAction::OpenConfig,
+                        "tray.about" => tray_logic::TrayAction::About,
+                        _ => tray_logic::TrayAction::Quit,
+                    };
+                    ids.insert(item.id().0.clone(), action);
+                    let _ = menu.append(&item);
+                }
+            }
+        }
+        let icon =
+            tray_icon::Icon::from_rgba(vec![0x33_u8, 0x99, 0xcc, 0xff].repeat(16 * 16), 16, 16)
+                .ok()?;
+        let tray = tray_icon::TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_icon(icon)
+            .with_tooltip(strings::text("tray.tooltip"))
+            .build()
+            .ok()?;
+        Some(Self { _tray: tray, ids })
+    }
+
+    fn poll(&self) -> Vec<tray_logic::TrayAction> {
+        let mut out = Vec::new();
+        while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            if let Some(action) = self.ids.get(&event.id().0) {
+                out.push(action.clone());
+            }
+        }
+        while let Ok(_event) = tray_icon::TrayIconEvent::receiver().try_recv() {}
+        out
+    }
+}
+
 /// Popup application state.
 struct ShellApp {
     vm: popup::PopupVm,
@@ -145,6 +205,49 @@ struct ShellApp {
     open: bool,
     error: String,
     last_poll: Instant,
+    config_open: bool,
+    config_doc: Option<config_model::ConfigDoc>,
+    config_filter: String,
+    config_tab: String,
+    config_edits: std::collections::HashMap<String, String>,
+    config_error: String,
+    caps_text: String,
+    version_text: String,
+    profile: PathBuf,
+    dark: bool,
+    font_scale: f32,
+    pause_deadline: Option<Instant>,
+    pending_apply: Vec<String>,
+    #[cfg(any(windows, target_os = "macos"))]
+    real_tray: Option<RealTray>,
+}
+
+/// Text form of a config value for an edit field.
+fn value_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => number.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Parse an edit field back into a value for one row kind.
+fn parse_edit(kind: config_model::Kind, text: &str) -> Option<Value> {
+    use config_model::Kind as K;
+    match kind {
+        K::Bool => text.parse::<bool>().ok().map(Value::from),
+        K::Int => text.trim().parse::<i64>().ok().map(Value::from),
+        K::Text | K::Chord | K::Enum => Some(Value::String(text.trim().to_string())),
+        K::StringList => Some(Value::Array(
+            text.split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(|part| Value::String(part.to_string()))
+                .collect(),
+        )),
+        K::ChordMap | K::PasteChords => serde_json::from_str(text).ok(),
+    }
 }
 
 impl ShellApp {
@@ -154,6 +257,7 @@ impl ShellApp {
     }
 
     /// Drain bridge events into view-model state.
+    #[allow(clippy::too_many_lines)]
     fn drain_events(&mut self) {
         for _ in 0..DRAIN_CAP {
             let Ok(event) = self.events.try_recv() else {
@@ -169,6 +273,9 @@ impl ShellApp {
                         .unwrap_or(false);
                     self.vm.set_paused(paused);
                     self.inputs.paused = paused;
+                    if let Some(version) = body.get("version").and_then(Value::as_str) {
+                        self.version_text = version.to_string();
+                    }
                     self.inputs.degraded = body
                         .get("degraded")
                         .and_then(Value::as_bool)
@@ -176,6 +283,8 @@ impl ShellApp {
                 }
                 ipc_bridge::UiEvent::History(body) => {
                     if self.vm.apply_history(&body) {
+                        let current = self.vm.clips().first().cloned();
+                        self.vm.set_current(current);
                         self.inputs.attached = true;
                         self.vm.set_offline(false);
                     } else {
@@ -191,8 +300,68 @@ impl ShellApp {
                 ipc_bridge::UiEvent::PasteUnavailable => {
                     self.error = strings::text("popup.paste_blocked").to_string();
                 }
+                ipc_bridge::UiEvent::Config(body) => {
+                    let doc = config_model::ConfigDoc::from_snapshot(&body);
+                    // Theme prefs live in the ui.theme extra key.
+                    if let Some(theme) = doc.get("ui.theme") {
+                        self.dark = theme.get("mode").and_then(Value::as_str) != Some("light");
+                        if let Some(scale) = theme.get("font_scale").and_then(Value::as_f64) {
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                self.font_scale = scale as f32;
+                            }
+                        }
+                    }
+                    // popup.keys live-apply (U1-F8).
+                    if let Some(keys_value) = doc.get("popup.keys") {
+                        if let Ok(keys) = serde_json::from_value::<
+                            std::collections::BTreeMap<String, String>,
+                        >(keys_value.clone())
+                        {
+                            let _ = self.vm.apply_keys(&keys);
+                        }
+                    }
+                    self.config_doc = Some(doc);
+                    self.config_edits.clear();
+                }
+                ipc_bridge::UiEvent::ConfigApplied(key) => {
+                    self.pending_apply.retain(|pending| pending != &key);
+                    if let Some(doc) = &mut self.config_doc {
+                        let wire_key = if key == "popup.keys" {
+                            "popup.keys.*"
+                        } else {
+                            key.as_str()
+                        };
+                        doc.mark_applied(wire_key);
+                    }
+                    self.config_edits.remove(&key);
+                }
+                ipc_bridge::UiEvent::Caps(body) => {
+                    self.caps_text = body.to_string();
+                }
+                ipc_bridge::UiEvent::HistoryClip(body) => {
+                    if let Some(clip_value) = body.get("clip") {
+                        if let Ok(clip) = serde_json::from_value::<clipmonger_core::model::Clip>(
+                            clip_value.clone(),
+                        ) {
+                            self.vm.set_current(Some(clip));
+                        }
+                    }
+                }
+                ipc_bridge::UiEvent::MonitorPaused(paused) => {
+                    self.inputs.paused = paused;
+                    self.vm.set_paused(paused);
+                    if !paused {
+                        self.pause_deadline = None;
+                    }
+                }
+                ipc_bridge::UiEvent::Purged(_) => {}
                 ipc_bridge::UiEvent::Error(message) => {
-                    self.error = message;
+                    self.error = message.clone();
+                    if !self.pending_apply.is_empty() {
+                        self.config_error = message;
+                        self.pending_apply.clear();
+                    }
                 }
             }
         }
@@ -211,6 +380,54 @@ impl ShellApp {
                 self.send(ipc_bridge::UiCmd::PinClip(id, pinned));
             }
             popup::VmEffect::Refresh => self.send(ipc_bridge::UiCmd::ListHistory),
+        }
+    }
+
+    /// Run one tray action.
+    #[allow(clippy::needless_pass_by_value)]
+    fn run_tray_action(&mut self, action: tray_logic::TrayAction) {
+        match action {
+            tray_logic::TrayAction::OpenPopup => {
+                self.open = true;
+                self.vm.target_session.show();
+                self.send(ipc_bridge::UiCmd::ListHistory);
+            }
+            tray_logic::TrayAction::TogglePause => {
+                self.pause_deadline = None;
+                self.send(ipc_bridge::UiCmd::MonitorToggle);
+            }
+            tray_logic::TrayAction::PauseFor1h => {
+                // Client-side deadline (U1-F3); a daemon restart loses it.
+                if !self.inputs.paused {
+                    self.pause_deadline = Some(Instant::now() + Duration::from_secs(3600));
+                    self.send(ipc_bridge::UiCmd::MonitorToggle);
+                }
+            }
+            tray_logic::TrayAction::OpenConfig => {
+                self.config_open = true;
+                self.send(ipc_bridge::UiCmd::ConfigGet);
+                self.send(ipc_bridge::UiCmd::CapsGet);
+            }
+            tray_logic::TrayAction::About => {
+                self.config_open = true;
+                self.config_tab = "about".to_string();
+                self.send(ipc_bridge::UiCmd::CapsGet);
+            }
+            tray_logic::TrayAction::Quit => self.send(ipc_bridge::UiCmd::Stop),
+        }
+    }
+
+    /// Poll tray controllers (fake logic tray plus the real OS tray).
+    fn poll_tray(&mut self) {
+        let actions = self.tray.on_events(&mut self.fake_tray);
+        for action in actions {
+            self.run_tray_action(action);
+        }
+        #[cfg(any(windows, target_os = "macos"))]
+        if let Some(real) = &self.real_tray {
+            for action in real.poll() {
+                self.run_tray_action(action);
+            }
         }
     }
 
@@ -252,10 +469,201 @@ impl ShellApp {
         }
     }
 
+    /// Render the maximalist config window.
+    #[allow(clippy::too_many_lines)]
+    fn render_config(&mut self, ctx: &egui::Context) {
+        if !self.config_open {
+            return;
+        }
+        let mut open = true;
+        let mut do_apply = false;
+        let mut do_revert = false;
+        let mut do_purge = false;
+        let mut stage_edits: Vec<(String, Value)> = Vec::new();
+        let mut theme_changed = false;
+        egui::Window::new(strings::text("config.title"))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.config_filter)
+                        .hint_text(strings::text("config.filter_hint")),
+                );
+                let tabs: &[(&str, &str)] = &[
+                    ("History", "config.tab_history"),
+                    ("Popup", "config.tab_popup"),
+                    ("Tray", "config.tab_tray"),
+                    ("Startup", "config.tab_startup"),
+                    ("Privacy", "config.tab_privacy"),
+                    ("Advanced", "config.tab_advanced"),
+                    ("PermanentClips", "config.tab_permanent_clips"),
+                    ("General", "config.tab_general"),
+                    ("databases", "config.tab_databases"),
+                    ("about", "config.tab_about"),
+                ];
+                ui.horizontal_wrapped(|ui| {
+                    for (name, label) in tabs {
+                        if ui
+                            .selectable_label(self.config_tab == *name, strings::text(label))
+                            .clicked()
+                        {
+                            self.config_tab = (*name).to_string();
+                        }
+                    }
+                });
+                if self.config_tab == "databases" {
+                    ui.label(strings::text("config.profile_path"));
+                    ui.label(self.profile.display().to_string());
+                    if ui.button(strings::text("config.purge_removed")).clicked() {
+                        do_purge = true;
+                    }
+                } else if self.config_tab == "about" {
+                    ui.label(strings::text("config.help_title"));
+                    ui.label(strings::text("config.about_version"));
+                    ui.label(&self.version_text);
+                    ui.label(strings::text("config.accesskit_note"));
+                    ui.label(strings::text("config.caps_title"));
+                    ui.label(&self.caps_text);
+                } else {
+                    // Theme controls persist through the ui.theme extra key.
+                    if ui
+                        .checkbox(&mut self.dark, strings::text("config.theme_dark"))
+                        .changed()
+                    {
+                        theme_changed = true;
+                    }
+                    let scale = egui::Slider::new(&mut self.font_scale, 0.8..=1.6)
+                        .text(strings::text("config.font_scale"));
+                    if ui.add(scale).changed() {
+                        theme_changed = true;
+                    }
+                    ui.label(strings::text("config.non_atomic_note"));
+                    if self.config_tab == "PermanentClips" {
+                        ui.label(strings::text("config.permanents_note"));
+                    }
+                    let Some(doc) = &self.config_doc else {
+                        ui.label(strings::text("popup.offline"));
+                        return;
+                    };
+                    let filtered = config_model::filter_rows(&self.config_filter);
+                    let mut rows: Vec<(String, config_model::Kind, String, String, bool)> =
+                        Vec::new();
+                    for index in filtered {
+                        let row = config_model::ROWS[index];
+                        if format!("{:?}", row.tab) != self.config_tab {
+                            continue;
+                        }
+                        let saved = doc.get(row.key);
+                        let staged = doc.staged(row.key);
+                        let current = staged.or(saved);
+                        let text = current.map_or_else(String::new, value_text);
+                        rows.push((
+                            row.key.to_string(),
+                            row.kind,
+                            strings::text(row.label).to_string(),
+                            text,
+                            doc.is_dirty(row.key),
+                        ));
+                        if row.key == "popup.hotkey" {}
+                    }
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for (key, kind, label, current, _dirty) in &rows {
+                            ui.label(label);
+                            if *kind == config_model::Kind::Bool {
+                                let mut flag = current == "true";
+                                if ui.checkbox(&mut flag, label.as_str()).changed() {
+                                    stage_edits.push((key.clone(), Value::Bool(flag)));
+                                }
+                            } else {
+                                let entry = self
+                                    .config_edits
+                                    .entry(key.clone())
+                                    .or_insert_with(|| current.clone());
+                                if ui.add(egui::TextEdit::singleline(entry)).changed() {
+                                    if let Some(value) = parse_edit(*kind, entry) {
+                                        stage_edits.push((key.clone(), value));
+                                    }
+                                }
+                            }
+                            if key == "popup.hotkey" {
+                                ui.label(strings::text("config.applies_on_restart"));
+                            }
+                        }
+                    });
+                    let dirty = doc.dirty_keys();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !dirty.is_empty(),
+                                egui::Button::new(strings::text("config.apply")),
+                            )
+                            .clicked()
+                        {
+                            do_apply = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                !dirty.is_empty(),
+                                egui::Button::new(strings::text("config.revert")),
+                            )
+                            .clicked()
+                        {
+                            do_revert = true;
+                        }
+                    });
+                    if !self.config_error.is_empty() {
+                        ui.label(&self.config_error);
+                    }
+                }
+                if theme_changed { /* handled after the window */ }
+            });
+        self.config_open = open;
+        if theme_changed {
+            let mode = if self.dark { "dark" } else { "light" };
+            self.send(ipc_bridge::UiCmd::ConfigSet(
+                "ui.theme".to_string(),
+                serde_json::json!({ "mode": mode, "font_scale": self.font_scale }),
+            ));
+        }
+        for (key, value) in stage_edits {
+            if let Some(doc) = &mut self.config_doc {
+                match doc.stage(&key, value) {
+                    Ok(()) => self.config_error.clear(),
+                    Err(id) => self.config_error = strings::text(&id).to_string(),
+                }
+            }
+        }
+        if do_purge {
+            self.send(ipc_bridge::UiCmd::PurgeRemoved);
+        }
+        if do_revert {
+            if let Some(doc) = &mut self.config_doc {
+                doc.revert();
+            }
+            self.config_edits.clear();
+        }
+        if do_apply {
+            if let Some(doc) = &self.config_doc {
+                self.pending_apply = doc.dirty_keys();
+                for (key, value) in doc.apply_plan() {
+                    let wire_key = if key == "popup.keys.*" {
+                        "popup.keys".to_string()
+                    } else {
+                        key
+                    };
+                    self.send(ipc_bridge::UiCmd::ConfigSet(wire_key, value));
+                }
+                // popup.keys live-applies in the Config event handler on reload.
+                self.send(ipc_bridge::UiCmd::ConfigGet);
+            }
+        }
+    }
+
     /// Render the popup window contents.
     fn render(&mut self, ui: &mut egui::Ui) {
         let mut query = self.vm.query.clone();
         let mut clicked_row: Option<usize> = Option::None;
+        let mut pin_row: Option<usize> = Option::None;
+        let mut delete_row: Option<usize> = Option::None;
         let mut search_focused = false;
         egui::CentralPanel::default().show(ui, |ui| {
             let field = ui.add(
@@ -265,6 +673,7 @@ impl ShellApp {
             search_focused = field.has_focus();
             if let Some(current) = self.vm.current() {
                 ui.label(strings::text("popup.current"));
+                ui.label(strings::text(popup::preview_kind(current)));
                 ui.label(&current.preview);
             }
             let count = self.vm.visible().len();
@@ -276,12 +685,28 @@ impl ShellApp {
                     let Some(clip) = self.vm.clip_at(row) else {
                         continue;
                     };
-                    if ui
-                        .selectable_label(self.vm.selected == row, &clip.preview)
-                        .clicked()
-                    {
+                    let clip_id = clip.id;
+                    let pinned = clip.pinned;
+                    let response = ui.selectable_label(self.vm.selected == row, &clip.preview);
+                    if response.clicked() {
                         clicked_row = Some(row);
                     }
+                    response.context_menu(|ui| {
+                        let pin_label = if pinned {
+                            strings::text("popup.unpin")
+                        } else {
+                            strings::text("popup.pin")
+                        };
+                        if ui.button(pin_label).clicked() {
+                            pin_row = Some(row);
+                            ui.close();
+                        }
+                        if ui.button(strings::text("popup.delete")).clicked() {
+                            delete_row = Some(row);
+                            ui.close();
+                        }
+                        let _ = clip_id;
+                    });
                 }
             });
             if !self.vm.banner().is_empty() {
@@ -295,6 +720,19 @@ impl ShellApp {
         if query != self.vm.query {
             self.vm.query = query;
             self.vm.selected = 0;
+        }
+        if let Some(row) = pin_row {
+            if let Some(clip) = self.vm.clip_at(row) {
+                let id = clip.id;
+                let pinned = !self.vm.is_pinned(id);
+                self.send(ipc_bridge::UiCmd::PinClip(id, pinned));
+            }
+        }
+        if let Some(row) = delete_row {
+            if let Some(clip) = self.vm.clip_at(row) {
+                let id = clip.id;
+                self.send(ipc_bridge::UiCmd::DeleteClip(id));
+            }
         }
         if let Some(row) = clicked_row {
             if row == self.vm.selected {
@@ -319,6 +757,20 @@ impl eframe::App for ShellApp {
             self.send(ipc_bridge::UiCmd::Stop);
         }
         self.drain_events();
+        self.poll_tray();
+        if let Some(deadline) = self.pause_deadline {
+            if Instant::now() >= deadline && self.inputs.paused {
+                self.pause_deadline = None;
+                self.send(ipc_bridge::UiCmd::MonitorToggle);
+            }
+        }
+        ui.ctx().set_visuals(if self.dark {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
+        ui.ctx().set_pixels_per_point(self.font_scale);
+        self.render_config(ui.ctx());
         if self.last_poll.elapsed() >= STATUS_PERIOD {
             self.last_poll = Instant::now();
             self.send(ipc_bridge::UiCmd::Status);
@@ -327,11 +779,20 @@ impl eframe::App for ShellApp {
             self.render(ui);
         } else {
             let mut reopen = false;
+            let mut open_config = false;
             egui::CentralPanel::default().show(ui, |ui| {
                 if ui.button(strings::text("popup.show")).clicked() {
                     reopen = true;
                 }
+                if ui.button(strings::text("config.open_config")).clicked() {
+                    open_config = true;
+                }
             });
+            if open_config {
+                self.config_open = true;
+                self.send(ipc_bridge::UiCmd::ConfigGet);
+                self.send(ipc_bridge::UiCmd::CapsGet);
+            }
             if reopen {
                 self.open = true;
                 self.send(ipc_bridge::UiCmd::ListHistory);
@@ -390,7 +851,30 @@ fn main() -> ExitCode {
         open: !minimized,
         error: String::new(),
         last_poll: Instant::now(),
+        config_open: false,
+        config_doc: None,
+        config_filter: String::new(),
+        config_tab: "History".to_string(),
+        config_edits: std::collections::HashMap::new(),
+        config_error: String::new(),
+        caps_text: String::new(),
+        version_text: String::new(),
+        profile: profile.clone(),
+        dark: true,
+        font_scale: 1.0,
+        pause_deadline: None,
+        pending_apply: Vec::new(),
+        #[cfg(any(windows, target_os = "macos"))]
+        real_tray: match RealTray::create(&tray_logic::TrayInputs::default()) {
+            Some(tray) => Some(tray),
+            None => {
+                eprintln!("tray unavailable: degraded, window still opens");
+                None
+            }
+        },
     };
+    #[cfg(target_os = "linux")]
+    eprintln!("tray unavailable on Linux in this build: degraded, window still opens");
     match eframe::run_native("clipmonger", options, Box::new(|_| Ok(Box::new(app)))) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

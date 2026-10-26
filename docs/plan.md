@@ -145,8 +145,20 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   PoC on Ubuntu 24.04 GNOME 46 box (VERIFY-marked APIs in
   gnome-ext/src), config.changed broadcast + hotkey popup push
   (Step 6).
-- **6. UI v1.** Seg-09 (popup, tray, maximalist config for v1 scope,
+- **6. UI v1. (CODE DONE 2026-10-27, WSL headless; T-905…908 + T-409 manual pending)**
+  Seg-09 (popup, tray, maximalist config for v1 scope,
   keymap). Tests T-901…907 subset.
+  Evidence: ui_v1_acceptance 34/34 (T-901/902/903/909/910, tray model,
+  target-session stale-never-pastes, ipc_bridge wire shapes) + pilot
+  26/26; config window (26-row matrix, staged Apply/Revert, settings
+  filter), Windows tray via tray-icon (Linux tray degraded, ksni
+  follow-up), theme via ui.theme, honest AccessKit About sentence
+  (not compiled in this build). Pilot bug fixed: ipc_bridge sent
+  {id}, daemon expects {clip}. Daemon honesty: unknown methods
+  (incl. history.*) return unknown_method, never purge. Open:
+  T-905…908 manual matrix, T-409 UAC matrix (Step 2 deferral),
+  permanents store+IPC (follow-up step; config tab ships groups
+  control only), Linux ksni tray, backup/logs daemon arms.
 - **7. v1 hardening + release.** Seg-11 gates (matrix, goldens, signoffs,
   budgets) → seg-12 release (artifacts, notes, checksums, bypass docs).
 - **8. v2 (after design-reopen gate).** Re-validate extension points

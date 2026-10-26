@@ -1520,10 +1520,14 @@ impl DaemonState {
                     None => Ok(serde_json::json!({"pinned": false})),
                 }
             }
-            _ => {
+            "history.purge_removed" => {
                 let purged = self.store.purge_removed();
                 Ok(serde_json::json!({"purged": purged}))
             }
+            other => Err(IpcError::new(
+                "unknown_method",
+                format!("unknown method: {other}"),
+            )),
         }
     }
 
@@ -1974,7 +1978,10 @@ impl DaemonState {
             }
             "config.get" => Ok(self.handle_config_get(params)),
             "config.set" => self.handle_config_set(params),
-            _ => Ok(serde_json::json!({"ok": true})),
+            other => Err(IpcError::new(
+                "unknown_method",
+                format!("unknown method: {other}"),
+            )),
         }
     }
 }
@@ -2175,6 +2182,31 @@ mod tests {
                 .any(|n| n.as_str().unwrap_or_default().contains("ctrl+alt+v")),
             "conflict must surface in caps notes, got {notes:?}"
         );
+    }
+
+    #[test]
+    fn unknown_history_method_is_unknown_method_and_never_purges() {
+        let (_dir, state) = fresh_state("unknown-history");
+        let before = history_texts(&state).len();
+        let err = state
+            .handle("history.bogus", &serde_json::json!({}))
+            .expect_err("unknown history method must fail");
+        assert_eq!(err.code, "unknown_method");
+        assert_eq!(history_texts(&state).len(), before, "history untouched");
+        for method in [
+            "ui.show_popup",
+            "events.subscribe",
+            "permanent.exec",
+            "backup.create",
+            "logs.tail",
+            "hotkey.register",
+            "hotkey.unregister",
+        ] {
+            let err = state
+                .handle(method, &serde_json::json!({}))
+                .expect_err("unknown method must fail");
+            assert_eq!(err.code, "unknown_method", "{method}");
+        }
     }
 
     #[test]

@@ -32,6 +32,18 @@ pub enum UiCmd {
     PasteClip(Uuid),
     /// Stop the daemon.
     Stop,
+    /// Fetch the full config document.
+    ConfigGet,
+    /// Apply one config key.
+    ConfigSet(String, Value),
+    /// Fetch capabilities.
+    CapsGet,
+    /// Toggle monitoring pause.
+    MonitorToggle,
+    /// Fetch one clip payload.
+    HistoryGet(Uuid),
+    /// Purge removed clips.
+    PurgeRemoved,
 }
 
 /// Event delivered from the bridge thread to the shell.
@@ -53,6 +65,18 @@ pub enum UiEvent {
     Stopped,
     /// Anything else, carrying the guard message.
     Error(String),
+    /// Config document reply body.
+    Config(Value),
+    /// One config key applied.
+    ConfigApplied(String),
+    /// Capabilities reply body.
+    Caps(Value),
+    /// One clip reply body.
+    HistoryClip(Value),
+    /// Monitoring paused flag after a toggle.
+    MonitorPaused(bool),
+    /// Removed clips purged.
+    Purged(u64),
 }
 
 /// Bridge handle spawner; the thread owns the transport alone.
@@ -77,7 +101,8 @@ impl Bridge {
 }
 
 /// Map one command to its IPC method name.
-fn method_for(cmd: &UiCmd) -> &'static str {
+#[must_use]
+pub fn method_for(cmd: &UiCmd) -> &'static str {
     match cmd {
         UiCmd::Status => "status",
         UiCmd::ListHistory => "history.list",
@@ -85,23 +110,39 @@ fn method_for(cmd: &UiCmd) -> &'static str {
         UiCmd::PinClip(_, _) => "history.pin",
         UiCmd::PasteClip(_) => "paste.execute",
         UiCmd::Stop => "daemon.stop",
+        UiCmd::ConfigGet => "config.get",
+        UiCmd::ConfigSet(_, _) => "config.set",
+        UiCmd::CapsGet => "caps.get",
+        UiCmd::MonitorToggle => "monitor.set",
+        UiCmd::HistoryGet(_) => "history.get",
+        UiCmd::PurgeRemoved => "history.purge_removed",
     }
 }
 
 /// Build the params object for one command.
-fn params_for(cmd: &UiCmd) -> Value {
+#[must_use]
+pub fn params_for(cmd: &UiCmd) -> Value {
     match cmd {
-        UiCmd::Status | UiCmd::ListHistory | UiCmd::Stop => serde_json::json!({}),
+        UiCmd::Status
+        | UiCmd::ListHistory
+        | UiCmd::Stop
+        | UiCmd::ConfigGet
+        | UiCmd::CapsGet
+        | UiCmd::PurgeRemoved => serde_json::json!({}),
+        UiCmd::ConfigSet(key, value) => serde_json::json!({ "key": key, "value": value }),
+        UiCmd::MonitorToggle => serde_json::json!({ "toggle": true }),
+        UiCmd::HistoryGet(id) => serde_json::json!({ "clip": id.to_string() }),
         UiCmd::DeleteClip(id) | UiCmd::PasteClip(id) => {
-            serde_json::json!({ "id": id.to_string() })
+            serde_json::json!({ "clip": id.to_string() })
         }
         UiCmd::PinClip(id, pinned) => {
-            serde_json::json!({ "id": id.to_string(), "pinned": pinned })
+            serde_json::json!({ "clip": id.to_string(), "pinned": pinned })
         }
     }
 }
 
 /// Turn one transport outcome into shell events.
+#[allow(clippy::match_same_arms)]
 fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
     match (cmd, outcome) {
         (UiCmd::Status, Ok(body)) => UiEvent::Status(body),
@@ -128,10 +169,39 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
         }
         (UiCmd::PasteClip(id), Ok(_)) => UiEvent::PasteDone(id),
         (UiCmd::Stop, Ok(_)) => UiEvent::Stopped,
+        (UiCmd::ConfigGet, Ok(body)) => UiEvent::Config(body),
+        (UiCmd::CapsGet, Ok(body)) => UiEvent::Caps(body),
+        (UiCmd::HistoryGet(_), Ok(body)) => UiEvent::HistoryClip(body),
+        (UiCmd::ConfigSet(key, _), Ok(body)) => {
+            if body.get("ok").and_then(Value::as_bool) == Some(true) {
+                UiEvent::ConfigApplied(key)
+            } else {
+                UiEvent::Error("unconfirmed config.set".to_string())
+            }
+        }
+        (UiCmd::MonitorToggle, Ok(body)) => UiEvent::MonitorPaused(
+            body.get("monitoring_paused")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+        (UiCmd::PurgeRemoved, Ok(body)) => {
+            UiEvent::Purged(body.get("purged").and_then(Value::as_u64).unwrap_or(0))
+        }
+        (
+            UiCmd::ConfigGet
+            | UiCmd::CapsGet
+            | UiCmd::HistoryGet(_)
+            | UiCmd::ConfigSet(_, _)
+            | UiCmd::MonitorToggle
+            | UiCmd::PurgeRemoved,
+            Err(error),
+        ) => UiEvent::Error(error.message),
         (UiCmd::Status | UiCmd::ListHistory | UiCmd::Stop, Err(error)) => {
             UiEvent::Error(error.message)
         }
-        (UiCmd::PasteClip(_), Err(error)) if error.code == "unavailable" => {
+        (UiCmd::PasteClip(_), Err(error))
+            if error.code == "unavailable" || error.code == "denied" =>
+        {
             UiEvent::PasteUnavailable
         }
         (UiCmd::PasteClip(_), Err(error)) => UiEvent::Error(error.message),

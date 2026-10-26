@@ -27,5 +27,9 @@ uuid = { version = "1.28", features = ["v7", "serde"] }
 eframe = { version = "0.37", optional = true, default-features = false, features = ["glow", "x11", "wayland"] }
 egui = { version = "0.37", optional = true }
 
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = "0.26"
+
+
 [lints]
 workspace = true

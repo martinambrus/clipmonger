@@ -156,6 +156,8 @@ pub struct BackendCaps {
 pub enum TrayState {
     /// Normal icon.
     Idle,
+    /// Monitoring paused.
+    Paused,
     /// Needs user attention.
     Attention,
 }

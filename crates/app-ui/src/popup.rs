@@ -4,7 +4,7 @@ use clipmonger_core::model::Clip;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{keymap, search, strings};
+use crate::{keymap, search, strings, target_session};
 
 /// Effect the shell or bridge must execute for one key press.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +23,22 @@ pub enum VmEffect {
     Refresh,
 }
 
+/// Preview-kind string id for one clip, from its MIME formats.
+#[must_use]
+pub fn preview_kind(clip: &Clip) -> &'static str {
+    if clip.formats.iter().any(|f| f.starts_with("image/")) {
+        "popup.kind_image"
+    } else if clip.formats.iter().any(|f| f.contains("html")) {
+        "popup.kind_html"
+    } else if clip.formats.iter().any(|f| f.contains("uri-list")) {
+        "popup.kind_file"
+    } else if clip.formats.is_empty() {
+        "popup.kind_text"
+    } else {
+        "popup.kind_other"
+    }
+}
+
 /// Number of rows a page key moves the selection.
 const PAGE_ROWS: isize = 10;
 
@@ -39,6 +55,8 @@ pub struct PopupVm {
     target_valid: bool,
     paused: bool,
     keymap: keymap::Keymap,
+    /// Target session wired to the paste guard.
+    pub target_session: target_session::TargetSession,
 }
 
 impl Default for PopupVm {
@@ -60,6 +78,7 @@ impl PopupVm {
             target_valid: true,
             paused: false,
             keymap: keymap::Keymap::defaults(),
+            target_session: target_session::TargetSession::new(),
         }
     }
 
@@ -89,6 +108,30 @@ impl PopupVm {
     /// Mark the captured target stale or valid.
     pub fn set_target_valid(&mut self, valid: bool) {
         self.target_valid = valid;
+        if valid {
+            self.target_session
+                .capture_target("current-target".to_string());
+        } else {
+            self.target_session.focus_lost();
+        }
+    }
+
+    /// Stored clips in list order.
+    #[must_use]
+    pub fn clips(&self) -> &[Clip] {
+        &self.clips
+    }
+
+    /// Apply popup.keys overrides live to the keymap.
+    ///
+    /// # Errors
+    /// Returns the parse/binding error text for a bad override.
+    pub fn apply_keys(
+        &mut self,
+        keys: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        self.keymap = keymap::Keymap::from_config_keys(keys)?;
+        Ok(())
     }
 
     /// Mark monitoring paused or running for the status line.
