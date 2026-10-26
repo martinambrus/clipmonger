@@ -84,9 +84,16 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   matrix + T-205/T-211 Windows legs (native runner, Step 2), image
   pixel-decode hashing (D-F4 note). Freeze decisions D-F1…F23 in
   `.agents/tmp/foundation-v1/ledger.md`.
-- **1b. UI shell pilot.** Popup/tray/lifecycle against fakes + real IPC
+- **1b. UI shell pilot. (DONE 2026-10-26, WSL)** Popup/tray/lifecycle against fakes + real IPC
   (validates paste-target behavior before backend paste exists). Seg-09
   subset. Then backends (steps 2–5 as listed).
+  Evidence: crates/app-ui (strings/search/keymap/placement/popup-VM/
+  lifecycle/IPC-bridge/tray logic + glow eframe shell); 26 acceptance
+  tests (T-901/902/903/904-logic/910) pass both feature modes with
+  DISPLAY unset; workspace 150 tests green; windows-gnu check clean.
+  Deferred: T-905 window matrix (needs real displays), wgpu renderer
+  (glow pilot, U-F2), tray Paused variant (U-F5), daemon search wiring
+  (U-F8) — all Step 6 / backend steps.
 - **2. Windows backend.** Seg-04 (listener, transfer, hotkeys, enigo
   paste, on-demand elevated helper, tray, autostart). Tests T-401…410
   incl. the UAC manual matrix.
