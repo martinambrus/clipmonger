@@ -1,45 +1,47 @@
-//! Blocking std IPC client over a Unix socket.
+//! Blocking std IPC client over a Unix socket or Windows named pipe.
 
 use std::path::Path;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::io::{BufRead, BufReader, Write};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::Mutex;
 
 use serde_json::Value;
 
 use crate::proto::IpcError;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::framing::{decode_line, encode_line};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::proto::{Envelope, FrameKind, IPC_VERSION};
 
 /// Blocking JSONL client; the hello handshake runs inside `connect`.
 pub struct Client {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     link: Mutex<ClientLink>,
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     link: NoLink,
 }
 
 #[cfg(unix)]
+type Stream = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+type Stream = std::fs::File;
+
+#[cfg(any(unix, windows))]
 struct ClientLink {
-    reader: BufReader<std::os::unix::net::UnixStream>,
+    reader: BufReader<Stream>,
     next_id: AtomicU64,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 struct NoLink;
 
-#[cfg(unix)]
-fn write_line(
-    reader: &mut BufReader<std::os::unix::net::UnixStream>,
-    bytes: &[u8],
-) -> Result<(), IpcError> {
+#[cfg(any(unix, windows))]
+fn write_line(reader: &mut BufReader<Stream>, bytes: &[u8]) -> Result<(), IpcError> {
     let stream = reader.get_mut();
     stream
         .write_all(bytes)
@@ -54,10 +56,8 @@ fn write_line(
         .map_err(|e| IpcError::new("io_failed", e.to_string()))
 }
 
-#[cfg(unix)]
-fn read_frame(
-    reader: &mut BufReader<std::os::unix::net::UnixStream>,
-) -> Result<Envelope, IpcError> {
+#[cfg(any(unix, windows))]
+fn read_frame(reader: &mut BufReader<Stream>) -> Result<Envelope, IpcError> {
     let mut line = String::new();
     let n = reader
         .read_line(&mut line)
@@ -71,6 +71,32 @@ fn read_frame(
     decode_line(line.as_bytes())
 }
 
+#[cfg(any(unix, windows))]
+fn hello(link: &mut ClientLink, token: &str) -> Result<(), IpcError> {
+    let env = Envelope {
+        v: IPC_VERSION.to_string(),
+        id: "hello-0".to_string(),
+        kind: FrameKind::Req,
+        method: Some("hello".to_string()),
+        params: Some(serde_json::json!({
+            "min": 1,
+            "max": 1,
+            "token": token,
+            "client": "clipmonger-cli",
+        })),
+        result: None,
+        error: None,
+        seq: None,
+    };
+    let bytes = encode_line(&env)?;
+    write_line(&mut link.reader, &bytes)?;
+    let welcome = read_frame(&mut link.reader)?;
+    if let Some(error) = welcome.error {
+        return Err(error);
+    }
+    Ok(())
+}
+
 impl Client {
     /// Connect and run the hello handshake; a bad token fails with `auth_failed`.
     ///
@@ -79,46 +105,41 @@ impl Client {
     /// Returns the server's handshake error (notably `auth_failed`) or an I/O failure.
     #[cfg(unix)]
     pub fn connect(sock: &Path, token: &str) -> Result<Self, IpcError> {
-        use std::os::unix::net::UnixStream;
-
-        let stream = UnixStream::connect(sock)
+        let stream = Stream::connect(sock)
             .map_err(|e| IpcError::new("connection_refused", e.to_string()))?;
         let mut link = ClientLink {
             reader: BufReader::new(stream),
             next_id: AtomicU64::new(0),
         };
-        let hello = Envelope {
-            v: IPC_VERSION.to_string(),
-            id: "hello-0".to_string(),
-            kind: FrameKind::Req,
-            method: Some("hello".to_string()),
-            params: Some(serde_json::json!({
-                "min": 1,
-                "max": 1,
-                "token": token,
-                "client": "clipmonger-cli",
-            })),
-            result: None,
-            error: None,
-            seq: None,
-        };
-        let bytes = encode_line(&hello)?;
-        write_line(&mut link.reader, &bytes)?;
-        let welcome = read_frame(&mut link.reader)?;
-        if let Some(error) = welcome.error {
-            return Err(error);
-        }
+        hello(&mut link, token)?;
         Ok(Self {
             link: Mutex::new(link),
         })
     }
 
-    /// Connect stub on platforms without Unix sockets.
+    /// Connect via the rendezvous `sock`; pipe paths use `connect_pipe`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the server's handshake error or an I/O failure.
+    #[cfg(windows)]
+    pub fn connect(sock: &Path, token: &str) -> Result<Self, IpcError> {
+        let text: String = sock.as_os_str().to_string_lossy().into_owned();
+        if text.starts_with(r"\\.\pipe\") {
+            return Self::connect_pipe(&text, token);
+        }
+        Err(IpcError::new(
+            "connection_refused",
+            format!("not a pipe path: {text}"),
+        ))
+    }
+
+    /// Connect and run the hello handshake; a bad token fails with `auth_failed`.
     ///
     /// # Errors
     ///
     /// Always fails with `unavailable`.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     pub fn connect(_sock: &Path, _token: &str) -> Result<Self, IpcError> {
         Err(IpcError::new(
             "unavailable",
@@ -126,12 +147,48 @@ impl Client {
         ))
     }
 
+    /// Connect to `pipe_name`, retrying busy pipes before the hello handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns `connection_refused` after the retry budget, or the server's
+    /// handshake error (notably `auth_failed`).
+    #[cfg(windows)]
+    pub fn connect_pipe(pipe_name: &str, token: &str) -> Result<Self, IpcError> {
+        let mut failure = IpcError::new("connection_refused", "pipe unavailable".to_string());
+        for attempt in 0..25_u32 {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(pipe_name)
+            {
+                Ok(file) => {
+                    let mut link = ClientLink {
+                        reader: BufReader::new(file),
+                        next_id: AtomicU64::new(0),
+                    };
+                    hello(&mut link, token)?;
+                    return Ok(Self {
+                        link: Mutex::new(link),
+                    });
+                }
+                Err(e) => {
+                    failure = IpcError::new("connection_refused", e.to_string());
+                    if attempt + 1 < 25 {
+                        std::thread::sleep(std::time::Duration::from_millis(40));
+                    }
+                }
+            }
+        }
+        Err(failure)
+    }
+
     /// Call `method` with JSON params; handler failures surface with their code.
     ///
     /// # Errors
     ///
     /// Returns the server's error for the call or an I/O failure.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn call(&self, method: &str, params: Value) -> Result<Value, IpcError> {
         let mut link = self
             .link
@@ -163,12 +220,12 @@ impl Client {
         }
     }
 
-    /// Call stub on platforms without Unix sockets.
+    /// Call stub on platforms without Unix sockets or named pipes.
     ///
     /// # Errors
     ///
     /// Always fails with `unavailable`.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     pub fn call(&self, _method: &str, _params: Value) -> Result<Value, IpcError> {
         let _ = &self.link;
         Err(IpcError::new(

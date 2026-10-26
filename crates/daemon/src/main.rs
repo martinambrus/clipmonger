@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clipmonger_daemon::{replay_script, write_rendezvous, DaemonLock, DaemonState};
+#[cfg(windows)]
+use clipmonger_ipc::framing::pipe_name_for;
+#[cfg(unix)]
 use clipmonger_ipc::framing::socket_path_for;
 
 fn usage() -> ! {
@@ -73,6 +76,7 @@ fn write_token(profile: &Path) -> Result<String, String> {
     Ok(token)
 }
 
+#[cfg(unix)]
 fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from)
 }
@@ -133,7 +137,11 @@ async fn main() {
         }
     };
 
+    #[cfg(unix)]
     let socket = socket_path_for(&profile, &runtime_dir());
+    #[cfg(windows)]
+    let socket = PathBuf::from(pipe_name_for(&profile));
+    #[cfg(unix)]
     if let Some(parent) = socket.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
             eprintln!("daemon: socket dir failed: {e}");
@@ -152,7 +160,15 @@ async fn main() {
         state.handle(&method, &params)
     });
 
+    #[cfg(unix)]
     if let Err(e) = clipmonger_ipc::server::Server::bind(&socket, token, handler).await {
+        eprintln!("daemon: bind failed: {e}");
+        std::process::exit(1);
+    }
+    #[cfg(windows)]
+    if let Err(e) =
+        clipmonger_ipc::server::Server::bind_pipe(&socket.to_string_lossy(), token, handler)
+    {
         eprintln!("daemon: bind failed: {e}");
         std::process::exit(1);
     }
@@ -171,5 +187,6 @@ async fn main() {
         _ = tokio::signal::ctrl_c() => {}
     }
     let _ = fs::remove_file(profile.join("rendezvous.json"));
+    #[cfg(unix)]
     let _ = fs::remove_file(&socket);
 }

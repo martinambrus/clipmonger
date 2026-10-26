@@ -102,6 +102,12 @@ pub fn profile_hash(profile: &Path) -> String {
     hex_digest(&sha256(profile.as_os_str().as_encoded_bytes()))[..16].to_string()
 }
 
+/// Named-pipe name for a profile on Windows.
+#[must_use]
+pub fn pipe_name_for(profile_dir: &Path) -> String {
+    format!(r"\\.\pipe\clipmonger-{}", profile_hash(profile_dir))
+}
+
 /// Socket path for a profile; long profile paths fall back under `runtime_dir`.
 #[must_use]
 pub fn socket_path_for(profile_dir: &Path, runtime_dir: &Path) -> PathBuf {

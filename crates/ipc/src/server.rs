@@ -1,6 +1,7 @@
 //! Tokio Unix-socket JSONL server plus the in-memory subscriber event bus.
 
 use std::collections::{HashMap, VecDeque};
+#[cfg(not(windows))]
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -8,13 +9,13 @@ use serde_json::Value;
 
 use crate::proto::{Envelope, FrameKind, IpcError, IPC_VERSION};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::framing::{decode_line, encode_line};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::proto::MAX_LINE_BYTES;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::collections::HashSet;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::{Arc, Mutex};
 
 /// Request handler: method name + params to result or typed error.
@@ -121,9 +122,9 @@ fn resync_event() -> Envelope {
     }
 }
 
-/// Tokio JSONL server bound to one Unix socket path.
+/// Tokio JSONL server bound to one Unix socket path or Windows named pipe.
 pub struct Server {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -143,12 +144,32 @@ impl Server {
         Ok(Self { _task: task })
     }
 
-    /// Bind stub on platforms without Unix sockets.
+    /// Bind `pipe_name` and serve `handler` concurrently per connection.
+    ///
+    /// The first instance claims the name, so a second `bind_pipe` on the
+    /// same name fails with `bind_failed`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `bind_failed` when the pipe name is taken or cannot be bound.
+    #[cfg(windows)]
+    pub fn bind_pipe(pipe_name: &str, token: String, handler: Handler) -> Result<Self, IpcError> {
+        let first = make_pipe_instance(pipe_name, true)?;
+        let task = tokio::spawn(windows_accept_loop(
+            pipe_name.to_string(),
+            token,
+            handler,
+            first,
+        ));
+        Ok(Self { _task: task })
+    }
+
+    /// Bind stub on platforms without Unix sockets or named pipes.
     ///
     /// # Errors
     ///
     /// Always fails with `unavailable`.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     pub async fn bind(_sock: &Path, _token: String, _handler: Handler) -> Result<Self, IpcError> {
         Err(IpcError::new(
             "unavailable",
@@ -157,9 +178,9 @@ impl Server {
     }
 }
 
-#[cfg(unix)]
-type SharedWriter = Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+type SharedWriter<S> = Arc<tokio::sync::Mutex<tokio::io::WriteHalf<S>>>;
+#[cfg(any(unix, windows))]
 type SharedCancels = Arc<Mutex<HashSet<String>>>;
 
 #[cfg(unix)]
@@ -172,11 +193,51 @@ async fn accept_loop(listener: tokio::net::UnixListener, token: String, handler:
     }
 }
 
-#[cfg(unix)]
-async fn serve_conn(stream: tokio::net::UnixStream, token: String, handler: Handler) {
-    let (read_half, write_half) = stream.into_split();
+#[cfg(windows)]
+fn make_pipe_instance(
+    pipe_name: &str,
+    first: bool,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer, IpcError> {
+    let mut opts = tokio::net::windows::named_pipe::ServerOptions::new();
+    opts.first_pipe_instance(first)
+        .reject_remote_clients(true)
+        .pipe_mode(tokio::net::windows::named_pipe::PipeMode::Byte);
+    opts.create(pipe_name)
+        .map_err(|e| IpcError::new("bind_failed", e.to_string()))
+}
+
+#[cfg(windows)]
+async fn windows_accept_loop(
+    pipe_name: String,
+    token: String,
+    handler: Handler,
+    mut listener: tokio::net::windows::named_pipe::NamedPipeServer,
+) {
+    loop {
+        if listener.connect().await.is_err() {
+            let _ = listener.disconnect();
+            continue;
+        }
+        match make_pipe_instance(&pipe_name, false) {
+            Ok(next) => {
+                let connected = std::mem::replace(&mut listener, next);
+                tokio::spawn(serve_conn(connected, token.clone(), handler.clone()));
+            }
+            Err(_) => {
+                let _ = listener.disconnect();
+            }
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+async fn serve_conn<S>(stream: S, token: String, handler: Handler)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(read_half);
-    let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(write_half));
+    let writer: SharedWriter<S> = Arc::new(tokio::sync::Mutex::new(write_half));
     let Some(Ok(hello)) = next_frame(&mut reader).await else {
         return;
     };
@@ -212,7 +273,7 @@ async fn serve_conn(stream: tokio::net::UnixStream, token: String, handler: Hand
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn hello_token_ok(hello: &Envelope, token: &str) -> bool {
     hello
         .params
@@ -222,8 +283,11 @@ fn hello_token_ok(hello: &Envelope, token: &str) -> bool {
         == Some(token)
 }
 
-#[cfg(unix)]
-async fn answer_hello(writer: &SharedWriter, hello: &Envelope, token: &str) {
+#[cfg(any(unix, windows))]
+async fn answer_hello<S>(writer: &SharedWriter<S>, hello: &Envelope, token: &str)
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
     if hello_token_ok(hello, token) {
         let welcome = serde_json::json!({
             "chosen": 1,
@@ -241,8 +305,11 @@ async fn answer_hello(writer: &SharedWriter, hello: &Envelope, token: &str) {
     }
 }
 
-#[cfg(unix)]
-fn dispatch(writer: SharedWriter, cancelled: SharedCancels, handler: Handler, req: Envelope) {
+#[cfg(any(unix, windows))]
+fn dispatch<S>(writer: SharedWriter<S>, cancelled: SharedCancels, handler: Handler, req: Envelope)
+where
+    S: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     tokio::spawn(async move {
         let id = req.id.clone();
         let method = req.method.clone().unwrap_or_default();
@@ -267,7 +334,7 @@ fn dispatch(writer: SharedWriter, cancelled: SharedCancels, handler: Handler, re
     });
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn is_cancelled(cancelled: &SharedCancels, id: &str) -> bool {
     match cancelled.lock() {
         Ok(set) => set.contains(id),
@@ -275,13 +342,20 @@ fn is_cancelled(cancelled: &SharedCancels, id: &str) -> bool {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn cancelled_error() -> IpcError {
     IpcError::new("cancelled", "request cancelled".to_string())
 }
 
-#[cfg(unix)]
-async fn send_res(writer: &SharedWriter, id: &str, result: Option<Value>, error: Option<IpcError>) {
+#[cfg(any(unix, windows))]
+async fn send_res<S>(
+    writer: &SharedWriter<S>,
+    id: &str,
+    result: Option<Value>,
+    error: Option<IpcError>,
+) where
+    S: tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::AsyncWriteExt as _;
 
     let env = Envelope {
@@ -301,10 +375,11 @@ async fn send_res(writer: &SharedWriter, id: &str, result: Option<Value>, error:
     let _ = guard.write_all(&bytes).await;
 }
 
-#[cfg(unix)]
-async fn next_frame(
-    reader: &mut tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
-) -> Option<Result<Envelope, IpcError>> {
+#[cfg(any(unix, windows))]
+async fn next_frame<R>(reader: &mut tokio::io::BufReader<R>) -> Option<Result<Envelope, IpcError>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     use tokio::io::AsyncBufReadExt as _;
 
     let mut line = Vec::new();
