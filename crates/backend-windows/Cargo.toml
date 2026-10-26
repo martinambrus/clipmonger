@@ -1,0 +1,15 @@
+[package]
+name = "clipmonger-backend-windows"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clipmonger-core = { path = "../core" }
+clipmonger-platform = { path = "../platform" }
+serde.workspace = true
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

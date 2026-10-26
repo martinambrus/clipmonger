@@ -385,6 +385,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipmonger-backend-windows"
+version = "0.1.0"
+dependencies = [
+ "clipmonger-core",
+ "clipmonger-platform",
+ "serde",
+]
+
+[[package]]
 name = "clipmonger-core"
 version = "0.1.0"
 dependencies = [
