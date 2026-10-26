@@ -399,6 +399,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipmonger-backend-x11"
+version = "0.1.0"
+dependencies = [
+ "clipmonger-core",
+ "clipmonger-platform",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "clipmonger-core"
 version = "0.1.0"
 dependencies = [
