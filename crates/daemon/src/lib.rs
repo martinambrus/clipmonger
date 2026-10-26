@@ -778,6 +778,236 @@ fn fnv_hex(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
+/// Decode standard padded base64; `None` on any malformed input.
+fn b64_decode(text: &str) -> Option<Vec<u8>> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let pad = chunk.iter().rev().take_while(|&&b| b == b'=').count();
+        if pad > 2 || (pad > 0 && !chunk[4 - pad..].iter().all(|&b| b == b'=')) {
+            return None;
+        }
+        let mut vals = [0u8; 4];
+        for (i, &b) in chunk.iter().enumerate() {
+            vals[i] = if b == b'=' { 0 } else { value(b)? };
+        }
+        let triple = (u32::from(vals[0]) << 18)
+            | (u32::from(vals[1]) << 12)
+            | (u32::from(vals[2]) << 6)
+            | u32::from(vals[3]);
+        out.push(((triple >> 16) & 0xFF) as u8);
+        if pad < 2 {
+            out.push(((triple >> 8) & 0xFF) as u8);
+        }
+        if pad < 1 {
+            out.push((triple & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Lowercase hex SHA-256 of `data` (self-contained FIPS 180-4).
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+fn sha256_hex(data: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
+    ];
+    let mut state: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+    let mut padded = data.to_vec();
+    let bit_len = u64::try_from(data.len())
+        .unwrap_or(u64::MAX)
+        .wrapping_mul(8);
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    let (blocks, _) = padded.as_chunks::<64>();
+    for block in blocks {
+        let mut w = [0_u32; 64];
+        let (words, _) = block.as_chunks::<4>();
+        for (i, word) in words.iter().enumerate().take(16) {
+            w[i] = u32::from_be_bytes(*word);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h) = (
+            state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7],
+        );
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
+    }
+    let mut out = String::with_capacity(64);
+    for word in state {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{word:08x}");
+    }
+    out
+}
+
+/// In-flight `blob.put` assembly for one `(clip, mime)` stream.
+struct BlobAsm {
+    data: Vec<u8>,
+    next_seq: u64,
+    updated_ms: i64,
+}
+
+/// Apply one dotted config key (`section.field`) to `config`.
+///
+/// Known fields are typed by the `Config` serde shape; unknown fields are
+/// preserved through its `extra` maps. Implemented via a JSON round-trip so
+/// no TOML value type is needed here.
+fn apply_config_key(
+    config: &mut clipmonger_core::Config,
+    key: &str,
+    value: &Value,
+) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Err("config.set: empty key".to_string());
+    }
+    let mut root = serde_json::to_value(&*config).map_err(|e| e.to_string())?;
+    let parts: Vec<&str> = key.split('.').collect();
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err(format!("{key}: empty key segment"));
+    }
+    let mut cursor = &mut root;
+    for part in &parts[..parts.len() - 1] {
+        let obj = cursor
+            .as_object_mut()
+            .ok_or_else(|| format!("{key}: not an object"))?;
+        cursor = obj
+            .entry((*part).to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !cursor.is_object() {
+            *cursor = Value::Object(serde_json::Map::new());
+        }
+    }
+    let last = parts[parts.len() - 1];
+    cursor
+        .as_object_mut()
+        .ok_or_else(|| format!("{key}: not an object"))?
+        .insert(last.to_string(), value.clone());
+    *config = serde_json::from_value(root).map_err(|e| format!("{key}: {e}"))?;
+    Ok(())
+}
+
 /// Outcome of storing real monitor payloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoreDecision {
@@ -957,6 +1187,12 @@ pub struct DaemonState {
     helper: Mutex<HelperSupervisor>,
     /// Portal shortcut bind outstanding (system dialog may be showing).
     portal_bind_pending: Mutex<bool>,
+    /// Loaded config served by `config.get`/`config.set`.
+    config: Mutex<clipmonger_core::Config>,
+    /// In-flight `blob.put` assemblies keyed by `(clip, mime)`.
+    blob_buf: Mutex<HashMap<(String, String), BlobAsm>>,
+    /// Latest `hotkey.conflict` note surfaced in caps notes.
+    hotkey_conflict_note: Mutex<Option<String>>,
     /// Dual-backend merge window state (seg-06 S8, W-F5: 2000 ms).
     #[cfg(all(unix, feature = "backend-wayland"))]
     merger: Mutex<clipmonger_backend_wayland::merge::Merger>,
@@ -966,6 +1202,12 @@ impl DaemonState {
     /// Wrap an opened store with fresh skeleton caps.
     #[must_use]
     pub fn new(store: Store) -> Self {
+        Self::with_config(store, clipmonger_core::Config::default())
+    }
+
+    /// Wrap an opened store with the loaded `config`.
+    #[must_use]
+    pub fn with_config(store: Store, config: clipmonger_core::Config) -> Self {
         Self {
             store,
             caps: CapsAggregator::new(),
@@ -977,9 +1219,31 @@ impl DaemonState {
             elevation_refused: Mutex::new(false),
             helper: Mutex::new(HelperSupervisor::new()),
             portal_bind_pending: Mutex::new(false),
+            config: Mutex::new(config),
+            blob_buf: Mutex::new(HashMap::new()),
+            hotkey_conflict_note: Mutex::new(None),
             #[cfg(all(unix, feature = "backend-wayland"))]
             merger: Mutex::new(clipmonger_backend_wayland::merge::Merger::new(2000)),
         }
+    }
+
+    /// Replace the stored config (call once at startup with the loaded one).
+    pub fn set_config(&self, config: clipmonger_core::Config) {
+        if let Ok(mut slot) = self.config.lock() {
+            *slot = config;
+        }
+    }
+
+    /// Flip the GNOME extension link state in caps.
+    pub fn set_extension_connected(&self, connected: bool) {
+        self.caps.set_extension_connected(connected);
+    }
+
+    /// Stored config as JSON (full document).
+    fn config_json(&self) -> Value {
+        self.config.lock().map_or(Value::Null, |config| {
+            serde_json::to_value(&*config).unwrap_or(Value::Null)
+        })
     }
 
     /// Point audit/helper events at `<profile>` (call once at startup).
@@ -1092,6 +1356,13 @@ impl DaemonState {
     #[must_use]
     pub fn caps_snapshot(&self) -> Value {
         let mut snapshot = self.caps.snapshot();
+        if let Ok(note) = self.hotkey_conflict_note.lock() {
+            if let Some(note) = note.as_ref() {
+                if let Some(notes) = snapshot.get_mut("notes").and_then(Value::as_array_mut) {
+                    notes.push(Value::from(note.clone()));
+                }
+            }
+        }
         if self.elevation_refused() {
             if let Some(paste) = snapshot.get_mut("paste") {
                 paste["level"] = Value::from("degraded");
@@ -1272,26 +1543,204 @@ impl DaemonState {
         Ok(serde_json::json!({"ok": true, "monitoring_paused": paused}))
     }
 
-    /// Dispatch `capture.report` without recording sensitive events.
+    /// Dispatch `capture.report`: decode `{event, payloads:{mime: base64}}`
+    /// and store the real payloads via `ingest_capture` (G-F3). Sensitive
+    /// events only bump the privacy counter through the same path.
     fn handle_capture(&self, params: &Value) -> Value {
-        let sensitive = params
-            .get("event")
-            .and_then(|event| event.get("sensitive"))
+        let event = params.get("event").cloned().unwrap_or(Value::Null);
+        let sensitive = event
+            .get("sensitive")
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if sensitive {
+            self.ingest_capture("gnome", true, &[]);
             return serde_json::json!({"accepted": false});
         }
-        let line = params
-            .get("event")
-            .map_or_else(|| "{}".to_string(), Value::to_string);
-        let stamp = u64::try_from(now_ms().max(0)).unwrap_or_default();
-        let report = process_capture(&self.store, &line, stamp);
-        let accepted = serde_json::from_str::<Value>(&report)
-            .ok()
-            .and_then(|value| value.get("accepted").and_then(Value::as_bool))
-            .unwrap_or(false);
+        let payloads_value = params
+            .get("payloads")
+            .or_else(|| event.get("payloads"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let mut payloads: Vec<(String, Vec<u8>)> = Vec::new();
+        match &payloads_value {
+            Value::Object(map) => {
+                let mut mimes: Vec<&String> = map.keys().collect();
+                mimes.sort();
+                for mime in mimes {
+                    let Some(encoded) = map.get(mime).and_then(Value::as_str) else {
+                        return serde_json::json!({"accepted": false});
+                    };
+                    let Some(bytes) = b64_decode(encoded) else {
+                        return serde_json::json!({"accepted": false});
+                    };
+                    payloads.push((mime.clone(), bytes));
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    let (Some(mime), Some(encoded)) = (
+                        item.get("mime").and_then(Value::as_str),
+                        item.get("inline_b64")
+                            .or_else(|| item.get("data_b64"))
+                            .or_else(|| item.get("b64"))
+                            .and_then(Value::as_str),
+                    ) else {
+                        continue;
+                    };
+                    let Some(bytes) = b64_decode(encoded) else {
+                        return serde_json::json!({"accepted": false});
+                    };
+                    payloads.push((mime.to_string(), bytes));
+                }
+            }
+            _ => {}
+        }
+        if payloads.is_empty() {
+            return serde_json::json!({"accepted": false});
+        }
+        let accepted = self.ingest_capture("gnome", false, &payloads);
         serde_json::json!({"accepted": accepted})
+    }
+
+    /// Dispatch `blob.put`: assemble chunks keyed by `(clip, mime)`; on
+    /// `eof`, verify the total SHA-256 when present and ingest the assembled
+    /// payload as one capture.
+    fn handle_blob_put(&self, params: &Value) -> Result<Value, IpcError> {
+        let clip = params
+            .get("clip")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let mime = params
+            .get("mime")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if clip.is_empty() || mime.is_empty() {
+            return Err(IpcError::new(
+                "backend",
+                "blob.put: clip and mime required".to_string(),
+            ));
+        }
+        let seq = params
+            .get("seq")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX);
+        let eof = params.get("eof").and_then(Value::as_bool).unwrap_or(false);
+        let sha256 = params
+            .get("sha256")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let chunk = params
+            .get("data_b64")
+            .and_then(Value::as_str)
+            .and_then(b64_decode)
+            .ok_or_else(|| IpcError::new("backend", "blob.put: bad base64 chunk".to_string()))?;
+        let max_bytes = self
+            .config
+            .lock()
+            .map_or(16 * 1024 * 1024, |config| config.monitor.max_bytes);
+        let key = (clip, mime.clone());
+        let assembled: Option<Vec<u8>> = {
+            let mut guard = self
+                .blob_buf
+                .lock()
+                .map_err(|_| IpcError::new("internal", "blob state poisoned".to_string()))?;
+            let now = now_ms();
+            guard.retain(|_, asm| now >= asm.updated_ms && now - asm.updated_ms <= 60_000);
+            let asm = guard.entry(key.clone()).or_insert_with(|| BlobAsm {
+                data: Vec::new(),
+                next_seq: 0,
+                updated_ms: now,
+            });
+            if seq != asm.next_seq {
+                guard.remove(&key);
+                return Err(IpcError::new(
+                    "backend",
+                    "blob.put: non-contiguous seq".to_string(),
+                ));
+            }
+            asm.data.extend_from_slice(&chunk);
+            asm.next_seq = asm.next_seq.wrapping_add(1);
+            asm.updated_ms = now;
+            if asm.data.len() as u64 > max_bytes {
+                guard.remove(&key);
+                return Err(IpcError::new(
+                    "backend",
+                    "blob.put: assembled blob exceeds max_bytes".to_string(),
+                ));
+            }
+            if eof {
+                guard.remove(&key).map(|done| done.data)
+            } else {
+                None
+            }
+        };
+        if let Some(data) = assembled {
+            if let Some(expected) = sha256 {
+                if !expected.eq_ignore_ascii_case(&sha256_hex(&data)) {
+                    return Err(IpcError::new(
+                        "backend",
+                        "blob.put: sha256 mismatch".to_string(),
+                    ));
+                }
+            }
+            self.ingest_capture("gnome", false, &[(mime, data)]);
+        }
+        Ok(serde_json::json!({"ok": true}))
+    }
+
+    /// Dispatch `config.get`: full stored config JSON, or one dotted key.
+    fn handle_config_get(&self, params: &Value) -> Value {
+        let full = self.config_json();
+        let Some(key) = params.get("key").and_then(Value::as_str) else {
+            return serde_json::json!({"config": full});
+        };
+        if key.is_empty() {
+            return serde_json::json!({"config": full});
+        }
+        let mut cursor = &full;
+        for part in key.split('.') {
+            match cursor.get(part) {
+                Some(next) => cursor = next,
+                None => return serde_json::json!({"config": Value::Null}),
+            }
+        }
+        serde_json::json!({"config": cursor.clone()})
+    }
+
+    /// Dispatch `config.set`: apply one dotted key and persist
+    /// `<profile>/config.toml`.
+    fn handle_config_set(&self, params: &Value) -> Result<Value, IpcError> {
+        let profile = self
+            .profile_dir
+            .lock()
+            .map_or_else(|_| PathBuf::new(), |dir| dir.clone());
+        if profile.as_os_str().is_empty() {
+            return Err(IpcError::new(
+                "unavailable",
+                "config.set: no profile dir configured".to_string(),
+            ));
+        }
+        let key = params
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| IpcError::new("backend", "config.set: key required".to_string()))?;
+        let value = params.get("value").cloned().unwrap_or(Value::Null);
+        let updated = {
+            let mut config = self
+                .config
+                .lock()
+                .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?;
+            apply_config_key(&mut config, key, &value)
+                .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
+            config.clone()
+        };
+        updated
+            .save(&profile.join("config.toml"))
+            .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
+        self.set_paste_limits(updated.popup.unicode_limit, updated.popup.delivery_dwell_ms);
+        Ok(serde_json::json!({"ok": true}))
     }
 
     /// Dispatch `paste.execute` through the live Windows backend, or refuse
@@ -1490,12 +1939,41 @@ impl DaemonState {
                 "version": DAEMON_VERSION,
                 "monitoring_paused": self.paused(),
             })),
-            "caps.get" | "caps.refresh" => Ok(self.caps.snapshot()),
+            "caps.get" | "caps.refresh" => Ok(self.caps_snapshot()),
             "ping" => Ok(serde_json::json!({"pong": true})),
             "paste.execute" => self.handle_paste_execute(params),
             method if method.starts_with("history.") => self.handle_history(method, params),
             "monitor.set" => self.handle_monitor(params),
             "capture.report" => Ok(self.handle_capture(params)),
+            "blob.put" => self.handle_blob_put(params),
+            "hotkey.fired" => {
+                let id = params.get("id").and_then(Value::as_u64);
+                if id.is_none() || id == Some(1) {
+                    self.mint_gesture_token();
+                }
+                Ok(serde_json::json!({"ok": true}))
+            }
+            "hotkey.conflict" => {
+                let chord = params
+                    .get("chord")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let reason = params
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let note = if reason.is_empty() {
+                    format!("hotkey conflict: {chord}")
+                } else {
+                    format!("hotkey conflict: {chord}: {reason}")
+                };
+                if let Ok(mut slot) = self.hotkey_conflict_note.lock() {
+                    *slot = Some(note);
+                }
+                Ok(serde_json::json!({"ok": true}))
+            }
+            "config.get" => Ok(self.handle_config_get(params)),
+            "config.set" => self.handle_config_set(params),
             _ => Ok(serde_json::json!({"ok": true})),
         }
     }
@@ -1522,6 +2000,181 @@ mod tests {
             "trigger token spends"
         );
         assert!(!state.consume_trigger_token(now_ms()), "single use only");
+    }
+
+    fn fresh_state(name: &str) -> (std::path::PathBuf, DaemonState) {
+        let dir = std::env::temp_dir().join(format!("cm-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        (dir, DaemonState::new(store))
+    }
+
+    fn history_texts(state: &DaemonState) -> Vec<String> {
+        let list = state
+            .handle("history.list", &serde_json::json!({}))
+            .expect("history.list");
+        list.get("clips")
+            .and_then(Value::as_array)
+            .map(|clips| {
+                clips
+                    .iter()
+                    .map(|clip| {
+                        clip.get("search_text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn capture_report_stores_real_payload_not_replay() {
+        let (_dir, state) = fresh_state("capture-real");
+        let got = state
+            .handle(
+                "capture.report",
+                &serde_json::json!({
+                    "event": {"sensitive": false, "origin": "Clipboard"},
+                    "payloads": {"text/plain": "aGVsbG8gZ25vbWU="}
+                }),
+            )
+            .expect("capture.report");
+        assert_eq!(got.get("accepted").and_then(Value::as_bool), Some(true));
+        let texts = history_texts(&state);
+        assert!(
+            texts.iter().any(|t| t == "hello gnome"),
+            "real payload must be stored, got {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("headless replay")),
+            "no synthetic replay rows, got {texts:?}"
+        );
+        let sensitive = state
+            .handle(
+                "capture.report",
+                &serde_json::json!({
+                    "event": {"sensitive": true},
+                    "payloads": {"text/plain": "aGVsbG8gZ25vbWU="}
+                }),
+            )
+            .expect("sensitive capture.report");
+        assert_eq!(
+            sensitive.get("accepted").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(history_texts(&state).len(), 1, "sensitive stores nothing");
+    }
+
+    #[test]
+    fn blob_put_assembles_and_verifies_sha() {
+        let (_dir, state) = fresh_state("blob-asm");
+        let clip = "01900000-0000-7000-8000-000000000001";
+        state
+            .handle(
+                "blob.put",
+                &serde_json::json!({"clip": clip, "mime": "text/plain", "seq": 0, "data_b64": "aGVsbG8=", "eof": false}),
+            )
+            .expect("chunk 0");
+        assert!(history_texts(&state).is_empty(), "no ingest before eof");
+        state
+            .handle(
+                "blob.put",
+                &serde_json::json!({"clip": clip, "mime": "text/plain", "seq": 1, "data_b64": "IGJsb2I=", "eof": true, "sha256": "e997afd18e5f6be004fc193aed2c90291e68ab2c7599a62538c935b7fca6ab0f"}),
+            )
+            .expect("chunk 1");
+        assert!(
+            history_texts(&state).iter().any(|t| t == "hello blob"),
+            "assembled payload must be ingested"
+        );
+        // Bad seq and bad hash are backend errors, not silent ok.
+        let bad_seq = state.handle(
+            "blob.put",
+            &serde_json::json!({"clip": clip, "mime": "text/plain", "seq": 5, "data_b64": "aGk=", "eof": true}),
+        );
+        assert_eq!(
+            bad_seq.expect_err("bad seq").code,
+            "backend",
+            "non-contiguous seq must fail"
+        );
+        let bad_hash = state.handle(
+            "blob.put",
+            &serde_json::json!({"clip": clip, "mime": "text/plain", "seq": 0, "data_b64": "aGk=", "eof": true, "sha256": "00"}),
+        );
+        assert_eq!(bad_hash.expect_err("bad hash").code, "backend");
+    }
+
+    #[test]
+    fn config_get_set_roundtrip_and_persist() {
+        let (dir, state) = fresh_state("config-rt");
+        // No profile dir yet: set is unavailable.
+        let unavailable = state.handle(
+            "config.set",
+            &serde_json::json!({"key": "popup.hotkey", "value": "ctrl+alt+x"}),
+        );
+        assert_eq!(unavailable.expect_err("no profile").code, "unavailable");
+        state.set_profile_dir(&dir);
+        state
+            .handle(
+                "config.set",
+                &serde_json::json!({"key": "popup.hotkey", "value": "ctrl+alt+x"}),
+            )
+            .expect("config.set known");
+        let one = state
+            .handle("config.get", &serde_json::json!({"key": "popup.hotkey"}))
+            .expect("config.get key");
+        assert_eq!(
+            one.get("config").and_then(Value::as_str),
+            Some("ctrl+alt+x")
+        );
+        state
+            .handle(
+                "config.set",
+                &serde_json::json!({"key": "custom.thing", "value": 123}),
+            )
+            .expect("config.set unknown preserved");
+        let unknown = state
+            .handle("config.get", &serde_json::json!({"key": "custom.thing"}))
+            .expect("config.get unknown");
+        assert_eq!(unknown.get("config").and_then(Value::as_i64), Some(123));
+        let loaded = clipmonger_core::Config::load(&dir.join("config.toml")).expect("reload");
+        assert_eq!(
+            loaded.popup.hotkey, "ctrl+alt+x",
+            "set must persist config.toml"
+        );
+    }
+
+    #[test]
+    fn hotkey_fired_mints_and_conflict_notes_caps() {
+        let (_dir, state) = fresh_state("hotkey-ipc");
+        state
+            .handle("hotkey.fired", &serde_json::json!({"id": 1}))
+            .expect("hotkey.fired");
+        assert!(
+            state.consume_trigger_token(now_ms()),
+            "hotkey.fired id=1 must mint a gesture token"
+        );
+        state
+            .handle(
+                "hotkey.conflict",
+                &serde_json::json!({"chord": "ctrl+alt+v", "reason": "already grabbed"}),
+            )
+            .expect("hotkey.conflict");
+        let status = state
+            .handle("status", &serde_json::json!({}))
+            .expect("status");
+        let notes = status
+            .pointer("/caps/notes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.as_str().unwrap_or_default().contains("ctrl+alt+v")),
+            "conflict must surface in caps notes, got {notes:?}"
+        );
     }
 
     #[test]

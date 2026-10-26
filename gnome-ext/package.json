@@ -1,0 +1,17 @@
+{
+  "name": "clipmonger-gnome-ext",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Clipmonger GNOME Shell extension (capture/hotkey relay; history lives in the daemon)",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test dist/tests/*.test.js"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@girs/gnome-shell": "46.0.2",
+    "@types/node": "^26.0.0"
+  }
+}

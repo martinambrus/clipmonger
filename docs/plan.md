@@ -132,8 +132,19 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   per-compositor manual matrix + real injection (Ubuntu GNOME/KDE
   box), t609 primary positive legs (needs primary-capable peer),
   X11-on-local-Xvfb connect hang noted in smoke (WSLg :0 used).
-- **5. GNOME extension (parallel with 4 after IPC freeze).** Seg-07
-  (relay, keybindings, IPC, matrix, packaging). Tests T-701…704.
+- **5. GNOME extension. (CODE DONE 2026-10-26, WSL headless; T-702…705 manual pending)**
+  Seg-07 (relay, keybindings, IPC, matrix, packaging). Tests T-701…704.
+  Evidence: T-701 node:test 30/30 (codec incl. 3MiB→12 chunks + sha256
+  vectors, relay fake-clock, polddiff, chord converter); tsc clean;
+  committed dist/ + install-extension.sh (no npm at install). Daemon
+  gaps closed: capture.report stores real payloads (was fake replay
+  insert), blob.put assembled+sha-verified, hotkey.fired mints gesture
+  token, hotkey.conflict caps note, config.get/set persisted, ipc
+  lifecycle callback flips extension_connected. Freeze G-F1…G-F8 in
+  working notes. Open: T-702…705 + Phase-0 MetaSelection rich-format
+  PoC on Ubuntu 24.04 GNOME 46 box (VERIFY-marked APIs in
+  gnome-ext/src), config.changed broadcast + hotkey popup push
+  (Step 6).
 - **6. UI v1.** Seg-09 (popup, tray, maximalist config for v1 scope,
   keymap). Tests T-901…907 subset.
 - **7. v1 hardening + release.** Seg-11 gates (matrix, goldens, signoffs,

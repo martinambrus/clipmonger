@@ -21,6 +21,24 @@ use std::sync::{Arc, Mutex};
 /// Request handler: method name + params to result or typed error.
 pub type Handler = std::sync::Arc<dyn Fn(String, Value) -> Result<Value, IpcError> + Send + Sync>;
 
+/// Connection lifecycle event fired for a connection that completed hello.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LifecycleEvent {
+    /// Hello succeeded; `client` is the hello `client` param (may be empty).
+    Hello {
+        /// Free-form client name from the hello params.
+        client: String,
+    },
+    /// A hello-completed connection ended.
+    Disconnected {
+        /// Free-form client name from the hello params.
+        client: String,
+    },
+}
+
+/// Callback invoked on connection lifecycle events.
+pub type LifecycleCb = std::sync::Arc<dyn Fn(LifecycleEvent) + Send + Sync>;
+
 /// Per-subscriber queue cap before a `resync-required` marker is appended.
 const QUEUE_CAP: usize = 128;
 /// Overflow marker method pushed when a subscriber falls behind.
@@ -137,10 +155,27 @@ impl Server {
     #[cfg(unix)]
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn bind(sock: &Path, token: String, handler: Handler) -> Result<Self, IpcError> {
+        Self::bind_with_lifecycle(sock, token, handler, None).await
+    }
+
+    /// Bind `sock` like [`Server::bind`], invoking `lifecycle` on hello
+    /// success and on disconnect of hello-completed connections.
+    ///
+    /// # Errors
+    ///
+    /// Returns `bind_failed` when the socket cannot be bound.
+    #[cfg(unix)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    pub async fn bind_with_lifecycle(
+        sock: &Path,
+        token: String,
+        handler: Handler,
+        lifecycle: Option<LifecycleCb>,
+    ) -> Result<Self, IpcError> {
         let _ = std::fs::remove_file(sock);
         let listener = tokio::net::UnixListener::bind(sock)
             .map_err(|e| IpcError::new("bind_failed", e.to_string()))?;
-        let task = tokio::spawn(accept_loop(listener, token, handler));
+        let task = tokio::spawn(accept_loop(listener, token, handler, lifecycle));
         Ok(Self { _task: task })
     }
 
@@ -154,12 +189,28 @@ impl Server {
     /// Returns `bind_failed` when the pipe name is taken or cannot be bound.
     #[cfg(windows)]
     pub fn bind_pipe(pipe_name: &str, token: String, handler: Handler) -> Result<Self, IpcError> {
+        Self::bind_pipe_with_lifecycle(pipe_name, token, handler, None)
+    }
+
+    /// Bind `pipe_name` like [`Server::bind_pipe`], with a lifecycle callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns `bind_failed` when the pipe name is taken or cannot be bound.
+    #[cfg(windows)]
+    pub fn bind_pipe_with_lifecycle(
+        pipe_name: &str,
+        token: String,
+        handler: Handler,
+        lifecycle: Option<LifecycleCb>,
+    ) -> Result<Self, IpcError> {
         let first = make_pipe_instance(pipe_name, true)?;
         let task = tokio::spawn(windows_accept_loop(
             pipe_name.to_string(),
             token,
             handler,
             first,
+            lifecycle,
         ));
         Ok(Self { _task: task })
     }
@@ -176,6 +227,24 @@ impl Server {
             "ipc server needs a Unix socket".to_string(),
         ))
     }
+
+    /// Lifecycle-binding stub on platforms without sockets or named pipes.
+    ///
+    /// # Errors
+    ///
+    /// Always fails with `unavailable`.
+    #[cfg(not(any(unix, windows)))]
+    pub async fn bind_with_lifecycle(
+        _sock: &Path,
+        _token: String,
+        _handler: Handler,
+        _lifecycle: Option<LifecycleCb>,
+    ) -> Result<Self, IpcError> {
+        Err(IpcError::new(
+            "unavailable",
+            "ipc server needs a Unix socket".to_string(),
+        ))
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -184,12 +253,22 @@ type SharedWriter<S> = Arc<tokio::sync::Mutex<tokio::io::WriteHalf<S>>>;
 type SharedCancels = Arc<Mutex<HashSet<String>>>;
 
 #[cfg(unix)]
-async fn accept_loop(listener: tokio::net::UnixListener, token: String, handler: Handler) {
+async fn accept_loop(
+    listener: tokio::net::UnixListener,
+    token: String,
+    handler: Handler,
+    lifecycle: Option<LifecycleCb>,
+) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
-        tokio::spawn(serve_conn(stream, token.clone(), handler.clone()));
+        tokio::spawn(serve_conn(
+            stream,
+            token.clone(),
+            handler.clone(),
+            lifecycle.clone(),
+        ));
     }
 }
 
@@ -212,6 +291,7 @@ async fn windows_accept_loop(
     token: String,
     handler: Handler,
     mut listener: tokio::net::windows::named_pipe::NamedPipeServer,
+    lifecycle: Option<LifecycleCb>,
 ) {
     loop {
         if listener.connect().await.is_err() {
@@ -221,7 +301,12 @@ async fn windows_accept_loop(
         match make_pipe_instance(&pipe_name, false) {
             Ok(next) => {
                 let connected = std::mem::replace(&mut listener, next);
-                tokio::spawn(serve_conn(connected, token.clone(), handler.clone()));
+                tokio::spawn(serve_conn(
+                    connected,
+                    token.clone(),
+                    handler.clone(),
+                    lifecycle.clone(),
+                ));
             }
             Err(_) => {
                 let _ = listener.disconnect();
@@ -231,7 +316,7 @@ async fn windows_accept_loop(
 }
 
 #[cfg(any(unix, windows))]
-async fn serve_conn<S>(stream: S, token: String, handler: Handler)
+async fn serve_conn<S>(stream: S, token: String, handler: Handler, lifecycle: Option<LifecycleCb>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -248,8 +333,37 @@ where
     if !hello_token_ok(&hello, &token) {
         return;
     }
+    let client = hello
+        .params
+        .as_ref()
+        .and_then(|params| params.get("client"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if let Some(cb) = &lifecycle {
+        cb(LifecycleEvent::Hello {
+            client: client.clone(),
+        });
+    }
+    serve_requests(&mut reader, &writer, &token, handler, client.clone()).await;
+    if let Some(cb) = &lifecycle {
+        cb(LifecycleEvent::Disconnected { client });
+    }
+}
+
+#[cfg(any(unix, windows))]
+async fn serve_requests<S, R>(
+    reader: &mut tokio::io::BufReader<R>,
+    writer: &SharedWriter<S>,
+    token: &str,
+    handler: Handler,
+    _client: String,
+) where
+    S: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    R: tokio::io::AsyncRead + Unpin,
+{
     let cancelled: SharedCancels = Arc::new(Mutex::new(HashSet::new()));
-    while let Some(frame) = next_frame(&mut reader).await {
+    while let Some(frame) = next_frame(reader).await {
         let env = match frame {
             Ok(env) => env,
             Err(e) if e.code == "oversize" => return,
@@ -263,9 +377,9 @@ where
             }
             FrameKind::Req => {
                 if env.method.as_deref() == Some("hello") {
-                    answer_hello(&writer, &env, &token).await;
+                    answer_hello(writer, &env, token).await;
                 } else {
-                    dispatch(writer.clone(), cancelled.clone(), handler.clone(), env);
+                    dispatch((*writer).clone(), cancelled.clone(), handler.clone(), env);
                 }
             }
             FrameKind::Res | FrameKind::Event => {}
@@ -394,4 +508,107 @@ where
         )));
     }
     Some(decode_line(&line))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    use super::{LifecycleEvent, Server};
+    use crate::framing::encode_line;
+    use crate::proto::{Envelope, FrameKind, IPC_VERSION};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lifecycle_fires_hello_and_disconnect() {
+        let dir = std::env::temp_dir().join(format!("cm-lifecycle-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("lc.sock");
+        let events: Arc<Mutex<Vec<LifecycleEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&events);
+        let cb = Arc::new(move |event: LifecycleEvent| {
+            if let Ok(mut guard) = seen.lock() {
+                guard.push(event);
+            }
+        });
+        let handler: super::Handler =
+            Arc::new(|_method, _params| Ok(serde_json::json!({"ok": true})));
+        let server = Server::bind_with_lifecycle(&sock, "tok".to_string(), handler, Some(cb))
+            .await
+            .expect("bind");
+        let mut stream = tokio::net::UnixStream::connect(&sock)
+            .await
+            .expect("connect");
+        let hello = Envelope {
+            v: IPC_VERSION.to_string(),
+            id: "h1".to_string(),
+            kind: FrameKind::Req,
+            method: Some("hello".to_string()),
+            params: Some(serde_json::json!({"token": "tok", "client": "gnome-ext"})),
+            result: None,
+            error: None,
+            seq: None,
+        };
+        stream
+            .write_all(&encode_line(&hello).expect("encode"))
+            .await
+            .expect("write hello");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read welcome");
+        assert!(line.contains("chosen"), "welcome expected, got {line}");
+        // Bad-token connection must not fire lifecycle events.
+        let mut bad = tokio::net::UnixStream::connect(&sock)
+            .await
+            .expect("connect bad");
+        let bad_hello = Envelope {
+            params: Some(serde_json::json!({"token": "nope", "client": "gnome-ext"})),
+            ..hello.clone()
+        };
+        bad.write_all(&encode_line(&bad_hello).expect("encode"))
+            .await
+            .expect("write bad hello");
+        let mut bad_reader = BufReader::new(bad);
+        let mut bad_line = String::new();
+        let _ = bad_reader.read_line(&mut bad_line).await;
+        drop(bad_reader);
+        drop(reader);
+        for _ in 0..100 {
+            let done = events.lock().is_ok_and(|guard| {
+                guard.contains(&LifecycleEvent::Disconnected {
+                    client: "gnome-ext".to_string(),
+                })
+            });
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let guard = events.lock().expect("events lock");
+        assert_eq!(
+            guard.first(),
+            Some(&LifecycleEvent::Hello {
+                client: "gnome-ext".to_string()
+            }),
+            "hello must fire first, got {guard:?}"
+        );
+        assert_eq!(
+            guard
+                .iter()
+                .filter(|e| matches!(e, LifecycleEvent::Hello { .. }))
+                .count(),
+            1,
+            "bad-token hello must not fire, got {guard:?}"
+        );
+        assert!(
+            guard.contains(&LifecycleEvent::Disconnected {
+                client: "gnome-ext".to_string()
+            }),
+            "disconnect must fire, got {guard:?}"
+        );
+        drop(guard);
+        drop(server);
+        let _ = std::fs::remove_file(&sock);
+    }
 }

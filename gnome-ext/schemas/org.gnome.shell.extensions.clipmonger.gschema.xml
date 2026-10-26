@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.clipmonger" path="/org/gnome/shell/extensions/clipmonger/">
+    <key name="popup" type="as">
+      <default>['&lt;Control&gt;&lt;Alt&gt;v']</default>
+      <summary>Popup keybinding</summary>
+    </key>
+    <key name="profile-dir" type="s">
+      <default>''</default>
+      <summary>Daemon profile directory (blank = default data_dir()/clipmonger)</summary>
+    </key>
+    <key name="denylist" type="as">
+      <default>[]</default>
+      <summary>App ids whose clipboard contents are never reported</summary>
+    </key>
+  </schema>
+</schemalist>

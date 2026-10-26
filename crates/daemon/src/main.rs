@@ -684,6 +684,7 @@ fn respond(
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(all(windows, feature = "backend-windows"))]
@@ -744,30 +745,62 @@ async fn main() {
 
     let state = Arc::new(DaemonState::new(store));
     state.set_profile_dir(&profile);
+    state.set_config(config.clone());
     state.set_paste_limits(config.popup.unicode_limit, config.popup.delivery_dwell_ms);
     let backend_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     setup_session_backends(&profile, &state, &config, &backend_shutdown);
     let stop: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
     let stop_handler = Arc::clone(&stop);
     let backend_stop = Arc::clone(&backend_shutdown);
+    let handler_state = Arc::clone(&state);
     let handler: clipmonger_ipc::server::Handler = Arc::new(move |method, params| {
         if method == "daemon.stop" {
             backend_stop.store(true, std::sync::atomic::Ordering::Relaxed);
             stop_handler.notify_one();
             return Ok(serde_json::json!({"ok": true}));
         }
-        state.handle(&method, &params)
+        handler_state.handle(&method, &params)
+    });
+
+    let ext_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let lifecycle_state = Arc::clone(&state);
+    let lifecycle: clipmonger_ipc::server::LifecycleCb = Arc::new(move |event| {
+        use clipmonger_ipc::server::LifecycleEvent;
+        match event {
+            LifecycleEvent::Hello { client } if client == "gnome-ext" => {
+                ext_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                lifecycle_state.set_extension_connected(true);
+            }
+            LifecycleEvent::Disconnected { client } if client == "gnome-ext" => {
+                let prev = ext_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if prev <= 1 {
+                    ext_count.store(0, std::sync::atomic::Ordering::SeqCst);
+                    lifecycle_state.set_extension_connected(false);
+                }
+            }
+            _ => {}
+        }
     });
 
     #[cfg(unix)]
-    if let Err(e) = clipmonger_ipc::server::Server::bind(&socket, token, handler).await {
+    if let Err(e) = clipmonger_ipc::server::Server::bind_with_lifecycle(
+        &socket,
+        token,
+        handler,
+        Some(lifecycle.clone()),
+    )
+    .await
+    {
         eprintln!("daemon: bind failed: {e}");
         std::process::exit(1);
     }
     #[cfg(windows)]
-    if let Err(e) =
-        clipmonger_ipc::server::Server::bind_pipe(&socket.to_string_lossy(), token, handler)
-    {
+    if let Err(e) = clipmonger_ipc::server::Server::bind_pipe_with_lifecycle(
+        &socket.to_string_lossy(),
+        token,
+        handler,
+        Some(lifecycle),
+    ) {
         eprintln!("daemon: bind failed: {e}");
         std::process::exit(1);
     }

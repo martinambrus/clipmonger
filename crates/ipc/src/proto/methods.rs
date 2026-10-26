@@ -236,6 +236,18 @@ pub struct HotkeyFiredParams {
 pub struct HotkeyFiredResult {
     pub ok: bool,
 }
+/// Hotkey conflict notice for `hotkey.conflict`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotkeyConflictParams {
+    pub chord: String,
+    #[serde(default)]
+    pub reason: String,
+}
+/// Hotkey conflict output for `hotkey.conflict`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotkeyConflictResult {
+    pub ok: bool,
+}
 /// Empty params for `ping`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PingParams {}

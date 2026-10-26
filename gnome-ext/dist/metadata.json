@@ -1,0 +1,8 @@
+{
+  "uuid": "clipmonger@extensions.clipmonger.dev",
+  "name": "Clipmonger",
+  "description": "Clipmonger capture/hotkey relay (history lives in the daemon)",
+  "shell-version": ["46", "47", "48", "49", "50", "51"],
+  "settings-schema": "org.gnome.shell.extensions.clipmonger",
+  "version": 1
+}
