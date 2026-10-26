@@ -13,6 +13,7 @@ pub mod autostart_logic;
 pub mod caps;
 pub mod foreground;
 pub mod formats;
+pub mod helper;
 pub mod hotkeys;
 pub mod html;
 pub mod monitor;
@@ -27,6 +28,13 @@ pub use foreground::{current_process_integrity, target_integrity, Integrity};
 pub use hotkeys::WinHotkeys;
 pub use monitor::WinMonitor;
 pub use paste::WinPaste;
+/// Elevated-helper spawn/auth primitives (Windows only; the runas served
+/// leg is manual QA, never automated).
+#[cfg(windows)]
+pub use sys::{
+    hwnd_owner_pid, pipe_client_pid, process_image_path, process_token_high, program_files_dir,
+    spawn_elevated_worker,
+};
 pub use transfer::WinTransfer;
 
 /// Healthy capability matrix for this backend (carries the `image/png`

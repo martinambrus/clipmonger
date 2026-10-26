@@ -44,9 +44,11 @@ impl WinPaste {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unavailable`] without a Windows session,
-    /// [`Error::Denied`] for stale/dead targets or elevated targets, and
-    /// [`Error::Unsupported`] when no portable payload is available.
+    /// Returns [`Error::Unavailable`] without a Windows session, or when
+    /// the target needs the elevated-helper route (the backend layer never
+    /// spawns the helper itself; the daemon owns that channel),
+    /// [`Error::Denied`] for stale/dead targets, and [`Error::Unsupported`]
+    /// when no portable payload is available.
     pub fn paste_payloads(
         &self,
         target: &PasteTarget,
@@ -61,8 +63,11 @@ impl WinPaste {
             if crate::foreground::target_integrity(&target.handle)
                 == crate::foreground::Integrity::High
             {
-                return Err(Error::Denied(
-                    "paste refused: elevated target needs the helper route".to_string(),
+                // Route::Helper decision surface: the backend layer never
+                // spawns the helper; the daemon owns that channel, so until
+                // it provides one this is HelperUnavailable.
+                return Err(Error::Unavailable(
+                    "helper unavailable: elevated target needs the helper route".to_string(),
                 ));
             }
             // Safety: handle was validated above; focus only queries it.
@@ -94,6 +99,23 @@ fn hwnd_of(handle: &clipmonger_platform::types::PlatformHandle) -> i64 {
         clipmonger_platform::types::PlatformHandle::WinHwnd(hwnd) => *hwnd,
         _ => 0,
     }
+}
+
+/// Inject one helper-job payload as synthetic input. Elevated-worker entry
+/// point: the daemon worker validates target foreground + high integrity
+/// per job before calling here, and pins the target process handle across
+/// the call (no PID-reuse race).
+///
+/// # Errors
+///
+/// Returns a message when the payload exceeds 64 KiB, is not usable UTF-8,
+/// or the injection backend refuses it.
+#[cfg(windows)]
+pub fn worker_send_input_batch(payload: &str) -> std::result::Result<(), String> {
+    if payload.len() > 64 * 1024 {
+        return Err(format!("payload {} bytes exceeds 65536", payload.len()));
+    }
+    inject_text(payload.as_bytes())
 }
 
 /// Unicode injection via enigo text (preferred, no clipboard clobber).

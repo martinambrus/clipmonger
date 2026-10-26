@@ -394,6 +394,7 @@ dependencies = [
  "enigo",
  "global-hotkey",
  "serde",
+ "serde_json",
  "windows-sys 0.61.2",
 ]
 

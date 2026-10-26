@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -92,6 +93,441 @@ pub fn read_rendezvous(profile_dir: &Path) -> Result<(PathBuf, String), CoreErro
         .unwrap_or(PROTOCOL)
         .to_string();
     Ok((PathBuf::from(socket), protocol))
+}
+
+// ---------------------------------------------------------------------------
+// Elevated-helper routing (seg-04 S5, WIN-F6 audit)
+// ---------------------------------------------------------------------------
+
+/// Gesture-token TTL in ms (matches the backend helper contract; kept as a
+/// literal here so the daemon builds without the backend on non-Windows).
+pub const GESTURE_TTL_MS: i64 = 30_000;
+/// Helper heartbeat deadline: 3 missed 15 s beats.
+pub const HELPER_DEAD_AFTER_MS: i64 = 45_000;
+
+/// Append one JSONL audit event to `<profile>/audit.log`.
+///
+/// Callers pass metadata only (action, op hash, target exe name, ts,
+/// result); payload bytes must never reach this function.
+pub fn append_audit(profile_dir: &Path, event: Value) {
+    if profile_dir.as_os_str().is_empty() {
+        return;
+    }
+    let mut stamped = event;
+    if stamped.get("ts").is_none() {
+        stamped["ts"] = Value::from(now_ms());
+    }
+    let mut line = serde_json::to_string(&stamped).unwrap_or_default();
+    if line.is_empty() {
+        return;
+    }
+    line.push('\n');
+    if fs::create_dir_all(profile_dir).is_err() {
+        return;
+    }
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(profile_dir.join("audit.log"))
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+/// Elevated-helper supervisor: on-demand runas spawn from a protected path
+/// only, reverse-connect pipe, peer verification, 15 s heartbeat with
+/// 45 s death, audit entries, refusal latching into caps paste Degraded.
+///
+/// The runas/UAC served leg is manual QA by the user; automated runs never
+/// spawn (no spawn call exists outside the Windows supervisor thread).
+pub struct HelperSupervisor {
+    /// Last worker heartbeat (unix ms), shared with the supervisor thread.
+    beat: std::sync::Arc<Mutex<Option<i64>>>,
+    /// Live job channel to the supervisor thread (Windows only).
+    #[cfg(all(windows, feature = "backend-windows"))]
+    link: Option<HelperLink>,
+}
+
+/// One helper job handed to the supervisor thread.
+#[cfg(all(windows, feature = "backend-windows"))]
+struct SupervisorJob {
+    /// Validated high-integrity target process id.
+    target_pid: u32,
+    /// Input text bytes (UTF-8).
+    payload: String,
+    /// Outcome channel back to the IPC handler.
+    reply: std::sync::mpsc::Sender<Result<(), String>>,
+}
+
+/// Live channel to the Windows supervisor thread.
+#[cfg(all(windows, feature = "backend-windows"))]
+struct HelperLink {
+    /// Job queue owned by the supervisor thread.
+    jobs: std::sync::mpsc::Sender<SupervisorJob>,
+}
+
+impl HelperSupervisor {
+    /// Idle supervisor with no helper and no heartbeat.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            beat: std::sync::Arc::new(Mutex::new(None)),
+            #[cfg(all(windows, feature = "backend-windows"))]
+            link: None,
+        }
+    }
+
+    /// Record a worker heartbeat at `at_ms`.
+    pub fn note_beat(&self, at_ms: i64) {
+        if let Ok(mut slot) = self.beat.lock() {
+            *slot = Some(at_ms);
+        }
+    }
+
+    /// True while within [`HELPER_DEAD_AFTER_MS`] of the last heartbeat.
+    #[must_use]
+    pub fn alive(&self, at_ms: i64) -> bool {
+        self.beat
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .is_some_and(|beat| at_ms >= beat && at_ms - beat <= HELPER_DEAD_AFTER_MS)
+    }
+
+    /// Ensure the supervisor thread exists (Windows only); elsewhere there
+    /// is no helper channel and every elevated paste stays `Unavailable`.
+    #[cfg(all(windows, feature = "backend-windows"))]
+    fn ensure_link(&mut self, profile: &Path) -> std::sync::mpsc::Sender<SupervisorJob> {
+        if let Some(link) = &self.link {
+            return link.jobs.clone();
+        }
+        let (jobs_tx, jobs_rx) = std::sync::mpsc::channel::<SupervisorJob>();
+        let beat = std::sync::Arc::clone(&self.beat);
+        let profile = profile.to_path_buf();
+        std::thread::spawn(move || supervisor_thread(profile, beat, jobs_rx));
+        self.link = Some(HelperLink {
+            jobs: jobs_tx.clone(),
+        });
+        jobs_tx
+    }
+
+    /// Drop a dead channel so the next elevated paste re-spawns (+prompt).
+    #[cfg(all(windows, feature = "backend-windows"))]
+    fn drop_link(&mut self) {
+        self.link = None;
+    }
+}
+
+impl Default for HelperSupervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Supervisor thread body (Windows only): create the reverse-connect pipe,
+/// runas-spawn the worker, verify the peer, then serve jobs with a 15 s
+/// heartbeat watch (3 misses = dead). Every wait is bounded; UAC cancel or
+/// peer mismatch fails jobs with an `elevation refused` message.
+///
+/// One long state machine by design (owned thread entry takes its channels
+/// by value), so length and by-value lints are allowed here.
+#[cfg(all(windows, feature = "backend-windows"))]
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+fn supervisor_thread(
+    profile: PathBuf,
+    beat: std::sync::Arc<Mutex<Option<i64>>>,
+    jobs: std::sync::mpsc::Receiver<SupervisorJob>,
+) {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
+
+    let fail_all = |jobs: &std::sync::mpsc::Receiver<SupervisorJob>, message: &str| {
+        append_audit(
+            &profile,
+            serde_json::json!({"kind": "helper", "action": "refused", "result": message}),
+        );
+        while let Ok(job) = jobs.try_recv() {
+            let _ = job.reply.send(Err(message.to_string()));
+        }
+    };
+
+    let note_beat = |at_ms: i64| {
+        if let Ok(mut slot) = beat.lock() {
+            *slot = Some(at_ms);
+        }
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            fail_all(
+                &jobs,
+                &format!("elevation refused: helper runtime failed: {e}"),
+            );
+            return;
+        }
+    };
+
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
+    let exe_dir = exe
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    if profile.starts_with(&exe_dir) {
+        fail_all(
+            &jobs,
+            "unavailable: portable layout, elevated route unavailable",
+        );
+        return;
+    }
+    if !clipmonger_backend_windows::helper::protected_path_ok(
+        &exe,
+        &clipmonger_backend_windows::program_files_dir(),
+    ) {
+        fail_all(
+            &jobs,
+            "unavailable: unprotected install path, elevated route unavailable",
+        );
+        return;
+    }
+
+    let pipe_name = format!(
+        r"\\.\pipe\clipmonger-help-{}",
+        clipmonger_backend_windows::helper::random_pipe_segment()
+    );
+    let listener = match ServerOptions::new()
+        .first_pipe_instance(true)
+        .reject_remote_clients(true)
+        .pipe_mode(PipeMode::Byte)
+        .create(&pipe_name)
+    {
+        Ok(listener) => listener,
+        Err(e) => {
+            fail_all(
+                &jobs,
+                &format!("elevation refused: helper pipe failed: {e}"),
+            );
+            return;
+        }
+    };
+    append_audit(
+        &profile,
+        serde_json::json!({"kind": "helper", "action": "spawn", "result": "runas prompt"}),
+    );
+    if let Err(e) =
+        clipmonger_backend_windows::spawn_elevated_worker(&exe.to_string_lossy(), &pipe_name)
+    {
+        fail_all(
+            &jobs,
+            &format!("elevation refused: helper spawn refused: {e}"),
+        );
+        return;
+    }
+    let server = match runtime.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(90), listener.connect()).await
+    }) {
+        Ok(Ok(())) => listener,
+        Ok(Err(e)) => {
+            fail_all(
+                &jobs,
+                &format!("elevation refused: helper connect failed: {e}"),
+            );
+            return;
+        }
+        Err(_) => {
+            fail_all(
+                &jobs,
+                "elevation refused: helper connect timed out (UAC consent?)",
+            );
+            return;
+        }
+    };
+    if !helper_peer_ok(&server, &exe) {
+        append_audit(
+            &profile,
+            serde_json::json!({"kind": "helper", "action": "alert", "result": "peer mismatch"}),
+        );
+        fail_all(&jobs, "elevation refused: helper peer mismatch");
+        return;
+    }
+    note_beat(now_ms());
+    let (read_half, mut write_half) = tokio::io::split(server);
+    let mut reader = tokio::io::BufReader::new(read_half);
+    let mut missed: u32 = 0;
+    loop {
+        match jobs.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(job) => {
+                let line = match clipmonger_backend_windows::helper::encode_job(
+                    &clipmonger_backend_windows::helper::Job {
+                        job_id: 1,
+                        target_pid: job.target_pid,
+                        op: clipmonger_backend_windows::helper::JobOp::SendInputBatch,
+                        payload: job.payload.clone(),
+                    },
+                ) {
+                    Ok(line) => line,
+                    Err(e) => {
+                        let _ = job.reply.send(Err(format!("backend: {e}")));
+                        continue;
+                    }
+                };
+                let outcome = runtime.block_on(async {
+                    if tokio::time::timeout(
+                        std::time::Duration::from_secs(120),
+                        write_half.write_all(line.as_bytes()),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return Err("helper write timed out".to_string());
+                    }
+                    let mut result_line = String::new();
+                    if tokio::time::timeout(
+                        std::time::Duration::from_secs(120),
+                        reader.read_line(&mut result_line),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return Err("helper result timed out".to_string());
+                    }
+                    match serde_json::from_str::<Value>(&result_line) {
+                        Ok(value) if value.get("heartbeat").is_some() => {
+                            Ok("heartbeat".to_string())
+                        }
+                        Ok(value) => {
+                            if value.get("ok").and_then(Value::as_bool) == Some(true) {
+                                Ok(String::new())
+                            } else {
+                                Err(value
+                                    .get("error")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("helper refused")
+                                    .to_string())
+                            }
+                        }
+                        Err(_) => Err("helper result unreadable".to_string()),
+                    }
+                });
+                match &outcome {
+                    Ok(marker) if marker == "heartbeat" => {
+                        note_beat(now_ms());
+                        let _ = job.reply.send(Err("helper busy: retry".to_string()));
+                    }
+                    Ok(marker) if marker.is_empty() => {
+                        note_beat(now_ms());
+                        append_audit(
+                            &profile,
+                            serde_json::json!({
+                                "kind": "helper",
+                                "action": "job",
+                                "op_hash": fnv_hex(job.payload.as_bytes()),
+                                "result": "ok",
+                            }),
+                        );
+                        let _ = job.reply.send(Ok(()));
+                    }
+                    _ => {
+                        let message = match &outcome {
+                            Ok(marker) => format!("helper protocol error: {marker:?}"),
+                            Err(e) => e.clone(),
+                        };
+                        append_audit(
+                            &profile,
+                            serde_json::json!({
+                                "kind": "helper",
+                                "action": "job",
+                                "op_hash": fnv_hex(job.payload.as_bytes()),
+                                "result": message,
+                            }),
+                        );
+                        let _ = job.reply.send(Err(message));
+                        return;
+                    }
+                }
+                missed = 0;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let mut heartbeat = String::new();
+                let got = runtime.block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(20),
+                        reader.read_line(&mut heartbeat),
+                    )
+                    .await
+                });
+                match got {
+                    Ok(Ok(0) | Err(_)) | Err(_) => {
+                        missed += 1;
+                        if missed >= 3 {
+                            append_audit(
+                                &profile,
+                                serde_json::json!({
+                                    "kind": "helper",
+                                    "action": "dead",
+                                    "result": "3 missed heartbeats",
+                                }),
+                            );
+                            return;
+                        }
+                    }
+                    Ok(Ok(_)) => {
+                        missed = 0;
+                        note_beat(now_ms());
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// Verify the connected helper peer: image path must equal our own exe and
+/// its token must be high-integrity. Mismatch drops the connection.
+#[cfg(all(windows, feature = "backend-windows"))]
+fn helper_peer_ok(server: &tokio::net::windows::named_pipe::NamedPipeServer, exe: &Path) -> bool {
+    use std::os::windows::io::AsRawHandle as _;
+    let Some(pid) = clipmonger_backend_windows::pipe_client_pid(server.as_raw_handle().cast())
+    else {
+        return false;
+    };
+    let own = exe.to_string_lossy().to_ascii_lowercase();
+    let peer_ok = clipmonger_backend_windows::process_image_path(pid)
+        .is_some_and(|image| image.to_ascii_lowercase() == own);
+    peer_ok && clipmonger_backend_windows::process_token_high(pid) == Some(true)
+}
+
+/// Map a helper failure message to a wire error: refusals latch caps paste
+/// Degraded, everything is audited with metadata only (never payloads).
+#[cfg(all(windows, feature = "backend-windows"))]
+fn helper_ipc_error(
+    state: &DaemonState,
+    target: &clipmonger_platform::types::PasteTarget,
+    message: &str,
+) -> IpcError {
+    let profile = state
+        .profile_dir
+        .lock()
+        .map_or_else(|_| PathBuf::new(), |dir| dir.clone());
+    append_audit(
+        &profile,
+        serde_json::json!({
+            "kind": "helper",
+            "action": "route_error",
+            "target": target.app.exe,
+            "result": message,
+        }),
+    );
+    if message.starts_with("elevation refused") {
+        state.note_elevation_refused(message);
+        IpcError::new("denied", format!("paste.execute: {message}"))
+    } else if message.starts_with("unavailable") {
+        IpcError::new("unavailable", format!("paste.execute: {message}"))
+    } else {
+        IpcError::new("backend", format!("paste.execute: {message}"))
+    }
 }
 
 /// Skeleton capability aggregator over registered backend snapshots.
@@ -433,6 +869,16 @@ pub struct DaemonState {
     monitoring_paused: Mutex<bool>,
     /// Paste delivery budget (`popup.unicode_limit`, `popup.delivery_dwell_ms`).
     paste_limits: Mutex<(u64, u64)>,
+    /// Profile dir for the audit log (set once at startup).
+    profile_dir: Mutex<PathBuf>,
+    /// Live single-use gesture tokens (hotkey/popup trigger path only).
+    gesture_tokens: Mutex<HashMap<u64, i64>>,
+    /// Gesture mint sequence mixed into every token.
+    gesture_counter: Mutex<u64>,
+    /// Elevation-refusal latch (caps paste Degraded until restart).
+    elevation_refused: Mutex<bool>,
+    /// Elevated-helper supervisor (Windows runas thread; idle elsewhere).
+    helper: Mutex<HelperSupervisor>,
 }
 
 impl DaemonState {
@@ -444,13 +890,115 @@ impl DaemonState {
             caps: CapsAggregator::new(),
             monitoring_paused: Mutex::new(false),
             paste_limits: Mutex::new((65536, 1000)),
+            profile_dir: Mutex::new(PathBuf::new()),
+            gesture_tokens: Mutex::new(HashMap::new()),
+            gesture_counter: Mutex::new(0),
+            elevation_refused: Mutex::new(false),
+            helper: Mutex::new(HelperSupervisor::new()),
         }
+    }
+
+    /// Point audit/helper events at `<profile>` (call once at startup).
+    pub fn set_profile_dir(&self, dir: &Path) {
+        if let Ok(mut slot) = self.profile_dir.lock() {
+            *slot = dir.to_path_buf();
+        }
+    }
+
+    /// Mint one single-use gesture token. HOTKEY/POPUP TRIGGER PATH ONLY:
+    /// the generic `paste.execute` IPC arm must never call this (a
+    /// same-user caller driving `paste.execute` gets standard-user paste
+    /// at most).
+    pub fn mint_gesture_token(&self) -> u64 {
+        let at_ms = now_ms();
+        let seq = if let Ok(mut counter) = self.gesture_counter.lock() {
+            *counter = counter.wrapping_add(1);
+            *counter
+        } else {
+            at_ms.cast_unsigned()
+        };
+        let mut token = at_ms
+            .cast_unsigned()
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        if token == 0 {
+            token = 0x9E37_79B9_7F4A_7C15;
+        }
+        if let Ok(mut tokens) = self.gesture_tokens.lock() {
+            tokens.retain(|_, minted| at_ms >= *minted && at_ms - *minted <= GESTURE_TTL_MS);
+            tokens.insert(token, at_ms);
+        }
+        token
+    }
+
+    /// Consume one gesture token: true exactly once while unexpired.
+    #[cfg_attr(not(all(windows, feature = "backend-windows")), allow(dead_code))]
+    fn consume_gesture_token(&self, token: u64, at_ms: i64) -> bool {
+        let minted = self
+            .gesture_tokens
+            .lock()
+            .ok()
+            .and_then(|mut tokens| tokens.remove(&token));
+        minted.is_some_and(|minted| at_ms >= minted && at_ms - minted <= GESTURE_TTL_MS)
+    }
+
+    /// Latch elevation refusal: caps paste Degraded plus an audit entry.
+    /// Never retry-spawns in a loop; the next attempt re-prompts.
+    pub fn note_elevation_refused(&self, reason: &str) {
+        if let Ok(mut flag) = self.elevation_refused.lock() {
+            *flag = true;
+        }
+        let profile = self
+            .profile_dir
+            .lock()
+            .map_or_else(|_| PathBuf::new(), |dir| dir.clone());
+        append_audit(
+            &profile,
+            serde_json::json!({
+                "kind": "helper",
+                "action": "elevation_refused",
+                "result": reason,
+            }),
+        );
+    }
+
+    /// Whether elevation was refused (caps paste Degraded until restart).
+    #[must_use]
+    pub fn elevation_refused(&self) -> bool {
+        self.elevation_refused.lock().is_ok_and(|flag| *flag)
+    }
+
+    /// Helper route state for `status`: route, liveness, refusal latch.
+    #[must_use]
+    pub fn helper_route_state(&self) -> Value {
+        let alive = self
+            .helper
+            .lock()
+            .is_ok_and(|supervisor| supervisor.alive(now_ms()));
+        serde_json::json!({
+            "route": if alive { "helper" } else { "unavailable" },
+            "alive": alive,
+            "elevation_refused": self.elevation_refused(),
+        })
     }
 
     /// Capability snapshot for `status`/`caps.*`.
     #[must_use]
     pub fn caps_snapshot(&self) -> Value {
-        self.caps.snapshot()
+        let mut snapshot = self.caps.snapshot();
+        if self.elevation_refused() {
+            if let Some(paste) = snapshot.get_mut("paste") {
+                paste["level"] = Value::from("degraded");
+                paste["strategy"] = Value::from("elevated_route");
+                paste["reason"] = Value::from("elevation refused");
+            }
+            if let Some(notes) = snapshot.get_mut("notes").and_then(Value::as_array_mut) {
+                notes.push(Value::from(
+                    "paste Degraded: elevation refused, retry available",
+                ));
+            }
+        }
+        snapshot
     }
 
     /// Typed backend snapshot for live backends (WIN-F3).
@@ -613,9 +1161,15 @@ impl DaemonState {
 
     /// Dispatch `paste.execute` through the live Windows backend, or refuse
     /// with `unavailable` when no live backend is compiled in.
+    ///
+    /// High-integrity targets take the elevated-helper route ONLY, gated on
+    /// a fresh single-use gesture token (`gesture` param). Generic IPC
+    /// callers cannot mint tokens, so tokenless elevated requests are
+    /// refused without ever spawning.
     fn handle_paste_execute(&self, params: &Value) -> Result<Value, IpcError> {
         #[cfg(all(windows, feature = "backend-windows"))]
         {
+            use clipmonger_backend_windows::Integrity;
             use clipmonger_platform::traits::PasteEngine as _;
             use clipmonger_platform::types::ClipRef;
             let found = self.requested_clip(params).ok_or_else(|| {
@@ -635,6 +1189,17 @@ impl DaemonState {
             let target = paste
                 .capture_target()
                 .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
+            if clipmonger_backend_windows::target_integrity(&target.handle) == Integrity::High {
+                let token = params.get("gesture").and_then(Value::as_u64);
+                if token.is_none_or(|token| !self.consume_gesture_token(token, now_ms())) {
+                    self.note_elevation_refused("missing or invalid gesture token");
+                    return Err(IpcError::new(
+                        "denied",
+                        "paste.execute: elevation refused (gesture required)".to_string(),
+                    ));
+                }
+                return self.paste_via_helper(&target, &payloads);
+            }
             paste
                 .paste_payloads(&target, &ClipRef(found.id), &payloads)
                 .map_err(|e| {
@@ -657,6 +1222,93 @@ impl DaemonState {
         }
     }
 
+    /// Paste into a high-integrity target via the elevated helper
+    /// (Windows only): resolve the target pid, hand one `send_input_batch`
+    /// job to the supervisor thread, and wait bounded for its result.
+    /// Refusals latch caps paste Degraded; portable/unprotected layouts
+    /// stay `Unavailable` with no spawn attempt.
+    #[cfg(all(windows, feature = "backend-windows"))]
+    fn paste_via_helper(
+        &self,
+        target: &clipmonger_platform::types::PasteTarget,
+        payloads: &[(String, Vec<u8>)],
+    ) -> Result<Value, IpcError> {
+        use clipmonger_platform::types::PlatformHandle;
+        let hwnd = match &target.handle {
+            PlatformHandle::WinHwnd(hwnd) => *hwnd,
+            _ => {
+                return Err(IpcError::new(
+                    "unavailable",
+                    "paste.execute: helper route needs a window target".to_string(),
+                ));
+            }
+        };
+        let pid = clipmonger_backend_windows::hwnd_owner_pid(hwnd).ok_or_else(|| {
+            IpcError::new(
+                "unavailable",
+                "paste.execute: helper route cannot resolve target".to_string(),
+            )
+        })?;
+        let text = payloads
+            .iter()
+            .find(|(mime, _)| mime == "text/plain")
+            .map(|(_, bytes)| bytes.clone())
+            .unwrap_or_default();
+        let payload = String::from_utf8(text).map_err(|_| {
+            IpcError::new(
+                "backend",
+                "paste.execute: helper route needs UTF-8 text".to_string(),
+            )
+        })?;
+        let profile = self
+            .profile_dir
+            .lock()
+            .map_or_else(|_| PathBuf::new(), |dir| dir.clone());
+        let jobs_tx = self
+            .helper
+            .lock()
+            .map_err(|_| {
+                IpcError::new(
+                    "internal",
+                    "paste.execute: helper state poisoned".to_string(),
+                )
+            })?
+            .ensure_link(&profile);
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let job = SupervisorJob {
+            target_pid: pid,
+            payload,
+            reply: reply_tx,
+        };
+        if jobs_tx.send(job).is_err() {
+            if let Ok(mut supervisor) = self.helper.lock() {
+                supervisor.drop_link();
+            }
+            return Err(IpcError::new(
+                "backend",
+                "paste.execute: helper channel lost".to_string(),
+            ));
+        }
+        match reply_rx.recv_timeout(std::time::Duration::from_secs(150)) {
+            Ok(Ok(())) => {
+                if let Ok(supervisor) = self.helper.lock() {
+                    supervisor.note_beat(now_ms());
+                }
+                Ok(serde_json::json!({"pasted": true}))
+            }
+            Ok(Err(e)) => Err(helper_ipc_error(self, target, &e)),
+            Err(_) => {
+                if let Ok(mut supervisor) = self.helper.lock() {
+                    supervisor.drop_link();
+                }
+                Err(IpcError::new(
+                    "backend",
+                    "paste.execute: helper result timed out".to_string(),
+                ))
+            }
+        }
+    }
+
     /// Dispatch one IPC method to a JSON result or typed wire error.
     ///
     /// # Errors
@@ -666,7 +1318,8 @@ impl DaemonState {
     pub fn handle(&self, method: &str, params: &Value) -> Result<Value, IpcError> {
         match method {
             "status" => Ok(serde_json::json!({
-                "caps": self.caps.snapshot(),
+                "caps": self.caps_snapshot(),
+                "helper": self.helper_route_state(),
                 "up": true,
                 "running": true,
                 "version": DAEMON_VERSION,

@@ -253,6 +253,14 @@ pub(crate) fn focus_hwnd(hwnd: HWND) -> bool {
     unsafe { SetForegroundWindow(hwnd) != 0 }
 }
 
+/// Owning process id of a `WinHwnd` handle value (daemon supervisor seam).
+#[must_use]
+pub fn hwnd_owner_pid(hwnd: i64) -> Option<u32> {
+    // Safety: i64 handle round-trips through HWND on 64-bit Windows (the
+    // only target this backend supports); the query never frees it.
+    window_pid(hwnd as HWND)
+}
+
 /// Owning process id of `hwnd`, or `None` when it cannot be determined.
 pub(crate) fn window_pid(hwnd: HWND) -> Option<u32> {
     let mut pid: u32 = 0;
@@ -513,6 +521,174 @@ pub(crate) fn run_value_delete() -> Result<(), String> {
         return Err(format!("RegDeleteValueW failed: status {status}"));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Elevated-helper spawn + peer authentication (seg-04 S5)
+//
+// The runas/UAC served leg is manual QA only: nothing here is ever called
+// from automated tests. The pipe name is a random 128-bit rendezvous, never
+// a credential; NO secret travels in argv.
+// ---------------------------------------------------------------------------
+
+/// Spawn the elevated helper worker via `ShellExecuteEx` with the `runas`
+/// verb (UAC consent prompt). `exe` must live under a protected install
+/// path (checked by the caller via `helper::protected_path_ok`); `args`
+/// carries only `__elevated-worker <random-pipe-name>`.
+///
+/// # Errors
+///
+/// Returns a message when the `runas` launch is refused (UAC cancel, missing
+/// binary, policy block).
+pub fn spawn_elevated_worker(exe: &str, pipe_name: &str) -> Result<(), String> {
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    let verb = to_wide("runas");
+    let file = to_wide(exe);
+    let params = to_wide(&format!("__elevated-worker {pipe_name}"));
+    // Safety: zeroed struct with only documented input fields set; string
+    // pointers stay alive for the call; hProcess (when returned) closed below.
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = u32::try_from(std::mem::size_of::<SHELLEXECUTEINFOW>()).unwrap_or(u32::MAX);
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = params.as_ptr();
+    info.nShow = SW_HIDE;
+    // Safety: info only borrows live nul-terminated buffers above.
+    let ok = unsafe { ShellExecuteExW(&raw mut info) };
+    if ok == 0 {
+        return Err(format!("ShellExecuteEx(runas) refused: {}", last_error()));
+    }
+    if !info.hProcess.is_null() {
+        // Safety: handle came from ShellExecuteEx with NOCLOSEPROCESS.
+        unsafe {
+            CloseHandle(info.hProcess);
+        }
+    }
+    Ok(())
+}
+
+/// Full image path for `pid` (peer authentication: must equal our own exe).
+#[must_use]
+pub fn process_image_path(pid: u32) -> Option<String> {
+    // Safety: OpenProcess with a query flag; handle closed below on all paths.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut len: u32 = 32768;
+    let mut buf = vec![0u16; len as usize];
+    // Safety: buffer and length pointer are valid; handle has query rights.
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &raw mut len) };
+    // Safety: handle came from OpenProcess and is still open here.
+    unsafe {
+        CloseHandle(handle);
+    }
+    if ok == 0 {
+        return None;
+    }
+    buf.truncate(len as usize);
+    Some(OsString::from_wide(&buf).to_string_lossy().into_owned())
+}
+
+/// Whether `pid` runs with an elevated token (daemon-side check that the
+/// helper peer is high-integrity).
+#[must_use]
+pub fn process_token_high(pid: u32) -> Option<bool> {
+    // Safety: OpenProcess with a query flag; handle closed below on all paths.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let elevated = token_elevated(handle);
+    // Safety: handle came from OpenProcess and is still open here.
+    unsafe {
+        CloseHandle(handle);
+    }
+    elevated
+}
+
+/// Client process id of a connected named-pipe server instance, or `None`
+/// when it cannot be determined (peer-authentication seam for the daemon's
+/// reverse-connect helper pipe; keeps `unsafe` inside this module).
+///
+/// Safe wrapper by design: the handle is only passed through to the OS
+/// query, never dereferenced as Rust data.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[must_use]
+pub fn pipe_client_pid(pipe_handle: *mut std::ffi::c_void) -> Option<u32> {
+    use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+    let mut pid: u32 = 0;
+    // Safety: handle is the live connected pipe instance owned by the
+    // caller; pid slot is valid for the call.
+    let ok = unsafe { GetNamedPipeClientProcessId(pipe_handle, &raw mut pid) };
+    if ok == 0 {
+        None
+    } else {
+        Some(pid)
+    }
+}
+
+/// Install `%ProgramFiles%` directory for the protected-path rule.
+pub fn program_files_dir() -> std::path::PathBuf {
+    std::env::var_os("ProgramFiles").map_or_else(
+        || std::path::PathBuf::from("C:\\Program Files"),
+        std::path::PathBuf::from,
+    )
+}
+
+/// 32 hex chars of OS randomness for the helper pipe rendezvous name.
+pub fn random_pipe_segment() -> String {
+    use std::fmt::Write as _;
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+    let mut bytes = [0u8; 16];
+    // Safety: output buffer is a live 16-byte array; null algorithm handle
+    // selects the system-preferred RNG per BCRYPT_USE_SYSTEM_PREFERRED_RNG.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        return fallback_pipe_segment();
+    }
+    let mut out = String::with_capacity(32);
+    for byte in &bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Non-OS fallback when the system RNG is unavailable (never preferred).
+fn fallback_pipe_segment() -> String {
+    use std::fmt::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let n = CTR.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    let mut x = nanos
+        .wrapping_add(n.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add(u64::from(std::process::id()) << 32);
+    let mut out = String::with_capacity(32);
+    for _ in 0..2 {
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^= x >> 31;
+        let _ = write!(out, "{x:016x}");
+    }
+    out
 }
 
 /// Raw `StartupApproved` override blob for this daemon's value, if present.
