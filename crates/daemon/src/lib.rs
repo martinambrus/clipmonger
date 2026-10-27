@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clipmonger_core::{CoreError, Store};
@@ -1189,8 +1189,10 @@ pub fn replay_script(store: &Store, lines: impl Iterator<Item = String>) -> Vec<
 
 /// Shared daemon request state behind the IPC handler.
 pub struct DaemonState {
-    /// Clip store for history methods.
-    store: Store,
+    /// Clip store for history methods. Interior mutability so
+    /// `backup.restore` can reopen the store on the restored profile
+    /// while other arms hold only read guards.
+    store: RwLock<Store>,
     /// Capability aggregator for status/caps methods.
     caps: CapsAggregator,
     /// Monitor pause flag toggled by `monitor.set`.
@@ -1231,7 +1233,7 @@ impl DaemonState {
     #[must_use]
     pub fn with_config(store: Store, config: clipmonger_core::Config) -> Self {
         Self {
-            store,
+            store: RwLock::new(store),
             caps: CapsAggregator::new(),
             monitoring_paused: Mutex::new(false),
             paste_limits: Mutex::new((65536, 1000)),
@@ -1485,8 +1487,11 @@ impl DaemonState {
             }
         }
         let seed = u64::try_from(now_ms().max(0)).unwrap_or_default();
+        let Ok(store) = self.store.read() else {
+            return false;
+        };
         matches!(
-            store_payloads(&self.store, origin, sensitive, payloads, seed),
+            store_payloads(&store, origin, sensitive, payloads, seed),
             (StoreDecision::Stored, _)
         )
     }
@@ -1495,13 +1500,23 @@ impl DaemonState {
     fn find_clip(&self, id: &str) -> Option<clipmonger_core::model::Clip> {
         // Bounded scan window: `u64::MAX` overflows the SQL `LIMIT` cast
         // and silently yields no rows (every get/paste misses).
-        let clips = self.store.list_history(10_000, 0, true).unwrap_or_default();
+        let Ok(store) = self.store.read() else {
+            return None;
+        };
+        let clips = store.list_history(10_000, 0, true).unwrap_or_default();
         clips.into_iter().find(|c| c.id.to_string() == id)
     }
 
     /// Whether the monitor is currently paused.
     fn paused(&self) -> bool {
         self.monitoring_paused.lock().is_ok_and(|flag| *flag)
+    }
+
+    /// Read guard on the clip store for `&self` arms.
+    fn store_read(&self) -> Result<std::sync::RwLockReadGuard<'_, Store>, IpcError> {
+        self.store
+            .read()
+            .map_err(|_| IpcError::new("internal", "store lock poisoned".to_string()))
     }
 
     /// Requested clip id from `params`, looked up in the store.
@@ -1525,13 +1540,13 @@ impl DaemonState {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let clips = self
-                    .store
+                    .store_read()?
                     .list_history(limit, offset, include_removed)
                     .map_err(|e| IpcError::new("backend", e.to_string()))?;
                 Ok(serde_json::json!({"clips": clips}))
             }
             "history.get" => match self.requested_clip(params) {
-                Some(found) => match self.store.get_clip(found.id) {
+                Some(found) => match self.store_read()?.get_clip(found.id) {
                     Ok(Some((clip, _))) => Ok(serde_json::json!({"clip": clip})),
                     Ok(None) => Ok(serde_json::json!({"clip": null})),
                     Err(e) => Err(IpcError::new("backend", e.to_string())),
@@ -1540,7 +1555,7 @@ impl DaemonState {
             },
             "history.delete" => match self.requested_clip(params) {
                 Some(found) => self
-                    .store
+                    .store_read()?
                     .soft_delete(found.id)
                     .map_err(|e| IpcError::new("backend", e.to_string()))
                     .map(|()| serde_json::json!({"deleted": true})),
@@ -1552,10 +1567,10 @@ impl DaemonState {
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
                 match self.requested_clip(params) {
-                    Some(found) => match self.store.get_clip(found.id) {
+                    Some(found) => match self.store_read()?.get_clip(found.id) {
                         Ok(Some((mut clip, payloads))) => {
                             clip.pinned = pinned;
-                            self.store
+                            self.store_read()?
                                 .insert_clip(&clip, &payloads)
                                 .map_err(|e| IpcError::new("backend", e.to_string()))
                                 .map(|_| serde_json::json!({"pinned": pinned}))
@@ -1567,7 +1582,7 @@ impl DaemonState {
                 }
             }
             "history.purge_removed" => {
-                let purged = self.store.purge_removed();
+                let purged = self.store_read()?.purge_removed();
                 Ok(serde_json::json!({"purged": purged}))
             }
             other => Err(IpcError::new(
@@ -1800,18 +1815,96 @@ impl DaemonState {
         Ok(serde_json::json!({"ok": true}))
     }
 
+    /// Dispatch `backup.create`: snapshot the live store into a ZIP at `dest`.
+    fn handle_backup_create(&self, params: &Value) -> Result<Value, IpcError> {
+        let dest = params
+            .get("dest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| IpcError::new("backend", "backup.create: dest required".to_string()))?;
+        self.store_read()?
+            .backup_zip(Path::new(dest))
+            .map_err(|e| IpcError::new(e.code(), e.to_string()))?;
+        Ok(serde_json::json!({"path": dest}))
+    }
+
+    /// Dispatch `backup.restore`: transactionally restore a ZIP over the
+    /// profile, then reopen the store so the same process serves the
+    /// restored clips. A bad `src` leaves the old DB in place.
+    fn handle_backup_restore(&self, params: &Value) -> Result<Value, IpcError> {
+        let src = params
+            .get("src")
+            .and_then(Value::as_str)
+            .ok_or_else(|| IpcError::new("backend", "backup.restore: src required".to_string()))?;
+        let profile = self
+            .profile_dir
+            .lock()
+            .map_or_else(|_| PathBuf::new(), |dir| dir.clone());
+        if profile.as_os_str().is_empty() {
+            return Err(IpcError::new(
+                "unavailable",
+                "backup.restore: no profile dir configured".to_string(),
+            ));
+        }
+        Store::restore_zip(Path::new(src), &profile)
+            .map_err(|e| IpcError::new(e.code(), e.to_string()))?;
+        let reopened = Store::open(&profile).map_err(|e| IpcError::new(e.code(), e.to_string()))?;
+        match self.store.write() {
+            Ok(mut slot) => {
+                *slot = reopened;
+            }
+            Err(_) => {
+                return Err(IpcError::new("internal", "store lock poisoned".to_string()));
+            }
+        }
+        Ok(serde_json::json!({"ok": true}))
+    }
+
+    /// Dispatch `logs.tail`: the last `lines` of `<profile>/audit.log`,
+    /// capped at 1000. A missing log is an empty Ok; only audit lines
+    /// are ever returned, never clipboard payload bytes.
+    fn handle_logs_tail(&self, params: &Value) -> Result<Value, IpcError> {
+        let want = params
+            .get("lines")
+            .and_then(Value::as_u64)
+            .unwrap_or(100)
+            .min(1000) as usize;
+        let path = self
+            .profile_dir
+            .lock()
+            .map_or_else(|_| PathBuf::new(), |dir| dir.join("audit.log"));
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(serde_json::json!({"lines": []}));
+            }
+            Err(e) => {
+                return Err(IpcError::new(
+                    "backend",
+                    format!("logs.tail: cannot read audit log: {e}"),
+                ));
+            }
+        };
+        let all: Vec<&str> = text.lines().collect();
+        let start = all.len().saturating_sub(want);
+        let lines: Vec<&str> = all[start..].to_vec();
+        Ok(serde_json::json!({"lines": lines}))
+    }
+
     /// Dispatch one `permanent.*` method (perm.md §2).
     fn handle_permanent(&self, method: &str, params: &Value) -> Result<Value, IpcError> {
         let perm_err = |e: CoreError| IpcError::new(e.code(), e.to_string());
         match method {
             "permanent.list" => {
                 let group = params.get("group").and_then(Value::as_str);
-                let permanents = self.store.list_permanents(group).map_err(perm_err)?;
+                let permanents = self
+                    .store_read()?
+                    .list_permanents(group)
+                    .map_err(perm_err)?;
                 Ok(serde_json::json!({"permanents": permanents}))
             }
             "permanent.create" => {
                 let created = self
-                    .store
+                    .store_read()?
                     .create_permanent(
                         params.get("group").and_then(Value::as_str).unwrap_or(""),
                         params.get("name").and_then(Value::as_str).unwrap_or(""),
@@ -1831,7 +1924,10 @@ impl DaemonState {
                 let clip: clipmonger_core::model::PermanentClip =
                     serde_json::from_value(raw.clone())
                         .map_err(|e| IpcError::new("backend", format!("permanent.update: {e}")))?;
-                let updated = self.store.update_permanent(&clip).map_err(perm_err)?;
+                let updated = self
+                    .store_read()?
+                    .update_permanent(&clip)
+                    .map_err(perm_err)?;
                 Ok(serde_json::json!({"updated": updated}))
             }
             "permanent.delete" => {
@@ -1842,11 +1938,11 @@ impl DaemonState {
                     .ok_or_else(|| {
                         IpcError::new("backend", "permanent.delete: id required".to_string())
                     })?;
-                let deleted = self.store.delete_permanent(id).map_err(perm_err)?;
+                let deleted = self.store_read()?.delete_permanent(id).map_err(perm_err)?;
                 Ok(serde_json::json!({"deleted": deleted}))
             }
             "permanent.groups" => {
-                let groups = self.store.list_perm_groups().map_err(perm_err)?;
+                let groups = self.store_read()?.list_perm_groups().map_err(perm_err)?;
                 let list: Vec<Value> = groups
                     .iter()
                     .map(|g| {
@@ -1857,14 +1953,14 @@ impl DaemonState {
             }
             "permanent.group_create" => {
                 let created = self
-                    .store
+                    .store_read()?
                     .create_perm_group(params.get("name").and_then(Value::as_str).unwrap_or(""))
                     .map_err(perm_err)?;
                 Ok(serde_json::json!({"created": created}))
             }
             "permanent.group_delete" => {
                 let deleted = self
-                    .store
+                    .store_read()?
                     .delete_perm_group(params.get("name").and_then(Value::as_str).unwrap_or(""))
                     .map_err(perm_err)?;
                 Ok(serde_json::json!({"deleted": deleted}))
@@ -1891,7 +1987,7 @@ impl DaemonState {
             ));
         };
         let perm = self
-            .store
+            .store_read()?
             .get_permanent(id)
             .map_err(perm_err)?
             .ok_or_else(|| {
@@ -1928,7 +2024,7 @@ impl DaemonState {
                 IpcError::new("backend", "paste.execute: unknown clip".to_string())
             })?;
             let payloads = self
-                .store
+                .store_read()?
                 .get_clip(found.id)
                 .map_err(|e| IpcError::new("backend", e.to_string()))?
                 .map(|(_, payloads)| payloads)
@@ -2207,6 +2303,9 @@ impl DaemonState {
             }
             "config.get" => Ok(self.handle_config_get(params)),
             "config.set" => self.handle_config_set(params),
+            "backup.create" => self.handle_backup_create(params),
+            "backup.restore" => self.handle_backup_restore(params),
+            "logs.tail" => self.handle_logs_tail(params),
             other => Err(IpcError::new(
                 "unknown_method",
                 format!("unknown method: {other}"),
@@ -2426,8 +2525,6 @@ mod tests {
             "ui.show_popup",
             "events.subscribe",
             "permanent.bogus",
-            "backup.create",
-            "logs.tail",
             "hotkey.register",
             "hotkey.unregister",
         ] {

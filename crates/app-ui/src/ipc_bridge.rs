@@ -62,6 +62,12 @@ pub enum UiCmd {
     PermGroupDelete(String),
     /// Execute one permanent.
     ExecPermanent(Uuid),
+    /// Create a backup ZIP at the given dest path.
+    BackupCreate(String),
+    /// Restore a backup ZIP over the profile.
+    BackupRestore(String),
+    /// Fetch the last N audit log lines.
+    LogsTail(u64),
 }
 
 /// Event delivered from the bridge thread to the shell.
@@ -105,6 +111,14 @@ pub enum UiEvent {
     PermGroups(Value),
     /// Permanent group set changed.
     PermGroupsChanged,
+    /// Backup created at the given path.
+    BackupDone(String),
+    /// Restore completed; history now serves restored clips.
+    RestoreDone,
+    /// Audit log tail lines.
+    LogsTail(Vec<String>),
+    /// Config-window error text (never an offline misreport).
+    ConfigError(String),
 }
 
 /// Bridge handle spawner; the thread owns the transport alone.
@@ -152,6 +166,9 @@ pub fn method_for(cmd: &UiCmd) -> &'static str {
         UiCmd::PermGroupCreate(_) => "permanent.group_create",
         UiCmd::PermGroupDelete(_) => "permanent.group_delete",
         UiCmd::ExecPermanent(_) => "permanent.exec",
+        UiCmd::BackupCreate(_) => "backup.create",
+        UiCmd::BackupRestore(_) => "backup.restore",
+        UiCmd::LogsTail(_) => "logs.tail",
     }
 }
 
@@ -183,6 +200,9 @@ pub fn params_for(cmd: &UiCmd) -> Value {
         UiCmd::PermGroupCreate(name) | UiCmd::PermGroupDelete(name) => {
             serde_json::json!({ "name": name })
         }
+        UiCmd::BackupCreate(dest) => serde_json::json!({ "dest": dest }),
+        UiCmd::BackupRestore(src) => serde_json::json!({ "src": src }),
+        UiCmd::LogsTail(lines) => serde_json::json!({ "lines": lines }),
         UiCmd::PinClip(id, pinned) => {
             serde_json::json!({ "clip": id.to_string(), "pinned": pinned })
         }
@@ -191,6 +211,7 @@ pub fn params_for(cmd: &UiCmd) -> Value {
 
 /// Turn one transport outcome into shell events.
 #[allow(clippy::match_same_arms)]
+#[allow(clippy::too_many_lines)]
 fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
     match (cmd, outcome) {
         (UiCmd::Status, Ok(body)) => UiEvent::Status(body),
@@ -260,6 +281,36 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
         ),
         (UiCmd::PurgeRemoved, Ok(body)) => {
             UiEvent::Purged(body.get("purged").and_then(Value::as_u64).unwrap_or(0))
+        }
+        (UiCmd::BackupCreate(_), Ok(body)) => {
+            if let Some(path) = body.get("path").and_then(Value::as_str) {
+                UiEvent::BackupDone(path.to_string())
+            } else {
+                UiEvent::ConfigError("unconfirmed backup.create".to_string())
+            }
+        }
+        (UiCmd::BackupRestore(_), Ok(body)) => {
+            if body.get("ok").and_then(Value::as_bool) == Some(true) {
+                UiEvent::RestoreDone
+            } else {
+                UiEvent::ConfigError("unconfirmed backup.restore".to_string())
+            }
+        }
+        (UiCmd::LogsTail(_), Ok(body)) => {
+            if let Some(items) = body.get("lines").and_then(Value::as_array) {
+                UiEvent::LogsTail(
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect(),
+                )
+            } else {
+                UiEvent::ConfigError("unconfirmed logs.tail".to_string())
+            }
+        }
+        (UiCmd::BackupCreate(_) | UiCmd::BackupRestore(_) | UiCmd::LogsTail(_), Err(error)) => {
+            UiEvent::ConfigError(error.message)
         }
         (
             UiCmd::ConfigGet

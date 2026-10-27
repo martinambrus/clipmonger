@@ -214,6 +214,8 @@ struct ShellApp {
     caps_text: String,
     version_text: String,
     profile: PathBuf,
+    backup_path: String,
+    log_lines: Vec<String>,
     dark: bool,
     font_scale: f32,
     pause_deadline: Option<Instant>,
@@ -381,6 +383,19 @@ impl ShellApp {
                     self.send(ipc_bridge::UiCmd::PermGroups);
                 }
                 ipc_bridge::UiEvent::Purged(_) => {}
+                ipc_bridge::UiEvent::BackupDone(path) => {
+                    self.config_error = format!("{} {path}", strings::text("config.backup_saved"));
+                }
+                ipc_bridge::UiEvent::RestoreDone => {
+                    self.config_error = strings::text("config.restore_done").to_string();
+                    self.send(ipc_bridge::UiCmd::ListHistory);
+                }
+                ipc_bridge::UiEvent::LogsTail(lines) => {
+                    self.log_lines = lines;
+                }
+                ipc_bridge::UiEvent::ConfigError(message) => {
+                    self.config_error = message;
+                }
                 ipc_bridge::UiEvent::Error(message) => {
                     self.error = message.clone();
                     if !self.pending_apply.is_empty() {
@@ -524,6 +539,9 @@ impl ShellApp {
         let mut do_apply = false;
         let mut do_revert = false;
         let mut do_purge = false;
+        let mut do_backup = false;
+        let mut do_restore = false;
+        let mut do_logs = false;
         let mut stage_edits: Vec<(String, Value)> = Vec::new();
         let mut theme_changed = false;
         let mut perm_send: Vec<ipc_bridge::UiCmd> = Vec::new();
@@ -568,6 +586,14 @@ impl ShellApp {
                     if ui.button(strings::text("config.purge_removed")).clicked() {
                         do_purge = true;
                     }
+                    ui.label(strings::text("config.backup_path"));
+                    ui.add(egui::TextEdit::singleline(&mut self.backup_path));
+                    if ui.button(strings::text("config.backup_create")).clicked() {
+                        do_backup = true;
+                    }
+                    if ui.button(strings::text("config.backup_restore")).clicked() {
+                        do_restore = true;
+                    }
                 } else if self.config_tab == "about" {
                     ui.label(strings::text("config.help_title"));
                     ui.label(strings::text("config.about_version"));
@@ -575,6 +601,13 @@ impl ShellApp {
                     ui.label(strings::text("config.accesskit_note"));
                     ui.label(strings::text("config.caps_title"));
                     ui.label(&self.caps_text);
+                    ui.label(strings::text("config.logs_title"));
+                    if ui.button(strings::text("config.logs_refresh")).clicked() {
+                        do_logs = true;
+                    }
+                    for line in &self.log_lines {
+                        ui.label(line);
+                    }
                 } else {
                     // Theme controls persist through the ui.theme extra key.
                     if ui
@@ -827,6 +860,15 @@ impl ShellApp {
         }
         if do_purge {
             self.send(ipc_bridge::UiCmd::PurgeRemoved);
+        }
+        if do_backup {
+            self.send(ipc_bridge::UiCmd::BackupCreate(self.backup_path.clone()));
+        }
+        if do_restore {
+            self.send(ipc_bridge::UiCmd::BackupRestore(self.backup_path.clone()));
+        }
+        if do_logs {
+            self.send(ipc_bridge::UiCmd::LogsTail(100));
         }
         if do_revert {
             if let Some(doc) = &mut self.config_doc {
@@ -1120,6 +1162,8 @@ fn main() -> ExitCode {
         caps_text: String::new(),
         version_text: String::new(),
         profile: profile.clone(),
+        backup_path: profile.join("backup.zip").display().to_string(),
+        log_lines: Vec::new(),
         dark: true,
         font_scale: 1.0,
         pause_deadline: None,
