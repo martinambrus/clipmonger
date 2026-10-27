@@ -1064,7 +1064,7 @@ fn store_payloads(
     let now = now_ms();
     let text = payloads
         .iter()
-        .find(|(mime, _)| mime == "text/plain")
+        .find(|(mime, _)| mime.split(';').next().map(str::trim) == Some("text/plain"))
         .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned());
     let preview = text
         .as_deref()

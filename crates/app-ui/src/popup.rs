@@ -36,7 +36,14 @@ pub fn preview_kind(clip: &Clip) -> &'static str {
         "popup.kind_html"
     } else if clip.formats.iter().any(|f| f.contains("uri-list")) {
         "popup.kind_file"
-    } else if clip.formats.is_empty() {
+    } else if clip.formats.is_empty()
+        || clip.formats.iter().any(|f| {
+            f.split(';')
+                .next()
+                .map(str::trim)
+                .is_some_and(|b| b.starts_with("text/"))
+        })
+    {
         "popup.kind_text"
     } else {
         "popup.kind_other"
