@@ -186,7 +186,7 @@ impl ClipboardMonitor for WinMonitor {
                                     events.push(event);
                                     break;
                                 }
-                                Err(Error::Timeout(_)) => continue,
+                                Err(Error::Timeout(_)) => {}
                                 Err(e) => return Err(e),
                             }
                         }

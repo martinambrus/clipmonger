@@ -64,6 +64,24 @@ fn conflict(chord_text: &str, detail: impl std::fmt::Display) -> Error {
     ))
 }
 
+/// Drain this thread's message queue once. `WM_HOTKEY` is dispatched to
+/// the `global-hotkey` hidden window only while its owning thread pumps.
+#[cfg(windows)]
+fn pump_thread_messages() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+    // Safety: `msg` is a valid out-param; the null HWND selects this
+    // thread's queue, which includes its windows' messages.
+    unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+        while PeekMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            let _ = TranslateMessage(&raw const msg);
+            DispatchMessageW(&raw const msg);
+        }
+    }
+}
+
 /// Map canonical modifiers to `global-hotkey` modifiers.
 #[cfg(windows)]
 fn ghk_mods(mods: &[String]) -> Result<global_hotkey::hotkey::Modifiers> {
@@ -270,6 +288,10 @@ impl HotkeyManager for WinHotkeys {
             let deadline = Instant::now() + timeout;
             let mut fired = Vec::new();
             while Instant::now() < deadline {
+                // WM_HOTKEY reaches the hidden window only when this thread
+                // pumps messages (the manager's HWND lives on the thread
+                // that constructed it); without the pump no fire arrives.
+                pump_thread_messages();
                 match global_hotkey::GlobalHotKeyEvent::receiver().try_recv() {
                     Ok(event) => {
                         if event.state == global_hotkey::HotKeyState::Pressed {
