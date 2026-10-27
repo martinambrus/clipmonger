@@ -6,7 +6,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use clipmonger_app_ui::{
-    config_model, ipc_bridge, keymap, lifecycle, permanents, placement, popup, strings, tray_logic,
+    config_model, ipc_bridge, keymap, lifecycle, linux_tray, permanents, placement, popup, strings,
+    tray_logic,
 };
 use clipmonger_core::config::Config;
 use clipmonger_ipc::client::Client;
@@ -241,6 +242,8 @@ struct ShellApp {
     viewport_corrected: bool,
     #[cfg(any(windows, target_os = "macos"))]
     real_tray: Option<RealTray>,
+    #[cfg(target_os = "linux")]
+    linux_tray: linux_tray::LinuxTray,
 }
 
 /// Text form of a config value for an edit field.
@@ -494,6 +497,10 @@ impl ShellApp {
             for action in real.poll() {
                 self.run_tray_action(action);
             }
+        }
+        #[cfg(target_os = "linux")]
+        for action in self.linux_tray.poll() {
+            self.run_tray_action(action);
         }
     }
 
@@ -1162,17 +1169,18 @@ fn main() -> ExitCode {
     };
     let mut vm = popup::PopupVm::new();
     vm.set_offline(!online);
+    let initial_inputs = tray_logic::TrayInputs {
+        paused: false,
+        degraded: false,
+        attached: online,
+    };
     let app = ShellApp {
         vm,
         cmds,
         events,
         tray: tray_logic::TrayLogic::new(),
         fake_tray: FakeTray::new(Vec::new()),
-        inputs: tray_logic::TrayInputs {
-            paused: false,
-            degraded: false,
-            attached: online,
-        },
+        inputs: initial_inputs,
         open: !minimized,
         error: String::new(),
         last_poll: Instant::now(),
@@ -1204,9 +1212,9 @@ fn main() -> ExitCode {
                 None
             }
         },
+        #[cfg(target_os = "linux")]
+        linux_tray: linux_tray::LinuxTray::spawn(&initial_inputs),
     };
-    #[cfg(target_os = "linux")]
-    eprintln!("tray unavailable on Linux in this build: degraded, window still opens");
     match eframe::run_native("clipmonger", options, Box::new(|_| Ok(Box::new(app)))) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

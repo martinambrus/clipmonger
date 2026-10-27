@@ -5,6 +5,7 @@ pub mod config_model;
 pub mod ipc_bridge;
 pub mod keymap;
 pub mod lifecycle;
+pub mod linux_tray;
 pub mod permanents;
 pub mod placement;
 pub mod popup;
