@@ -36,8 +36,14 @@ export class CaptureRelay {
       const offers: OfferInput[] = [];
       for (const mime of mimes) {
         if (mime.startsWith('text/plain') || mime === 'UTF8_STRING') {
-          const text: string = await new Promise((resolve) =>
-            clipboard.get_text(St.SelectionType.SELECTION_CLIPBOARD, (_c: any, t: string | null) => resolve(t ?? '')));
+          // A get_text callback that never fires must not wedge isReading.
+          const text: string = await new Promise((resolve) => {
+            const timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => { resolve(''); return GLib.SOURCE_REMOVE; });
+            clipboard.get_text(St.SelectionType.SELECTION_CLIPBOARD, (_c: any, t: string | null) => {
+              GLib.source_remove(timer);
+              resolve(t ?? '');
+            });
+          });
           if (text) offers.push({ mime: 'text/plain', bytes: new TextEncoder().encode(text) });
         } else {
           // VERIFY: read via MetaSelection transfer; until proven, size-only offer.
@@ -50,9 +56,13 @@ export class CaptureRelay {
       const hint = offers.find((o) => o.mime === 'x-kde-passwordManagerHint');
       void hint;
       const decision = this.diff.decide({ offers, focusedAppId, nowMs: Date.now() });
-      if (decision.kind === 'Report') await this.emitReport(decision.offers, decision.truncated, focusedAppId);
+      if (decision.kind === 'Report') {
+        console.log(`clipmonger: capture report (${decision.offers.length} offers, app=${focusedAppId ?? '?'})`);
+        await this.emitReport(decision.offers, decision.truncated, focusedAppId);
+      }
       this.ipc.relay.recordSuccess();
-    } catch {
+    } catch (e) {
+      console.log(`clipmonger: capture poll failed: ${e instanceof Error ? e.message : String(e)}`);
       this.ipc.relay.recordFailure(); // 3 consecutive -> capture-paused intent
     } finally { this.diff.setReading(false); }
   }

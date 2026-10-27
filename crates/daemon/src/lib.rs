@@ -586,12 +586,12 @@ fn strategy_str(strategy: PasteStrategy) -> &'static str {
 }
 
 impl CapsAggregator {
-    /// Create an aggregator with the extension link up and no backends.
+    /// Create an aggregator with no extension connected and no backends.
     #[must_use]
     pub fn new() -> Self {
         Self {
             registered: Mutex::new(HashMap::new()),
-            extension_connected: Mutex::new(true),
+            extension_connected: Mutex::new(false),
             backends: Mutex::new(HashMap::new()),
         }
     }
@@ -2566,6 +2566,14 @@ mod tests {
     #[test]
     fn caps_extension_flip_marks_gnome_unavailable() {
         let caps = CapsAggregator::new();
+        assert_eq!(
+            caps.snapshot()
+                .get("extension_connected")
+                .and_then(Value::as_bool),
+            Some(false),
+            "no extension has connected yet"
+        );
+        caps.set_extension_connected(true);
         let connected = caps.snapshot();
         assert_eq!(
             connected

@@ -62,7 +62,7 @@ export class IpcClient {
   start(): void { this.relay.start(); }
   private async connect(): Promise<void> {
     const found = discoverDaemon(this.profileDirPref);
-    if (!found) { this.relay.handleDisconnect(); return; }
+    if (!found) { console.log('clipmonger: daemon not discovered (no rendezvous/token)'); this.relay.handleDisconnect(); return; }
     try {
       const client = new Gio.SocketClient();
       const address = Gio.UnixSocketAddress.new(found.socket);
@@ -73,17 +73,23 @@ export class IpcClient {
       this.out = Gio.DataOutputStream.new(this.conn.get_output_stream());
       this.input = Gio.DataInputStream.new(this.conn.get_input_stream());
       (this as any)._token = found.token;
+      console.log(`clipmonger: connected to daemon at ${found.socket}`);
       this.relay.handleConnected();
       void this.readLoop();
-    } catch { this.relay.handleDisconnect(); }
+    } catch (e) {
+      console.log(`clipmonger: connect failed: ${e instanceof Error ? e.message : String(e)}`);
+      this.relay.handleDisconnect();
+    }
   }
   private async sendHello(): Promise<void> {
     try {
       const result = await this.request(helloRequest(this.nextId(), (this as any)._token ?? ''));
       void result;
+      console.log('clipmonger: hello ok');
       this.relay.handleHelloOk();
     } catch (e) {
       const code = e instanceof Error ? e.message : 'auth_failed';
+      console.log(`clipmonger: hello failed: ${code}`);
       this.relay.handleHelloError(code.includes('auth_failed') ? 'auth_failed' : code);
     }
   }
