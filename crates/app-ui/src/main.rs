@@ -1105,7 +1105,15 @@ impl eframe::App for ShellApp {
             .input(|input| input.viewport().focused.unwrap_or(true));
         let focus_gained = focused && !self.was_focused;
         self.was_focused = focused;
-        if self.config_open != self.window_config_sized || focus_gained {
+        let size_mismatch = ui.ctx().input(|input| {
+            input.viewport().inner_rect.is_some_and(|rect| {
+                let (w, h) = placement::window_size_for(self.config_open);
+                #[allow(clippy::cast_precision_loss)]
+                let want = egui::vec2(w as f32, h as f32);
+                (rect.width() - want.x).abs() > 8.0 || (rect.height() - want.y).abs() > 8.0
+            })
+        });
+        if (self.config_open != self.window_config_sized || focus_gained) && size_mismatch {
             let (w, h) = placement::window_size_for(self.config_open);
             #[allow(clippy::cast_precision_loss)]
             let size = egui::vec2(w as f32, h as f32);
