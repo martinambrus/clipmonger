@@ -163,8 +163,20 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   exec (Paste kind, shared paste path; X11 honest unavailable),
   config-window editor + popup group tabs. Rulers C/I/D/U 13/2/7/10
   green. Per-clip hotkeys stored, not yet registered live.
-- **7. v1 hardening + release.** Seg-11 gates (matrix, goldens, signoffs,
+- **7. v1 hardening + release. (CODE DONE 2026-10-27; manual signoffs pending)**
+  Seg-11 gates (matrix, goldens, signoffs,
   budgets) → seg-12 release (artifacts, notes, checksums, bypass docs).
+  Evidence: scripts/release-gate.sh exit 0 (fmt/clippy/tests/xvfb
+  serial/windows-gnu/gnome/caps-golden/cargo-deny PASS here);
+  dist-release/clipmonger-0.1.0-{windows,linux}-x86_64.zip +
+  SHA256SUMS verified (gitignored, cross-built Windows zip labelled);
+  CHANGELOG 0.1.0 + draft release notes; 15 manual-QA scripts in
+  tests/manual/. Perf calibration: idle RSS 6.3MB, 10k search p95
+  76.8ms release (over initial 50ms budget — FNF for v1 freeze).
+  Open: manual signoffs (T-409/T-905…908/GNOME/Ubuntu legs), zip-crate
+  advisory upgrade (documented ignores in deny.toml; extract()
+  unused), GitHub release creation (user decision), cargo-packager
+  installers on native runners.
 - **8. v2 (after design-reopen gate).** Re-validate extension points
   vs current deps/platforms, then: macOS backend (seg-08), macrolib JS
   (seg-03 §7), bar/AutoSwitch/paste-modes (seg-09), export (seg-10 §4),

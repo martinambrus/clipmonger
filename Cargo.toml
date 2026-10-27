@@ -22,6 +22,10 @@ wayland-client = "0.31"
 clap = { version = "4.6", features = ["derive"] }
 zip = { version = "4", default-features = false, features = ["deflate"] }
 
+[profile.release]
+lto = "thin"
+strip = true
+
 [workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"

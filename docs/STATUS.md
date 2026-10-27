@@ -1,4 +1,23 @@
 # Docs status
+
+## Implementation state (refreshed 2026-10-27, Step 7)
+
+Source of truth for step detail: `plan.md` Steps.
+
+- Steps 1-4: DONE (foundation, UI pilot, Windows/X11/Wayland backends).
+- Step 5: CODE DONE (GNOME extension); manual legs pending.
+- Step 6: CODE DONE (UI v1 + permanents follow-up); manual legs pending.
+- Step 7: release prep done on this box (release gate script, caps
+  golden, `deny.toml`, changelog/notes drafts, `tests/manual/` scripts,
+  dist-release zips + SHA256SUMS). Draft only: no tag/GitHub release.
+- Manual pending (user/native/Ubuntu legs): T-409, T-410, T-508,
+  T-606, T-607, T-702..T-705, T-905..T-908, T-1117 (release-time),
+  T-1204. Scripts: `tests/manual/`.
+- Known gaps: update-check (T-1202, out of 0.1.0), per-box caps goldens
+  beyond headless, coverage-floor enforcement, cargo-packager
+  installers (native runners), CI matrix.
+
+## Document inventory
 - `README.md` — Plan (source of truth)
 - `adr-001-plugins.md` — ADR-001 — Out-of-process IPC plugin system (Notepad++-inspired UX)
 - `adr-002-i18n.md` — ADR-002 — Internationalization: string ids + community catalogs

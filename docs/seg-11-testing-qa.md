@@ -44,6 +44,14 @@ weekly/RC cadence per §2, finding 48).
 - T-1117 `[manual-qa]` evidence-bundle audit: every release claims a
   FINITE, reviewable bundle — each manual script ran inside its
   timeboxed window with evidence attached (review M-02).
+- T-315 `[integration]` permanents store CRUD + groups
+  (`crates/core/tests/permanents_acceptance.rs`).
+- T-316 `[integration]` permanents IPC (`permanent.*`)
+  (`crates/ipc/tests/perm_ipc_acceptance.rs`).
+- T-317 `[integration]` permanents daemon arm (exec via shared paste path)
+  (`crates/daemon/tests/perm_daemon_acceptance.rs`).
+- T-318 `[integration]` permanents UI editor + popup group tabs
+  (`crates/app-ui/tests/perm_ui_acceptance.rs`).
 
 ## 4. Harnesses (all chosen, versions verified at implementation)
 

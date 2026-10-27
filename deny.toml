@@ -1,0 +1,46 @@
+# cargo-deny config (seg-11 §5 gate 6, R-F3): advisories + licenses +
+# bans + sources in one tool. First run is calibration (rel.md Q5).
+
+[advisories]
+version = 2
+# Calibration triage (2026-10-27): the three zip advisories affect only
+# `ZipArchive::extract()` / `ZipStreamReader::extract()`. Core never calls
+# them: `extract_zip` (crates/core/src/store.rs) validates every entry with
+# `enclosed_name()`, rejects symlink entries, caps sizes, and writes via
+# `File::create` (no SUID/permission preservation). Upgrade of `zip`
+# itself is filed as found-not-fixed, not done in this hardening step.
+ignore = [
+    { id = "RUSTSEC-2026-0367", reason = "zip extract() SUID preservation; extract() not used, see above" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract() symlink target; extract() not used, symlinks rejected, see above" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract() permissions via symlink; extract() not used, see above" },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained (transitive build dep); no vulnerability, triage at next dep bump" },
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "rev"

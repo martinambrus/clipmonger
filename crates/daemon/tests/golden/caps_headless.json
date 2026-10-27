@@ -1,0 +1,29 @@
+{
+  "autostart": false,
+  "extension_connected": true,
+  "hotkey": {
+    "level": "unavailable",
+    "reason": "no backends in foundation skeleton"
+  },
+  "monitor": {
+    "level": "degraded",
+    "reason": "no backends in foundation skeleton"
+  },
+  "notes": [
+    "no backends in foundation skeleton"
+  ],
+  "paste": {
+    "level": "unavailable",
+    "reason": "no backends in foundation skeleton",
+    "strategy": "unavailable"
+  },
+  "primary_selection": false,
+  "transfer": {
+    "level": "unavailable",
+    "reason": "no backends in foundation skeleton"
+  },
+  "tray": {
+    "level": "unavailable",
+    "reason": "no backends in foundation skeleton"
+  }
+}
