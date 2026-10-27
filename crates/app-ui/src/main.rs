@@ -221,7 +221,7 @@ struct ShellApp {
     error: String,
     last_poll: Instant,
     config_open: bool,
-    config_focus_pending: bool,
+    config_focus_pending: u8,
     config_doc: Option<config_model::ConfigDoc>,
     config_filter: String,
     config_tab: String,
@@ -478,7 +478,7 @@ impl ShellApp {
             }
             tray_logic::TrayAction::OpenConfig => {
                 self.config_open = true;
-                self.config_focus_pending = true;
+                self.config_focus_pending = 3;
                 self.send(ipc_bridge::UiCmd::ConfigGet);
                 self.send(ipc_bridge::UiCmd::CapsGet);
                 self.send(ipc_bridge::UiCmd::ListPermanents);
@@ -486,7 +486,7 @@ impl ShellApp {
             }
             tray_logic::TrayAction::About => {
                 self.config_open = true;
-                self.config_focus_pending = true;
+                self.config_focus_pending = 3;
                 self.config_tab = "about".to_string();
                 self.send(ipc_bridge::UiCmd::CapsGet);
             }
@@ -586,9 +586,11 @@ impl ShellApp {
         let cfg_size = egui::vec2(cfg_w as f32, cfg_h as f32);
         let mut close_child = false;
         let config_viewport_id = egui::ViewportId::from_hash_of("clipmonger-config");
-        if self.config_focus_pending {
-            ctx.send_viewport_cmd_to(config_viewport_id, egui::ViewportCommand::Focus);
-            self.config_focus_pending = false;
+        if self.config_focus_pending > 0 {
+            self.config_focus_pending -= 1;
+            if self.config_focus_pending == 0 {
+                ctx.send_viewport_cmd_to(config_viewport_id, egui::ViewportCommand::Focus);
+            }
         }
         ctx.show_viewport_immediate(
             config_viewport_id,
@@ -602,6 +604,7 @@ impl ShellApp {
                     close_child = true;
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.config_filter)
@@ -1158,7 +1161,7 @@ impl eframe::App for ShellApp {
             });
             if open_config {
                 self.config_open = true;
-                self.config_focus_pending = true;
+                self.config_focus_pending = 3;
                 self.send(ipc_bridge::UiCmd::ConfigGet);
                 self.send(ipc_bridge::UiCmd::CapsGet);
                 self.send(ipc_bridge::UiCmd::ListPermanents);
@@ -1228,7 +1231,7 @@ fn main() -> ExitCode {
         error: String::new(),
         last_poll: Instant::now(),
         config_open: false,
-        config_focus_pending: false,
+        config_focus_pending: 0,
         config_doc: None,
         config_filter: String::new(),
         config_tab: "History".to_string(),
