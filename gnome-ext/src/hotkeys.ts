@@ -10,6 +10,7 @@ export class Hotkeys {
   private settings: any;
   private ipc: IpcClient;
   private registered: string[] = [];
+  private currentAccel: string | null = null;
   constructor(settings: any, ipc: IpcClient) { this.settings = settings; this.ipc = ipc; }
 
   /** Register the popup binding (id 1). Returns false on conflict. */
@@ -19,6 +20,14 @@ export class Hotkeys {
       notify('Clipmonger', `Unparseable shortcut: ${chord}`);
       this.ipc.notify(hotkeyConflictRequest(this.ipc.nextId(), chord, 'unparseable chord'));
       return false;
+    }
+    // enable() registers a fallback chord, then onConfig registers again:
+    // re-adding the same binding makes addKeybinding report a false conflict.
+    if (this.registered.includes('popup')) {
+      if (this.currentAccel === accel) return true;
+      try { wm.removeKeybinding('popup'); } catch { /* not registered */ }
+      this.registered = [];
+      this.currentAccel = null;
     }
     this.settings.set_strv('popup', [accel]);
     // VERIFY: Meta.KeyBindingFlags.NONE === 0 and Shell.ActionMode.NORMAL|MESSAGE_TRAY values.
@@ -32,10 +41,12 @@ export class Hotkeys {
       return false;
     }
     this.registered.push('popup');
+    this.currentAccel = accel;
     return true;
   }
   unregisterAll(): void {
     for (const name of this.registered) { try { wm.removeKeybinding(name); } catch { /* VERIFY name */ } }
     this.registered = [];
+    this.currentAccel = null;
   }
 }
