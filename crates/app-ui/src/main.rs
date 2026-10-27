@@ -240,8 +240,6 @@ struct ShellApp {
     perm_group_new: String,
     perm_confirm_delete: Option<uuid::Uuid>,
     viewport_corrected: bool,
-    window_config_sized: bool,
-    was_focused: bool,
     #[cfg(any(windows, target_os = "macos"))]
     real_tray: Option<RealTray>,
     #[cfg(target_os = "linux")]
@@ -575,9 +573,20 @@ impl ShellApp {
         let mut perm_begin_edit: Option<uuid::Uuid> = None;
         let mut perm_select: Option<usize> = None;
         let mut perm_confirm: Option<uuid::Uuid> = None;
-        egui::Window::new(strings::text("config.title"))
-            .open(&mut open)
-            .show(ctx, |ui| {
+        let (cfg_w, cfg_h) = placement::window_size_for(true);
+        #[allow(clippy::cast_precision_loss)]
+        let cfg_size = egui::vec2(cfg_w as f32, cfg_h as f32);
+        let mut close_child = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("clipmonger-config"),
+            egui::ViewportBuilder::default()
+                .with_title(strings::text("config.title"))
+                .with_inner_size(cfg_size)
+                .with_resizable(true),
+            |ui, _class| {
+                if ui.ctx().input(|input| input.viewport().close_requested()) {
+                    close_child = true;
+                }
                 ui.add(
                     egui::TextEdit::singleline(&mut self.config_filter)
                         .hint_text(strings::text("config.filter_hint")),
@@ -826,8 +835,12 @@ impl ShellApp {
                         ui.label(&self.config_error);
                     }
                 }
-                if theme_changed { /* handled after the window */ }
-            });
+                if theme_changed { /* handled after the viewport */ }
+            },
+        );
+        if close_child {
+            open = false;
+        }
         self.config_open = open;
         if let Some(index) = perm_select {
             self.perm_vm.select_group(index);
@@ -1100,29 +1113,6 @@ impl eframe::App for ShellApp {
             egui::Visuals::light()
         });
         ui.ctx().set_pixels_per_point(self.font_scale);
-        let focused = ui
-            .ctx()
-            .input(|input| input.viewport().focused.unwrap_or(true));
-        let focus_gained = focused && !self.was_focused;
-        self.was_focused = focused;
-        let size_mismatch = ui.ctx().input(|input| {
-            input.viewport().inner_rect.is_none_or(|rect| {
-                let (w, h) = placement::window_size_for(self.config_open);
-                #[allow(clippy::cast_precision_loss)]
-                let want = egui::vec2(w as f32, h as f32);
-                (rect.width() - want.x).abs() > 8.0 || (rect.height() - want.y).abs() > 8.0
-            })
-        });
-        if (self.config_open != self.window_config_sized || focus_gained) && size_mismatch {
-            let (w, h) = placement::window_size_for(self.config_open);
-            #[allow(clippy::cast_precision_loss)]
-            let size = egui::vec2(w as f32, h as f32);
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Resizable(self.config_open));
-            self.window_config_sized = self.config_open;
-        }
         self.render_config(ui.ctx());
         if self.last_poll.elapsed() >= STATUS_PERIOD {
             self.last_poll = Instant::now();
@@ -1231,8 +1221,6 @@ fn main() -> ExitCode {
         perm_group_new: String::new(),
         perm_confirm_delete: None,
         viewport_corrected: false,
-        window_config_sized: false,
-        was_focused: true,
         #[cfg(any(windows, target_os = "macos"))]
         real_tray: match RealTray::create(&tray_logic::TrayInputs::default()) {
             Some(tray) => Some(tray),
