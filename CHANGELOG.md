@@ -5,6 +5,23 @@ reserved for the release that passes all seg-11 §5 gates.
 
 ## [Unreleased]
 
+### Added
+
+- Paste delivery switch `popup.delivery` (config window, Popup tab):
+  `clipboard_restore` (default — clipboard write + Ctrl+V with
+  guarded restore, any size, standard and elevated routes) or
+  `unicode_inject` (synthetic keystrokes).
+
+### Fixed
+
+- T-409 UAC matrix (PASS 11/11, Windows host): daemon hotkey could
+  never fire (global-hotkey message pump + registration thread);
+  helper supervisor panicked creating the Tokio pipe outside the
+  runtime; heartbeats could be mistaken for job results and the
+  supervisor died after helper refusals; helper target validation
+  raced the UAC desktop switch. Release builds now enable the
+  platform backend features so the shipped daemon is not a skeleton.
+
 ## [0.1.0] — 2026-10-27
 
 Pre-release hardening build (R-F1). Draft artifacts are unsigned local

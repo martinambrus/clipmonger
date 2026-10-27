@@ -10,7 +10,12 @@ name = "clipmonger-daemon"
 path = "src/main.rs"
 
 [features]
-default = []
+# Backends are on by default: a default build must never ship the
+# skeleton daemon (T-409 finding). Deps are target-gated, so enabling
+# all three is a no-op on non-matching targets. Use
+# `--no-default-features` (optionally `--features minimal`) for the
+# headless skeleton.
+default = ["backend-windows", "backend-x11", "backend-wayland"]
 backend-windows = ["dep:clipmonger-backend-windows"]
 backend-x11 = ["dep:clipmonger-backend-x11"]
 backend-wayland = ["dep:clipmonger-backend-wayland", "dep:ashpd", "dep:futures-util"]

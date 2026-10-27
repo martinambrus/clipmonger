@@ -97,7 +97,7 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   Manual evidence 2026-10-26: Windows window-open test PASSED (user-run
   clipmonger.exe on Win host: opens, stays, renders empty popup; offline
   fix f58987f after first run exited pre-window).
-- **2. Windows backend. (CODE DONE 2026-10-26, WSL+Win host; T-409 manual pending)**
+- **2. Windows backend. (DONE 2026-10-27, WSL+Win host; T-409 PASS 11/11)**
   Seg-04 (listener, transfer, hotkeys, enigo
   paste, on-demand elevated helper, tray, autostart). Tests T-401…410
   incl. the UAC manual matrix.
@@ -107,9 +107,15 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   T-403/413-unit/414 (12 tests); daemon live-ingest + caps proven via
   CLI. Coexistence with ArsClip + RustDesk/ScreenConnect verified by
   design (passive listener; sync tools paused only for clean test
-  runs). Open: T-409 UAC matrix (user manual QA, needs Program Files
-  install), T-410 reboot leg, popup gesture-token handoff, tray icon
-  (app-ui Step 6), PNG/DIB conversion, explicit pipe DACL.
+  runs). T-409 UAC matrix PASSED 11/11 interactively on the Windows
+  host 2026-10-27 (verdict in tests/manual/T-409-uac-matrix.md);
+  bugs found and fixed en route: release daemon lacked backends
+  (feature flags), daemon hotkey could not fire, helper supervisor
+  panicked outside the Tokio runtime, heartbeat/result stream race,
+  UAC foreground-settle race. Paste delivery switched to
+  clipboard-restore by default (popup.delivery, user decision) and
+  re-verified live on standard + elevated routes. Open: T-410
+  reboot leg, explicit pipe DACL, PNG/DIB conversion.
 - **3. X11 backend. (DONE 2026-10-26, WSL Xvfb)** Seg-05 (XFixes + manager role, transfer+INCR,
   hotkeys, enigo paste, KSNI tray, .desktop autostart). Tests T-501…508
   (Xvfb headless).
@@ -145,7 +151,7 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   PoC on Ubuntu 24.04 GNOME 46 box (VERIFY-marked APIs in
   gnome-ext/src), config.changed broadcast + hotkey popup push
   (Step 6).
-- **6. UI v1. (CODE DONE 2026-10-27, WSL headless; T-905…908 + T-409 manual pending)**
+- **6. UI v1. (CODE DONE 2026-10-27, WSL headless; T-905…908 manual pending)**
   Seg-09 (popup, tray, maximalist config for v1 scope,
   keymap). Tests T-901…907 subset.
   Evidence: ui_v1_acceptance 34/34 (T-901/902/903/909/910, tray model,
@@ -155,9 +161,10 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   follow-up), theme via ui.theme, honest AccessKit About sentence
   (not compiled in this build). Pilot bug fixed: ipc_bridge sent
   {id}, daemon expects {clip}. Daemon honesty: unknown methods
-  (incl. history.*) return unknown_method, never purge. Open:
-  T-905…908 manual matrix, T-409 UAC matrix (Step 2 deferral),
-  Linux ksni tray, backup/logs daemon arms.
+  (incl. history.*) return unknown_method, never purge. Paste
+  delivery row added 2026-10-27 (popup.delivery, 27-row matrix,
+  default clipboard_restore; user decision). Open:
+  T-905…908 manual matrix, Linux ksni tray, backup/logs daemon arms.
   Permanents follow-up (DONE 2026-10-27): store CRUD + groups
   (perm_groups authoritative, no migration), permanent.* IPC +
   exec (Paste kind, shared paste path; X11 honest unavailable),
@@ -173,7 +180,8 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   CHANGELOG 0.1.0 + draft release notes; 15 manual-QA scripts in
   tests/manual/. Perf calibration: idle RSS 6.3MB, 10k search p95
   76.8ms release (over initial 50ms budget — FNF for v1 freeze).
-  Open: manual signoffs (T-409/T-905…908/GNOME/Ubuntu legs), zip-crate
+  Open: manual signoffs (T-905…908/GNOME/Ubuntu legs; T-409 PASSED
+  2026-10-27 on the Windows host), zip-crate
   advisory upgrade (documented ignores in deny.toml; extract()
   unused), GitHub release creation (user decision), cargo-packager
   installers on native runners.

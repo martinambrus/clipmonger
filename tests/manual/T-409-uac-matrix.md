@@ -36,7 +36,24 @@ Caps dumps before/after each leg, audit.log excerpt, screenshots of the UAC prom
 
 ## Verdict
 
-- Verdict: PASS / FAIL / BLOCKED (circle one)
-- Notes:
-- Signature:
-- Date:
+- Verdict: **PASS** (11/11 legs, Windows host, 2026-10-27)
+- Notes: Executed interactively with the user (agent drove, user
+  consented/cancelled UAC prompts and confirmed visually). Findings
+  fixed en route: daemon shipped without backends in release builds
+  (feature flags), daemon hotkey could never fire (global-hotkey
+  message pump + on-thread registration), helper supervisor panicked
+  (Tokio pipe created outside the runtime), heartbeats could be
+  mistaken for job results and supervisor died after refusals,
+  helper target validation raced the UAC desktop switch (3 s
+  foreground-settle wait added). Cancellation leg: win32 1223,
+  caps Degraded, audit metadata-only (25 entries, no payloads).
+  Portable leg: elevated route unavailable from unprotected path,
+  standard paste worked. Follow-ups recorded: first retry after a
+  refusal hits a stale helper channel once; `elevation_refused`
+  stayed set after a later success until daemon restart; helper
+  died twice on missed heartbeats while idle. Paste delivery was
+  then switched to clipboard-restore by default (popup.delivery)
+  and re-verified live on both routes with a 2,026-byte clip
+  (instant paste, previous clipboard restored).
+- Signature: user (interactive session)
+- Date: 2026-10-27
