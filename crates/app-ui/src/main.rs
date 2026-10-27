@@ -589,6 +589,10 @@ impl ShellApp {
         if self.config_focus_pending > 0 {
             self.config_focus_pending -= 1;
             if self.config_focus_pending == 0 {
+                ctx.send_viewport_cmd_to(
+                    config_viewport_id,
+                    egui::ViewportCommand::Minimized(false),
+                );
                 ctx.send_viewport_cmd_to(config_viewport_id, egui::ViewportCommand::Focus);
             }
         }
