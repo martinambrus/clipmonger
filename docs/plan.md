@@ -163,8 +163,16 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   {id}, daemon expects {clip}. Daemon honesty: unknown methods
   (incl. history.*) return unknown_method, never purge. Paste
   delivery row added 2026-10-27 (popup.delivery, 27-row matrix,
-  default clipboard_restore; user decision). Open:
-  T-905…908 manual matrix, Linux ksni tray, backup/logs daemon arms.
+  default clipboard_restore; user decision). Ubuntu closure
+  2026-10-27 (this box, GNOME 46/Wayland): toolchain 1.99.1 installed,
+  automated suites first observed here (app-ui 80/80 incl. new
+  backup/logs, tray-mapping, viewport and font tests); backup/logs
+  daemon arms wired (d232f9a, store reopened in-process on restore),
+  seg-09 §1 popup viewport recipes implemented (952cf74), Linux ksni
+  tray added (b81aa19, ksni 0.3.7), tofu-squares font regression fixed
+  (c94d6d3, eframe default_fonts/system_fonts restored). Open:
+  T-905…908 manual matrix (user legs on real displays; T-906 script
+  corrected 26→27 rows).
   Permanents follow-up (DONE 2026-10-27): store CRUD + groups
   (perm_groups authoritative, no migration), permanent.* IPC +
   exec (Paste kind, shared paste path; X11 honest unavailable),

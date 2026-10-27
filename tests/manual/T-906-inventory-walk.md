@@ -1,6 +1,6 @@
 # T-906 — Config inventory walk [manual-qa]
 
-- **ID / goal:** T-906. Touch EVERY control in the maximalist config window; verify staged Apply/Revert for each of the 26 config rows.
+- **ID / goal:** T-906. Touch EVERY control in the maximalist config window; verify staged Apply/Revert for each of the 27 config rows (incl. `popup.delivery`).
 - **Setup (box, build, profile fixture):** Any real display (Win first). Config matrix generated from seg-03 §6 key table x seg-09 §4 matrix; fresh profile plus a backed-up profile. Use a fresh test profile; SYNTHETIC clipboard fixtures only.
 - **Session timebox:** 2 sessions of 60 min (M-02 split expected) (M-02: cap per session; split overruns into a new session).
 
@@ -8,7 +8,7 @@
 
 1. Open config; walk every tab/section top to bottom, screenshotting each.
    - Expected: Every documented control is present and reachable.
-2. For each of the 26 rows: change the value, Apply, restart the daemon/UI.
+2. For each of the 27 rows: change the value, Apply, restart the daemon/UI.
    - Expected: Change persists and takes effect as documented.
 3. For each row: change the value, then Revert before Apply.
    - Expected: Original value restored; no partial writes.
@@ -22,7 +22,7 @@
 
 ## Evidence to attach
 
-26-row checklist with PASS/FAIL per row, screenshots, config file diff per Apply. Redact paths/window titles/tokens (finding 52).
+27-row checklist with PASS/FAIL per row, screenshots, config file diff per Apply. Redact paths/window titles/tokens (finding 52).
 
 ## Verdict
 

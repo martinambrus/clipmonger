@@ -14,6 +14,14 @@ reserved for the release that passes all seg-11 §5 gates.
 
 ### Fixed
 
+- UI text rendered as squares (tofu) on real displays: eframe's
+  `default-features = false` had dropped its embedded/system fonts.
+  Restored `default_fonts`/`system_fonts`; regression test pins it.
+  Found by the user on Ubuntu 24.04 during Step 6 closure.
+- Step 6 Ubuntu closure: `backup.create`/`backup.restore`/`logs.tail`
+  daemon arms wired (were `unknown_method`; restore reopens the store
+  in-process), seg-09 §1 popup viewport recipes (frameless/on-top)
+  implemented, Linux tray added via ksni (was degraded-only).
 - T-409 UAC matrix (PASS 11/11, Windows host): daemon hotkey could
   never fire (global-hotkey message pump + registration thread);
   helper supervisor panicked creating the Tokio pipe outside the

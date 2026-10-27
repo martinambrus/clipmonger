@@ -6,7 +6,10 @@ Source of truth for step detail: `plan.md` Steps.
 
 - Steps 1-4: DONE (foundation, UI pilot, Windows/X11/Wayland backends).
 - Step 5: CODE DONE (GNOME extension); manual legs pending.
-- Step 6: CODE DONE (UI v1 + permanents follow-up); manual legs pending.
+- Step 6: CODE DONE (UI v1 + permanents follow-up); Ubuntu automated
+  suites green on this box 2026-10-27 (app-ui 80/80); backup/logs arms,
+  viewport recipes, Linux ksni tray, and font regression closed;
+  manual legs T-905..T-908 still pending (user, real displays).
 - Step 7: release prep done on this box (release gate script, caps
   golden, `deny.toml`, changelog/notes drafts, `tests/manual/` scripts,
   dist-release zips + SHA256SUMS). Draft only: no tag/GitHub release.
