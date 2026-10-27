@@ -542,7 +542,7 @@ impl ShellApp {
         });
         for (name, ctrl, alt) in pressed {
             let editing = search_focused && !ctrl && !alt;
-            if editing && name != "Enter" && name != "Escape" && name != "F5" {
+            if editing && !popup::forwards_key_when_editing(&name) {
                 continue;
             }
             let event = keymap::KeyEvent::new(name, ctrl, alt, false);

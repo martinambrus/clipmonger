@@ -50,6 +50,25 @@ pub fn preview_kind(clip: &Clip) -> &'static str {
     }
 }
 
+/// Whether a special key reaches the view-model while the search field is
+/// being edited: navigation and commit keys forward, text-editing keys stay
+/// with the field (Delete there edits text, never soft-deletes a clip).
+#[must_use]
+pub fn forwards_key_when_editing(name: &str) -> bool {
+    matches!(
+        name,
+        "ArrowUp"
+            | "ArrowDown"
+            | "Home"
+            | "End"
+            | "PageUp"
+            | "PageDown"
+            | "Enter"
+            | "Escape"
+            | "F5"
+    )
+}
+
 /// Number of rows a page key moves the selection.
 const PAGE_ROWS: isize = 10;
 
