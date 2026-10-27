@@ -1106,7 +1106,7 @@ impl eframe::App for ShellApp {
         let focus_gained = focused && !self.was_focused;
         self.was_focused = focused;
         let size_mismatch = ui.ctx().input(|input| {
-            input.viewport().inner_rect.map_or(true, |rect| {
+            input.viewport().inner_rect.is_none_or(|rect| {
                 let (w, h) = placement::window_size_for(self.config_open);
                 #[allow(clippy::cast_precision_loss)]
                 let want = egui::vec2(w as f32, h as f32);
