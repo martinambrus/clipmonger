@@ -221,6 +221,7 @@ struct ShellApp {
     error: String,
     last_poll: Instant,
     config_open: bool,
+    config_focus_pending: bool,
     config_doc: Option<config_model::ConfigDoc>,
     config_filter: String,
     config_tab: String,
@@ -477,6 +478,7 @@ impl ShellApp {
             }
             tray_logic::TrayAction::OpenConfig => {
                 self.config_open = true;
+                self.config_focus_pending = true;
                 self.send(ipc_bridge::UiCmd::ConfigGet);
                 self.send(ipc_bridge::UiCmd::CapsGet);
                 self.send(ipc_bridge::UiCmd::ListPermanents);
@@ -484,6 +486,7 @@ impl ShellApp {
             }
             tray_logic::TrayAction::About => {
                 self.config_open = true;
+                self.config_focus_pending = true;
                 self.config_tab = "about".to_string();
                 self.send(ipc_bridge::UiCmd::CapsGet);
             }
@@ -582,12 +585,18 @@ impl ShellApp {
         #[allow(clippy::cast_precision_loss)]
         let cfg_size = egui::vec2(cfg_w as f32, cfg_h as f32);
         let mut close_child = false;
+        let config_viewport_id = egui::ViewportId::from_hash_of("clipmonger-config");
+        if self.config_focus_pending {
+            ctx.send_viewport_cmd_to(config_viewport_id, egui::ViewportCommand::Focus);
+            self.config_focus_pending = false;
+        }
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("clipmonger-config"),
+            config_viewport_id,
             egui::ViewportBuilder::default()
                 .with_title(strings::text("config.title"))
                 .with_inner_size(cfg_size)
-                .with_resizable(true),
+                .with_resizable(true)
+                .with_active(true),
             |ui, _class| {
                 if ui.ctx().input(|input| input.viewport().close_requested()) {
                     close_child = true;
@@ -620,6 +629,10 @@ impl ShellApp {
                             }
                         }
                     });
+                    if !self.config_error.is_empty() {
+                        ui.label(&self.config_error);
+                        ui.separator();
+                    }
                     if self.config_tab == "databases" {
                         ui.label(strings::text("config.profile_path"));
                         ui.label(self.profile.display().to_string());
@@ -842,9 +855,6 @@ impl ShellApp {
                                 do_revert = true;
                             }
                         });
-                        if !self.config_error.is_empty() {
-                            ui.label(&self.config_error);
-                        }
                     }
                     if theme_changed { /* handled after the viewport */ }
                 });
@@ -1148,6 +1158,7 @@ impl eframe::App for ShellApp {
             });
             if open_config {
                 self.config_open = true;
+                self.config_focus_pending = true;
                 self.send(ipc_bridge::UiCmd::ConfigGet);
                 self.send(ipc_bridge::UiCmd::CapsGet);
                 self.send(ipc_bridge::UiCmd::ListPermanents);
@@ -1217,6 +1228,7 @@ fn main() -> ExitCode {
         error: String::new(),
         last_poll: Instant::now(),
         config_open: false,
+        config_focus_pending: false,
         config_doc: None,
         config_filter: String::new(),
         config_tab: "History".to_string(),
