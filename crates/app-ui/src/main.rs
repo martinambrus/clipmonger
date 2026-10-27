@@ -593,7 +593,7 @@ impl ShellApp {
                     close_child = true;
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                egui::CentralPanel::default().show_inside(ui, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.config_filter)
                             .hint_text(strings::text("config.filter_hint")),
