@@ -240,6 +240,7 @@ struct ShellApp {
     perm_group_new: String,
     perm_confirm_delete: Option<uuid::Uuid>,
     viewport_corrected: bool,
+    window_config_sized: bool,
     #[cfg(any(windows, target_os = "macos"))]
     real_tray: Option<RealTray>,
     #[cfg(target_os = "linux")]
@@ -773,30 +774,32 @@ impl ShellApp {
                         ));
                         if row.key == "popup.hotkey" {}
                     }
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (key, kind, label, current, _dirty) in &rows {
-                            ui.label(label);
-                            if *kind == config_model::Kind::Bool {
-                                let mut flag = current == "true";
-                                if ui.checkbox(&mut flag, label.as_str()).changed() {
-                                    stage_edits.push((key.clone(), Value::Bool(flag)));
-                                }
-                            } else {
-                                let entry = self
-                                    .config_edits
-                                    .entry(key.clone())
-                                    .or_insert_with(|| current.clone());
-                                if ui.add(egui::TextEdit::singleline(entry)).changed() {
-                                    if let Some(value) = parse_edit(*kind, entry) {
-                                        stage_edits.push((key.clone(), value));
+                    egui::ScrollArea::vertical()
+                        .max_height(380.0)
+                        .show(ui, |ui| {
+                            for (key, kind, label, current, _dirty) in &rows {
+                                ui.label(label);
+                                if *kind == config_model::Kind::Bool {
+                                    let mut flag = current == "true";
+                                    if ui.checkbox(&mut flag, label.as_str()).changed() {
+                                        stage_edits.push((key.clone(), Value::Bool(flag)));
+                                    }
+                                } else {
+                                    let entry = self
+                                        .config_edits
+                                        .entry(key.clone())
+                                        .or_insert_with(|| current.clone());
+                                    if ui.add(egui::TextEdit::singleline(entry)).changed() {
+                                        if let Some(value) = parse_edit(*kind, entry) {
+                                            stage_edits.push((key.clone(), value));
+                                        }
                                     }
                                 }
+                                if key == "popup.hotkey" {
+                                    ui.label(strings::text("config.applies_on_restart"));
+                                }
                             }
-                            if key == "popup.hotkey" {
-                                ui.label(strings::text("config.applies_on_restart"));
-                            }
-                        }
-                    });
+                        });
                     let dirty = doc.dirty_keys();
                     ui.horizontal(|ui| {
                         if ui
@@ -1096,6 +1099,16 @@ impl eframe::App for ShellApp {
             egui::Visuals::light()
         });
         ui.ctx().set_pixels_per_point(self.font_scale);
+        if self.config_open != self.window_config_sized {
+            let (w, h) = placement::window_size_for(self.config_open);
+            #[allow(clippy::cast_precision_loss)]
+            let size = egui::vec2(w as f32, h as f32);
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Resizable(self.config_open));
+            self.window_config_sized = self.config_open;
+        }
         self.render_config(ui.ctx());
         if self.last_poll.elapsed() >= STATUS_PERIOD {
             self.last_poll = Instant::now();
@@ -1204,6 +1217,7 @@ fn main() -> ExitCode {
         perm_group_new: String::new(),
         perm_confirm_delete: None,
         viewport_corrected: false,
+        window_config_sized: false,
         #[cfg(any(windows, target_os = "macos"))]
         real_tray: match RealTray::create(&tray_logic::TrayInputs::default()) {
             Some(tray) => Some(tray),

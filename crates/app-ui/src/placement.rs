@@ -56,6 +56,23 @@ fn pick(cursor: (i32, i32), monitors: &[Rect]) -> Rect {
     best
 }
 
+/// Shell window size in the popup state.
+pub const POPUP_DEFAULT: (i32, i32) = (480, 360);
+
+/// Shell window size while the config window is open (seg-09 section 4:
+/// the maximalist config needs tabs, rows and Apply/Revert co-visible).
+pub const CONFIG_DEFAULT: (i32, i32) = (960, 680);
+
+/// Window size for the shell state: config open grows the one window.
+#[must_use]
+pub fn window_size_for(config_open: bool) -> (i32, i32) {
+    if config_open {
+        CONFIG_DEFAULT
+    } else {
+        POPUP_DEFAULT
+    }
+}
+
 /// Fallback monitor size used only when the runtime reports no monitor size.
 pub const FALLBACK_MONITOR_SIZE: (u32, u32) = (1920, 1080);
 
