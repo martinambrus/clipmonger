@@ -1,6 +1,6 @@
 {
   "autostart": false,
-  "extension_connected": true,
+  "extension_connected": false,
   "hotkey": {
     "level": "unavailable",
     "reason": "no backends in foundation skeleton"
@@ -10,7 +10,8 @@
     "reason": "no backends in foundation skeleton"
   },
   "notes": [
-    "no backends in foundation skeleton"
+    "no backends in foundation skeleton",
+    "gnome extension disconnected: paste unavailable"
   ],
   "paste": {
     "level": "unavailable",
