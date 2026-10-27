@@ -5,7 +5,7 @@
 // Pure modules must NOT import any of these.
 declare module 'gi://Gio?version=2.0' { const m: any; export default m; }
 declare module 'gi://GLib?version=2.0' { const m: any; export default m; }
-declare module 'gi://St?version=1.0' { const m: any; export default m; }
+declare module 'gi://St' { const m: any; export default m; }
 declare module 'gi://Gtk?version=4.0' { const m: any; export default m; }
 declare module 'gi://Adw?version=1' { const m: any; export default m; }
 declare module 'resource:///org/gnome/shell/ui/main.js' { export const wm: any; export function notify(title: string, body?: string): void; }

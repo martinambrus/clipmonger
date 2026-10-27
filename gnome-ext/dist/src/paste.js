@@ -1,5 +1,5 @@
 // Shell glue: paste-assist v1 = write clipboard + toast. No key injection.
-import St from 'gi://St?version=1.0';
+import St from 'gi://St';
 import { notify } from 'resource:///org/gnome/shell/ui/main.js';
 export class PasteAssist {
     capture;
