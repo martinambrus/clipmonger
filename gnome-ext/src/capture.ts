@@ -1,7 +1,7 @@
 // Shell glue: St.Clipboard 500 ms poll feeding PollDiff. Async reads only; a
 // wedged read degrades to capture-paused (3 failures) and never blocks Shell.
-import St from 'gi://St-1.0';
-import GLib from 'gi://GLib-2.0';
+import St from 'gi://St?version=1.0';
+import GLib from 'gi://GLib?version=2.0';
 import { PollDiff, type OfferInput } from './polddiff.js';
 import { base64Encode, captureReportRequest, blobPutRequests, newClipId, CHUNK_RAW_BYTES, type CaptureEvent } from './codec.js';
 import type { IpcClient } from './ipc.js';

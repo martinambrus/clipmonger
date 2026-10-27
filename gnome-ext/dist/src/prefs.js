@@ -1,7 +1,7 @@
 // Minimal Gtk4/Adw prefs: profile-dir + denylist fields.
 // VERIFY (T-702): Adw PreferencesPage/EntryRow API on GNOME 46-51.
-import Gtk from 'gi://Gtk-4.0';
-import Adw from 'gi://Adw-1';
+import Gtk from 'gi://Gtk?version=4.0';
+import Adw from 'gi://Adw?version=1';
 import { ExtensionPreferences } from 'resource:///org/gnome/shell/extensions/extension.js';
 export default class ClipmongerPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {

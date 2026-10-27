@@ -1,7 +1,7 @@
 // Shell glue: Gio Unix-socket client. Async only — never blocks the Shell main loop.
 // VERIFY (T-702): Gio.SocketClient/DataInputStream async shapes on GNOME 46-51.
-import Gio from 'gi://Gio-2.0';
-import GLib from 'gi://GLib-2.0';
+import Gio from 'gi://Gio?version=2.0';
+import GLib from 'gi://GLib?version=2.0';
 import {
   decodeEnvelope, encodeEnvelope, createIdGen, helloRequest, pingRequest,
   configGetRequest, eventsSubscribeRequest, type Envelope,
