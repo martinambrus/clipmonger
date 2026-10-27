@@ -222,6 +222,8 @@ struct ShellApp {
     last_poll: Instant,
     config_open: bool,
     config_focus_pending: u8,
+    config_child_was_focused: bool,
+    config_shuttle_pending: bool,
     config_doc: Option<config_model::ConfigDoc>,
     config_filter: String,
     config_tab: String,
@@ -586,6 +588,15 @@ impl ShellApp {
         let cfg_size = egui::vec2(cfg_w as f32, cfg_h as f32);
         let mut close_child = false;
         let config_viewport_id = egui::ViewportId::from_hash_of("clipmonger-config");
+        if ctx.input_for(config_viewport_id, |input| {
+            input.viewport().close_requested()
+        }) {
+            ctx.send_viewport_cmd_to(config_viewport_id, egui::ViewportCommand::Close);
+            self.config_open = false;
+            self.config_focus_pending = 0;
+            self.config_shuttle_pending = false;
+            return;
+        }
         if self.config_focus_pending > 0 {
             self.config_focus_pending -= 1;
             if self.config_focus_pending == 0 {
@@ -608,6 +619,15 @@ impl ShellApp {
                     close_child = true;
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+                let child_focused = ui
+                    .ctx()
+                    .input(|input| input.viewport().focused.unwrap_or(false));
+                if child_focused && !self.config_child_was_focused && !self.config_shuttle_pending {
+                    self.config_shuttle_pending = true;
+                    ui.ctx()
+                        .send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+                }
+                self.config_child_was_focused = child_focused;
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.add(
@@ -1129,6 +1149,18 @@ impl eframe::App for ShellApp {
             self.send(ipc_bridge::UiCmd::Stop);
         }
         self.drain_events();
+        if self.config_shuttle_pending {
+            let root_focused = ui
+                .ctx()
+                .input(|input| input.viewport().focused.unwrap_or(false));
+            if root_focused {
+                self.config_shuttle_pending = false;
+                ui.ctx().send_viewport_cmd_to(
+                    egui::ViewportId::from_hash_of("clipmonger-config"),
+                    egui::ViewportCommand::Focus,
+                );
+            }
+        }
         if self.exit_requested {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -1236,6 +1268,8 @@ fn main() -> ExitCode {
         last_poll: Instant::now(),
         config_open: false,
         config_focus_pending: 0,
+        config_child_was_focused: false,
+        config_shuttle_pending: false,
         config_doc: None,
         config_filter: String::new(),
         config_tab: "History".to_string(),
