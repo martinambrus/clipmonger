@@ -1,4 +1,4 @@
-//! Config window model: the 26 v1 rows, staged edits, validation.
+//! Config window model: the 27 v1 rows, staged edits, validation.
 
 use std::collections::HashMap;
 
@@ -61,7 +61,7 @@ pub struct Row {
     pub label: &'static str,
 }
 
-/// The exact 26 v1 rows in seg-03 S6 table order.
+/// The exact 27 v1 rows in seg-03 S6 table order.
 pub const ROWS: &[Row] = &[
     Row {
         key: "monitor.formats",
@@ -219,6 +219,12 @@ pub const ROWS: &[Row] = &[
         kind: Kind::Enum,
         label: "config.logging_level",
     },
+    Row {
+        key: "popup.delivery",
+        tab: Tab::Popup,
+        kind: Kind::Enum,
+        label: "config.popup_delivery",
+    },
 ];
 
 /// Row indices the config window renders for `tab` (P-F1): the
@@ -312,6 +318,15 @@ pub fn validate(key: &str, value: &Value) -> ValidateResult {
     ValidateResult(validate_inner(key, value))
 }
 
+fn enum_allowed(key: &str) -> &'static [&'static str] {
+    match key {
+        "popup.placement" => &["cursor", "center"],
+        "popup.delivery" => &["clipboard_restore", "unicode_inject"],
+        "logging.level" => &["trace", "debug", "info", "warn", "error"],
+        _ => &[],
+    }
+}
+
 fn validate_inner(key: &str, value: &Value) -> Result<(), String> {
     let row = row_for(key).ok_or_else(|| "config.unknown_key".to_string())?;
     match row.kind {
@@ -361,12 +376,7 @@ fn validate_inner(key: &str, value: &Value) -> Result<(), String> {
             let Some(text) = value.as_str() else {
                 return Err("config.invalid_type".to_string());
             };
-            let allowed: &[&str] = match key {
-                "popup.placement" => &["cursor", "center"],
-                "logging.level" => &["trace", "debug", "info", "warn", "error"],
-                _ => &[],
-            };
-            if allowed.contains(&text) {
+            if enum_allowed(key).contains(&text) {
                 Ok(())
             } else {
                 Err("config.invalid_enum".to_string())

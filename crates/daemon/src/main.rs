@@ -130,11 +130,54 @@ fn setup_windows_backend(
         }
     };
 
-    let mut hotkeys = WinHotkeys::new();
+    // The global-hotkey HWND lives on the thread that constructs the
+    // manager and only fires while that thread pumps messages, so
+    // construction + registration happen on the polling thread itself;
+    // its result is reported back before caps are computed.
+    let (hk_ready_tx, hk_ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    {
+        let shutdown = Arc::clone(shutdown);
+        let state = Arc::clone(state);
+        let chord = config.popup.hotkey.clone();
+        std::thread::spawn(move || {
+            let mut hotkeys = WinHotkeys::new();
+            let registered = hotkeys.register(HotkeyId(1), &chord);
+            let ok = registered.is_ok();
+            let _ = hk_ready_tx.send(registered.map_err(|e| e.to_string()));
+            if !ok {
+                return;
+            }
+            while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                match hotkeys.poll(std::time::Duration::from_millis(200)) {
+                    Ok(ids) => {
+                        for id in ids {
+                            // Gesture mint: hotkey/popup trigger path ONLY. The
+                            // token is never logged and never minted from the
+                            // generic paste.execute arm; the popup flow presents
+                            // it back within 30 s for elevated targets.
+                            state.mint_gesture_token();
+                            eprintln!("daemon: hotkey fired id={} (daemon-event only)", id.0);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("daemon: hotkey poll failed: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
     let mut hotkey_conflict = false;
-    if let Err(e) = hotkeys.register(HotkeyId(1), &config.popup.hotkey) {
-        eprintln!("daemon: popup hotkey unavailable: {e}");
-        hotkey_conflict = true;
+    match hk_ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("daemon: popup hotkey unavailable: {e}");
+            hotkey_conflict = true;
+        }
+        Err(e) => {
+            eprintln!("daemon: popup hotkey setup timed out/failed: {e}");
+            hotkey_conflict = true;
+        }
     }
 
     // Autostart handle for future UI wiring; never enabled at startup.
@@ -195,29 +238,6 @@ fn setup_windows_backend(
             }
         });
     }
-
-    let shutdown = Arc::clone(shutdown);
-    let state = Arc::clone(state);
-    std::thread::spawn(move || {
-        while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            match hotkeys.poll(std::time::Duration::from_millis(200)) {
-                Ok(ids) => {
-                    for id in ids {
-                        // Gesture mint: hotkey/popup trigger path ONLY. The
-                        // token is never logged and never minted from the
-                        // generic paste.execute arm; the popup flow presents
-                        // it back within 30 s for elevated targets.
-                        state.mint_gesture_token();
-                        eprintln!("daemon: hotkey fired id={} (daemon-event only)", id.0);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("daemon: hotkey poll failed: {e}");
-                    break;
-                }
-            }
-        }
-    });
 }
 
 /// Construct the live X11 backend: typed caps, monitor thread (real
@@ -642,8 +662,16 @@ fn run_elevated_worker(pipe_name: &str) -> i32 {
         };
         let outcome = (|| {
             let pinned = clipmonger_backend_windows::helper::pin_helper_target(job.target_pid)?;
-            clipmonger_backend_windows::paste::worker_send_input_batch(&job.payload)
-                .map_err(|detail| format!("inject failed: {detail}"))?;
+            match job.op {
+                clipmonger_backend_windows::helper::JobOp::SendInputBatch => {
+                    clipmonger_backend_windows::paste::worker_send_input_batch(&job.payload)
+                        .map_err(|detail| format!("inject failed: {detail}"))?;
+                }
+                clipmonger_backend_windows::helper::JobOp::PasteChord => {
+                    clipmonger_backend_windows::paste::worker_press_paste_chord()
+                        .map_err(|detail| format!("inject failed: {detail}"))?;
+                }
+            }
             let _ = pinned;
             Ok::<(), String>(())
         })();

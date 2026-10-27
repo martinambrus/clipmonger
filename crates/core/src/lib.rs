@@ -8,7 +8,7 @@ pub mod model;
 pub mod policy;
 pub mod store;
 
-pub use config::{AppPaths, Config};
+pub use config::{AppPaths, Config, PasteDelivery};
 pub use error::{BackendKind, CoreError};
 pub use store::{GcReport, InsertOutcome, PermGroup, Store};
 

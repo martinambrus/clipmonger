@@ -79,6 +79,17 @@ fn default_paste_chords() -> Vec<PasteChord> {
     }]
 }
 
+/// How a paste is delivered to its target.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PasteDelivery {
+    /// Write payloads to the clipboard, send Ctrl+V, then guarded-restore.
+    #[default]
+    ClipboardRestore,
+    /// Type the text as synthetic Unicode keystrokes.
+    UnicodeInject,
+}
+
 /// One paste chord binding.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PasteChord {
@@ -175,6 +186,8 @@ pub struct PopupConfig {
     pub unicode_limit: u64,
     #[serde(default = "default_delivery_dwell_ms")]
     pub delivery_dwell_ms: u64,
+    #[serde(default)]
+    pub delivery: PasteDelivery,
     /// Unknown keys preserved for forward compatibility.
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
@@ -191,6 +204,7 @@ impl Default for PopupConfig {
             paste_chords: default_paste_chords(),
             unicode_limit: default_unicode_limit(),
             delivery_dwell_ms: default_delivery_dwell_ms(),
+            delivery: PasteDelivery::default(),
             extra: BTreeMap::new(),
         }
     }
@@ -452,4 +466,44 @@ fn env_list(key: &str) -> Option<Vec<String>> {
             .map(ToString::to_string)
             .collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_defaults_to_clipboard_restore() {
+        assert_eq!(
+            Config::default().popup.delivery,
+            PasteDelivery::ClipboardRestore
+        );
+        assert_eq!(PasteDelivery::default(), PasteDelivery::ClipboardRestore);
+        let cfg: Config = toml::from_str("[popup]\n").unwrap();
+        assert_eq!(cfg.popup.delivery, PasteDelivery::ClipboardRestore);
+    }
+
+    #[test]
+    fn delivery_toml_roundtrip_both_variants() {
+        for (delivery, text) in [
+            (PasteDelivery::ClipboardRestore, "clipboard_restore"),
+            (PasteDelivery::UnicodeInject, "unicode_inject"),
+        ] {
+            let mut cfg = Config::default();
+            cfg.popup.delivery = delivery;
+            let rendered = toml::to_string(&cfg).unwrap();
+            assert!(
+                rendered.contains(&format!("delivery = \"{text}\"")),
+                "{rendered}"
+            );
+            let back: Config = toml::from_str(&rendered).unwrap();
+            assert_eq!(back.popup.delivery, delivery);
+        }
+    }
+
+    #[test]
+    fn delivery_unknown_value_is_config_error() {
+        let parsed: Result<Config, _> = toml::from_str("[popup]\ndelivery = \"bogus\"\n");
+        assert!(parsed.is_err());
+    }
 }

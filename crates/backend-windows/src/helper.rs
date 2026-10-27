@@ -27,6 +27,9 @@ pub const HEARTBEAT_DEAD_AFTER_MS: i64 = 45_000;
 pub enum JobOp {
     /// Inject the payload bytes as synthetic input into the pinned target.
     SendInputBatch,
+    /// Press Ctrl+V into the pinned target; the payload is empty and the
+    /// daemon owns the clipboard write (the helper stays input-only).
+    PasteChord,
 }
 
 /// One unit of elevated input work handed to the helper.
@@ -36,7 +39,7 @@ pub struct Job {
     pub job_id: u64,
     /// Target process id, revalidated per job by the helper.
     pub target_pid: u32,
-    /// Narrow op discriminant; only [`JobOp::SendInputBatch`] exists.
+    /// Narrow op discriminant (input injection or paste chord only).
     pub op: JobOp,
     /// Input bytes (UTF-8 text), at most [`MAX_PAYLOAD_BYTES`] bytes.
     pub payload: String,
@@ -333,12 +336,35 @@ impl Drop for PinnedTarget {
 /// process AND high-integrity, then pin it by open process HANDLE held
 /// across the injection. Anything else is a refusal, never blind input.
 ///
+/// The UAC secure-desktop switch can leave Windows with no foreground
+/// window for a short transition after consent. Wait briefly for the
+/// already-captured target to become foreground; do not relax the PID or
+/// integrity checks.
+///
 /// # Errors
 ///
-/// Returns a refusal message when there is no foreground window, the target
-/// is not foreground, is not high-integrity, or cannot be pinned.
+/// Returns the last refusal message when no foreground window settles on
+/// the target, the target is not high-integrity, or it cannot be pinned.
 #[cfg(windows)]
 pub fn pin_helper_target(target_pid: u32) -> Result<PinnedTarget, String> {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match try_pin_helper_target(target_pid) {
+            Ok(target) => return Ok(target),
+            Err(reason) => {
+                if Instant::now() >= deadline {
+                    return Err(reason);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(windows)]
+fn try_pin_helper_target(target_pid: u32) -> Result<PinnedTarget, String> {
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     let hwnd =
         crate::sys::foreground_hwnd().ok_or_else(|| "refused: no foreground window".to_string())?;
@@ -356,4 +382,37 @@ pub fn pin_helper_target(target_pid: u32) -> Result<PinnedTarget, String> {
         return Err("refused: cannot pin target process".to_string());
     }
     Ok(PinnedTarget { pid, handle })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paste_chord_job_roundtrips_with_empty_payload() {
+        let job = Job {
+            job_id: 7,
+            target_pid: 42,
+            op: JobOp::PasteChord,
+            payload: String::new(),
+        };
+        let line = encode_job(&job).unwrap();
+        let back = decode_job(&line).unwrap();
+        assert_eq!(back, job);
+        assert_eq!(back.op, JobOp::PasteChord);
+        assert_eq!(back.payload, "");
+    }
+
+    #[test]
+    fn send_input_batch_wire_unchanged() {
+        let job = Job {
+            job_id: 1,
+            target_pid: 2,
+            op: JobOp::SendInputBatch,
+            payload: "hi".to_string(),
+        };
+        let line = encode_job(&job).unwrap();
+        assert!(line.contains("\"SendInputBatch\""), "{line}");
+        assert_eq!(decode_job(&line).unwrap(), job);
+    }
 }

@@ -156,7 +156,9 @@ pub struct HelperSupervisor {
 struct SupervisorJob {
     /// Validated high-integrity target process id.
     target_pid: u32,
-    /// Input text bytes (UTF-8).
+    /// Helper operation (text injection or paste chord).
+    op: clipmonger_backend_windows::helper::JobOp,
+    /// Input text bytes (UTF-8); empty for a paste-chord job.
     payload: String,
     /// Outcome channel back to the IPC handler.
     reply: std::sync::mpsc::Sender<Result<(), String>>,
@@ -300,50 +302,39 @@ fn supervisor_thread(
         r"\\.\pipe\clipmonger-help-{}",
         clipmonger_backend_windows::helper::random_pipe_segment()
     );
-    let listener = match ServerOptions::new()
-        .first_pipe_instance(true)
-        .reject_remote_clients(true)
-        .pipe_mode(PipeMode::Byte)
-        .create(&pipe_name)
-    {
-        Ok(listener) => listener,
-        Err(e) => {
-            fail_all(
-                &jobs,
-                &format!("elevation refused: helper pipe failed: {e}"),
-            );
-            return;
-        }
-    };
-    append_audit(
-        &profile,
-        serde_json::json!({"kind": "helper", "action": "spawn", "result": "runas prompt"}),
-    );
-    if let Err(e) =
-        clipmonger_backend_windows::spawn_elevated_worker(&exe.to_string_lossy(), &pipe_name)
-    {
-        fail_all(
-            &jobs,
-            &format!("elevation refused: helper spawn refused: {e}"),
+    // Listener creation registers with the Tokio reactor, so it must run
+    // inside the runtime context (creating it outside panics the thread).
+    let spawn_profile = profile.clone();
+    let exe_for_spawn = exe.clone();
+    let server = match runtime.block_on(async move {
+        let listener = match ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .pipe_mode(PipeMode::Byte)
+            .create(&pipe_name)
+        {
+            Ok(listener) => listener,
+            Err(e) => return Err(format!("elevation refused: helper pipe failed: {e}")),
+        };
+        append_audit(
+            &spawn_profile,
+            serde_json::json!({"kind": "helper", "action": "spawn", "result": "runas prompt"}),
         );
-        return;
-    }
-    let server = match runtime.block_on(async {
-        tokio::time::timeout(std::time::Duration::from_secs(90), listener.connect()).await
-    }) {
-        Ok(Ok(())) => listener,
-        Ok(Err(e)) => {
-            fail_all(
-                &jobs,
-                &format!("elevation refused: helper connect failed: {e}"),
-            );
-            return;
+        if let Err(e) = clipmonger_backend_windows::spawn_elevated_worker(
+            &exe_for_spawn.to_string_lossy(),
+            &pipe_name,
+        ) {
+            return Err(format!("elevation refused: helper spawn refused: {e}"));
         }
-        Err(_) => {
-            fail_all(
-                &jobs,
-                "elevation refused: helper connect timed out (UAC consent?)",
-            );
+        match tokio::time::timeout(std::time::Duration::from_secs(90), listener.connect()).await {
+            Ok(Ok(())) => Ok(listener),
+            Ok(Err(e)) => Err(format!("elevation refused: helper connect failed: {e}")),
+            Err(_) => Err("elevation refused: helper connect timed out (UAC consent?)".to_string()),
+        }
+    }) {
+        Ok(server) => server,
+        Err(message) => {
+            fail_all(&jobs, &message);
             return;
         }
     };
@@ -366,7 +357,7 @@ fn supervisor_thread(
                     &clipmonger_backend_windows::helper::Job {
                         job_id: 1,
                         target_pid: job.target_pid,
-                        op: clipmonger_backend_windows::helper::JobOp::SendInputBatch,
+                        op: job.op,
                         payload: job.payload.clone(),
                     },
                 ) {
@@ -386,32 +377,47 @@ fn supervisor_thread(
                     {
                         return Err("helper write timed out".to_string());
                     }
-                    let mut result_line = String::new();
-                    if tokio::time::timeout(
-                        std::time::Duration::from_secs(120),
-                        reader.read_line(&mut result_line),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return Err("helper result timed out".to_string());
-                    }
-                    match serde_json::from_str::<Value>(&result_line) {
-                        Ok(value) if value.get("heartbeat").is_some() => {
-                            Ok("heartbeat".to_string())
+                    let deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+                    loop {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            return Err("helper result timed out".to_string());
                         }
-                        Ok(value) => {
-                            if value.get("ok").and_then(Value::as_bool) == Some(true) {
-                                Ok(String::new())
-                            } else {
-                                Err(value
+                        let mut result_line = String::new();
+                        let read = match tokio::time::timeout(
+                            remaining,
+                            reader.read_line(&mut result_line),
+                        )
+                        .await
+                        {
+                            Ok(read) => read,
+                            Err(_) => return Err("helper result timed out".to_string()),
+                        };
+                        let bytes = match read {
+                            Ok(bytes) => bytes,
+                            Err(_) => return Err("helper result unreadable".to_string()),
+                        };
+                        if bytes == 0 {
+                            return Err("helper result unreadable".to_string());
+                        }
+                        match serde_json::from_str::<Value>(&result_line) {
+                            // Heartbeats share the result stream; they prove
+                            // liveness but are not this job's result.
+                            Ok(value) if value.get("heartbeat").is_some() => continue,
+                            Ok(value) => {
+                                if value.get("ok").and_then(Value::as_bool) == Some(true) {
+                                    return Ok(String::new());
+                                }
+                                return Err(value
                                     .get("error")
                                     .and_then(Value::as_str)
                                     .unwrap_or("helper refused")
-                                    .to_string())
+                                    .to_string());
                             }
+                            Err(_) => return Err("helper result unreadable".to_string()),
                         }
-                        Err(_) => Err("helper result unreadable".to_string()),
                     }
                 });
                 match &outcome {
@@ -446,8 +452,13 @@ fn supervisor_thread(
                                 "result": message,
                             }),
                         );
-                        let _ = job.reply.send(Err(message));
-                        return;
+                        let _ = job.reply.send(Err(message.clone()));
+                        // A helper-returned refusal (for example, the target
+                        // was not foreground) ends only this job. Pipe I/O
+                        // and protocol failures are fatal to the link.
+                        if message.contains("timed out") || message.contains("unreadable") {
+                            return;
+                        }
                     }
                 }
                 missed = 0;
@@ -599,6 +610,17 @@ impl CapsAggregator {
     pub fn register_backend(&self, name: &str, caps: BackendCaps) {
         if let Ok(mut backends) = self.backends.lock() {
             backends.insert(name.to_string(), caps);
+        }
+    }
+
+    /// Update one registered backend's paste strategy in place.
+    pub fn set_paste_strategy(&self, name: &str, strategy: PasteStrategy) {
+        if let Ok(mut backends) = self.backends.lock() {
+            if let Some(caps) = backends.get_mut(name) {
+                if caps.paste.strategy != PasteStrategy::ElevatedRoute {
+                    caps.paste.strategy = strategy;
+                }
+            }
         }
     }
 
@@ -1378,8 +1400,23 @@ impl DaemonState {
         snapshot
     }
 
-    /// Typed backend snapshot for live backends (WIN-F3).
-    pub fn register_backend(&self, name: &str, caps: BackendCaps) {
+    /// Typed backend snapshot for live backends (WIN-F3). For the Windows
+    /// backend, a configured clipboard-restore delivery is reflected in
+    /// the reported paste strategy.
+    pub fn register_backend(&self, name: &str, mut caps: BackendCaps) {
+        if name == "windows" {
+            let delivery = self
+                .config
+                .lock()
+                .map_or(clipmonger_core::PasteDelivery::ClipboardRestore, |c| {
+                    c.popup.delivery
+                });
+            if delivery == clipmonger_core::PasteDelivery::ClipboardRestore
+                && caps.paste.strategy != PasteStrategy::ElevatedRoute
+            {
+                caps.paste.strategy = PasteStrategy::ClipboardRestore;
+            }
+        }
         self.caps.register_backend(name, caps);
     }
 
@@ -1390,12 +1427,21 @@ impl DaemonState {
         }
     }
 
-    /// Current paste delivery budget.
+    /// Current paste delivery budget; delivery is read live from the
+    /// stored config so UI changes apply without a restart.
     #[cfg_attr(not(all(windows, feature = "backend-windows")), allow(dead_code))]
-    fn paste_budget(&self) -> (u64, u64) {
-        self.paste_limits
+    fn paste_budget(&self) -> (u64, u64, clipmonger_core::PasteDelivery) {
+        let (unicode_limit, dwell_ms) = self
+            .paste_limits
             .lock()
-            .map_or((65536, 1000), |limits| *limits)
+            .map_or((65536, 1000), |limits| *limits);
+        let delivery = self
+            .config
+            .lock()
+            .map_or(clipmonger_core::PasteDelivery::ClipboardRestore, |config| {
+                config.popup.delivery
+            });
+        (unicode_limit, dwell_ms, delivery)
     }
 
     /// Mark a portal shortcut bind as outstanding or settled (W-F4).
@@ -1744,6 +1790,13 @@ impl DaemonState {
             .save(&profile.join("config.toml"))
             .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
         self.set_paste_limits(updated.popup.unicode_limit, updated.popup.delivery_dwell_ms);
+        self.caps.set_paste_strategy(
+            "windows",
+            match updated.popup.delivery {
+                clipmonger_core::PasteDelivery::ClipboardRestore => PasteStrategy::ClipboardRestore,
+                clipmonger_core::PasteDelivery::UnicodeInject => PasteStrategy::UnicodeInject,
+            },
+        );
         Ok(serde_json::json!({"ok": true}))
     }
 
@@ -1917,11 +1970,12 @@ impl DaemonState {
         {
             use clipmonger_backend_windows::Integrity;
             use clipmonger_platform::traits::PasteEngine as _;
-            let (unicode_limit, dwell_ms) = self.paste_budget();
+            let (unicode_limit, dwell_ms, delivery) = self.paste_budget();
             let paste = clipmonger_backend_windows::WinPaste::new(
                 usize::try_from(unicode_limit).unwrap_or(65536),
             )
-            .with_dwell_ms(dwell_ms);
+            .with_dwell_ms(dwell_ms)
+            .with_clipboard_first(delivery == clipmonger_core::PasteDelivery::ClipboardRestore);
             let target = paste
                 .capture_target()
                 .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
@@ -2006,6 +2060,22 @@ impl DaemonState {
                 "paste.execute: helper route cannot resolve target".to_string(),
             )
         })?;
+        let (_, dwell_ms, delivery) = self.paste_budget();
+        if delivery == clipmonger_core::PasteDelivery::ClipboardRestore {
+            // The daemon (medium integrity) owns the clipboard write; the
+            // helper only presses Ctrl+V. Swap BEFORE ensure_link/job.
+            let swap = clipmonger_backend_windows::paste::ClipboardSwap::begin(payloads)
+                .map_err(|e| IpcError::new("backend", format!("paste.execute: {e}")))?;
+            let outcome = self.send_helper_job(
+                target,
+                pid,
+                clipmonger_backend_windows::helper::JobOp::PasteChord,
+                String::new(),
+            );
+            // If the chord never fired, restoring immediately is correct.
+            swap.finish(if outcome.is_ok() { dwell_ms } else { 0 });
+            return outcome;
+        }
         let text = payloads
             .iter()
             .find(|(mime, _)| mime == "text/plain")
@@ -2017,6 +2087,23 @@ impl DaemonState {
                 "paste.execute: helper route needs UTF-8 text".to_string(),
             )
         })?;
+        self.send_helper_job(
+            target,
+            pid,
+            clipmonger_backend_windows::helper::JobOp::SendInputBatch,
+            payload,
+        )
+    }
+
+    /// Hand one job to the supervisor thread and wait bounded for its result.
+    #[cfg(all(windows, feature = "backend-windows"))]
+    fn send_helper_job(
+        &self,
+        target: &clipmonger_platform::types::PasteTarget,
+        pid: u32,
+        op: clipmonger_backend_windows::helper::JobOp,
+        payload: String,
+    ) -> Result<Value, IpcError> {
         let profile = self
             .profile_dir
             .lock()
@@ -2034,6 +2121,7 @@ impl DaemonState {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let job = SupervisorJob {
             target_pid: pid,
+            op,
             payload,
             reply: reply_tx,
         };
