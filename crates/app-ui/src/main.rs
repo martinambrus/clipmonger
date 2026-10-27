@@ -241,6 +241,7 @@ struct ShellApp {
     perm_confirm_delete: Option<uuid::Uuid>,
     viewport_corrected: bool,
     window_config_sized: bool,
+    was_focused: bool,
     #[cfg(any(windows, target_os = "macos"))]
     real_tray: Option<RealTray>,
     #[cfg(target_os = "linux")]
@@ -1099,7 +1100,12 @@ impl eframe::App for ShellApp {
             egui::Visuals::light()
         });
         ui.ctx().set_pixels_per_point(self.font_scale);
-        if self.config_open != self.window_config_sized {
+        let focused = ui
+            .ctx()
+            .input(|input| input.viewport().focused.unwrap_or(true));
+        let focus_gained = focused && !self.was_focused;
+        self.was_focused = focused;
+        if self.config_open != self.window_config_sized || focus_gained {
             let (w, h) = placement::window_size_for(self.config_open);
             #[allow(clippy::cast_precision_loss)]
             let size = egui::vec2(w as f32, h as f32);
@@ -1218,6 +1224,7 @@ fn main() -> ExitCode {
         perm_confirm_delete: None,
         viewport_corrected: false,
         window_config_sized: false,
+        was_focused: true,
         #[cfg(any(windows, target_os = "macos"))]
         real_tray: match RealTray::create(&tray_logic::TrayInputs::default()) {
             Some(tray) => Some(tray),
