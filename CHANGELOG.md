@@ -22,6 +22,11 @@ reserved for the release that passes all seg-11 §5 gates.
   daemon arms wired (were `unknown_method`; restore reopens the store
   in-process), seg-09 §1 popup viewport recipes (frameless/on-top)
   implemented, Linux tray added via ksni (was degraded-only).
+- Joint manual QA fixes (Ubuntu, user-verified): copied text from X11
+  (`text/plain;charset=utf-8`) no longer stores blank previews; arrow
+  keys navigate while the popup search box has focus; Settings window
+  is a deferred viewport (input/repaint independent of the popup) with
+  a working native close button and status visible on every tab.
 - T-409 UAC matrix (PASS 11/11, Windows host): daemon hotkey could
   never fire (global-hotkey message pump + registration thread);
   helper supervisor panicked creating the Tokio pipe outside the

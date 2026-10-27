@@ -170,9 +170,16 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   daemon arms wired (d232f9a, store reopened in-process on restore),
   seg-09 §1 popup viewport recipes implemented (952cf74), Linux ksni
   tray added (b81aa19, ksni 0.3.7), tofu-squares font regression fixed
-  (c94d6d3, eframe default_fonts/system_fonts restored). Open:
-  T-905…908 manual matrix (user legs on real displays; T-906 script
-  corrected 26→27 rows).
+  (c94d6d3, eframe default_fonts/system_fonts restored). Joint
+  manual session 2026-10-27 (user hands, agent shell): charset-MIME
+  blank clips (e09bc4c), search-focus arrows (fd677f3), settings
+  deferred viewport + close (624078c, e324027) all user-verified;
+  T-906 walk PASS with findings, T-907 popup leg PASS, T-908 safety
+  leg PASS (delivery = extension/Xorg round), T-905 GNOME row
+  frameless PASS / on-top+placement platform-limited on Wayland.
+  Open: logout round (GNOME extension enable; Xorg session rows),
+  T-905 fullscreen/scale rows, signoff filing. T-906 script
+  corrected 26→27 rows.
   Permanents follow-up (DONE 2026-10-27): store CRUD + groups
   (perm_groups authoritative, no migration), permanent.* IPC +
   exec (Paste kind, shared paste path; X11 honest unavailable),
