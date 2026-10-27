@@ -24,7 +24,7 @@ clipmonger-ipc = { path = "../ipc" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 uuid = { version = "1.28", features = ["v7", "serde"] }
-eframe = { version = "0.37", optional = true, default-features = false, features = ["glow", "x11", "wayland"] }
+eframe = { version = "0.37", optional = true, default-features = false, features = ["glow", "x11", "wayland", "default_fonts", "system_fonts"] }
 egui = { version = "0.37", optional = true }
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
