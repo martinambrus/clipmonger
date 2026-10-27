@@ -26,6 +26,19 @@ const DRAIN_CAP: usize = 32;
 /// Popup window size.
 const POPUP_SIZE: (i32, i32) = (480, 360);
 
+/// Popup position from the runtime monitor size, if reported yet.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn popup_position_for_monitor(monitor_size: Option<egui::Vec2>) -> Option<egui::Pos2> {
+    let size = monitor_size?;
+    let monitor = placement::monitor_rect_from_size(Some((size.x as u32, size.y as u32)));
+    let (px, py) = placement::place(placement::Placement::Center, (0, 0), &[monitor], POPUP_SIZE);
+    Some(egui::pos2(px as f32, py as f32))
+}
+
 /// Blocking client wrapped as bridge transport.
 struct ClientTransport {
     client: Client,
@@ -195,6 +208,7 @@ impl RealTray {
 }
 
 /// Popup application state.
+#[allow(clippy::struct_excessive_bools)]
 struct ShellApp {
     vm: popup::PopupVm,
     cmds: mpsc::Sender<ipc_bridge::UiCmd>,
@@ -224,6 +238,7 @@ struct ShellApp {
     perm_source: Option<usize>,
     perm_group_new: String,
     perm_confirm_delete: Option<uuid::Uuid>,
+    viewport_corrected: bool,
     #[cfg(any(windows, target_os = "macos"))]
     real_tray: Option<RealTray>,
 }
@@ -1049,6 +1064,14 @@ impl ShellApp {
 
 impl eframe::App for ShellApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if !self.viewport_corrected {
+            let monitor_size = ui.ctx().input(|input| input.viewport().monitor_size);
+            if let Some(pos) = popup_position_for_monitor(monitor_size) {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                self.viewport_corrected = true;
+            }
+        }
         if ui.ctx().input(|input| input.viewport().close_requested()) {
             self.send(ipc_bridge::UiCmd::Stop);
         }
@@ -1124,17 +1147,17 @@ fn main() -> ExitCode {
     let _ = cmds.send(ipc_bridge::UiCmd::ListHistory);
     let _ = cmds.send(ipc_bridge::UiCmd::ListPermanents);
     let _ = cmds.send(ipc_bridge::UiCmd::PermGroups);
-    let monitor = placement::Rect {
-        x: 0,
-        y: 0,
-        w: 1920,
-        h: 1080,
-    };
+    let monitor = placement::monitor_rect_from_size(None);
     let (px, py) = placement::place(placement::Placement::Center, (0, 0), &[monitor], POPUP_SIZE);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([POPUP_SIZE.0 as f32, POPUP_SIZE.1 as f32])
-            .with_position(egui::pos2(px as f32, py as f32)),
+            .with_position(egui::pos2(px as f32, py as f32))
+            .with_decorations(false)
+            .with_window_level(egui::WindowLevel::AlwaysOnTop)
+            .with_taskbar(false)
+            .with_active(true)
+            .with_resizable(false),
         ..Default::default()
     };
     let mut vm = popup::PopupVm::new();
@@ -1172,6 +1195,7 @@ fn main() -> ExitCode {
         perm_source: None,
         perm_group_new: String::new(),
         perm_confirm_delete: None,
+        viewport_corrected: false,
         #[cfg(any(windows, target_os = "macos"))]
         real_tray: match RealTray::create(&tray_logic::TrayInputs::default()) {
             Some(tray) => Some(tray),

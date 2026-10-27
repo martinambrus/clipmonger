@@ -56,6 +56,24 @@ fn pick(cursor: (i32, i32), monitors: &[Rect]) -> Rect {
     best
 }
 
+/// Fallback monitor size used only when the runtime reports no monitor size.
+pub const FALLBACK_MONITOR_SIZE: (u32, u32) = (1920, 1080);
+
+/// Map the runtime monitor size to the placement monitor rectangle.
+///
+/// Falls back to 1920x1080 at the origin only when the size is unknown
+/// (`None`); a reported size is used as-is.
+#[must_use]
+pub fn monitor_rect_from_size(monitor_size: Option<(u32, u32)>) -> Rect {
+    let (w, h) = monitor_size.unwrap_or(FALLBACK_MONITOR_SIZE);
+    Rect {
+        x: 0,
+        y: 0,
+        w: i32::try_from(w).unwrap_or(i32::MAX),
+        h: i32::try_from(h).unwrap_or(i32::MAX),
+    }
+}
+
 /// Compute the popup top-left so it fits fully inside the monitor.
 #[must_use]
 pub fn place(

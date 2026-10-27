@@ -473,6 +473,41 @@ fn t903_place_empty_monitors_and_oversized() {
 }
 
 // ---------------------------------------------------------------------------
+// t905_*: popup monitor rect from runtime monitor size (T-905, seg-09 §1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t905_monitor_rect_falls_back_only_when_size_unknown() {
+    assert_eq!(
+        placement::monitor_rect_from_size(None),
+        placement::Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080
+        }
+    );
+    assert_eq!(
+        placement::monitor_rect_from_size(Some((2560, 1440))),
+        placement::Rect {
+            x: 0,
+            y: 0,
+            w: 2560,
+            h: 1440
+        }
+    );
+    assert_eq!(
+        placement::monitor_rect_from_size(Some((1920, 1080))),
+        placement::Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------
 // t909_*: settings-coverage matrix (T-909) + ConfigDoc behaviour
 // ---------------------------------------------------------------------------
 
