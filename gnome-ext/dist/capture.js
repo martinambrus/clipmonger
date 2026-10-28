@@ -7,6 +7,7 @@ export class CaptureRelay {
     timer = null;
     diff;
     ipc;
+    loggedFirstRead = false;
     pollMs;
     constructor(ipc, diff, pollMs = 500) { this.ipc = ipc; this.diff = diff; this.pollMs = pollMs; }
     setPollMs(ms) { this.pollMs = ms; }
@@ -36,14 +37,21 @@ export class CaptureRelay {
             const offers = [];
             for (const mime of mimes) {
                 if (mime.startsWith('text/plain') || mime === 'UTF8_STRING') {
-                    // A get_text callback that never fires must not wedge isReading.
+                    // get_text may answer via callback or via a returned promise,
+                    // depending on Shell version; a callback that never fires must
+                    // not wedge isReading.
                     const text = await new Promise((resolve) => {
                         const timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => { resolve(''); return GLib.SOURCE_REMOVE; });
-                        clipboard.get_text(St.ClipboardType.CLIPBOARD, (_c, t) => {
-                            GLib.source_remove(timer);
-                            resolve(t ?? '');
-                        });
+                        const done = (t) => { GLib.source_remove(timer); resolve(t ?? ''); };
+                        const returned = clipboard.get_text(St.ClipboardType.CLIPBOARD, (_c, t) => done(t));
+                        if (returned && typeof returned.then === 'function') {
+                            returned.then(done, () => done(''));
+                        }
                     });
+                    if (!this.loggedFirstRead) {
+                        this.loggedFirstRead = true;
+                        console.log(`clipmonger: clipboard read ok (${mimes.length} mimes, text=${text.length} chars)`);
+                    }
                     if (text)
                         offers.push({ mime: 'text/plain', bytes: new TextEncoder().encode(text) });
                 }
