@@ -31,4 +31,4 @@ all = "warn"
 pedantic = "warn"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "warn"

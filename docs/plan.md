@@ -82,7 +82,9 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   CLI daemon-down path run on the Windows host via WSL interop.
   Deferred inside step: T-304 (v2 macrolib, D-F6), T-209 full lifecycle
   matrix + T-205/T-211 Windows legs (native runner, Step 2), image
-  pixel-decode hashing (D-F4 note). Freeze decisions D-F1…F23 in
+  pixel-decode hashing (D-F4 note). Freeze decisions D-F1…F24 (D-024
+  `Win32` CPU fallback unified — `fallback.rs` reuses `PopupVm`, no
+  `GPU`/`OpenGL`, `RustDesk`/`RDP`/`headless` OK) in
   `.agents/tmp/foundation-v1/ledger.md`.
 - **1b. UI shell pilot. (DONE 2026-10-26, WSL)** Popup/tray/lifecycle against fakes + real IPC
   (validates paste-target behavior before backend paste exists). Seg-09
@@ -91,8 +93,11 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   lifecycle/IPC-bridge/tray logic + glow eframe shell); 26 acceptance
   tests (T-901/902/903/904-logic/910) pass both feature modes with
   DISPLAY unset; workspace 150 tests green; windows-gnu check clean.
-  Deferred: T-905 window matrix (needs real displays), wgpu renderer
-  (glow pilot, U-F2), tray Paused variant (U-F5), daemon search wiring
+  Deferred: T-905 window matrix (needs real displays), `wgpu` renderer
+  (`glow` pilot, U-F2; `D-024` `Win32` CPU fallback now ships on Windows
+  via `fallback.rs` — `PopupVm` reused, no `GPU`/`OpenGL`, `RustDesk`/`RDP`
+  OK; `egui` `glow` remains on real displays, `wgpu` still deferred),
+  tray Paused variant (U-F5), daemon search wiring
   (U-F8) — all Step 6 / backend steps.
   Manual evidence 2026-10-26: Windows window-open test PASSED (user-run
   clipmonger.exe on Win host: opens, stays, renders empty popup; offline

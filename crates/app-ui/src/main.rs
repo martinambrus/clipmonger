@@ -15,6 +15,8 @@ use clipmonger_ipc::framing;
 use clipmonger_ipc::proto::IpcError;
 use clipmonger_platform::fakes::FakeTray;
 use serde_json::Value;
+#[cfg(all(windows, feature = "software"))]
+mod fallback;
 
 /// Status re-poll period.
 const STATUS_PERIOD: Duration = Duration::from_secs(30);
@@ -1362,10 +1364,28 @@ fn main() -> ExitCode {
         #[cfg(target_os = "linux")]
         linux_tray: linux_tray::LinuxTray::spawn(&initial_inputs),
     };
-    match eframe::run_native("clipmonger", options, Box::new(|_| Ok(Box::new(app)))) {
+    let eframe_res = eframe::run_native("clipmonger", options, Box::new(|_| Ok(Box::new(app))));
+    match eframe_res {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("shell failed: {error}");
+            #[cfg(all(windows, feature = "software"))]
+            {
+                let msg = error.to_string();
+                if msg.contains("opengl") || msg.contains("OpenGL") || msg.contains("glow") {
+                    eprintln!("eframe glow unavailable (virtual display), falling back to softbuffer (CPU)");
+                    let fb_transport: Box<dyn ipc_bridge::Transport> = match try_connect(&profile) {
+                        Some(c) => Box::new(ClientTransport { client: c }),
+                        None => Box::new(OfflineTransport),
+                    };
+                    let fallback_cfg =
+                        Arc::new(Mutex::new(ConfigWindowState::new(profile.clone())));
+                    let (f_cmds, f_events) = ipc_bridge::Bridge::spawn(fb_transport);
+                    let _ = f_cmds.send(ipc_bridge::UiCmd::Status);
+                    let _ = f_cmds.send(ipc_bridge::UiCmd::ListHistory);
+                    return fallback::run_fallback(f_cmds, f_events, fallback_cfg);
+                }
+            }
             ExitCode::from(1)
         }
     }

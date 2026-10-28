@@ -1,0 +1,580 @@
+#![allow(unsafe_code)]
+use crate::{ipc_bridge, popup, strings};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
+use windows::core::w;
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, RegisterClassW,
+    SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE,
+    ES_AUTOHSCROLL, HMENU, LBN_DBLCLK, LBN_SELCHANGE, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_SETFOCUS, WM_SIZE, WM_TIMER,
+    WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+};
+const POPUP_SIZE: (u32, u32) = (480, 360);
+const IDC_SEARCH: i32 = 101;
+const IDC_LIST: i32 = 102;
+const IDC_STATUS: i32 = 103;
+const TIMER_IPC: usize = 1;
+struct PopupState {
+    vm: popup::PopupVm,
+    cmds: mpsc::Sender<ipc_bridge::UiCmd>,
+    events: mpsc::Receiver<ipc_bridge::UiEvent>,
+    config: Arc<Mutex<crate::ConfigWindowState>>,
+    hwnd_search: HWND,
+    hwnd_list: HWND,
+    hwnd_status: HWND,
+    last_poll: Instant,
+    should_exit: bool,
+}
+static mut G_STATE: Option<*mut PopupState> = None;
+static mut G_ORIG_EDIT: isize = 0;
+static mut G_ORIG_LIST: isize = 0;
+unsafe extern "system" fn edit_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_KEYDOWN {
+        let vk = wparam.0 as i32;
+        if matches!(vk, 0x26 | 0x28 | 0x1B | 0x0D | 0x2E) {
+            if let Some(ptr) = G_STATE {
+                let state = &mut *ptr;
+                match vk {
+                    0x1B => {
+                        let par = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd)
+                            .unwrap_or(HWND(std::ptr::null_mut()));
+                        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                            Some(par),
+                            WM_CLOSE,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                        return LRESULT(0);
+                    }
+                    0x26 => {
+                        if state.vm.selected > 0 {
+                            state.vm.selected -= 1;
+                            sync_selection(state);
+                        }
+                        return LRESULT(0);
+                    }
+                    0x28 => {
+                        let len = state.vm.visible().len();
+                        if state.vm.selected + 1 < len {
+                            state.vm.selected += 1;
+                            sync_selection(state);
+                        }
+                        return LRESULT(0);
+                    }
+                    0x0D => {
+                        // Sync from listbox sel before paste (in case vm.selected stale after blur)
+                        let list_sel = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                            state.hwnd_list,
+                            windows::Win32::UI::WindowsAndMessaging::LB_GETCURSEL,
+                            Some(WPARAM(0)),
+                            Some(LPARAM(0)),
+                        );
+                        if list_sel.0 >= 0 {
+                            let vis_len = state.vm.visible().len();
+                            if (list_sel.0 as usize) < vis_len {
+                                state.vm.selected = list_sel.0 as usize;
+                            }
+                        }
+                        do_paste(state);
+                        return LRESULT(0);
+                    }
+                    0x2E => {
+                        if let Some(c) = state.vm.clip_at(state.vm.selected) {
+                            let id = c.id;
+                            let _ = state.cmds.send(crate::ipc_bridge::UiCmd::DeleteClip(id));
+                        }
+                        return LRESULT(0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    windows::Win32::UI::WindowsAndMessaging::CallWindowProcW(
+        std::mem::transmute(G_ORIG_EDIT),
+        hwnd,
+        msg,
+        wparam,
+        lparam,
+    )
+}
+unsafe extern "system" fn list_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_KEYDOWN {
+        let vk = wparam.0 as i32;
+        if vk == 0x1B {
+            let par = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd).unwrap_or(hwnd);
+            windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(par),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+            return LRESULT(0);
+        }
+        if vk == 0x0D {
+            if let Some(ptr) = G_STATE {
+                let state = &mut *ptr;
+                do_paste(state);
+                return LRESULT(0);
+            }
+        }
+        if vk == 0x2E {
+            if let Some(ptr) = G_STATE {
+                let state = &mut *ptr;
+                if let Some(c) = state.vm.clip_at(state.vm.selected) {
+                    let id = c.id;
+                    let _ = state.cmds.send(crate::ipc_bridge::UiCmd::DeleteClip(id));
+                }
+                return LRESULT(0);
+            }
+        }
+    }
+    windows::Win32::UI::WindowsAndMessaging::CallWindowProcW(
+        std::mem::transmute(G_ORIG_LIST),
+        hwnd,
+        msg,
+        wparam,
+        lparam,
+    )
+}
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_CREATE => {
+            let cs = &*(lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW);
+            let state_ptr = cs.lpCreateParams as *mut PopupState;
+            G_STATE = Some(state_ptr);
+            let state = &mut *state_ptr;
+            let hinst = HINSTANCE(GetModuleHandleW(None).unwrap().0);
+            state.hwnd_search = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("EDIT"),
+                w!(""),
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32),
+                8,
+                8,
+                464,
+                22,
+                Some(hwnd),
+                Some(HMENU(IDC_SEARCH as *mut _)),
+                Some(hinst),
+                None,
+            )
+            .unwrap();
+            state.hwnd_list = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("LISTBOX"),
+                w!(""),
+                WINDOW_STYLE(
+                    WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0 | WS_VSCROLL.0 | 0x0001, /*LBS_NOTIFY*/
+                ),
+                8,
+                36,
+                464,
+                280,
+                Some(hwnd),
+                Some(HMENU(IDC_LIST as *mut _)),
+                Some(hinst),
+                None,
+            )
+            .unwrap();
+            state.hwnd_status = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("Clipmonger - CPU fallback (no OpenGL needed)"),
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+                8,
+                322,
+                464,
+                16,
+                Some(hwnd),
+                Some(HMENU(IDC_STATUS as *mut _)),
+                Some(hinst),
+                None,
+            )
+            .unwrap();
+            SetTimer(Some(hwnd), TIMER_IPC, 100, None);
+            G_ORIG_EDIT = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                state.hwnd_search,
+                windows::Win32::UI::WindowsAndMessaging::GWLP_WNDPROC,
+            );
+            windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+                state.hwnd_search,
+                windows::Win32::UI::WindowsAndMessaging::GWLP_WNDPROC,
+                edit_subclass as isize,
+            );
+            G_ORIG_LIST = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                state.hwnd_list,
+                windows::Win32::UI::WindowsAndMessaging::GWLP_WNDPROC,
+            );
+            windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+                state.hwnd_list,
+                windows::Win32::UI::WindowsAndMessaging::GWLP_WNDPROC,
+                list_subclass as isize,
+            );
+            refresh_list(state);
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            if let Some(ptr) = G_STATE {
+                let state = &mut *ptr;
+                let w = (lparam.0 & 0xFFFF) as i32;
+                let h = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                if w > 0 && h > 0 {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::MoveWindow(
+                        state.hwnd_search,
+                        8,
+                        8,
+                        w - 16,
+                        22,
+                        true,
+                    );
+                    let _ = windows::Win32::UI::WindowsAndMessaging::MoveWindow(
+                        state.hwnd_list,
+                        8,
+                        36,
+                        w - 16,
+                        h - 60,
+                        true,
+                    );
+                    let _ = windows::Win32::UI::WindowsAndMessaging::MoveWindow(
+                        state.hwnd_status,
+                        8,
+                        h - 18,
+                        w - 16,
+                        16,
+                        true,
+                    );
+                }
+            }
+            LRESULT(0)
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as i32;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            if let Some(ptr) = G_STATE {
+                let state = &mut *ptr;
+                match (id, code) {
+                    (IDC_SEARCH, EN_CHANGE) => {
+                        let mut buf = [0u16; 512];
+                        let len = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(
+                            state.hwnd_search,
+                            &mut buf,
+                        );
+                        let q = String::from_utf16_lossy(&buf[..len as usize]);
+                        state.vm.query = q;
+                        state.vm.selected = 0;
+                        refresh_list(state);
+                    }
+                    (IDC_LIST, LBN_SELCHANGE) => {
+                        let sel = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                            state.hwnd_list,
+                            windows::Win32::UI::WindowsAndMessaging::LB_GETCURSEL,
+                            Some(WPARAM(0)),
+                            Some(LPARAM(0)),
+                        );
+                        eprintln!(
+                            "LBN_SELCHANGE sel={} vm.sel before={}",
+                            sel.0, state.vm.selected
+                        );
+                        if sel.0 >= 0 {
+                            let vis = state.vm.visible();
+                            if (sel.0 as usize) < vis.len() {
+                                state.vm.selected = sel.0 as usize;
+                                eprintln!("  vm.sel after={}", state.vm.selected);
+                            }
+                        }
+                    }
+                    (IDC_LIST, LBN_DBLCLK) => do_paste(state),
+                    _ => {}
+                }
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            if let Some(ptr) = G_STATE {
+                let state = &mut *ptr;
+                match wparam.0 as i32 {
+                    0x1B => {
+                        windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                    }
+                    0x0D => {
+                        let list_sel = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                            state.hwnd_list,
+                            windows::Win32::UI::WindowsAndMessaging::LB_GETCURSEL,
+                            Some(WPARAM(0)),
+                            Some(LPARAM(0)),
+                        );
+                        if list_sel.0 >= 0 {
+                            let vis_len = state.vm.visible().len();
+                            if (list_sel.0 as usize) < vis_len {
+                                state.vm.selected = list_sel.0 as usize;
+                            }
+                        }
+                        do_paste(state);
+                    }
+                    0x26 => {
+                        if state.vm.selected > 0 {
+                            state.vm.selected -= 1;
+                            sync_selection(state);
+                        }
+                    }
+                    0x28 => {
+                        let len = state.vm.visible().len();
+                        if state.vm.selected + 1 < len {
+                            state.vm.selected += 1;
+                            sync_selection(state);
+                        }
+                    }
+                    0x2E => {
+                        if let Some(c) = state.vm.clip_at(state.vm.selected) {
+                            let id = c.id;
+                            let _ = state.cmds.send(crate::ipc_bridge::UiCmd::DeleteClip(id));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            if wparam.0 == TIMER_IPC {
+                if let Some(ptr) = G_STATE {
+                    let state = &mut *ptr;
+                    drain_events(state);
+                    if state.should_exit {
+                        windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            if let Some(ptr) = G_STATE {
+                KillTimer(Some(hwnd), TIMER_IPC);
+                let _ = Box::from_raw(ptr);
+                G_STATE = None;
+            }
+            windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+fn drain_events(state: &mut PopupState) {
+    unsafe {
+        static mut LH: Option<Instant> = None;
+        let now = Instant::now();
+        if LH.map_or(true, |l| now.duration_since(l) >= Duration::from_secs(1)) {
+            LH = Some(now);
+            let _ = state.cmds.send(crate::ipc_bridge::UiCmd::ListHistory);
+        }
+    }
+    for _ in 0..32 {
+        let Ok(ev) = state.events.try_recv() else {
+            break;
+        };
+        match ev {
+            ipc_bridge::UiEvent::Status(b) => {
+                state.vm.set_paused(
+                    b.get("monitoring_paused")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                );
+                state.vm.set_offline(false);
+            }
+            ipc_bridge::UiEvent::History(b) => {
+                let prev_id = state.vm.clip_at(state.vm.selected).map(|c| c.id);
+                if state.vm.apply_history(&b) {
+                    let c = state.vm.clips().first().cloned();
+                    state.vm.set_current(c);
+                    if let Some(pid) = prev_id {
+                        if let Some(pos) =
+                            state.vm.visible().iter().position(|i| {
+                                state.vm.clips().get(*i).map_or(false, |cl| cl.id == pid)
+                            })
+                        {
+                            state.vm.selected = pos;
+                        }
+                    }
+                }
+                refresh_list(state);
+            }
+            ipc_bridge::UiEvent::Deleted(id) => {
+                state.vm.remove_clip(id);
+                refresh_list(state);
+            }
+            ipc_bridge::UiEvent::Pinned(id, p) => {
+                state.vm.apply_pin(id, p);
+                refresh_list(state);
+            }
+            ipc_bridge::UiEvent::Stopped => state.should_exit = true,
+            ipc_bridge::UiEvent::PasteUnavailable => unsafe {
+                windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                    Some(state.hwnd_list),
+                    w!("Paste target changed - stale-target blocked"),
+                    w!("Clipmonger"),
+                    windows::Win32::UI::WindowsAndMessaging::MB_OK,
+                );
+            },
+            _ => {}
+        }
+    }
+    if state.last_poll.elapsed() >= Duration::from_secs(30) {
+        state.last_poll = Instant::now();
+        let _ = state.cmds.send(ipc_bridge::UiCmd::Status);
+    }
+    update_status(state);
+}
+fn refresh_list(state: &mut PopupState) {
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+            state.hwnd_list,
+            windows::Win32::UI::WindowsAndMessaging::LB_RESETCONTENT,
+            Some(WPARAM(0)),
+            Some(LPARAM(0)),
+        );
+        let vis = state.vm.visible();
+        for idx in vis.iter() {
+            if let Some(clip) = state.vm.clips().get(*idx) {
+                let mut label = clip.preview.chars().take(90).collect::<String>();
+                if label.is_empty() {
+                    label = format!("[{}] {}", clip.formats.join(","), clip.id);
+                }
+                if clip.pinned {
+                    label = format!("📌 {}", label);
+                }
+                let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+                windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                    state.hwnd_list,
+                    windows::Win32::UI::WindowsAndMessaging::LB_ADDSTRING,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(wide.as_ptr() as isize)),
+                );
+            }
+        }
+        sync_selection(state);
+    }
+    update_status(state);
+}
+fn sync_selection(state: &mut PopupState) {
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+            state.hwnd_list,
+            windows::Win32::UI::WindowsAndMessaging::LB_SETCURSEL,
+            Some(WPARAM(state.vm.selected)),
+            Some(LPARAM(0)),
+        );
+    }
+}
+fn update_status(state: &mut PopupState) {
+    let banner = state.vm.banner();
+    let status = if !banner.is_empty() {
+        banner.to_string()
+    } else {
+        state.vm.status_line()
+    };
+    let wide: Vec<u16> = status.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(state.hwnd_status, w!(""));
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+            state.hwnd_status,
+            windows::core::PCWSTR(wide.as_ptr()),
+        );
+    }
+}
+fn do_paste(state: &mut PopupState) {
+    eprintln!(
+        "PASTE sel={} vis={:?} clips={:?}",
+        state.vm.selected,
+        state.vm.visible(),
+        state
+            .vm
+            .clips()
+            .iter()
+            .map(|c| (c.id, c.preview.chars().take(20).collect::<String>()))
+            .collect::<Vec<_>>()
+    );
+    if let Some(clip) = state.vm.clip_at(state.vm.selected) {
+        let id = clip.id;
+        eprintln!("  paste id={} preview={}", id, clip.preview);
+        let _ = state.cmds.send(ipc_bridge::UiCmd::PasteClip(id));
+    } else {
+        eprintln!("  clip_at None");
+    }
+}
+pub fn run_fallback(
+    cmds: mpsc::Sender<ipc_bridge::UiCmd>,
+    events: mpsc::Receiver<ipc_bridge::UiEvent>,
+    config: Arc<Mutex<crate::ConfigWindowState>>,
+) -> std::process::ExitCode {
+    let mut vm = popup::PopupVm::new();
+    vm.set_offline(false);
+    let state = Box::new(PopupState {
+        vm,
+        cmds,
+        events,
+        config,
+        hwnd_search: HWND::default(),
+        hwnd_list: HWND::default(),
+        hwnd_status: HWND::default(),
+        last_poll: Instant::now(),
+        should_exit: false,
+    });
+    let state_ptr = Box::into_raw(state);
+    unsafe {
+        let hinstance: HINSTANCE = GetModuleHandleW(None).unwrap().into();
+        let class_name = w!("ClipmongerFallback");
+        let wc = WNDCLASSW {
+            hInstance: hinstance,
+            lpszClassName: class_name,
+            lpfnWndProc: Some(wndproc),
+            style: CS_HREDRAW | CS_VREDRAW,
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            class_name,
+            w!("Clipmonger - Popup (CPU, no OpenGL) - RustDesk OK"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            POPUP_SIZE.0 as i32,
+            POPUP_SIZE.1 as i32,
+            None,
+            None,
+            Some(hinstance),
+            Some(state_ptr as *const std::ffi::c_void),
+        )
+        .unwrap();
+        ShowWindow(hwnd, SW_SHOW);
+        if let Some(ptr) = G_STATE {
+            let s = &mut *ptr;
+            let _ = s.cmds.send(ipc_bridge::UiCmd::ListHistory);
+            let _ = s.cmds.send(ipc_bridge::UiCmd::Status);
+        }
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}

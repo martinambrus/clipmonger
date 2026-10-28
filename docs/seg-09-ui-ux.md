@@ -1,10 +1,14 @@
 # UI/UX — popup, config (maximalist), bar, tray, keys (crate `app-ui`)
 
-Stack: egui/eframe 0.37 (docs inspected). One process, multiple viewports:
-root (tray host; visible only when a main window is open) + popup +
-config + clipboard-bar (v2) as child viewports. Renderer: wgpu default,
-`glow` fallback (`NativeOptions::renderer`, verified field). NO tokio in
-`app-ui` (seg-02 §8): a dedicated thread owns IPC, UI polls a channel.
+Stack: egui/eframe 0.37 (docs inspected) + Win32 CPU fallback (unified).
+One process, multiple viewports on egui path: root (tray host) + popup +
+config + bar (v2). Renderer: `glow` pilot (U-F2), `Win32 GDI` CPU fallback
+on Windows when `glow` is unavailable (headless/RustDesk/virtual display —
+D-024, `fallback.rs`); `wgpu` deferred (upstream `windows` skew). NO tokio
+in `app-ui` (seg-02 §8): a dedicated thread owns IPC, UI polls a channel.
+Fallback reuses the same `PopupVm`/`ConfigDoc`/`Placement`/`IPC bridge`
+— `ArsClip`-style `Win32 GDI` (`CreateWindowExW`/`GDI`) for `popup` when
+`OpenGL` is absent (no `GPU` required; `RDP`/`RustDesk`/`Safe Mode` OK).
 
 ## 1. Viewport recipes (verified `ViewportBuilder` surface)
 

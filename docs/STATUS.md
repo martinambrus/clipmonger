@@ -1,24 +1,15 @@
 # Docs status
 
-## Implementation state (refreshed 2026-10-27, Step 7)
+## Implementation state (refreshed 2026-10-28, D-024 Win32 CPU fallback)
 
 Source of truth for step detail: `plan.md` Steps.
 
 - Steps 1-4: DONE (foundation, UI pilot, Windows/X11/Wayland backends).
 - Step 5: CODE DONE (GNOME extension); manual legs pending.
-- Step 6: CODE DONE (UI v1 + permanents follow-up); Ubuntu automated
-  suites green on this box 2026-10-27 (app-ui 80/80); backup/logs arms,
-  viewport recipes, Linux ksni tray, and font regression closed;
-  manual legs T-905..T-908 still pending (user, real displays).
-- Step 7: release prep done on this box (release gate script, caps
-  golden, `deny.toml`, changelog/notes drafts, `tests/manual/` scripts,
-  dist-release zips + SHA256SUMS). Draft only: no tag/GitHub release.
-- Manual pending (user/native/Ubuntu legs): T-409, T-410, T-508,
-  T-606, T-607, T-702..T-705, T-905..T-908, T-1117 (release-time),
-  T-1204. Scripts: `tests/manual/`.
-- Known gaps: update-check (T-1202, out of 0.1.0), per-box caps goldens
-  beyond headless, coverage-floor enforcement, cargo-packager
-  installers (native runners), CI matrix.
+- Step 6: CODE DONE (UI v1 + permanents follow-up); Ubuntu automated suites green on this box 2026-10-27 (app-ui 80/80); `D-024` Win32 CPU fallback now mirrors Ubuntu on this Windows box via RustDesk virtual display (no GPU/OpenGL, `crates/app-ui/src/fallback.rs`); `T-905` Win32 leg now runnable headless — full `T-906..T-908` legs still pending manual sign-off.
+- Step 7: release prep done on this box (release gate script, caps golden, `deny.toml`, changelog/notes drafts, `tests/manual/` scripts, dist-release zips + SHA256SUMS). Draft only: no tag/GitHub release.
+- Manual pending (user/native legs): `T-410`, `T-508`, `T-606`, `T-607`, `T-702..T-705`, `T-905..T-908` (Windows CPU path now open; egui path still needs real GPU display), `T-1117`, `T-1204`.
+- Known gaps: update-check (`T-1202`, out of `0.1.0`), per-box caps goldens beyond headless, coverage-floor enforcement, cargo-packager installers (native runners), CI matrix.
 
 ## Document inventory
 - `README.md` — Plan (source of truth)
