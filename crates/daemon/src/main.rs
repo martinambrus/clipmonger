@@ -712,7 +712,8 @@ fn run_elevated_persistent(profile: &std::path::Path) -> i32 {
     static mut G_CTRL: bool = false;
     static mut G_ALT: bool = false;
     static mut G_SHIFT: bool = false;
-    unsafe { G_VK = vk; G_CTRL = want_ctrl; G_ALT = want_alt; G_SHIFT = want_shift; }
+    static mut G_PROFILE: Option<std::path::PathBuf> = None;
+    unsafe { G_VK = vk; G_CTRL = want_ctrl; G_ALT = want_alt; G_SHIFT = want_shift; G_PROFILE = Some(profile.to_path_buf()); }
     let pipe = clipmonger_ipc::framing::pipe_name_for(profile);
     let token = std::fs::read_to_string(profile.join("token")).unwrap_or_default().trim().to_string();
     unsafe { G_PIPE2 = Some(pipe.clone()); G_TOKEN2 = Some(token.clone()); }
@@ -724,9 +725,19 @@ fn run_elevated_persistent(profile: &std::path::Path) -> i32 {
                 let alt = (GetAsyncKeyState(VK_MENU as i32) as u16 & 0x8000) != 0;
                 let shift = (GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000) != 0;
                 if ctrl == G_CTRL && alt == G_ALT && shift == G_SHIFT {
-                    if let (Some(p), Some(t)) = (G_PIPE2.clone(), G_TOKEN2.clone()) {
+                    let (p, t) = if let (Some(p), Some(t)) = (G_PIPE2.clone(), G_TOKEN2.clone()) { (p, t) } else if let Some(prof) = unsafe { G_PROFILE.clone() } { (clipmonger_ipc::framing::pipe_name_for(&prof), std::fs::read_to_string(prof.join("token")).unwrap_or_default().trim().to_string()) } else { (String::new(), String::new()) };
+                    if !p.is_empty() && !t.is_empty() {
                         if let Ok(client) = clipmonger_ipc::client::Client::connect_pipe(&p, &t) {
-                            let c = client; let _ = c.call("hotkey.fired", serde_json::json!({"id": 1}));
+                            let _ = client.call("hotkey.fired", serde_json::json!({"id": 1}));
+                        } else if let Some(prof) = unsafe { G_PROFILE.clone() } {
+                            let fresh_p = clipmonger_ipc::framing::pipe_name_for(&prof);
+                            let fresh_t = std::fs::read_to_string(prof.join("token")).unwrap_or_default().trim().to_string();
+                            if !fresh_t.is_empty() {
+                                if let Ok(client) = clipmonger_ipc::client::Client::connect_pipe(&fresh_p, &fresh_t) {
+                                    let _ = client.call("hotkey.fired", serde_json::json!({"id": 1}));
+                                    unsafe { G_PIPE2 = Some(fresh_p); G_TOKEN2 = Some(fresh_t); }
+                                }
+                            }
                         }
                     }
                     let _ = clipmonger_backend_windows::elevated_task::notify_popup();
