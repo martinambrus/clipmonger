@@ -618,13 +618,15 @@ fn do_paste(state: &mut PopupState) {
     eprintln!("  paste id={} preview={}", id, clip.preview);
     let target = unsafe { G_TARGET_HWND };
     let cmds = state.cmds.clone();
-    let hwnd_main = state.hwnd_main; let hwnd_main_usize = hwnd_main.0 as usize;
+    let hwnd_main = unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(state.hwnd_search).unwrap_or(HWND(std::ptr::null_mut())) }; let hwnd_main_usize = hwnd_main.0 as usize;
     // Hide popup first so paste goes to previous window, not filter input (SW_HIDE for frameless POPUP, not MINIMIZE)
     if hwnd_main_usize != 0 {
-        unsafe { windows::Win32::UI::WindowsAndMessaging::ShowWindow(HWND(hwnd_main_usize as *mut _), windows::Win32::UI::WindowsAndMessaging::SW_HIDE); }
-        eprintln!("  hid popup hwnd={:?}", hwnd_main_usize);
+        let h = HWND(hwnd_main_usize as *mut _);
+        let ok = unsafe { windows::Win32::UI::WindowsAndMessaging::ShowWindow(h, windows::Win32::UI::WindowsAndMessaging::SW_HIDE) };
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("C:\\Temp\\clipmonger-hide.log").and_then(|mut f| { use std::io::Write; writeln!(f, "hide hwnd={:?} ok={} visible={}", hwnd_main_usize, ok.as_bool(), unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(h).as_bool() }) });
+        eprintln!("  hide ok={}", ok.as_bool());
     } else {
-        eprintln!("  hwnd_main invalid, cannot hide");
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("C:\\Temp\\clipmonger-hide.log").and_then(|mut f| { use std::io::Write; writeln!(f, "hide hwnd_main=0") });
     }
     // Restore focus to target, then paste after delay
     let target_usize = target.map(|h| h.0 as usize);
