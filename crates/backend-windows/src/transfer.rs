@@ -71,12 +71,12 @@ pub(crate) mod imp {
     const OPEN_RETRY_MS: u64 = 20;
 
     /// Standard (predefined, nameless) format ids we understand.
-    const CF_TEXT: u32 = 1;
-    const CF_OEMTEXT: u32 = 7;
+    pub(crate) const CF_TEXT: u32 = 1;
+    pub(crate) const CF_OEMTEXT: u32 = 7;
     const CF_DIB: u32 = 8;
     const CF_DIBV5: u32 = 17;
     const CF_HDROP: u32 = 15;
-    const CF_UNICODETEXT: u32 = 13;
+    pub(crate) const CF_UNICODETEXT: u32 = 13;
 
     pub(crate) fn clip_error(op: &str, err: impl std::fmt::Display) -> Error {
         Error::Io(format!("clipboard {op} failed: {err}"))
@@ -237,8 +237,18 @@ impl ClipboardTransfer for WinTransfer {
     fn read(&self, mime: &str, max_bytes: u64) -> Result<Vec<u8>> {
         #[cfg(windows)]
         {
-            let id = imp::id_for_mime(mime)?;
-            imp::with_open("read", || imp::read_one(id, mime, max_bytes))
+            imp::with_open("read", || {
+                if mime == "text/plain" {
+                    for cand in [imp::CF_UNICODETEXT, imp::CF_TEXT, imp::CF_OEMTEXT] {
+                        if let Ok(bytes) = imp::read_one(cand, mime, max_bytes) {
+                            if !bytes.is_empty() { return Ok(bytes); }
+                        }
+                    }
+                    return Err(Error::Unavailable("text/plain not available".to_string()));
+                }
+                let id = imp::id_for_mime(mime)?;
+                imp::read_one(id, mime, max_bytes)
+            })
         }
         #[cfg(not(windows))]
         {
