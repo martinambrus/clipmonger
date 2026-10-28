@@ -72,6 +72,7 @@ pub(crate) mod imp {
 
     /// Standard (predefined, nameless) format ids we understand.
     const CF_TEXT: u32 = 1;
+    const CF_OEMTEXT: u32 = 7;
     const CF_DIB: u32 = 8;
     const CF_DIBV5: u32 = 17;
     const CF_HDROP: u32 = 15;
@@ -108,6 +109,7 @@ pub(crate) mod imp {
         match id {
             CF_UNICODETEXT => Some("text/plain".to_string()),
             CF_TEXT => Some("text/plain".to_string()),
+            CF_OEMTEXT => Some("text/plain".to_string()),
             CF_DIB | CF_DIBV5 => Some("image/png".to_string()),
             CF_HDROP => Some("text/uri-list".to_string()),
             _ => {
@@ -152,7 +154,7 @@ pub(crate) mod imp {
                 out = fragment.into_bytes();
             }
         } else if mime == "text/plain" {
-            if id == CF_TEXT {
+            if id == CF_TEXT || id == CF_OEMTEXT {
                 raw::get_vec(id, &mut out).map_err(|e| clip_error("read text", e))?;
             } else {
                 raw::get_string(&mut out).map_err(|e| clip_error("read text", e))?;

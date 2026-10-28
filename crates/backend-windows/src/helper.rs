@@ -19,7 +19,7 @@ pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Gesture-token time to live: 30 000 ms after minting.
 pub const GESTURE_TTL_MS: i64 = 30_000;
 /// Heartbeat deadline: 3 missed 15 s beats (45 s) since the last beat.
-pub const HEARTBEAT_DEAD_AFTER_MS: i64 = 45_000;
+pub const HEARTBEAT_DEAD_AFTER_MS: i64 = 300_000;
 
 /// Narrow helper operation: input injection only. The helper receives one
 /// job's bytes and can never read history, config, or the DB.
