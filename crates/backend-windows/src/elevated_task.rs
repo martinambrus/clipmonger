@@ -131,11 +131,11 @@ pub fn uninstall() -> Result<(), String> {
 /// Returns true on Yes (on Windows), false on No/cancel/elsewhere.
 #[cfg(windows)]
 pub fn prompt_consent() -> bool {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_YESNO, MB_ICONQUESTION};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_YESNO, MB_ICONQUESTION, MB_SYSTEMMODAL, MB_SETFOREGROUND, MB_TOPMOST};
     fn w(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
     let text = w("Enable clipboard in admin windows?\n\nYes = one-time UAC to install helper (then silent at logon).\nNo = ask again next restart.");
     let cap = w("Clipmonger");
-    let ret = unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), cap.as_ptr(), MB_YESNO | MB_ICONQUESTION) };
+    let ret = unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), cap.as_ptr(), MB_YESNO | MB_ICONQUESTION | MB_SYSTEMMODAL | MB_SETFOREGROUND | MB_TOPMOST) };
     ret == 6 // IDYES
 }
 #[cfg(not(windows))]
