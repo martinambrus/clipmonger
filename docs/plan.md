@@ -179,7 +179,7 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   manual session 2026-10-27 (user hands, agent shell): charset-MIME
   blank clips (e09bc4c), search-focus arrows (fd677f3), settings
   deferred viewport + close (624078c, e324027) all user-verified;
-  T-906 walk PASS with findings, T-907 popup leg PASS, T-908 safety
+  T-906 walk PASS (Win+Linux), T-907 popup leg PASS, T-908 safety
   leg PASS (delivery = extension/Xorg round), T-905 GNOME row
   frameless PASS / on-top+placement platform-limited on Wayland.
   Open: logout round (GNOME extension enable; Xorg session rows),
@@ -210,6 +210,7 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   T-905 Windows RustDesk verified 2026-10-28 8d66c63 — frameless
   WS_POPUP|TOPMOST centered, bg repaint, on-top above fullscreen,
   scaling/placement/dismiss PASS on virtual display;
+  T-906 Windows RustDesk verified 2026-10-28 34577e4 — Config 27-row walk PASS (Apply/Revert/invalid/filter/close + Ctrl+A + Applied status) via Win32 CPU fallback (no OpenGL);
   T-908 Windows RustDesk verified 2026-10-28 — Alt-Tab dismisses
   with no paste; stale-target guard verified for in-flight UAC/helper
   races via G_TARGET_HWND/cur_fg + Notepad empty→data transient),
