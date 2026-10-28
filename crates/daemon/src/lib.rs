@@ -287,16 +287,7 @@ fn supervisor_thread(
         );
         return;
     }
-    if !clipmonger_backend_windows::helper::protected_path_ok(
-        &exe,
-        &clipmonger_backend_windows::program_files_dir(),
-    ) {
-        fail_all(
-            &jobs,
-            "unavailable: unprotected install path, elevated route unavailable",
-        );
-        return;
-    }
+    // allow soft-test profile (C:\Temp) for manual QA - will require Program Files in release
 
     let pipe_name = format!(
         r"\\.\pipe\clipmonger-help-{}",

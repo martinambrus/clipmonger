@@ -645,36 +645,40 @@ fn run_batch(profile: &Path, script: &Path) -> i32 {
 /// fallback popup + mints gesture via daemon IPC.
 #[cfg(all(windows, feature = "backend-windows"))]
 fn run_elevated_hotkey_helper(profile: &std::path::Path) -> i32 {
-    use clipmonger_backend_windows::WinHotkeys;
-    use clipmonger_platform::traits::HotkeyManager;
-    use clipmonger_platform::types::HotkeyId;
-    let chord = clipmonger_core::Config::load(&profile.join("config.toml"))
-        .map(|c| c.popup.hotkey.clone())
-        .unwrap_or_else(|_| "ctrl+alt+h".to_string());
-    let mut hotkeys = WinHotkeys::new();
-    if let Err(e) = hotkeys.register(HotkeyId(1), &chord) {
-        eprintln!("elevated hotkey helper: register failed: {e}");
-        return 1;
-    }
-    eprintln!("elevated hotkey helper: registered {chord} at High IL");
-    loop {
-        match hotkeys.poll(std::time::Duration::from_millis(200)) {
-            Ok(ids) if !ids.is_empty() => {
-                eprintln!("elevated hotkey helper: fired {:?}", ids);
-                let pipe = clipmonger_ipc::framing::pipe_name_for(profile);
-                let token = std::fs::read_to_string(profile.join("token")).unwrap_or_default(); let token = token.trim().to_string();
-                if let Ok(mut client) = clipmonger_ipc::client::Client::connect_pipe(&pipe, &token) {
-                    let _ = client.call("hotkey.fired", serde_json::json!({"id": 1}));
+    use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN, HC_ACTION, WH_KEYBOARD_LL, MSG};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_MENU};
+    static mut G_PIPE: Option<String> = None;
+    static mut G_TOKEN: Option<String> = None;
+    unsafe extern "system" fn ll_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+        if n_code as u32 == HC_ACTION && (w_param as u32 == WM_KEYDOWN || w_param as u32 == WM_SYSKEYDOWN) {
+            let kb = &*(l_param as *const KBDLLHOOKSTRUCT);
+            if kb.vkCode == 0x48 {
+                let ctrl = (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
+                let alt = (GetAsyncKeyState(VK_MENU as i32) as u16 & 0x8000) != 0;
+                if ctrl && alt {
+                    if let (Some(pipe), Some(token)) = (G_PIPE.clone(), G_TOKEN.clone()) {
+                        if let Ok(client) = clipmonger_ipc::client::Client::connect_pipe(&pipe, &token) {
+                            let mut c = client; let _ = c.call("hotkey.fired", serde_json::json!({"id": 1}));
+                        }
+                    }
+                    let _ = clipmonger_backend_windows::elevated_task::notify_popup();
+                    return 1;
                 }
-                let _ = clipmonger_backend_windows::elevated_task::notify_popup();
-            }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("elevated hotkey helper: poll failed: {e}");
-                return 1;
             }
         }
+        CallNextHookEx(std::ptr::null_mut(), n_code, w_param, l_param)
     }
+    let pipe = clipmonger_ipc::framing::pipe_name_for(profile);
+    let token = std::fs::read_to_string(profile.join("token")).unwrap_or_default().trim().to_string();
+    unsafe { G_PIPE = Some(pipe); G_TOKEN = Some(token); }
+    let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_proc), std::ptr::null_mut(), 0) };
+    if hook.is_null() { eprintln!("elevated hotkey helper: hook failed"); return 1; }
+    eprintln!("elevated hotkey helper: LL hook at High IL for Ctrl+Alt+H");
+    let mut msg = std::mem::MaybeUninit::<MSG>::uninit();
+    unsafe { while GetMessageW(msg.as_mut_ptr(), std::ptr::null_mut(), 0, 0) != 0 {} }
+    unsafe { UnhookWindowsHookEx(hook) };
+    0
 }
 
 /// Elevated-helper worker entry point (Windows only): connect to the

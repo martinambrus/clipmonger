@@ -37,6 +37,7 @@ rusqlite.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 clipmonger-backend-windows = { path = "../backend-windows", optional = true }
+windows-sys = { version = "0.61", features = ["Win32_Foundation","Win32_UI_WindowsAndMessaging","Win32_UI_Input_KeyboardAndMouse","Win32_System_LibraryLoader","Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
 clipmonger-backend-x11 = { path = "../backend-x11", optional = true }
