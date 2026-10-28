@@ -2163,11 +2163,8 @@ impl DaemonState {
             use clipmonger_backend_windows::Integrity;
             use clipmonger_platform::traits::PasteEngine as _;
             let (unicode_limit, dwell_ms, delivery) = self.paste_budget();
-            let paste = clipmonger_backend_windows::WinPaste::new(
-                usize::try_from(unicode_limit).unwrap_or(65536),
-            )
-            .with_dwell_ms(dwell_ms)
-            .with_clipboard_first(delivery == clipmonger_core::PasteDelivery::ClipboardRestore);
+            let restore = self.config.lock().map(|cfg| cfg.popup.restore_clipboard).unwrap_or(true);
+            let paste = clipmonger_backend_windows::WinPaste::new(usize::try_from(unicode_limit).unwrap_or(65536)).with_dwell_ms(dwell_ms).with_clipboard_first(delivery == clipmonger_core::PasteDelivery::ClipboardRestore).with_restore_clipboard(restore);
             let target = paste
                 .capture_target()
                 .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
@@ -2182,7 +2179,9 @@ impl DaemonState {
                         "paste.execute: elevation refused (gesture required)".to_string(),
                     ));
                 }
-                return self.paste_via_helper(&target, payloads);
+                let res = self.paste_via_helper(&target, payloads);
+                if res.is_ok() { let _ = self.store.read().ok().and_then(|s| s.bump_clip(clip.0, now_ms()).ok()); }
+                return res;
             }
             paste
                 .paste_payloads(&target, &clip, payloads)
@@ -2194,6 +2193,7 @@ impl DaemonState {
                         IpcError::new("backend", format!("paste.execute: {e}"))
                     }
                 })?;
+            let _ = self.store.read().ok().and_then(|s| s.bump_clip(clip.0, now_ms()).ok());
             Ok(serde_json::json!({"pasted": true}))
         }
         #[cfg(all(unix, feature = "backend-wayland"))]
@@ -2253,19 +2253,15 @@ impl DaemonState {
             )
         })?;
         let (_, dwell_ms, delivery) = self.paste_budget();
+        let restore = self.config.lock().map(|cfg| cfg.popup.restore_clipboard).unwrap_or(true);
         if delivery == clipmonger_core::PasteDelivery::ClipboardRestore {
-            // The daemon (medium integrity) owns the clipboard write; the
-            // helper only presses Ctrl+V. Swap BEFORE ensure_link/job.
             let swap = clipmonger_backend_windows::paste::ClipboardSwap::begin(payloads)
                 .map_err(|e| IpcError::new("backend", format!("paste.execute: {e}")))?;
-            let outcome = self.send_helper_job(
-                target,
-                pid,
-                clipmonger_backend_windows::helper::JobOp::PasteChord,
-                String::new(),
-            );
-            // If the chord never fired, restoring immediately is correct.
-            swap.finish(if outcome.is_ok() { dwell_ms } else { 0 });
+            let outcome = self.send_helper_job(target, pid, clipmonger_backend_windows::helper::JobOp::PasteChord, String::new());
+            let dwell = if restore { if outcome.is_ok() { dwell_ms } else { 0 } } else { 0 };
+            if restore {
+                swap.finish(dwell, true);
+            }
             return outcome;
         }
         let text = payloads

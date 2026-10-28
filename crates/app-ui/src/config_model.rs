@@ -226,6 +226,12 @@ pub const ROWS: &[Row] = &[
         label: "config.popup_delivery",
     },
     Row {
+        key: "popup.restore_clipboard",
+        tab: Tab::Popup,
+        kind: Kind::Bool,
+        label: "config.popup_restore_clipboard",
+    },
+    Row {
         key: "windows.helper_auto_elevate",
         tab: Tab::Advanced,
         kind: Kind::Bool,

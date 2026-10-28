@@ -60,6 +60,7 @@ const ENTRIES: &[(&str, &str)] = &[
     ("config.updates_check", "Check for updates"),
     ("config.logging_level", "Logging level"),
     ("config.popup_delivery", "Popup paste delivery"),
+    ("config.popup_restore_clipboard", "Restore clipboard after paste"),
     ("config.title", "Settings"),
     ("config.apply", "Apply"),
     ("config.revert", "Revert"),

@@ -804,6 +804,12 @@ impl Store {
         }
     }
 
+    pub fn bump_clip(&self, id: Uuid, now_ms: i64) -> Result<bool, CoreError> {
+        if self.read_only { return Err(readonly_err()); }
+        let changed = self.lock().execute("UPDATE clips SET last_used_ms=?1 WHERE id=?2", params![now_ms, id.to_string()]).map_err(|e| db_err(&e))?;
+        Ok(changed > 0)
+    }
+
     /// Fetch one clip with its payloads (external blobs verified).
     ///
     /// # Errors

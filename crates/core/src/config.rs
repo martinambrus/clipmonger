@@ -188,6 +188,8 @@ pub struct PopupConfig {
     pub delivery_dwell_ms: u64,
     #[serde(default)]
     pub delivery: PasteDelivery,
+    #[serde(default = "default_true")]
+    pub restore_clipboard: bool,
     /// Unknown keys preserved for forward compatibility.
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
@@ -205,6 +207,7 @@ impl Default for PopupConfig {
             unicode_limit: default_unicode_limit(),
             delivery_dwell_ms: default_delivery_dwell_ms(),
             delivery: PasteDelivery::default(),
+            restore_clipboard: true,
             extra: BTreeMap::new(),
         }
     }

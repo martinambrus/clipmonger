@@ -47,6 +47,8 @@ pub struct WinPaste {
     dwell_ms: u64,
     #[cfg_attr(not(windows), allow(dead_code))]
     clipboard_first: bool,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    restore_clipboard: bool,
 }
 
 impl WinPaste {
@@ -57,6 +59,7 @@ impl WinPaste {
             unicode_limit,
             dwell_ms: 1000,
             clipboard_first: false,
+            restore_clipboard: true,
         }
     }
 
@@ -71,6 +74,12 @@ impl WinPaste {
     #[must_use]
     pub fn with_clipboard_first(mut self, clipboard_first: bool) -> Self {
         self.clipboard_first = clipboard_first;
+        self
+    }
+
+    #[must_use]
+    pub fn with_restore_clipboard(mut self, restore: bool) -> Self {
+        self.restore_clipboard = restore;
         self
     }
 
@@ -121,7 +130,7 @@ impl WinPaste {
             ) {
                 DeliveryRoute::Inject => inject_text(&text.unwrap_or_default())
                     .map_err(|detail| Error::Io(format!("unicode inject failed: {detail}"))),
-                DeliveryRoute::Clipboard => clipboard_restore(payloads, self.dwell_ms),
+                DeliveryRoute::Clipboard => clipboard_restore(payloads, self.dwell_ms, self.restore_clipboard),
             }
         }
         #[cfg(not(windows))]
@@ -240,16 +249,17 @@ impl ClipboardSwap {
         }
     }
 
-    /// Sleep `dwell_ms`, then guarded-restore the saved clipboard.
-    pub fn finish(self, dwell_ms: u64) {
+    /// Sleep `dwell_ms`, then guarded-restore if `restore` is true.
+    pub fn finish(self, dwell_ms: u64, restore: bool) {
         #[cfg(windows)]
         {
+            if !restore { return; }
             std::thread::sleep(std::time::Duration::from_millis(dwell_ms));
             guarded_restore(&self);
         }
         #[cfg(not(windows))]
         {
-            let _ = dwell_ms;
+            let _ = (dwell_ms, restore);
         }
     }
 }
@@ -294,10 +304,10 @@ fn inject_text(bytes: &[u8]) -> std::result::Result<(), String> {
 /// `ClipboardRestore`: save, write payloads, Ctrl+V, restore only when the
 /// slot still equals our temporary write (user copies always win).
 #[cfg(windows)]
-fn clipboard_restore(payloads: &[(String, Vec<u8>)], dwell_ms: u64) -> Result<()> {
+fn clipboard_restore(payloads: &[(String, Vec<u8>)], dwell_ms: u64, restore: bool) -> Result<()> {
     let swap = ClipboardSwap::begin(payloads)?;
     worker_press_paste_chord().map_err(|e| Error::Io(format!("paste chord failed: {e}")))?;
-    swap.finish(dwell_ms);
+    swap.finish(dwell_ms, restore);
     Ok(())
 }
 
