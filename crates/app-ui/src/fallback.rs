@@ -32,6 +32,8 @@ static mut G_ORIG_EDIT: isize = 0;
 static mut G_ORIG_LIST: isize = 0;
 static mut G_TARGET_HWND: Option<windows::Win32::Foundation::HWND> = None;
 static mut G_HOTKEY_FALLBACK: bool = false;
+static mut G_HOTKEY_HOOK: Option<windows::Win32::UI::WindowsAndMessaging::HHOOK> = None;
+static mut G_HOTKEY_HWND: Option<HWND> = None;
 static mut G_HOTKEY_PREV_DOWN: bool = false;
 unsafe extern "system" fn edit_subclass(
     hwnd: HWND,
@@ -52,7 +54,7 @@ unsafe extern "system" fn edit_subclass(
     }
     if msg == WM_KEYDOWN {
         let vk = wparam.0 as i32;
-        if matches!(vk, 0x26 | 0x28 | 0x1B | 0x0D | 0x2E | 0x09) {
+        if matches!(vk, 0x26 | 0x28 | 0x1B | 0x0D | 0x09) {
             if let Some(ptr) = G_STATE {
                 let state = &mut *ptr;
                 match vk {
@@ -91,13 +93,6 @@ unsafe extern "system" fn edit_subclass(
                             }
                         }
                         do_paste(state);
-                        return LRESULT(0);
-                    }
-                    0x2E => {
-                        if let Some(c) = state.vm.clip_at(state.vm.selected) {
-                            let id = c.id;
-                            let _ = state.cmds.send(crate::ipc_bridge::UiCmd::DeleteClip(id));
-                        }
                         return LRESULT(0);
                     }
                     0x09 => {
@@ -177,6 +172,22 @@ unsafe extern "system" fn list_subclass(
         lparam,
     )
 }
+unsafe extern "system" fn ll_hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+    if n_code >= 0 && (w_param.0 as u32 == windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN || w_param.0 as u32 == windows::Win32::UI::WindowsAndMessaging::WM_SYSKEYDOWN) {
+        let kb = &*(l_param.0 as *const windows::Win32::UI::WindowsAndMessaging::KBDLLHOOKSTRUCT);
+        if kb.vkCode == 0x48 { // H
+            let ctrl = (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+            let alt = (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_MENU.0 as i32) as u16 & 0x8000) != 0;
+            if ctrl && alt {
+                if let Some(hwnd) = unsafe { G_HOTKEY_HWND } {
+                    windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(hwnd), windows::Win32::UI::WindowsAndMessaging::WM_HOTKEY, WPARAM(1), LPARAM(0));
+                    return LRESULT(1);
+                }
+            }
+        }
+    }
+    windows::Win32::UI::WindowsAndMessaging::CallNextHookEx(None, n_code, w_param, l_param)
+}
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
@@ -234,7 +245,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             .unwrap();
             state.hwnd_config = CreateWindowExW(WINDOW_EX_STYLE::default(), w!("BUTTON"), w!("Config"), WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | 0x00010000 | 0x00000000), 392, 320, 80, 22, Some(hwnd), Some(HMENU(IDC_CONFIG as *mut _)), Some(hinst), None).unwrap();
             eprintln!("Config button created hwnd={:?}", state.hwnd_config);
-            SetTimer(Some(hwnd), TIMER_IPC, 20, None);
+            SetTimer(Some(hwnd), TIMER_IPC, 100, None);
             G_ORIG_EDIT = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
                 state.hwnd_search,
                 windows::Win32::UI::WindowsAndMessaging::GWLP_WNDPROC,
@@ -439,44 +450,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if state.should_exit {
                         windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
                     }
-                    if unsafe { G_HOTKEY_FALLBACK } {
-                        let vk_ctrl = windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32;
-                        let vk_lctrl = windows::Win32::UI::Input::KeyboardAndMouse::VK_LCONTROL.0 as i32;
-                        let vk_rctrl = windows::Win32::UI::Input::KeyboardAndMouse::VK_RCONTROL.0 as i32;
-                        let vk_alt = windows::Win32::UI::Input::KeyboardAndMouse::VK_MENU.0 as i32;
-                        let vk_lalt = windows::Win32::UI::Input::KeyboardAndMouse::VK_LMENU.0 as i32;
-                        let vk_ralt = windows::Win32::UI::Input::KeyboardAndMouse::VK_RMENU.0 as i32;
-                        let ctrl = ((windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk_ctrl) as u16 & 0x8000) != 0) || ((windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk_lctrl) as u16 & 0x8000) != 0) || ((windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk_rctrl) as u16 & 0x8000) != 0) || ((windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(vk_ctrl) as u16 & 0x8000) != 0);
-                        let alt = ((windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk_alt) as u16 & 0x8000) != 0) || ((windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk_lalt) as u16 & 0x8000) != 0) || ((windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk_ralt) as u16 & 0x8000) != 0) || ((windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(vk_alt) as u16 & 0x8000) != 0);
-                        let h_down = (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x48) as u16 & 0x8000) != 0;
-                        let f8_down = (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x77) as u16 & 0x8000) != 0;
-                        let hot_down = h_down || f8_down;
-                        let down = (ctrl && alt && h_down) || f8_down;
-                        let prev = unsafe { G_HOTKEY_PREV_DOWN };
-
-
-                        if down && !prev {
-                            // Hotkey pressed: toggle popup
-                            let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool();
-                            let minimized = windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool();
-                            if visible && !minimized {
-                                windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE);
-                            } else {
-                                let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
-                                if fg != hwnd { G_TARGET_HWND = Some(fg); }
-                                ShowWindow(hwnd, SW_SHOW);
-                                windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_RESTORE);
-                                windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-                                if let Some(ptr2) = G_STATE { let s2 = &mut *ptr2; let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(s2.hwnd_search)); }
-                            }
-                        }
-                        unsafe { G_HOTKEY_PREV_DOWN = down; }
-                    }
                 }
             }
             LRESULT(0)
         }
         WM_HOTKEY => {
+            // ArsClip-style foreground steal: AttachThreadInput to foreground thread
             let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool();
             let minimized = windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool();
             if visible && !minimized {
@@ -484,13 +463,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else {
                 let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
                 if fg != hwnd { G_TARGET_HWND = Some(fg); }
-                ShowWindow(hwnd, SW_SHOW);
+                windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
                 windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_RESTORE);
-                windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-                if let Some(ptr) = G_STATE {
-                    let state = &mut *ptr;
-                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(state.hwnd_search));
-                }
+                unsafe { let fg_thread = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fg, None); let cur_thread = windows::Win32::System::Threading::GetCurrentThreadId(); if fg_thread != cur_thread { windows::Win32::System::Threading::AttachThreadInput(fg_thread, cur_thread, true); windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(hwnd); windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd); windows::Win32::System::Threading::AttachThreadInput(fg_thread, cur_thread, false); } else { windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(hwnd); windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd); } }
+                if let Some(ptr) = G_STATE { let s = &mut *ptr; let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(s.hwnd_search)); }
+
             }
             LRESULT(0)
         }
@@ -499,6 +476,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_DESTROY => {
+            unsafe { if let Some(hook) = G_HOTKEY_HOOK { windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx(hook); G_HOTKEY_HOOK = None; } }
             if let Some(ptr) = G_STATE {
                 KillTimer(Some(hwnd), TIMER_IPC);
                 let _ = Box::from_raw(ptr);
@@ -710,9 +688,7 @@ pub fn run_fallback(
         )
         .unwrap();
         let hk_ok = windows::Win32::UI::Input::KeyboardAndMouse::RegisterHotKey(Some(hwnd), 1, windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(windows::Win32::UI::Input::KeyboardAndMouse::MOD_CONTROL.0 | windows::Win32::UI::Input::KeyboardAndMouse::MOD_ALT.0), 0x48);
-        // Also try F8 as secondary hotkey for RustDesk virtual display
-        let _hk2 = windows::Win32::UI::Input::KeyboardAndMouse::RegisterHotKey(Some(hwnd), 2, windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(0), 0x77);
-        if hk_ok.is_ok() { eprintln!("hotkey Ctrl+Alt+H registered - window hidden until hotkey"); unsafe { G_HOTKEY_FALLBACK = false; } } else { let err = windows::Win32::Foundation::GetLastError(); eprintln!("hotkey register failed err={:?} (degraded, using poll fallback) - showing window", err); unsafe { G_HOTKEY_FALLBACK = true; } ShowWindow(hwnd, SW_SHOW); windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd); }
+        if hk_ok.is_ok() { eprintln!("hotkey Ctrl+Alt+H registered - window hidden until hotkey"); unsafe { G_HOTKEY_FALLBACK = false; } } else { let err = windows::Win32::Foundation::GetLastError(); eprintln!("hotkey register failed err={:?} (degraded, installing LL hook) - showing window", err); unsafe { G_HOTKEY_FALLBACK = true; G_HOTKEY_HWND = Some(hwnd); match windows::Win32::UI::WindowsAndMessaging::SetWindowsHookExW(windows::Win32::UI::WindowsAndMessaging::WH_KEYBOARD_LL, Some(ll_hook_proc), None, 0) { Ok(hook) => { if hook.is_invalid() { eprintln!("LL hook invalid"); } else { eprintln!("LL hook installed for Ctrl+Alt+H"); G_HOTKEY_HOOK = Some(hook); } }, Err(e) => { eprintln!("LL hook install failed {:?}", e); } } } ShowWindow(hwnd, SW_SHOW); windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd); }
         if let Some(ptr) = G_STATE {
             let s = &mut *ptr;
             let _ = s.cmds.send(ipc_bridge::UiCmd::ListHistory);
