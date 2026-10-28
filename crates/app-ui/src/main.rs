@@ -17,6 +17,7 @@ use clipmonger_platform::fakes::FakeTray;
 use serde_json::Value;
 #[cfg(all(windows, feature = "software"))]
 mod fallback;
+#[cfg(all(windows, feature = "software"))]
 mod fallback_config;
 
 /// Status re-poll period.
