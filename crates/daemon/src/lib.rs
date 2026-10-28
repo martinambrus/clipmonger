@@ -2168,9 +2168,22 @@ impl DaemonState {
             )
             .with_dwell_ms(dwell_ms)
             .with_clipboard_first(delivery == clipmonger_core::PasteDelivery::ClipboardRestore);
-            let target = paste
+            let mut target = paste
                 .capture_target()
                 .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
+            // High IL targets need foreground to settle after popup hide (120ms may not be enough for UAC lock).
+            // Retry briefly if we captured the popup's previous host (e.g., Terminal) instead of the intended High IL window.
+            if clipmonger_backend_windows::target_integrity(&target.handle) != Integrity::High {
+                for _ in 0..6 {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    if let Ok(nt) = paste.capture_target() {
+                        if clipmonger_backend_windows::target_integrity(&nt.handle) == Integrity::High {
+                            target = nt;
+                            break;
+                        }
+                    }
+                }
+            }
             if clipmonger_backend_windows::target_integrity(&target.handle) == Integrity::High {
                 let token = params.get("gesture").and_then(Value::as_u64);
                 let token_ok = token.is_some_and(|t| self.consume_gesture_token(t, now_ms()))
