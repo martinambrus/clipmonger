@@ -225,6 +225,12 @@ pub const ROWS: &[Row] = &[
         kind: Kind::Enum,
         label: "config.popup_delivery",
     },
+    Row {
+        key: "windows.helper_auto_elevate",
+        tab: Tab::Advanced,
+        kind: Kind::Bool,
+        label: "config.windows_helper_auto_elevate",
+    },
 ];
 
 /// Row indices the config window renders for `tab` (P-F1): the

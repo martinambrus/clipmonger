@@ -237,7 +237,7 @@ pub(crate) fn start_pump(wakes: Sender<()>) -> Result<PumpHandle, String> {
 // ---------------------------------------------------------------------------
 
 /// Foreground window handle, or `None` when there is none.
-pub(crate) fn foreground_hwnd() -> Option<HWND> {
+pub fn foreground_hwnd() -> Option<HWND> {
     // Safety: GetForegroundWindow takes no arguments and has no preconditions.
     let hwnd = unsafe { GetForegroundWindow() };
     if hwnd.is_null() {
@@ -262,7 +262,7 @@ pub fn hwnd_owner_pid(hwnd: i64) -> Option<u32> {
 }
 
 /// Owning process id of `hwnd`, or `None` when it cannot be determined.
-pub(crate) fn window_pid(hwnd: HWND) -> Option<u32> {
+pub fn window_pid(hwnd: HWND) -> Option<u32> {
     let mut pid: u32 = 0;
     // Safety: pid pointer is valid for the call; return value is the thread id.
     unsafe {
@@ -322,7 +322,7 @@ pub(crate) fn window_title_hash(hwnd: HWND) -> u64 {
 }
 
 /// Whether `pid` runs elevated, or `None` when it cannot be determined.
-pub(crate) fn process_elevated(pid: u32) -> Option<bool> {
+pub fn process_elevated(pid: u32) -> Option<bool> {
     // Safety: OpenProcess with a query flag; handle closed below on all paths.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {

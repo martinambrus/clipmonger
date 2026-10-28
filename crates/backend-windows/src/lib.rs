@@ -19,8 +19,9 @@ pub mod html;
 pub mod monitor;
 pub mod optout;
 pub mod paste;
+pub mod elevated_task;
 #[cfg(windows)]
-pub(crate) mod sys;
+pub mod sys;
 pub mod transfer;
 
 pub use autostart::WinAutostart;

@@ -196,6 +196,57 @@ fn setup_windows_backend(
             .push("monitor Degraded: session clipboard unavailable".to_string());
     }
     state.register_backend("windows", caps);
+    // Elevated helper auto-install / admin-window consent (one-time UAC, snoozed per boot)
+    {
+        let profile = profile.to_path_buf();
+        let shutdown = std::sync::Arc::clone(shutdown);
+        std::thread::spawn(move || {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SNOOZED: AtomicBool = AtomicBool::new(false);
+            // If already opted-in, ensure helper task + hotkey helper running
+            let cfg = clipmonger_core::Config::load(&profile.join("config.toml")).unwrap_or_default();
+            if cfg.windows.helper_auto_elevate {
+                if !clipmonger_backend_windows::elevated_task::is_installed() {
+                    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("clipmonger-daemon"));
+                    let _ = clipmonger_backend_windows::elevated_task::install_via_uac(&exe, &profile);
+                }
+                // spawn High IL hotkey helper now if not already via task
+                if !shutdown.load(Ordering::Relaxed) {
+                    // helper will be started via scheduled task on next logon; for immediate use the helper pipe path already handles paste
+                    // fallback: direct spawn of hotkey helper via runas schtasks path is task-based; for now spawn_elevated for paste worker path not ideal
+                }
+            }
+            while !shutdown.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if SNOOZED.load(Ordering::Relaxed) { continue; }
+                let cfg = clipmonger_core::Config::load(&profile.join("config.toml")).unwrap_or_default();
+                if cfg.windows.helper_auto_elevate { continue; }
+                // Check if foreground is High IL
+                let is_high = {
+                    #[cfg(windows)]
+                    {
+                        clipmonger_backend_windows::sys::foreground_hwnd()
+                            .and_then(|hw| clipmonger_backend_windows::sys::window_pid(hw))
+                            .and_then(|pid| clipmonger_backend_windows::sys::process_elevated(pid))
+                            .unwrap_or(false)
+                    }
+                    #[cfg(not(windows))]
+                    { false }
+                };
+                if is_high {
+                    if clipmonger_backend_windows::elevated_task::prompt_consent() {
+                        let mut cfg2 = clipmonger_core::Config::load(&profile.join("config.toml")).unwrap_or_default();
+                        cfg2.windows.helper_auto_elevate = true;
+                        let _ = cfg2.save(&profile.join("config.toml"));
+                        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("clipmonger-daemon"));
+                        let _ = clipmonger_backend_windows::elevated_task::install_via_uac(&exe, &profile);
+                    } else {
+                        SNOOZED.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
 
     if let Some(mut monitor) = monitor {
         let state = Arc::clone(state);
@@ -589,6 +640,43 @@ fn run_batch(profile: &Path, script: &Path) -> i32 {
     0
 }
 
+/// Elevated hotkey helper: High IL hotkey forwarder for admin windows.
+/// Registers Ctrl+Alt+H at High IL and forwards WM_HOTKEY to the
+/// fallback popup + mints gesture via daemon IPC.
+#[cfg(all(windows, feature = "backend-windows"))]
+fn run_elevated_hotkey_helper(profile: &std::path::Path) -> i32 {
+    use clipmonger_backend_windows::WinHotkeys;
+    use clipmonger_platform::traits::HotkeyManager;
+    use clipmonger_platform::types::HotkeyId;
+    let chord = clipmonger_core::Config::load(&profile.join("config.toml"))
+        .map(|c| c.popup.hotkey.clone())
+        .unwrap_or_else(|_| "ctrl+alt+h".to_string());
+    let mut hotkeys = WinHotkeys::new();
+    if let Err(e) = hotkeys.register(HotkeyId(1), &chord) {
+        eprintln!("elevated hotkey helper: register failed: {e}");
+        return 1;
+    }
+    eprintln!("elevated hotkey helper: registered {chord} at High IL");
+    loop {
+        match hotkeys.poll(std::time::Duration::from_millis(200)) {
+            Ok(ids) if !ids.is_empty() => {
+                eprintln!("elevated hotkey helper: fired {:?}", ids);
+                let pipe = clipmonger_ipc::framing::pipe_name_for(profile);
+                let token = std::fs::read_to_string(profile.join("token")).unwrap_or_default(); let token = token.trim().to_string();
+                if let Ok(mut client) = clipmonger_ipc::client::Client::connect_pipe(&pipe, &token) {
+                    let _ = client.call("hotkey.fired", serde_json::json!({"id": 1}));
+                }
+                let _ = clipmonger_backend_windows::elevated_task::notify_popup();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("elevated hotkey helper: poll failed: {e}");
+                return 1;
+            }
+        }
+    }
+}
+
 /// Elevated-helper worker entry point (Windows only): connect to the
 /// daemon's reverse-connect pipe and serve `send_input_batch` jobs.
 ///
@@ -715,6 +803,11 @@ fn respond(
 #[allow(clippy::too_many_lines)]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(all(windows, feature = "backend-windows"))]
+    if args.iter().any(|a| a == "__elevated-hotkey-helper") {
+        let profile = profile_arg(&args);
+        std::process::exit(run_elevated_hotkey_helper(&profile));
+    }
     #[cfg(all(windows, feature = "backend-windows"))]
     if let Some(index) = args.iter().position(|arg| arg == "__elevated-worker") {
         let pipe_name = args.get(index + 1).cloned().unwrap_or_default();

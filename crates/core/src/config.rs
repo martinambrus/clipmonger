@@ -222,6 +222,29 @@ pub struct PrivacyConfig {
     pub extra: BTreeMap<String, toml::Value>,
 }
 
+/// `[windows]` section (Windows-only, ignored elsewhere).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowsConfig {
+    /// Auto-elevate helper at logon via Scheduled Task (one-time UAC).
+    /// When true the daemon installs `ClipmongerHelper` task and keeps
+    /// the High IL hotkey/paste helper alive for admin windows.
+    #[serde(default)]
+    pub helper_auto_elevate: bool,
+    /// Unknown keys preserved for forward compatibility.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+impl Default for WindowsConfig {
+    fn default() -> Self {
+        Self {
+            helper_auto_elevate: false,
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+
 /// Top-level config. Unknown root keys (e.g. future `[tray]`, `[ui]`
 /// sections) survive in `extra`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -236,6 +259,8 @@ pub struct Config {
     pub popup: PopupConfig,
     #[serde(default)]
     pub privacy: PrivacyConfig,
+    #[serde(default)]
+    pub windows: WindowsConfig,
     /// Unknown root-level keys preserved for forward compatibility.
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
@@ -256,6 +281,7 @@ impl Default for Config {
             history: HistoryConfig::default(),
             popup: PopupConfig::default(),
             privacy: PrivacyConfig::default(),
+            windows: WindowsConfig::default(),
             extra: BTreeMap::new(),
             warned_newer_version: false,
         }
