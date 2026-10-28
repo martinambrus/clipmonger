@@ -500,18 +500,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(ptr) = G_STATE { let s = &mut *ptr; let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(s.hwnd_search)); }
                 }
             } else if event == WM_RBUTTONUP {
-                // Right-click also toggles for now (menu TODO)
-                let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool();
-                let minimized = windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool();
-                if visible && !minimized {
-                    windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
-                } else {
-                    let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
-                    if fg != hwnd { G_TARGET_HWND = Some(fg); }
-                    windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
-                    windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_RESTORE);
-                    windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-                    if let Some(ptr) = G_STATE { let s = &mut *ptr; let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(s.hwnd_search)); }
+                unsafe {
+                    let hmenu = CreatePopupMenu().unwrap();
+                    let _ = AppendMenuW(hmenu, MF_STRING, ID_TRAY_SHOW as usize, w!("Show Popup"));
+                    let _ = AppendMenuW(hmenu, MF_STRING, ID_TRAY_SETTINGS, w!("Settings"));
+                    let _ = AppendMenuW(hmenu, MF_STRING, ID_TRAY_EXIT, w!("Exit"));
+                    let mut pt = windows::Win32::Foundation::POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    let _ = SetFgWin(hwnd);
+                    let _ = TrackPopupMenu(hmenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, Some(0), hwnd, None);
                 }
             }
             LRESULT(0)
