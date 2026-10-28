@@ -728,7 +728,7 @@ fn do_paste(state: &mut PopupState) {
     let target_usize = target.map(|h| h.0 as usize);
     std::thread::spawn(move || {
         if let Some(tu) = target_usize { let t = HWND(tu as *mut _); unsafe { let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(t); let _ = windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(t); }
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            std::thread::sleep(std::time::Duration::from_millis(130));
         } else {
             std::thread::sleep(std::time::Duration::from_millis(60));
         }
