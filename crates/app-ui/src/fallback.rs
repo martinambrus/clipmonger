@@ -3,13 +3,13 @@ use crate::{ipc_bridge, popup, strings};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::core::w;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM, WPARAM as WParamInner};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, RegisterClassW,
-    SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE,
+    SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE, SW_HIDE,
     ES_AUTOHSCROLL, HMENU, LBN_DBLCLK, LBN_SELCHANGE, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_SETFOCUS, WM_SIZE, WM_TIMER,
+    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_SETFOCUS, WM_SIZE, WM_TIMER,
     WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 const POPUP_SIZE: (u32, u32) = (480, 360);
@@ -42,19 +42,13 @@ unsafe extern "system" fn edit_subclass(
 ) -> LRESULT {
     if msg == WM_KEYDOWN {
         let vk = wparam.0 as i32;
-        if matches!(vk, 0x26 | 0x28 | 0x1B | 0x0D | 0x2E) {
+        if matches!(vk, 0x26 | 0x28 | 0x1B | 0x0D | 0x2E | 0x09) {
             if let Some(ptr) = G_STATE {
                 let state = &mut *ptr;
                 match vk {
                     0x1B => {
-                        let par = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd)
-                            .unwrap_or(HWND(std::ptr::null_mut()));
-                        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                            Some(par),
-                            WM_CLOSE,
-                            WPARAM(0),
-                            LPARAM(0),
-                        );
+                        let par = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd).unwrap_or(HWND(std::ptr::null_mut()));
+                        ShowWindow(par, SW_HIDE);
                         return LRESULT(0);
                     }
                     0x26 => {
@@ -96,6 +90,17 @@ unsafe extern "system" fn edit_subclass(
                         }
                         return LRESULT(0);
                     }
+                    0x09 => {
+                        let focus = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus();
+                        if focus == state.hwnd_search {
+                            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(state.hwnd_list));
+                        } else if focus == state.hwnd_list {
+                            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(state.hwnd_config));
+                        } else {
+                            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(state.hwnd_search));
+                        }
+                        return LRESULT(0);
+                    }
                     _ => {}
                 }
             }
@@ -119,13 +124,22 @@ unsafe extern "system" fn list_subclass(
         let vk = wparam.0 as i32;
         if vk == 0x1B {
             let par = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd).unwrap_or(hwnd);
-            windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                Some(par),
-                WM_CLOSE,
-                WPARAM(0),
-                LPARAM(0),
-            );
+            ShowWindow(par, SW_HIDE);
             return LRESULT(0);
+        }
+        if vk == 0x09 {
+            if let Some(ptr) = G_STATE {
+                let state = &mut *ptr;
+                let focus = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus();
+                if focus == hwnd {
+                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(state.hwnd_config));
+                } else if focus == state.hwnd_config {
+                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(state.hwnd_search));
+                } else {
+                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
+                }
+                return LRESULT(0);
+            }
         }
         if vk == 0x0D {
             if let Some(ptr) = G_STATE {
@@ -323,7 +337,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let state = &mut *ptr;
                 match wparam.0 as i32 {
                     0x1B => {
-                        windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                        ShowWindow(hwnd, SW_HIDE);
                     }
                     0x0D => {
                         let list_sel = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
@@ -359,6 +373,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let _ = state.cmds.send(crate::ipc_bridge::UiCmd::DeleteClip(id));
                         }
                     }
+                    0x09 => {
+                        let focus = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus();
+                        if focus == state.hwnd_search {
+                            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(state.hwnd_list));
+                        } else if focus == state.hwnd_list {
+                            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(state.hwnd_config));
+                        } else {
+                            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(state.hwnd_search));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -376,8 +400,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_HOTKEY => {
+            let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool();
+            if visible {
+                ShowWindow(hwnd, SW_HIDE);
+            } else {
+                let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+                if fg != hwnd { G_TARGET_HWND = Some(fg); }
+                ShowWindow(hwnd, SW_SHOW);
+                windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+                if let Some(ptr) = G_STATE {
+                    let state = &mut *ptr;
+                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(state.hwnd_search));
+                }
+            }
+            LRESULT(0)
+        }
         WM_CLOSE => {
-            windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+            ShowWindow(hwnd, SW_HIDE);
             LRESULT(0)
         }
         WM_DESTROY => {
