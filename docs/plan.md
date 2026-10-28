@@ -206,7 +206,10 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   drain + fallback poll, App A/B ingest + stale-target verified;
   T-907 Windows fallback Tab/Esc/Config verified 2026-10-28 f47bff2
   — RustDesk: degraded hotkey (daemon owns Ctrl+Alt+H), fallback
-  minimizes to taskbar, Config placeholder),
+  minimizes to taskbar, Config placeholder;
+  T-905 Windows RustDesk verified 2026-10-28 8d66c63 — frameless
+  WS_POPUP|TOPMOST centered, bg repaint, on-top above fullscreen,
+  scaling/placement/dismiss PASS on virtual display),
   zip-crate
   advisory upgrade (documented ignores in deny.toml; extract()
   unused), GitHub release creation (user decision), cargo-packager
