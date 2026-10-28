@@ -206,6 +206,15 @@ impl HelperSupervisor {
         if let Some(link) = &self.link {
             return link.jobs.clone();
         }
+        let persist_pipe = clipmonger_backend_windows::helper::persistent_pipe_name(profile);
+        if std::fs::OpenOptions::new().read(true).write(true).open(&persist_pipe).is_ok() {
+            let beat = std::sync::Arc::clone(&self.beat);
+            let persist_pipe2 = persist_pipe.clone();
+            let (jobs_tx, jobs_rx) = std::sync::mpsc::channel::<SupervisorJob>();
+            std::thread::spawn(move || persistent_supervisor_thread(persist_pipe2, beat, jobs_rx));
+            self.link = Some(HelperLink { jobs: jobs_tx.clone() });
+            return jobs_tx;
+        }
         let (jobs_tx, jobs_rx) = std::sync::mpsc::channel::<SupervisorJob>();
         let beat = std::sync::Arc::clone(&self.beat);
         let profile = profile.to_path_buf();
@@ -477,6 +486,48 @@ fn supervisor_thread(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+#[cfg(all(windows, feature = "backend-windows"))]
+fn persistent_supervisor_thread(pipe_name: String, beat: std::sync::Arc<Mutex<Option<i64>>>, jobs: std::sync::mpsc::Receiver<SupervisorJob>) {
+    use std::io::{BufRead as _, Write as _};
+    let note_beat = |at_ms: i64| { if let Ok(mut slot) = beat.lock() { *slot = Some(at_ms); } };
+    let mut pipe_file = None;
+    for _ in 0..5 {
+        if let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(&pipe_name) { pipe_file = Some(f); break; }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let Some(file) = pipe_file else {
+        while let Ok(job) = jobs.try_recv() { let _ = job.reply.send(Err("persistent helper not available".to_string())); }
+        return;
+    };
+    note_beat(now_ms());
+    let writer = std::sync::Arc::new(std::sync::Mutex::new(file.try_clone().unwrap()));
+    let mut reader = std::io::BufReader::new(file);
+    loop {
+        let job = match jobs.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(j) => j,
+            Err(_) => {
+                let mut hb = String::new();
+                let mut r = &mut reader;
+                let ok = std::io::BufRead::read_line(&mut r, &mut hb).is_ok();
+                if ok && hb.contains("heartbeat") { note_beat(now_ms()); continue; }
+                while let Ok(j) = jobs.try_recv() { let _ = j.reply.send(Err("persistent helper dead".to_string())); }
+                return;
+            }
+        };
+        let job_id = 1;
+        let line = match clipmonger_backend_windows::helper::encode_job(&clipmonger_backend_windows::helper::Job { job_id, target_pid: job.target_pid, op: job.op, payload: job.payload.clone() }) {
+            Ok(l) => l,
+            Err(e) => { let _ = job.reply.send(Err(format!("backend: {}", e))); continue; }
+        };
+        if let Ok(mut w) = writer.lock() { if w.write_all(line.as_bytes()).is_err() { let _ = job.reply.send(Err("persistent helper write failed".to_string())); return; } if w.flush().is_err() { let _ = job.reply.send(Err("persistent helper flush failed".to_string())); return; } }
+        let mut resp_line = String::new();
+        let read_ok = reader.read_line(&mut resp_line).is_ok() && !resp_line.is_empty();
+        if !read_ok { let _ = job.reply.send(Err("persistent helper read failed".to_string())); return; }
+        let val: serde_json::Value = match serde_json::from_str(&resp_line) { Ok(v) => v, Err(_) => { let _ = job.reply.send(Err("persistent helper protocol error".to_string())); continue; } };
+        if val.get("ok").and_then(|v| v.as_bool()) == Some(true) { note_beat(now_ms()); let _ = job.reply.send(Ok(())); } else { let e = val.get("error").and_then(|v| v.as_str()).unwrap_or("helper refused").to_string(); let _ = job.reply.send(Err(e)); }
     }
 }
 

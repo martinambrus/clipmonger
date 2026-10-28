@@ -34,7 +34,7 @@ pub fn is_installed() -> bool {
 #[cfg(windows)]
 fn task_tr(exe: &Path, profile: &Path) -> String {
     format!(
-        "\"{}\" --profile-dir \"{}\" __elevated-hotkey-helper",
+        "\"{}\" --profile-dir \"{}\" __elevated-persistent",
         exe.display(),
         profile.display()
     )
@@ -64,6 +64,31 @@ fn do_install(exe: &Path, profile: &Path) -> Result<(), String> {
             "schtasks create refused: {}",
             String::from_utf8_lossy(&status.stderr)
         ))
+    }
+}
+
+pub fn ensure_persistent_task(exe: &Path, profile: &Path) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        let tr_expected = task_tr(exe, profile);
+        if is_installed() {
+            let xml = std::process::Command::new("schtasks").arg("/query").arg("/tn").arg(TASK_NAME).arg("/XML").output().map_err(|e| format!("schtasks query failed: {e}"))?;
+            let xml_str = String::from_utf8_lossy(&xml.stdout);
+            if !xml_str.contains("__elevated-persistent") {
+                let _ = std::process::Command::new("schtasks").arg("/delete").arg("/tn").arg(TASK_NAME).arg("/f").output();
+            } else if xml_str.contains(&tr_expected) {
+                return Ok(false);
+            } else {
+                let _ = std::process::Command::new("schtasks").arg("/delete").arg("/tn").arg(TASK_NAME).arg("/f").output();
+            }
+        }
+        do_install(exe, profile)?;
+        Ok(true)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (exe, profile);
+        Ok(false)
     }
 }
 

@@ -303,6 +303,17 @@ pub fn random_pipe_segment() -> String {
     }
 }
 
+#[must_use]
+pub fn persistent_pipe_name(profile: &std::path::Path) -> String {
+    let s = profile.to_string_lossy();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!(r"\\.\pipe\clipmonger-persist-{:016x}", h)
+}
+
 #[cfg(not(windows))]
 fn nanos_now() -> u64 {
     std::time::SystemTime::now()
