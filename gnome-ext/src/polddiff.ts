@@ -10,7 +10,7 @@ export interface OfferInput {
 }
 export interface ReportedOffer { mime: string; bytes_hint: number; bytes?: Uint8Array; hash: string }
 export type CaptureDecision =
-  | { kind: 'Ignore'; reason: 'no-change' | 'denylist' | 'self-write' | 'reading' | 'oversize' | 'empty' }
+  | { kind: 'Ignore'; reason: 'no-change' | 'denylist' | 'self-write' | 'oversize' | 'empty' }
   | { kind: 'Report'; offers: ReportedOffer[]; truncated: string[] }
   | { kind: 'Sensitive'; reason: 'password-hint' };
 
@@ -50,7 +50,10 @@ export class PollDiff {
     const { offers, focusedAppId = null, nowMs } = input;
     // Denylist first: emit nothing at all, request no payload reads.
     if (isDenylisted(focusedAppId, this.denylist)) return { kind: 'Ignore', reason: 'denylist' };
-    if (this.reading) return { kind: 'Ignore', reason: 'reading' };
+    // NOTE: no `reading` check here. pollOnce sets the guard flag before the
+    // async read and tests it at tick entry to drop overlapping ticks; decide
+    // itself must always evaluate the owning tick's offers. A check here made
+    // every poll return Ignore('reading'), so capture never reported.
     if (offers.length === 0) return { kind: 'Ignore', reason: 'empty' };
     // Password hint: suppress before any payload handling.
     const hintOffer = offers.find((o) => o.mime === PASSWORD_HINT_MIME);

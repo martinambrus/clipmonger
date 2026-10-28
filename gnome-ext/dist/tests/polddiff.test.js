@@ -56,10 +56,15 @@ test('self-write suppressed within TTL (one-shot), real copy after TTL kept', ()
     d2.markSelfWrite(text('pasted'), 0);
     assert.equal(d2.decide({ offers: text('pasted'), nowMs: 6001 }).kind, 'Report');
 });
-test('poll tick during Reading is dropped (no overlap)', () => {
+test('owning tick decides while guard flag is set (pollOnce flow)', () => {
+    // Mirrors capture.ts pollOnce: guard set -> read offers -> decide -> clear.
+    // The guard must only stop overlapping ticks, never the owning tick.
     const d = new PollDiff();
     d.setReading(true);
-    assert.deepEqual(d.decide({ offers: text('x'), nowMs: 0 }), { kind: 'Ignore', reason: 'reading' });
-    d.setReading(false);
-    assert.equal(d.decide({ offers: text('x'), nowMs: 0 }).kind, 'Report');
+    try {
+        assert.equal(d.decide({ offers: text('test 222'), nowMs: 0 }).kind, 'Report');
+    }
+    finally {
+        d.setReading(false);
+    }
 });

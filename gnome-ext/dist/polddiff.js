@@ -35,8 +35,10 @@ export class PollDiff {
         // Denylist first: emit nothing at all, request no payload reads.
         if (isDenylisted(focusedAppId, this.denylist))
             return { kind: 'Ignore', reason: 'denylist' };
-        if (this.reading)
-            return { kind: 'Ignore', reason: 'reading' };
+        // NOTE: no `reading` check here. pollOnce sets the guard flag before the
+        // async read and tests it at tick entry to drop overlapping ticks; decide
+        // itself must always evaluate the owning tick's offers. A check here made
+        // every poll return Ignore('reading'), so capture never reported.
         if (offers.length === 0)
             return { kind: 'Ignore', reason: 'empty' };
         // Password hint: suppress before any payload handling.
