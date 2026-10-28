@@ -31,6 +31,8 @@ static mut G_STATE: Option<*mut PopupState> = None;
 static mut G_ORIG_EDIT: isize = 0;
 static mut G_ORIG_LIST: isize = 0;
 static mut G_TARGET_HWND: Option<windows::Win32::Foundation::HWND> = None;
+static mut G_HOTKEY_FALLBACK: bool = false;
+static mut G_HOTKEY_PREV_DOWN: bool = false;
 unsafe extern "system" fn edit_subclass(
     hwnd: HWND,
     msg: u32,
@@ -232,7 +234,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             .unwrap();
             state.hwnd_config = CreateWindowExW(WINDOW_EX_STYLE::default(), w!("BUTTON"), w!("Config"), WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | 0x00010000 | 0x00000000), 392, 320, 80, 22, Some(hwnd), Some(HMENU(IDC_CONFIG as *mut _)), Some(hinst), None).unwrap();
             eprintln!("Config button created hwnd={:?}", state.hwnd_config);
-            SetTimer(Some(hwnd), TIMER_IPC, 100, None);
+            SetTimer(Some(hwnd), TIMER_IPC, 20, None);
             G_ORIG_EDIT = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
                 state.hwnd_search,
                 windows::Win32::UI::WindowsAndMessaging::GWLP_WNDPROC,
@@ -437,8 +439,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if state.should_exit {
                         windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
                     }
-                    // Degraded hotkey poll: daemon owns Ctrl+Alt+H, so check if window hidden and daemon says hotkey fired recently
-                    // Instead use a simple taskbar-restore: if hidden, check for tray-restore via IsWindowVisible fallback timer
+                    if unsafe { G_HOTKEY_FALLBACK } {
+                        let vk_ctrl = windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32;
+                        let vk_lctrl = windows::Win32::UI::Input::KeyboardAndMouse::VK_LCONTROL.0 as i32;
+                        let vk_rctrl = windows::Win32::UI::Input::KeyboardAndMouse::VK_RCONTROL.0 as i32;
+                        let vk_alt = windows::Win32::UI::Input::KeyboardAndMouse::VK_MENU.0 as i32;
+                        let vk_lalt = windows::Win32::UI::Input::KeyboardAndMouse::VK_LMENU.0 as i32;
+                        let vk_ralt = windows::Win32::UI::Input::KeyboardAndMouse::VK_RMENU.0 as i32;
+                        let ctrl = ((windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk_ctrl) as u16 & 0x8000) != 0) || ((windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk_lctrl) as u16 & 0x8000) != 0) || ((windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk_rctrl) as u16 & 0x8000) != 0) || ((windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(vk_ctrl) as u16 & 0x8000) != 0);
+                        let alt = ((windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk_alt) as u16 & 0x8000) != 0) || ((windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk_lalt) as u16 & 0x8000) != 0) || ((windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk_ralt) as u16 & 0x8000) != 0) || ((windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(vk_alt) as u16 & 0x8000) != 0);
+                        let h_down = (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x48) as u16 & 0x8000) != 0;
+                        let f8_down = (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x77) as u16 & 0x8000) != 0;
+                        let hot_down = h_down || f8_down;
+                        let down = (ctrl && alt && h_down) || f8_down;
+                        let prev = unsafe { G_HOTKEY_PREV_DOWN };
+
+
+                        if down && !prev {
+                            // Hotkey pressed: toggle popup
+                            let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool();
+                            let minimized = windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool();
+                            if visible && !minimized {
+                                windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE);
+                            } else {
+                                let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+                                if fg != hwnd { G_TARGET_HWND = Some(fg); }
+                                ShowWindow(hwnd, SW_SHOW);
+                                windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_RESTORE);
+                                windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+                                if let Some(ptr2) = G_STATE { let s2 = &mut *ptr2; let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(s2.hwnd_search)); }
+                            }
+                        }
+                        unsafe { G_HOTKEY_PREV_DOWN = down; }
+                    }
                 }
             }
             LRESULT(0)
@@ -677,7 +710,9 @@ pub fn run_fallback(
         )
         .unwrap();
         let hk_ok = windows::Win32::UI::Input::KeyboardAndMouse::RegisterHotKey(Some(hwnd), 1, windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(windows::Win32::UI::Input::KeyboardAndMouse::MOD_CONTROL.0 | windows::Win32::UI::Input::KeyboardAndMouse::MOD_ALT.0), 0x48);
-        if hk_ok.is_ok() { eprintln!("hotkey Ctrl+Alt+H registered - window hidden until hotkey"); } else { let err = windows::Win32::Foundation::GetLastError(); eprintln!("hotkey register failed err={:?} (degraded) - showing window", err); ShowWindow(hwnd, SW_SHOW); windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd); }
+        // Also try F8 as secondary hotkey for RustDesk virtual display
+        let _hk2 = windows::Win32::UI::Input::KeyboardAndMouse::RegisterHotKey(Some(hwnd), 2, windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(0), 0x77);
+        if hk_ok.is_ok() { eprintln!("hotkey Ctrl+Alt+H registered - window hidden until hotkey"); unsafe { G_HOTKEY_FALLBACK = false; } } else { let err = windows::Win32::Foundation::GetLastError(); eprintln!("hotkey register failed err={:?} (degraded, using poll fallback) - showing window", err); unsafe { G_HOTKEY_FALLBACK = true; } ShowWindow(hwnd, SW_SHOW); windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd); }
         if let Some(ptr) = G_STATE {
             let s = &mut *ptr;
             let _ = s.cmds.send(ipc_bridge::UiCmd::ListHistory);
