@@ -27,6 +27,8 @@ pub struct WinMonitor {
     subscribed_clipboard: bool,
     #[cfg(windows)]
     last_seq: Option<u32>,
+    #[cfg(windows)]
+    last_hash: Option<String>,
 }
 
 impl WinMonitor {
@@ -47,6 +49,7 @@ impl WinMonitor {
                 wakes: Some(rx),
                 subscribed_clipboard: false,
                 last_seq: None,
+                last_hash: None,
             })
         }
         #[cfg(not(windows))]
@@ -220,6 +223,19 @@ impl ClipboardMonitor for WinMonitor {
                             }
                             Err(Error::Timeout(_)) => {}
                             Err(e) => return Err(e),
+                        }
+                    }
+                }
+                if events.is_empty() {
+                    if let Ok(event) = current_event() {
+                        let mut h: u64 = 0xcbf29ce484222325;
+                        for o in &event.offers { for b in o.mime.as_bytes() { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); } }
+                        let hash = format!("{:x}", h);
+                        if self.last_hash.as_deref() != Some(&hash) {
+                            if !event.offers.is_empty() {
+                                self.last_hash = Some(hash);
+                                events.push(event);
+                            }
                         }
                     }
                 }
