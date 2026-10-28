@@ -271,19 +271,21 @@ fn setup_windows_backend(
                         continue;
                     }
                     let mut payloads = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
                     for offer in &event.offers {
                         if !wanted_format(&offer.mime, &formats) {
                             continue;
                         }
+                        if !seen.insert(offer.mime.clone()) { continue; }
                         match transfer.read(&offer.mime, max_bytes) {
                             Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
                             Err(e) => {
                                 eprintln!("daemon: payload read skipped ({}): {e}", offer.mime);
+                                let _ = std::fs::OpenOptions::new().create(true).append(true).open("C:\\Temp\\monitor.log").and_then(|mut f| { use std::io::Write; writeln!(f, "read skipped {}: {}", offer.mime, e) });
                             }
                         }
                     }
                     if !payloads.is_empty() {
-                        let _ = state.ingest_capture("windows", false, &payloads);
                     }
                 }
             }
@@ -410,14 +412,17 @@ fn setup_x11_backend(
                         continue;
                     }
                     let mut payloads = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
                     for offer in &event.offers {
                         if !wanted_format(&offer.mime, &formats) {
                             continue;
                         }
+                        if !seen.insert(offer.mime.clone()) { continue; }
                         match transfer.read(&offer.mime, max_bytes) {
                             Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
                             Err(e) => {
                                 eprintln!("daemon: payload read skipped ({}): {e}", offer.mime);
+                                let _ = std::fs::OpenOptions::new().create(true).append(true).open("C:\\Temp\\monitor.log").and_then(|mut f| { use std::io::Write; writeln!(f, "read skipped {}: {}", offer.mime, e) });
                             }
                         }
                     }
@@ -548,10 +553,12 @@ fn setup_wayland_backend(
                         continue;
                     }
                     let mut payloads = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
                     for offer in &event.offers {
                         if !wanted_format(&offer.mime, &formats) {
                             continue;
                         }
+                        if !seen.insert(offer.mime.clone()) { continue; }
                         match transfer.read(&offer.mime, max_bytes) {
                             Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
                             Err(e) => {
