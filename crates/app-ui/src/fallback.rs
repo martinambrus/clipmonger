@@ -589,7 +589,11 @@ fn drain_events(state: &mut PopupState) {
     unsafe {
         static mut LH: Option<Instant> = None;
         let now = Instant::now();
-        if LH.map_or(true, |l| now.duration_since(l) >= Duration::from_secs(1)) {
+        let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(state.hwnd_main).as_bool();
+        if visible && LH.map_or(true, |l| now.duration_since(l) >= Duration::from_secs(1)) {
+            LH = Some(now);
+            let _ = state.cmds.send(crate::ipc_bridge::UiCmd::ListHistory);
+        } else if !visible && LH.map_or(true, |l| now.duration_since(l) >= Duration::from_secs(3)) {
             LH = Some(now);
             let _ = state.cmds.send(crate::ipc_bridge::UiCmd::ListHistory);
         }
@@ -652,32 +656,25 @@ fn drain_events(state: &mut PopupState) {
 }
 fn refresh_list(state: &mut PopupState) {
     unsafe {
-        windows::Win32::UI::WindowsAndMessaging::SendMessageW(
-            state.hwnd_list,
-            windows::Win32::UI::WindowsAndMessaging::LB_RESETCONTENT,
-            Some(WPARAM(0)),
-            Some(LPARAM(0)),
-        );
+        let top = windows::Win32::UI::WindowsAndMessaging::SendMessageW(state.hwnd_list, windows::Win32::UI::WindowsAndMessaging::LB_GETTOPINDEX, Some(WPARAM(0)), Some(LPARAM(0))).0;
+        let had_focus = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == state.hwnd_list;
+        windows::Win32::UI::WindowsAndMessaging::SendMessageW(state.hwnd_list, windows::Win32::UI::WindowsAndMessaging::WM_SETREDRAW, Some(WPARAM(0)), Some(LPARAM(0)));
+        windows::Win32::UI::WindowsAndMessaging::SendMessageW(state.hwnd_list, windows::Win32::UI::WindowsAndMessaging::LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
         let vis = state.vm.visible();
         for idx in vis.iter() {
             if let Some(clip) = state.vm.clips().get(*idx) {
                 let mut label = clip.preview.chars().take(90).collect::<String>();
-                if label.is_empty() {
-                    label = format!("[{}] {}", clip.formats.join(","), clip.id);
-                }
-                if clip.pinned {
-                    label = format!("📌 {}", label);
-                }
+                if label.is_empty() { label = format!("[{}] {}", clip.formats.join(","), clip.id); }
+                if clip.pinned { label = format!("📌 {}", label); }
                 let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
-                windows::Win32::UI::WindowsAndMessaging::SendMessageW(
-                    state.hwnd_list,
-                    windows::Win32::UI::WindowsAndMessaging::LB_ADDSTRING,
-                    Some(WPARAM(0)),
-                    Some(LPARAM(wide.as_ptr() as isize)),
-                );
+                windows::Win32::UI::WindowsAndMessaging::SendMessageW(state.hwnd_list, windows::Win32::UI::WindowsAndMessaging::LB_ADDSTRING, Some(WPARAM(0)), Some(LPARAM(wide.as_ptr() as isize)));
             }
         }
+        windows::Win32::UI::WindowsAndMessaging::SendMessageW(state.hwnd_list, windows::Win32::UI::WindowsAndMessaging::WM_SETREDRAW, Some(WPARAM(1)), Some(LPARAM(0)));
+        if top >= 0 { let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(state.hwnd_list, windows::Win32::UI::WindowsAndMessaging::LB_SETTOPINDEX, Some(WPARAM(top as usize)), Some(LPARAM(0))); }
         sync_selection(state);
+        if had_focus { let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(state.hwnd_list)); }
+        windows::Win32::Graphics::Gdi::InvalidateRect(Some(state.hwnd_list), None, true);
     }
     update_status(state);
 }
