@@ -12,6 +12,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_BORDER, WS_CHILD, WS_VISIBLE, WS_VSCROLL, WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, FillRect, GetStockObject, InvalidateRect, PAINTSTRUCT, WHITE_BRUSH, HBRUSH, HDC};
+use windows::Win32::UI::Controls::EM_SETSEL;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetKeyState, VK_CONTROL};
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, WM_ERASEBKGND, WM_PAINT, WM_TIMER};
 use crate::{config_model, ipc_bridge};
 use clipmonger_ipc::client::Client;
@@ -43,9 +45,21 @@ struct CfgState {
     hwnd_revert: HWND,
     hwnd_status: HWND,
     hwnd_set: HWND,
+    last_applied: Option<Instant>,
+    last_applied_key: Option<String>,
 }
 
 static mut G_CFG: Option<*mut CfgState> = None;
+static mut G_CFG_EDIT_ORIG: isize = 0;
+static mut G_CFG_EDIT_ORIG2: isize = 0;
+unsafe extern "system" fn cfg_filter_subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == 0x0100 || msg == 0x0102 { let vk = wparam.0 as i32; if vk == 0x41 || vk == 0x61 || wparam.0 == 1 { let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 || (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0; if ctrl || wparam.0 == 1 { windows::Win32::UI::WindowsAndMessaging::SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1))); return LRESULT(0); } } }
+    windows::Win32::UI::WindowsAndMessaging::CallWindowProcW(std::mem::transmute(G_CFG_EDIT_ORIG), hwnd, msg, wparam, lparam)
+}
+unsafe extern "system" fn cfg_value_subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == 0x0100 || msg == 0x0102 { let vk = wparam.0 as i32; if vk == 0x41 || vk == 0x61 || wparam.0 == 1 { let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 || (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0; if ctrl || wparam.0 == 1 { windows::Win32::UI::WindowsAndMessaging::SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1))); return LRESULT(0); } } }
+    windows::Win32::UI::WindowsAndMessaging::CallWindowProcW(std::mem::transmute(G_CFG_EDIT_ORIG2), hwnd, msg, wparam, lparam)
+}
 
 unsafe fn refresh_rows(state: &mut CfgState) {
     SendMessageW(state.hwnd_rows, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
@@ -65,7 +79,7 @@ unsafe fn refresh_rows(state: &mut CfgState) {
         let wide: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
         SendMessageW(state.hwnd_rows, LB_ADDSTRING, Some(WPARAM(0)), Some(LPARAM(wide.as_ptr() as isize)));
     }
-    update_status(state);
+    if state.last_applied.map_or(true, |t| t.elapsed() > Duration::from_secs(2)) { update_status(state); }
 }
 
 unsafe fn update_value(state: &mut CfgState) {
@@ -82,6 +96,7 @@ unsafe fn update_value(state: &mut CfgState) {
 }
 
 unsafe fn update_status(state: &mut CfgState) {
+    if let Some(t) = state.last_applied { if t.elapsed() < Duration::from_secs(3) { if let Some(k) = &state.last_applied_key { let txt = format!("Applied {}", k); let wide: Vec<u16> = txt.encode_utf16().chain(std::iter::once(0)).collect(); windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(state.hwnd_status, windows::core::PCWSTR(wide.as_ptr())); return; } } }
     let txt = if state.doc.is_none() { "Loading...".to_string() } else {
         let dirty = state.doc.as_ref().map(|d| d.dirty_keys().len()).unwrap_or(0);
         if dirty > 0 { format!("{} dirty - Apply/Revert", dirty) } else { "Clean".to_string() }
@@ -112,6 +127,10 @@ unsafe extern "system" fn cfg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             s.hwnd_apply = CreateWindowExW(WINDOW_EX_STYLE::default(), w!("BUTTON"), w!("Apply"), WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | 0x0000), 590, 310, 60, 22, Some(hwnd), Some(windows::Win32::UI::WindowsAndMessaging::HMENU(IDC_APPLY as *mut _)), Some(hinst), None).unwrap();
             s.hwnd_revert = CreateWindowExW(WINDOW_EX_STYLE::default(), w!("BUTTON"), w!("Revert"), WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | 0x0000), 660, 310, 60, 22, Some(hwnd), Some(windows::Win32::UI::WindowsAndMessaging::HMENU(IDC_REVERT as *mut _)), Some(hinst), None).unwrap();
             s.hwnd_status = CreateWindowExW(WINDOW_EX_STYLE::default(), w!("STATIC"), w!("Loading..."), WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0), 8, 345, 600, 18, Some(hwnd), Some(windows::Win32::UI::WindowsAndMessaging::HMENU(IDC_STATUS as *mut _)), Some(hinst), None).unwrap();
+            G_CFG_EDIT_ORIG = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(s.hwnd_filter, windows::Win32::UI::WindowsAndMessaging::GWLP_WNDPROC);
+            windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(s.hwnd_filter, windows::Win32::UI::WindowsAndMessaging::GWLP_WNDPROC, cfg_filter_subclass as isize);
+            G_CFG_EDIT_ORIG2 = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(s.hwnd_value, windows::Win32::UI::WindowsAndMessaging::GWLP_WNDPROC);
+            windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(s.hwnd_value, windows::Win32::UI::WindowsAndMessaging::GWLP_WNDPROC, cfg_value_subclass as isize);
             windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), TIMER_CFG, 100, None);
             let _ = s.cmds.send(ipc_bridge::UiCmd::ConfigGet);
             LRESULT(0)
@@ -167,6 +186,8 @@ unsafe extern "system" fn cfg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                                 let txt = format!("Applied {}", k);
                                 let wide: Vec<u16> = txt.encode_utf16().chain(std::iter::once(0)).collect();
                                 windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(s.hwnd_status, windows::core::PCWSTR(wide.as_ptr()));
+                                s.last_applied = Some(Instant::now());
+                                s.last_applied_key = Some(k.clone());
                             }
                             ipc_bridge::UiEvent::Error(e) => {
                                 let wide: Vec<u16> = e.encode_utf16().chain(std::iter::once(0)).collect();
@@ -295,7 +316,7 @@ pub fn run_config_window(profile: PathBuf) {
             cmds, events, doc: None, filter: String::new(), tab: "History".to_string(), selected: None, filtered: Vec::new(),
             hwnd_tab: HWND(std::ptr::null_mut()), hwnd_filter: HWND(std::ptr::null_mut()), hwnd_rows: HWND(std::ptr::null_mut()),
             hwnd_value: HWND(std::ptr::null_mut()), hwnd_apply: HWND(std::ptr::null_mut()), hwnd_revert: HWND(std::ptr::null_mut()),
-            hwnd_status: HWND(std::ptr::null_mut()), hwnd_set: HWND(std::ptr::null_mut()),
+            hwnd_status: HWND(std::ptr::null_mut()), hwnd_set: HWND(std::ptr::null_mut()), last_applied: None, last_applied_key: None,
         });
         let ptr = Box::into_raw(state);
         let hwnd = CreateWindowExW(WINDOW_EX_STYLE::default(), cls, w!("Clipmonger - Config (CPU) - 27 rows"), WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 750, 420, None, None, Some(hinst), Some(ptr as *const _)).unwrap();

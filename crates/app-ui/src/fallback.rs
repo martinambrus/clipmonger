@@ -37,6 +37,17 @@ unsafe extern "system" fn edit_subclass(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_KEYDOWN || msg == 0x0102 {
+        let vk = wparam.0 as i32;
+        if vk == 0x41 || vk == 0x61 || wparam.0 == 1 {
+            let ctrl = (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32) as u16 & 0x8000) != 0
+                || (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+            if ctrl || wparam.0 == 1 {
+                windows::Win32::UI::WindowsAndMessaging::SendMessageW(hwnd, windows::Win32::UI::Controls::EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+                return LRESULT(0);
+            }
+        }
+    }
     if msg == WM_KEYDOWN {
         let vk = wparam.0 as i32;
         if matches!(vk, 0x26 | 0x28 | 0x1B | 0x0D | 0x2E | 0x09) {
