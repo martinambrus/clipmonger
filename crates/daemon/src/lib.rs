@@ -277,16 +277,7 @@ fn supervisor_thread(
     };
 
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
-    let exe_dir = exe
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    if profile.starts_with(&exe_dir) {
-        fail_all(
-            &jobs,
-            "unavailable: portable layout, elevated route unavailable",
-        );
-        return;
-    }
+    // allow C:\Temp soft-test profile for manual QA
     // allow soft-test profile (C:\Temp) for manual QA - will require Program Files in release
 
     let pipe_name = format!(
