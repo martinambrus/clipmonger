@@ -286,6 +286,7 @@ fn setup_windows_backend(
                         }
                     }
                     if !payloads.is_empty() {
+                        state.ingest_capture("windows", false, &payloads);
                     }
                 }
             }
@@ -669,7 +670,9 @@ fn run_elevated_hotkey_helper(profile: &std::path::Path) -> i32 {
                             let mut c = client; let _ = c.call("hotkey.fired", serde_json::json!({"id": 1}));
                         }
                     }
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open("C:\\Temp\\helper.log").and_then(|mut f| { use std::io::Write; writeln!(f, "helper fired at {:?}", std::time::SystemTime::now()) });
                     let _ = clipmonger_backend_windows::elevated_task::notify_popup();
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open("C:\\Temp\\helper.log").and_then(|mut f| { use std::io::Write; writeln!(f, "notify done") });
 
                 }
             }

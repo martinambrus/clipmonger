@@ -43,6 +43,33 @@ static mut G_HOTKEY_HOOK: Option<windows::Win32::UI::WindowsAndMessaging::HHOOK>
 static mut G_HOTKEY_HWND: Option<HWND> = None;
 static mut G_TRAY_HWND: Option<HWND> = None;
 static mut G_HOTKEY_PREV_DOWN: bool = false;
+static mut G_HOTKEY_VK: u32 = 0x48;
+static mut G_HOTKEY_CTRL: bool = true;
+static mut G_HOTKEY_ALT: bool = true;
+static mut G_HOTKEY_SHIFT: bool = false;
+fn parse_hotkey(hotkey: &str) -> (u32, bool, bool, bool) {
+    let lower = hotkey.to_ascii_lowercase();
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut vk: u32 = 0x48;
+    for part in lower.split('+') {
+        let p = part.trim();
+        match p {
+            "ctrl" | "control" => ctrl = true,
+            "alt" => alt = true,
+            "shift" => shift = true,
+            "win" | "super" | "meta" => {},
+            key if key.len() == 1 => {
+                if let Some(c) = key.chars().next() {
+                    vk = (c.to_ascii_uppercase() as u32) & 0xFF;
+                }
+            }
+            _ => {}
+        }
+    }
+    (vk, ctrl, alt, shift)
+}
 unsafe extern "system" fn edit_subclass(
     hwnd: HWND,
     msg: u32,
@@ -183,10 +210,14 @@ unsafe extern "system" fn list_subclass(
 unsafe extern "system" fn ll_hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     if n_code >= 0 && (w_param.0 as u32 == windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN || w_param.0 as u32 == windows::Win32::UI::WindowsAndMessaging::WM_SYSKEYDOWN) {
         let kb = &*(l_param.0 as *const windows::Win32::UI::WindowsAndMessaging::KBDLLHOOKSTRUCT);
-        if kb.vkCode == 0x48 { // H
+        if kb.vkCode == unsafe { G_HOTKEY_VK } {
             let ctrl = (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
             let alt = (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_MENU.0 as i32) as u16 & 0x8000) != 0;
-            if ctrl && alt {
+            let shift = (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
+            let want_ctrl = unsafe { G_HOTKEY_CTRL };
+            let want_alt = unsafe { G_HOTKEY_ALT };
+            let want_shift = unsafe { G_HOTKEY_SHIFT };
+            if ctrl == want_ctrl && alt == want_alt && shift == want_shift {
                 if let Some(hwnd) = unsafe { G_HOTKEY_HWND } {
                     windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(hwnd), windows::Win32::UI::WindowsAndMessaging::WM_HOTKEY, WPARAM(1), LPARAM(0));
                     return LRESULT(1);
@@ -465,6 +496,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_HOTKEY => {
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open("C:\\Temp\\app.log").and_then(|mut f| { use std::io::Write; writeln!(f, "WM_HOTKEY fired visible check") });
             // ArsClip-style foreground steal: AttachThreadInput to foreground thread
             let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool();
             let minimized = windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool();
@@ -754,9 +786,20 @@ pub fn run_fallback(
             Some(state_ptr as *const std::ffi::c_void),
         )
 .unwrap();
-        unsafe { G_TRAY_HWND = Some(hwnd); let mut nid = NOTIFYICONDATAW::default(); nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32; nid.hWnd = hwnd; nid.uID = 1; nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; nid.uCallbackMessage = WM_TRAY; nid.hIcon = windows::Win32::UI::WindowsAndMessaging::LoadIconW(None, windows::Win32::UI::WindowsAndMessaging::IDI_APPLICATION).unwrap_or_default(); let tip: Vec<u16> = "Clipmonger - Ctrl+Alt+H".encode_utf16().chain(std::iter::once(0)).collect(); for (i, c) in tip.iter().enumerate() { if i < 128 { nid.szTip[i] = *c; } } let _ = Shell_NotifyIconW(NIM_ADD, &mut nid); }
-        let hk_ok = windows::Win32::UI::Input::KeyboardAndMouse::RegisterHotKey(Some(hwnd), 1, windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(windows::Win32::UI::Input::KeyboardAndMouse::MOD_CONTROL.0 | windows::Win32::UI::Input::KeyboardAndMouse::MOD_ALT.0), 0x48);
-        if hk_ok.is_ok() { eprintln!("hotkey Ctrl+Alt+H registered - window hidden until hotkey"); unsafe { G_HOTKEY_FALLBACK = false; } } else { let err = windows::Win32::Foundation::GetLastError(); eprintln!("hotkey register failed err={:?} (degraded, LL hook, start hidden)", err); unsafe { G_HOTKEY_FALLBACK = true; G_HOTKEY_HWND = Some(hwnd); match windows::Win32::UI::WindowsAndMessaging::SetWindowsHookExW(windows::Win32::UI::WindowsAndMessaging::WH_KEYBOARD_LL, Some(ll_hook_proc), None, 0) { Ok(hook) => { if hook.is_invalid() { eprintln!("LL hook invalid"); } else { eprintln!("LL hook installed for Ctrl+Alt+H"); G_HOTKEY_HOOK = Some(hook); } }, Err(e) => { eprintln!("LL hook install failed {:?}", e); } } } }
+        let hotkey_str = {
+            let cfg = std::fs::read_to_string((*(*state_ptr).config.lock().unwrap()).profile.join("config.toml")).unwrap_or_default();
+            let hotkey = cfg.lines().find(|l| l.trim_start().starts_with("hotkey")).and_then(|l| l.split('=').nth(1)).map(|v| v.trim().trim_matches('"').to_string()).unwrap_or_else(|| "ctrl+alt+h".to_string());
+            hotkey
+        };
+        let (vk, want_ctrl, want_alt, want_shift) = parse_hotkey(&hotkey_str);
+        unsafe { G_HOTKEY_VK = vk; G_HOTKEY_CTRL = want_ctrl; G_HOTKEY_ALT = want_alt; G_HOTKEY_SHIFT = want_shift; }
+        let mut mods = windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(0);
+        if want_ctrl { mods.0 |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_CONTROL.0; }
+        if want_alt { mods.0 |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_ALT.0; }
+        if want_shift { mods.0 |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_SHIFT.0; }
+        unsafe { G_TRAY_HWND = Some(hwnd); let mut nid = NOTIFYICONDATAW::default(); nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32; nid.hWnd = hwnd; nid.uID = 1; nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; nid.uCallbackMessage = WM_TRAY; nid.hIcon = windows::Win32::UI::WindowsAndMessaging::LoadIconW(None, windows::Win32::UI::WindowsAndMessaging::IDI_APPLICATION).unwrap_or_default(); let tip: Vec<u16> = format!("Clipmonger - {}", hotkey_str).encode_utf16().chain(std::iter::once(0)).collect(); for (i, c) in tip.iter().enumerate() { if i < 128 { nid.szTip[i] = *c; } } let _ = Shell_NotifyIconW(NIM_ADD, &mut nid); }
+        let hk_ok = windows::Win32::UI::Input::KeyboardAndMouse::RegisterHotKey(Some(hwnd), 1, mods, vk);
+        if hk_ok.is_ok() { eprintln!("hotkey {} registered - window hidden until hotkey", hotkey_str); unsafe { G_HOTKEY_FALLBACK = false; } } else { let err = windows::Win32::Foundation::GetLastError(); eprintln!("hotkey {} register failed err={:?} (degraded, LL hook, start hidden)", hotkey_str, err); unsafe { G_HOTKEY_FALLBACK = true; G_HOTKEY_HWND = Some(hwnd); match windows::Win32::UI::WindowsAndMessaging::SetWindowsHookExW(windows::Win32::UI::WindowsAndMessaging::WH_KEYBOARD_LL, Some(ll_hook_proc), None, 0) { Ok(hook) => { if hook.is_invalid() { eprintln!("LL hook invalid"); } else { eprintln!("LL hook installed for {}", hotkey_str); G_HOTKEY_HOOK = Some(hook); } }, Err(e) => { eprintln!("LL hook install failed {:?}", e); } } } }
         ShowWindow(hwnd, SW_HIDE);
         if let Some(ptr) = G_STATE {
             let s = &mut *ptr;

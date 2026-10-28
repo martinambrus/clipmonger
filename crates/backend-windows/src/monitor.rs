@@ -137,6 +137,46 @@ fn current_event() -> Result<CaptureEvent> {
     })
 }
 
+#[cfg(windows)]
+fn content_fingerprint(event: &CaptureEvent) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let read_bytes: Result<Vec<u8>> = crate::transfer::imp::with_open("fingerprint", || {
+        let mut out = Vec::new();
+        if clipboard_win::raw::get_string(&mut out).is_ok() && !out.is_empty() {
+            return Ok(out);
+        }
+        out.clear();
+        if clipboard_win::raw::get_vec(crate::transfer::imp::CF_TEXT, &mut out).is_ok() && !out.is_empty() {
+            return Ok(out);
+        }
+        out.clear();
+        if clipboard_win::raw::get_vec(crate::transfer::imp::CF_OEMTEXT, &mut out).is_ok() && !out.is_empty() {
+            return Ok(out);
+        }
+        Err(Error::Unavailable("no text".to_string()))
+    });
+    if let Ok(bytes) = read_bytes {
+        for b in &bytes {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        for o in &event.offers {
+            for b in o.mime.as_bytes() {
+                hash ^= *b as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        return format!("{:x}:{}", hash, bytes.len());
+    }
+    for o in &event.offers {
+        for b in o.mime.as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("{:x}", hash)
+}
+
 impl ClipboardMonitor for WinMonitor {
     const AFFINITY: Affinity = Affinity::Worker;
 
@@ -195,6 +235,7 @@ impl ClipboardMonitor for WinMonitor {
                                         continue;
                                     }
                                     self.last_seq = seq;
+                                    self.last_hash = Some(content_fingerprint(&event));
                                     events.push(event);
                                     std::thread::sleep(std::time::Duration::from_millis(30));
                                     continue;
@@ -218,7 +259,9 @@ impl ClipboardMonitor for WinMonitor {
                     if Some(seq) != self.last_seq {
                         match current_event() {
                             Ok(event) => {
+                                let fp = content_fingerprint(&event);
                                 self.last_seq = Some(seq);
+                                self.last_hash = Some(fp);
                                 events.push(event);
                             }
                             Err(Error::Timeout(_)) => {}
@@ -228,12 +271,10 @@ impl ClipboardMonitor for WinMonitor {
                 }
                 if events.is_empty() {
                     if let Ok(event) = current_event() {
-                        let mut h: u64 = 0xcbf29ce484222325;
-                        for o in &event.offers { for b in o.mime.as_bytes() { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); } }
-                        let hash = format!("{:x}", h);
-                        if self.last_hash.as_deref() != Some(&hash) {
-                            if !event.offers.is_empty() {
-                                self.last_hash = Some(hash);
+                        if !event.offers.is_empty() {
+                            let fp = content_fingerprint(&event);
+                            if self.last_hash.as_deref() != Some(&fp) {
+                                self.last_hash = Some(fp);
                                 events.push(event);
                             }
                         }

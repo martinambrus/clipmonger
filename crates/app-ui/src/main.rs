@@ -139,6 +139,8 @@ fn parse_args() -> (Option<PathBuf>, bool) {
             profile = args.next().map(PathBuf::from);
         } else if arg == "--minimized" {
             minimized = true;
+        } else if arg == "--fallback" {
+            std::env::set_var("CLIPMONGER_FORCE_FALLBACK", "1");
         }
     }
     (profile, minimized)
@@ -1365,6 +1367,19 @@ fn main() -> ExitCode {
         #[cfg(target_os = "linux")]
         linux_tray: linux_tray::LinuxTray::spawn(&initial_inputs),
     };
+    #[cfg(all(windows, feature = "software"))]
+    if std::env::var("CLIPMONGER_FORCE_FALLBACK").as_deref() == Ok("1") {
+        eprintln!("forced fallback mode (virtual display / RustDesk)");
+        let fb_transport: Box<dyn ipc_bridge::Transport> = match try_connect(&profile) {
+            Some(c) => Box::new(ClientTransport { client: c }),
+            None => Box::new(OfflineTransport),
+        };
+        let fallback_cfg = Arc::new(Mutex::new(ConfigWindowState::new(profile.clone())));
+        let (f_cmds, f_events) = ipc_bridge::Bridge::spawn(fb_transport);
+        let _ = f_cmds.send(ipc_bridge::UiCmd::Status);
+        let _ = f_cmds.send(ipc_bridge::UiCmd::ListHistory);
+        return fallback::run_fallback(f_cmds, f_events, fallback_cfg);
+    }
     let eframe_res = eframe::run_native("clipmonger", options, Box::new(|_| Ok(Box::new(app))));
     match eframe_res {
         Ok(()) => ExitCode::SUCCESS,
