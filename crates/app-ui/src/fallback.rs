@@ -20,6 +20,7 @@ struct PopupState {
     cmds: mpsc::Sender<ipc_bridge::UiCmd>,
     events: mpsc::Receiver<ipc_bridge::UiEvent>,
     config: Arc<Mutex<crate::ConfigWindowState>>,
+    hwnd_main: HWND,
     hwnd_search: HWND,
     hwnd_list: HWND,
     hwnd_status: HWND,
@@ -611,24 +612,28 @@ fn update_status(state: &mut PopupState) {
     }
 }
 fn do_paste(state: &mut PopupState) {
-    eprintln!(
-        "PASTE sel={} vis={:?} clips={:?}",
-        state.vm.selected,
-        state.vm.visible(),
-        state
-            .vm
-            .clips()
-            .iter()
-            .map(|c| (c.id, c.preview.chars().take(20).collect::<String>()))
-            .collect::<Vec<_>>()
-    );
-    if let Some(clip) = state.vm.clip_at(state.vm.selected) {
-        let id = clip.id;
-        eprintln!("  paste id={} preview={}", id, clip.preview);
-        let _ = state.cmds.send(ipc_bridge::UiCmd::PasteClip(id));
-    } else {
-        eprintln!("  clip_at None");
+    eprintln!("PASTE sel={} vis={:?}", state.vm.selected, state.vm.visible());
+    let Some(clip) = state.vm.clip_at(state.vm.selected) else { eprintln!("  clip_at None"); return; };
+    let id = clip.id;
+    eprintln!("  paste id={} preview={}", id, clip.preview);
+    let target = unsafe { G_TARGET_HWND };
+    let cmds = state.cmds.clone();
+    let hwnd_main = state.hwnd_main; let hwnd_main_usize = hwnd_main.0 as usize;
+    // Hide popup first so paste goes to previous window, not filter input
+    if hwnd_main_usize != 0 {
+        unsafe { windows::Win32::UI::WindowsAndMessaging::ShowWindow(HWND(hwnd_main_usize as *mut _), windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE); }
     }
+    // Restore focus to target, then paste after delay
+    let target_usize = target.map(|h| h.0 as usize);
+    std::thread::spawn(move || {
+        if let Some(tu) = target_usize { let t = HWND(tu as *mut _); unsafe { let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(t); let _ = windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(t); }
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        let _ = cmds.send(ipc_bridge::UiCmd::PasteClip(id));
+        eprintln!("  paste sent after hide");
+    });
 }
 pub fn run_fallback(
     cmds: mpsc::Sender<ipc_bridge::UiCmd>,
@@ -642,6 +647,7 @@ pub fn run_fallback(
         cmds,
         events,
         config,
+        hwnd_main: HWND(std::ptr::null_mut()),
         hwnd_search: HWND::default(),
         hwnd_list: HWND::default(),
         hwnd_status: HWND::default(),
