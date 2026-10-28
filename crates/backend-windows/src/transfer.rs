@@ -107,9 +107,9 @@ pub(crate) mod imp {
     pub(crate) fn mime_for_id(id: u32) -> Option<String> {
         match id {
             CF_UNICODETEXT => Some("text/plain".to_string()),
+            CF_TEXT => Some("text/plain".to_string()),
             CF_DIB | CF_DIBV5 => Some("image/png".to_string()),
             CF_HDROP => Some("text/uri-list".to_string()),
-            CF_TEXT => None,
             _ => {
                 let name = raw::format_name_big(id)?;
                 if crate::optout::is_optout_name(&name) {
@@ -152,7 +152,11 @@ pub(crate) mod imp {
                 out = fragment.into_bytes();
             }
         } else if mime == "text/plain" {
-            raw::get_string(&mut out).map_err(|e| clip_error("read text", e))?;
+            if id == CF_TEXT {
+                raw::get_vec(id, &mut out).map_err(|e| clip_error("read text", e))?;
+            } else {
+                raw::get_string(&mut out).map_err(|e| clip_error("read text", e))?;
+            }
         } else {
             raw::get_vec(id, &mut out).map_err(|e| clip_error("read", e))?;
         }
