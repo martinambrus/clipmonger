@@ -201,7 +201,10 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   tests/manual/. Perf calibration: idle RSS 6.3MB, 10k search p95
   76.8ms release (over initial 50ms budget — FNF for v1 freeze).
   Open: manual signoffs (T-905…908/GNOME/Ubuntu legs; T-409 PASSED
-  2026-10-27 on the Windows host), zip-crate
+  2026-10-27 on the Windows host; T-908 Windows Notepad transient
+  fix 2026-10-28 a1c36c9 — RustDesk virtual display: monitor empty→data
+  drain + fallback poll, App A/B ingest + stale-target verified),
+  zip-crate
   advisory upgrade (documented ignores in deny.toml; extract()
   unused), GitHub release creation (user decision), cargo-packager
   installers on native runners.
