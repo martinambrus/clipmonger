@@ -739,54 +739,61 @@ fn run_elevated_persistent(profile: &std::path::Path) -> i32 {
     if hook.is_null() { eprintln!("persistent helper: hook failed"); return 1; }
     eprintln!("persistent helper: LL hook for {} at High IL", hotkey_str);
     let persist_pipe = clipmonger_backend_windows::helper::persistent_pipe_name(profile);
+    let persist_pipe_thread = persist_pipe.clone();
     std::thread::spawn(move || {
-        use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(async move {
-            loop {
-                let server = match ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).pipe_mode(PipeMode::Byte).create(&persist_pipe) {
-                    Ok(s) => s,
-                    Err(_) => { tokio::time::sleep(std::time::Duration::from_secs(1)).await; continue; }
-                };
-                if server.connect().await.is_err() { continue; }
-                let (read_half, mut write_half) = tokio::io::split(server);
-                let mut reader = tokio::io::BufReader::new(read_half);
-                loop {
-                    let mut line = String::new();
-                    use tokio::io::AsyncBufReadExt as _;
-                    use tokio::io::AsyncWriteExt as _;
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {},
-                        Err(_) => break,
-                    }
-                    let job = match clipmonger_backend_windows::helper::decode_job(&line) {
-                        Ok(j) => j,
-                        Err(e) => {
-                            let resp = serde_json::json!({"job_id": 0, "ok": false, "error": format!("refused: {}", e)}).to_string() + "\n";
-                            let _ = write_half.write_all(resp.as_bytes()).await;
-                            let _ = write_half.flush().await;
-                            continue;
-                        }
-                    };
-                    let outcome = (|| {
-                        let pinned = clipmonger_backend_windows::helper::pin_helper_target(job.target_pid)?;
-                        match job.op {
-                            clipmonger_backend_windows::helper::JobOp::SendInputBatch => clipmonger_backend_windows::paste::worker_send_input_batch(&job.payload).map_err(|d| format!("inject failed: {}", d))?,
-                            clipmonger_backend_windows::helper::JobOp::PasteChord => clipmonger_backend_windows::paste::worker_press_paste_chord().map_err(|d| format!("inject failed: {}", d))?,
-                        }
-                        let _ = pinned;
-                        Ok::<(), String>(())
-                    })();
-                    let resp = match outcome {
-                        Ok(()) => serde_json::json!({"job_id": job.job_id, "ok": true}).to_string() + "\n",
-                        Err(e) => serde_json::json!({"job_id": job.job_id, "ok": false, "error": e}).to_string() + "\n",
-                    };
-                    if write_half.write_all(resp.as_bytes()).await.is_err() { break; }
-                    if write_half.flush().await.is_err() { break; }
-                }
+        use std::io::{BufRead as _, Write as _};
+        loop {
+            let mut pipe = None;
+            for _ in 0..60 {
+                if let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(&persist_pipe_thread) { pipe = Some(f); break; }
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
-        });
+            let Some(pipe) = pipe else { std::thread::sleep(std::time::Duration::from_secs(2)); continue; };
+            eprintln!("persistent helper: connected to daemon pipe {}", persist_pipe_thread);
+            let writer = match pipe.try_clone() { Ok(w) => std::sync::Arc::new(std::sync::Mutex::new(w)), Err(_) => { std::thread::sleep(std::time::Duration::from_secs(1)); continue; } };
+            let mut reader = std::io::BufReader::new(pipe);
+            // heartbeat thread
+            let hb_writer = std::sync::Arc::clone(&writer);
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(15));
+                    let Ok(mut w) = hb_writer.lock() else { return; };
+                    if writeln!(*w, "{{\"heartbeat\":{}}}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())).is_err() { return; }
+                    if w.flush().is_err() { return; }
+                }
+            });
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {},
+                    Err(_) => break,
+                }
+                if line.trim().is_empty() { continue; }
+                if line.contains("heartbeat") { continue; }
+                let job = match clipmonger_backend_windows::helper::decode_job(&line) {
+                    Ok(j) => j,
+                    Err(e) => { let resp = serde_json::json!({"job_id": 0, "ok": false, "error": format!("refused: {}", e)}).to_string() + "\n"; if let Ok(mut w) = writer.lock() { let _ = w.write_all(resp.as_bytes()); let _ = w.flush(); } continue; }
+                };
+                let outcome = (|| {
+                    let pinned = clipmonger_backend_windows::helper::pin_helper_target(job.target_pid)?;
+                    match job.op {
+                        clipmonger_backend_windows::helper::JobOp::SendInputBatch => clipmonger_backend_windows::paste::worker_send_input_batch(&job.payload).map_err(|d| format!("inject failed: {}", d))?,
+                        clipmonger_backend_windows::helper::JobOp::PasteChord => clipmonger_backend_windows::paste::worker_press_paste_chord().map_err(|d| format!("inject failed: {}", d))?,
+                    }
+                    let _ = pinned;
+                    Ok::<(), String>(())
+                })();
+                let resp = match outcome {
+                    Ok(()) => serde_json::json!({"job_id": job.job_id, "ok": true}).to_string() + "\n",
+                    Err(e) => serde_json::json!({"job_id": job.job_id, "ok": false, "error": e}).to_string() + "\n",
+                };
+                let mut w = match writer.lock() { Ok(w) => w, Err(_) => break };
+                if w.write_all(resp.as_bytes()).is_err() { break; }
+                if w.flush().is_err() { break; }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
     });
     let mut msg = std::mem::MaybeUninit::<MSG>::uninit();
     unsafe { while GetMessageW(msg.as_mut_ptr(), std::ptr::null_mut(), 0, 0) != 0 {} }

@@ -206,12 +206,16 @@ impl HelperSupervisor {
         if let Some(link) = &self.link {
             return link.jobs.clone();
         }
-        let persist_pipe = clipmonger_backend_windows::helper::persistent_pipe_name(profile);
-        if std::fs::OpenOptions::new().read(true).write(true).open(&persist_pipe).is_ok() {
+        // Prefer persistent helper when the scheduled task is installed (High IL helper
+        // already running at logon). This avoids per-paste UAC. The persistent path
+        // makes the daemon the pipe server (Medium IL) so the High IL helper can
+        // connect as client without mandatory-integrity blocks.
+        if clipmonger_backend_windows::elevated_task::is_installed() {
+            let persist_pipe = clipmonger_backend_windows::helper::persistent_pipe_name(profile);
             let beat = std::sync::Arc::clone(&self.beat);
-            let persist_pipe2 = persist_pipe.clone();
+            let profile_path = profile.to_path_buf();
             let (jobs_tx, jobs_rx) = std::sync::mpsc::channel::<SupervisorJob>();
-            std::thread::spawn(move || persistent_supervisor_thread(persist_pipe2, beat, jobs_rx));
+            std::thread::spawn(move || persistent_supervisor_thread(persist_pipe, beat, profile_path, jobs_rx));
             self.link = Some(HelperLink { jobs: jobs_tx.clone() });
             return jobs_tx;
         }
@@ -490,44 +494,103 @@ fn supervisor_thread(
 }
 
 #[cfg(all(windows, feature = "backend-windows"))]
-fn persistent_supervisor_thread(pipe_name: String, beat: std::sync::Arc<Mutex<Option<i64>>>, jobs: std::sync::mpsc::Receiver<SupervisorJob>) {
-    use std::io::{BufRead as _, Write as _};
+fn persistent_supervisor_thread(pipe_name: String, beat: std::sync::Arc<Mutex<Option<i64>>>, profile: PathBuf, jobs: std::sync::mpsc::Receiver<SupervisorJob>) {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
     let note_beat = |at_ms: i64| { if let Ok(mut slot) = beat.lock() { *slot = Some(at_ms); } };
-    let mut pipe_file = None;
-    for _ in 0..5 {
-        if let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(&pipe_name) { pipe_file = Some(f); break; }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    let Some(file) = pipe_file else {
-        while let Ok(job) = jobs.try_recv() { let _ = job.reply.send(Err("persistent helper not available".to_string())); }
-        return;
+    let fail_all = |jobs: &std::sync::mpsc::Receiver<SupervisorJob>, message: &str| {
+        append_audit(&profile, serde_json::json!({"kind": "helper", "action": "refused", "result": message}));
+        while let Ok(job) = jobs.try_recv() { let _ = job.reply.send(Err(message.to_string())); }
     };
-    note_beat(now_ms());
-    let writer = std::sync::Arc::new(std::sync::Mutex::new(file.try_clone().unwrap()));
-    let mut reader = std::io::BufReader::new(file);
-    loop {
-        let job = match jobs.recv_timeout(std::time::Duration::from_secs(60)) {
-            Ok(j) => j,
-            Err(_) => {
-                let mut hb = String::new();
-                let mut r = &mut reader;
-                let ok = std::io::BufRead::read_line(&mut r, &mut hb).is_ok();
-                if ok && hb.contains("heartbeat") { note_beat(now_ms()); continue; }
-                while let Ok(j) = jobs.try_recv() { let _ = j.reply.send(Err("persistent helper dead".to_string())); }
-                return;
-            }
-        };
-        let job_id = 1;
-        let line = match clipmonger_backend_windows::helper::encode_job(&clipmonger_backend_windows::helper::Job { job_id, target_pid: job.target_pid, op: job.op, payload: job.payload.clone() }) {
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(r) => r,
+        Err(e) => { fail_all(&jobs, &format!("elevation refused: helper runtime failed: {e}")); return; }
+    };
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
+    let profile_clone = profile.clone();
+    let server = match runtime.block_on(async move {
+        let listener = match ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).pipe_mode(PipeMode::Byte).create(&pipe_name) {
             Ok(l) => l,
-            Err(e) => { let _ = job.reply.send(Err(format!("backend: {}", e))); continue; }
+            Err(e) => return Err(format!("elevation refused: helper pipe failed: {e}")),
         };
-        if let Ok(mut w) = writer.lock() { if w.write_all(line.as_bytes()).is_err() { let _ = job.reply.send(Err("persistent helper write failed".to_string())); return; } if w.flush().is_err() { let _ = job.reply.send(Err("persistent helper flush failed".to_string())); return; } }
-        let mut resp_line = String::new();
-        let read_ok = reader.read_line(&mut resp_line).is_ok() && !resp_line.is_empty();
-        if !read_ok { let _ = job.reply.send(Err("persistent helper read failed".to_string())); return; }
-        let val: serde_json::Value = match serde_json::from_str(&resp_line) { Ok(v) => v, Err(_) => { let _ = job.reply.send(Err("persistent helper protocol error".to_string())); continue; } };
-        if val.get("ok").and_then(|v| v.as_bool()) == Some(true) { note_beat(now_ms()); let _ = job.reply.send(Ok(())); } else { let e = val.get("error").and_then(|v| v.as_str()).unwrap_or("helper refused").to_string(); let _ = job.reply.send(Err(e)); }
+        append_audit(&profile_clone, serde_json::json!({"kind": "helper", "action": "persistent_wait", "result": "awaiting High IL client"}));
+        match tokio::time::timeout(std::time::Duration::from_secs(90), listener.connect()).await {
+            Ok(Ok(())) => Ok(listener),
+            Ok(Err(e)) => Err(format!("elevation refused: helper connect failed: {e}")),
+            Err(_) => Err("elevation refused: persistent helper connect timed out (helper not running?)".to_string()),
+        }
+    }) {
+        Ok(s) => s,
+        Err(msg) => { fail_all(&jobs, &msg); return; }
+    };
+    if !helper_peer_ok(&server, &exe) {
+        append_audit(&profile, serde_json::json!({"kind": "helper", "action": "alert", "result": "peer mismatch"}));
+        fail_all(&jobs, "elevation refused: helper peer mismatch");
+        return;
+    }
+    note_beat(now_ms());
+    append_audit(&profile, serde_json::json!({"kind": "helper", "action": "persistent_connected", "result": "ok"}));
+    let (read_half, mut write_half) = tokio::io::split(server);
+    let mut reader = tokio::io::BufReader::new(read_half);
+    let mut missed: u32 = 0;
+    loop {
+        match jobs.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(job) => {
+                let line = match clipmonger_backend_windows::helper::encode_job(&clipmonger_backend_windows::helper::Job { job_id: 1, target_pid: job.target_pid, op: job.op, payload: job.payload.clone() }) {
+                    Ok(l) => l,
+                    Err(e) => { let _ = job.reply.send(Err(format!("backend: {e}"))); continue; }
+                };
+                let outcome = runtime.block_on(async {
+                    if tokio::time::timeout(std::time::Duration::from_secs(120), write_half.write_all(line.as_bytes())).await.is_err() { return Err("helper write timed out".to_string()); }
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+                    loop {
+                        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() { return Err("helper result timed out".to_string()); }
+                        let mut result_line = String::new();
+                        let read = match tokio::time::timeout(remaining, reader.read_line(&mut result_line)).await { Ok(r) => r, Err(_) => return Err("helper result timed out".to_string()) };
+                        let bytes = match read { Ok(b) => b, Err(_) => return Err("helper result unreadable".to_string()) };
+                        if bytes == 0 { return Err("helper result unreadable".to_string()); }
+                        match serde_json::from_str::<serde_json::Value>(&result_line) {
+                            Ok(v) if v.get("heartbeat").is_some() => continue,
+                            Ok(v) => {
+                                if v.get("ok").and_then(|x| x.as_bool()) == Some(true) { return Ok(String::new()); }
+                                return Err(v.get("error").and_then(|x| x.as_str()).unwrap_or("helper refused").to_string());
+                            }
+                            Err(_) => return Err("helper result unreadable".to_string()),
+                        }
+                    }
+                });
+                match &outcome {
+                    Ok(m) if m.is_empty() => {
+                        note_beat(now_ms());
+                        append_audit(&profile, serde_json::json!({"kind": "helper", "action": "job", "op_hash": fnv_hex(job.payload.as_bytes()), "result": "ok"}));
+                        let _ = job.reply.send(Ok(()));
+                    }
+                    _ => {
+                        let message = match &outcome { Ok(m) => format!("helper protocol error: {m:?}"), Err(e) => e.clone() };
+                        append_audit(&profile, serde_json::json!({"kind": "helper", "action": "job", "op_hash": fnv_hex(job.payload.as_bytes()), "result": message}));
+                        let _ = job.reply.send(Err(message.clone()));
+                        if message.contains("timed out") || message.contains("unreadable") { return; }
+                    }
+                }
+                missed = 0;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let mut heartbeat = String::new();
+                let got = runtime.block_on(async { tokio::time::timeout(std::time::Duration::from_secs(20), reader.read_line(&mut heartbeat)).await });
+                match got {
+                    Ok(Ok(0) | Err(_)) | Err(_) => {
+                        missed += 1;
+                        if missed >= 3 {
+                            append_audit(&profile, serde_json::json!({"kind": "helper", "action": "dead", "result": "3 missed heartbeats"}));
+                            return;
+                        }
+                    }
+                    Ok(Ok(_)) => { missed = 0; note_beat(now_ms()); }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
     }
 }
 

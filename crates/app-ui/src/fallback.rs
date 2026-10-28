@@ -497,6 +497,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_HOTKEY => {
             let _ = std::fs::OpenOptions::new().create(true).append(true).open("C:\\Temp\\app.log").and_then(|mut f| { use std::io::Write; writeln!(f, "WM_HOTKEY fired visible check") });
+            static mut LAST_TOGGLE: Option<std::time::Instant> = None;
+            let now = std::time::Instant::now();
+            if let Some(last) = unsafe { LAST_TOGGLE } {
+                if now.duration_since(last) < std::time::Duration::from_millis(300) {
+                    return LRESULT(0);
+                }
+            }
+            unsafe { LAST_TOGGLE = Some(now); }
             // ArsClip-style foreground steal: AttachThreadInput to foreground thread
             let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool();
             let minimized = windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool();
