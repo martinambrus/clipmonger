@@ -213,7 +213,8 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   T-906 Windows RustDesk verified 2026-10-28 34577e4 — Config 27-row walk PASS (Apply/Revert/invalid/filter/close + Ctrl+A + Applied status) via Win32 CPU fallback (no OpenGL);
   T-908 Windows RustDesk verified 2026-10-28 — Alt-Tab dismisses
   with no paste; stale-target guard verified for in-flight UAC/helper
-  races via G_TARGET_HWND/cur_fg + Notepad empty→data transient),
+  races via G_TARGET_HWND/cur_fg + Notepad empty→data transient);
+  T-906/907/908 re-verified 2026-10-29 ff47f03 — popup.restore_clipboard bool (default true) with live ConfigSet reload (no restart), bump_clip keeps pasted on top, WSL highlight+right-click ingest via content_fingerprint (CF_UNICODETEXT/CF_TEXT/CF_OEMTEXT) and fallback focus restore verified on RustDesk virtual display; Linux gate fix 1739725,
   zip-crate
   advisory upgrade (documented ignores in deny.toml; extract()
   unused), GitHub release creation (user decision), cargo-packager
