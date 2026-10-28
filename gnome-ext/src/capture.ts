@@ -32,7 +32,7 @@ export class CaptureRelay {
       // image/png + text/uri-list bytes in-Shell. Text path below is the
       // known-good St.Clipboard text API; rich offers stay behind this call.
       const clipboard = St.Clipboard.get_default();
-      const mimes: string[] = typeof clipboard.get_mimetypes === 'function' ? await clipboard.get_mimetypes() : ['text/plain'];
+      const mimes: string[] = typeof clipboard.get_mimetypes === 'function' ? await clipboard.get_mimetypes(St.SelectionType.SELECTION_CLIPBOARD) : ['text/plain'];
       const offers: OfferInput[] = [];
       for (const mime of mimes) {
         if (mime.startsWith('text/plain') || mime === 'UTF8_STRING') {
