@@ -48,7 +48,7 @@ unsafe extern "system" fn edit_subclass(
                 match vk {
                     0x1B => {
                         let par = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd).unwrap_or(HWND(std::ptr::null_mut()));
-                        ShowWindow(par, SW_HIDE);
+                        windows::Win32::UI::WindowsAndMessaging::ShowWindow(par, windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE);
                         return LRESULT(0);
                     }
                     0x26 => {
@@ -124,7 +124,7 @@ unsafe extern "system" fn list_subclass(
         let vk = wparam.0 as i32;
         if vk == 0x1B {
             let par = windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd).unwrap_or(hwnd);
-            ShowWindow(par, SW_HIDE);
+            windows::Win32::UI::WindowsAndMessaging::ShowWindow(par, windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE);
             return LRESULT(0);
         }
         if vk == 0x09 {
@@ -274,14 +274,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         8,
                         36,
                         w - 16,
-                        h - 60,
+                        h - 70,
+                        true,
+                    );
+                    let _ = windows::Win32::UI::WindowsAndMessaging::MoveWindow(
+                        state.hwnd_config,
+                        w - 88,
+                        h - 30,
+                        80,
+                        22,
                         true,
                     );
                     let _ = windows::Win32::UI::WindowsAndMessaging::MoveWindow(
                         state.hwnd_status,
                         8,
                         h - 18,
-                        w - 16,
+                        w - 100,
                         16,
                         true,
                     );
@@ -326,7 +334,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     }
                     (IDC_LIST, LBN_DBLCLK) => do_paste(state),
-                    (IDC_CONFIG, _) => { state.config.lock().unwrap().open = true; eprintln!("Config opened via keyboard"); }
+                    (IDC_CONFIG, _) => {
+                        let open = { state.config.lock().unwrap().open = true; true };
+                        if open {
+                            windows::Win32::UI::WindowsAndMessaging::MessageBoxW(None, w!("Config window (maximalist 27 rows) - use main build on real display for full editor.\n\nFallback shows status only."), w!("Clipmonger Config"), windows::Win32::UI::WindowsAndMessaging::MB_OK);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -337,7 +350,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let state = &mut *ptr;
                 match wparam.0 as i32 {
                     0x1B => {
-                        ShowWindow(hwnd, SW_HIDE);
+                        // Minimize to taskbar so user can restore without hotkey (degraded mode)
+                        windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE);
                     }
                     0x0D => {
                         let list_sel = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
@@ -396,18 +410,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if state.should_exit {
                         windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
                     }
+                    // Degraded hotkey poll: daemon owns Ctrl+Alt+H, so check if window hidden and daemon says hotkey fired recently
+                    // Instead use a simple taskbar-restore: if hidden, check for tray-restore via IsWindowVisible fallback timer
                 }
             }
             LRESULT(0)
         }
         WM_HOTKEY => {
             let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool();
-            if visible {
-                ShowWindow(hwnd, SW_HIDE);
+            let minimized = windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool();
+            if visible && !minimized {
+                windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE);
             } else {
                 let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
                 if fg != hwnd { G_TARGET_HWND = Some(fg); }
                 ShowWindow(hwnd, SW_SHOW);
+                windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_RESTORE);
                 windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
                 if let Some(ptr) = G_STATE {
                     let state = &mut *ptr;
@@ -417,7 +435,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_CLOSE => {
-            ShowWindow(hwnd, SW_HIDE);
+            windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE);
             LRESULT(0)
         }
         WM_DESTROY => {
