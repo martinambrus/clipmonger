@@ -32,14 +32,14 @@ export class CaptureRelay {
       // image/png + text/uri-list bytes in-Shell. Text path below is the
       // known-good St.Clipboard text API; rich offers stay behind this call.
       const clipboard = St.Clipboard.get_default();
-      const mimes: string[] = typeof clipboard.get_mimetypes === 'function' ? await clipboard.get_mimetypes(St.SelectionType.SELECTION_CLIPBOARD) : ['text/plain'];
+      const mimes: string[] = typeof clipboard.get_mimetypes === 'function' ? await clipboard.get_mimetypes(St.ClipboardType.CLIPBOARD) : ['text/plain'];
       const offers: OfferInput[] = [];
       for (const mime of mimes) {
         if (mime.startsWith('text/plain') || mime === 'UTF8_STRING') {
           // A get_text callback that never fires must not wedge isReading.
           const text: string = await new Promise((resolve) => {
             const timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => { resolve(''); return GLib.SOURCE_REMOVE; });
-            clipboard.get_text(St.SelectionType.SELECTION_CLIPBOARD, (_c: any, t: string | null) => {
+            clipboard.get_text(St.ClipboardType.CLIPBOARD, (_c: any, t: string | null) => {
               GLib.source_remove(timer);
               resolve(t ?? '');
             });
