@@ -209,7 +209,10 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   minimizes to taskbar, Config placeholder;
   T-905 Windows RustDesk verified 2026-10-28 8d66c63 — frameless
   WS_POPUP|TOPMOST centered, bg repaint, on-top above fullscreen,
-  scaling/placement/dismiss PASS on virtual display),
+  scaling/placement/dismiss PASS on virtual display;
+  T-908 Windows RustDesk verified 2026-10-28 — Alt-Tab dismisses
+  with no paste; stale-target guard verified for in-flight UAC/helper
+  races via G_TARGET_HWND/cur_fg + Notepad empty→data transient),
   zip-crate
   advisory upgrade (documented ignores in deny.toml; extract()
   unused), GitHub release creation (user decision), cargo-packager
