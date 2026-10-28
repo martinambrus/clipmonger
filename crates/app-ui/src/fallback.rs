@@ -619,9 +619,12 @@ fn do_paste(state: &mut PopupState) {
     let target = unsafe { G_TARGET_HWND };
     let cmds = state.cmds.clone();
     let hwnd_main = state.hwnd_main; let hwnd_main_usize = hwnd_main.0 as usize;
-    // Hide popup first so paste goes to previous window, not filter input
+    // Hide popup first so paste goes to previous window, not filter input (SW_HIDE for frameless POPUP, not MINIMIZE)
     if hwnd_main_usize != 0 {
-        unsafe { windows::Win32::UI::WindowsAndMessaging::ShowWindow(HWND(hwnd_main_usize as *mut _), windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE); }
+        unsafe { windows::Win32::UI::WindowsAndMessaging::ShowWindow(HWND(hwnd_main_usize as *mut _), windows::Win32::UI::WindowsAndMessaging::SW_HIDE); }
+        eprintln!("  hid popup hwnd={:?}", hwnd_main_usize);
+    } else {
+        eprintln!("  hwnd_main invalid, cannot hide");
     }
     // Restore focus to target, then paste after delay
     let target_usize = target.map(|h| h.0 as usize);
