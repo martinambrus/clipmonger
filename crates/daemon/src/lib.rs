@@ -1889,17 +1889,13 @@ impl DaemonState {
             .ok_or_else(|| IpcError::new("backend", "config.set: key required".to_string()))?;
         let value = params.get("value").cloned().unwrap_or(Value::Null);
         let updated = {
-            let mut config = self
-                .config
-                .lock()
-                .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?;
-            apply_config_key(&mut config, key, &value)
-                .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
-            config.clone()
+            let mut config = self.config.lock().map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?;
+            apply_config_key(&mut config, key, &value).map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
+            let cloned = config.clone();
+            cloned
         };
-        updated
-            .save(&profile.join("config.toml"))
-            .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
+        updated.save(&profile.join("config.toml")).map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
+        if let Ok(mut cfg) = self.config.lock() { *cfg = updated.clone(); }
         self.set_paste_limits(updated.popup.unicode_limit, updated.popup.delivery_dwell_ms);
         self.caps.set_paste_strategy(
             "windows",
