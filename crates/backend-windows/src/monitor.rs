@@ -124,6 +124,7 @@ fn enumerate_offers() -> Result<Offers> {
 #[cfg(windows)]
 fn current_event() -> Result<CaptureEvent> {
     let (offers, probe) = enumerate_offers()?;
+    
     let sensitive = crate::optout::should_skip(&probe);
     Ok(CaptureEvent {
         offers,
