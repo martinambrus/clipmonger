@@ -6,8 +6,10 @@ use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM, WPARAM as WParamInner};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, KillTimer, RegisterClassW, SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE, SW_HIDE, ES_AUTOHSCROLL, HMENU, LBN_DBLCLK, LBN_SELCHANGE, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, KillTimer, RegisterClassW, SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE, SW_HIDE, ES_AUTOHSCROLL, HMENU, LBN_DBLCLK, LBN_SELCHANGE, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP,
 };
+use windows::Win32::UI::Shell::{Shell_NotifyIconW, NOTIFYICONDATAW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW_0};
+use windows::Win32::UI::WindowsAndMessaging::{CreatePopupMenu, AppendMenuW, TrackPopupMenu, GetCursorPos, SetForegroundWindow as SetFgWin, TPM_BOTTOMALIGN, TPM_LEFTALIGN, MF_STRING};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, FillRect, GetStockObject, InvalidateRect, PAINTSTRUCT, WHITE_BRUSH};
 const POPUP_SIZE: (u32, u32) = (480, 360);
 const IDC_SEARCH: i32 = 101;
@@ -15,6 +17,10 @@ const IDC_LIST: i32 = 102;
 const IDC_STATUS: i32 = 103;
 const IDC_CONFIG: i32 = 104;
 const TIMER_IPC: usize = 1;
+const WM_TRAY: u32 = WM_APP + 1;
+const ID_TRAY_SHOW: usize = 1001;
+const ID_TRAY_SETTINGS: usize = 1002;
+const ID_TRAY_EXIT: usize = 1003;
 struct PopupState {
     vm: popup::PopupVm,
     cmds: mpsc::Sender<ipc_bridge::UiCmd>,
@@ -35,6 +41,7 @@ static mut G_TARGET_HWND: Option<windows::Win32::Foundation::HWND> = None;
 static mut G_HOTKEY_FALLBACK: bool = false;
 static mut G_HOTKEY_HOOK: Option<windows::Win32::UI::WindowsAndMessaging::HHOOK> = None;
 static mut G_HOTKEY_HWND: Option<HWND> = None;
+static mut G_TRAY_HWND: Option<HWND> = None;
 static mut G_HOTKEY_PREV_DOWN: bool = false;
 unsafe extern "system" fn edit_subclass(
     hwnd: HWND,
@@ -341,6 +348,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as i32;
+            if id as usize == ID_TRAY_SHOW { let fg = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }; if fg != hwnd { unsafe { G_TARGET_HWND = Some(fg); } } unsafe { ShowWindow(hwnd, SW_SHOW); windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_RESTORE); windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd); } return LRESULT(0); }
+            if id as usize == ID_TRAY_SETTINGS { if let Some(ptr) = G_STATE { let s = &mut *ptr; let profile = s.config.lock().unwrap().profile.clone(); windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE); std::thread::spawn(move || crate::fallback_config::run_config_window(profile)); } return LRESULT(0); }
+            if id as usize == ID_TRAY_EXIT { unsafe { if let Some(th) = G_TRAY_HWND { let mut nid = NOTIFYICONDATAW::default(); nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32; nid.hWnd = th; nid.uID = 1; let _ = Shell_NotifyIconW(NIM_DELETE, &mut nid); } } windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0); return LRESULT(0); }
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
             if let Some(ptr) = G_STATE {
                 let state = &mut *ptr;
@@ -472,12 +482,46 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_TRAY => {
+            let event = (lparam.0 as u32) & 0xFFFF;
+            if event == WM_LBUTTONUP {
+                // Toggle popup like hotkey
+                let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool();
+                let minimized = windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool();
+                if visible && !minimized {
+                    windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+                } else {
+                    let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+                    if fg != hwnd { G_TARGET_HWND = Some(fg); }
+                    windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
+                    windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_RESTORE);
+                    windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(hwnd);
+                    windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+                    if let Some(ptr) = G_STATE { let s = &mut *ptr; let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(s.hwnd_search)); }
+                }
+            } else if event == WM_RBUTTONUP {
+                // Right-click also toggles for now (menu TODO)
+                let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool();
+                let minimized = windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool();
+                if visible && !minimized {
+                    windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+                } else {
+                    let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+                    if fg != hwnd { G_TARGET_HWND = Some(fg); }
+                    windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
+                    windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_RESTORE);
+                    windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+                    if let Some(ptr) = G_STATE { let s = &mut *ptr; let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(s.hwnd_search)); }
+                }
+            }
+            LRESULT(0)
+        }
         WM_CLOSE => {
             windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE);
             LRESULT(0)
         }
         WM_DESTROY => {
-            unsafe { if let Some(hook) = G_HOTKEY_HOOK { windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx(hook); G_HOTKEY_HOOK = None; } }
+            unsafe { if let Some(th) = G_TRAY_HWND { let mut nid = NOTIFYICONDATAW::default(); nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32; nid.hWnd = th; nid.uID = 1; let _ = Shell_NotifyIconW(NIM_DELETE, &mut nid); G_TRAY_HWND = None; } if let Some(hook) = G_HOTKEY_HOOK { windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx(hook); G_HOTKEY_HOOK = None; } }
             if let Some(ptr) = G_STATE {
                 KillTimer(Some(hwnd), TIMER_IPC);
                 let _ = Box::from_raw(ptr);
@@ -684,7 +728,7 @@ pub fn run_fallback(
             (x, y)
         };
         let hwnd = CreateWindowExW(
-            windows::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST,
+            windows::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST | windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW,
             class_name,
             w!("Clipmonger - Popup (CPU, no OpenGL) - RustDesk OK"),
             windows::Win32::UI::WindowsAndMessaging::WS_POPUP | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WS_THICKFRAME | windows::Win32::UI::WindowsAndMessaging::WS_SYSMENU,
@@ -697,7 +741,8 @@ pub fn run_fallback(
             Some(hinstance),
             Some(state_ptr as *const std::ffi::c_void),
         )
-        .unwrap();
+.unwrap();
+        unsafe { G_TRAY_HWND = Some(hwnd); let mut nid = NOTIFYICONDATAW::default(); nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32; nid.hWnd = hwnd; nid.uID = 1; nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; nid.uCallbackMessage = WM_TRAY; nid.hIcon = windows::Win32::UI::WindowsAndMessaging::LoadIconW(None, windows::Win32::UI::WindowsAndMessaging::IDI_APPLICATION).unwrap_or_default(); let tip: Vec<u16> = "Clipmonger - Ctrl+Alt+H".encode_utf16().chain(std::iter::once(0)).collect(); for (i, c) in tip.iter().enumerate() { if i < 128 { nid.szTip[i] = *c; } } let _ = Shell_NotifyIconW(NIM_ADD, &mut nid); }
         let hk_ok = windows::Win32::UI::Input::KeyboardAndMouse::RegisterHotKey(Some(hwnd), 1, windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(windows::Win32::UI::Input::KeyboardAndMouse::MOD_CONTROL.0 | windows::Win32::UI::Input::KeyboardAndMouse::MOD_ALT.0), 0x48);
         if hk_ok.is_ok() { eprintln!("hotkey Ctrl+Alt+H registered - window hidden until hotkey"); unsafe { G_HOTKEY_FALLBACK = false; } } else { let err = windows::Win32::Foundation::GetLastError(); eprintln!("hotkey register failed err={:?} (degraded, LL hook, start hidden)", err); unsafe { G_HOTKEY_FALLBACK = true; G_HOTKEY_HWND = Some(hwnd); match windows::Win32::UI::WindowsAndMessaging::SetWindowsHookExW(windows::Win32::UI::WindowsAndMessaging::WH_KEYBOARD_LL, Some(ll_hook_proc), None, 0) { Ok(hook) => { if hook.is_invalid() { eprintln!("LL hook invalid"); } else { eprintln!("LL hook installed for Ctrl+Alt+H"); G_HOTKEY_HOOK = Some(hook); } }, Err(e) => { eprintln!("LL hook install failed {:?}", e); } } } }
         ShowWindow(hwnd, SW_HIDE);
