@@ -232,7 +232,7 @@ fn setup_windows_backend(
                         }
                     }
                     if !payloads.is_empty() {
-                        state.ingest_capture("windows", false, &payloads);
+                        let _ = state.ingest_capture("windows", false, &payloads);
                     }
                 }
             }

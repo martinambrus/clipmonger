@@ -79,7 +79,7 @@ future_key = "keep-me"
 [history]
 max_items = 10
 [popup]
-hotkey = "ctrl+alt+v"
+hotkey = "ctrl+alt+h"
 [privacy]
 strict = false
 [tray]
@@ -99,7 +99,7 @@ enabled = true
 fn t306_config_defaults() {
     let cfg = config::Config::default();
     assert_eq!(cfg.config_version, 1);
-    assert_eq!(cfg.popup.hotkey, "ctrl+alt+v");
+    assert_eq!(cfg.popup.hotkey, "ctrl+alt+h");
     assert_eq!(cfg.history.max_items, 750);
     assert_eq!(cfg.history.dedupe_window, 100);
     assert_eq!(cfg.monitor.formats.len(), 6);
@@ -114,7 +114,7 @@ fn t306_config_parse_and_env_override() {
     let cfg = config::Config::default();
     cfg.save(&path).unwrap();
     let loaded = config::Config::load(&path).unwrap();
-    assert_eq!(loaded.popup.hotkey, "ctrl+alt+v");
+    assert_eq!(loaded.popup.hotkey, "ctrl+alt+h");
     // SAFETY: single-threaded test env override; restore afterwards.
     std::env::set_var("CLIPMONGER_POPUP_HOTKEY", "ctrl+shift+x");
     std::env::set_var("CLIPMONGER_HISTORY_MAX_ITEMS", "42");

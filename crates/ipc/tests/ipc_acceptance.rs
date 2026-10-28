@@ -360,7 +360,7 @@ fn t201_monitor_set() {
 fn t201_hotkey_register() {
     roundtrip(&HotkeyRegisterParams {
         id: 41,
-        chord: "ctrl+alt+v".to_string(),
+        chord: "ctrl+alt+h".to_string(),
     });
     roundtrip(&HotkeyRegisterResult { ok: true });
 }

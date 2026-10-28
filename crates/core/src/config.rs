@@ -49,7 +49,7 @@ fn default_dedupe_window() -> usize {
 }
 
 fn default_hotkey() -> String {
-    "ctrl+alt+v".to_string()
+    "ctrl+alt+h".to_string()
 }
 
 fn default_placement() -> String {

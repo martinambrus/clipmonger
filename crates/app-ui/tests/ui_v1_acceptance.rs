@@ -250,7 +250,7 @@ fn t902_defaults_match_seg09_s8() {
 
 #[test]
 fn t902_parse_chord_vectors() {
-    let ev = chord::parse_chord("ctrl+alt+v").expect("ctrl+alt+v parses");
+    let ev = chord::parse_chord("ctrl+alt+h").expect("ctrl+alt+h parses");
     assert_eq!(ev, key("v", true, true, false));
     // Case-insensitive modifier and key names.
     assert_eq!(
@@ -295,7 +295,7 @@ fn t902_parse_chord_rejections() {
 #[test]
 fn t902_format_chord_roundtrips_canonical_defaults() {
     for canonical in [
-        "ctrl+alt+v",
+        "ctrl+alt+h",
         "Enter",
         "Escape",
         "Delete",
@@ -365,11 +365,11 @@ fn t902_reserved_chords_rejected_with_reason_id() {
         ("alt+tab", chord::Os::Windows, true),
         // Secure-attention sequence: unregistrable on Windows.
         ("ctrl+alt+delete", chord::Os::Windows, true),
-        ("ctrl+alt+v", chord::Os::Windows, false),
+        ("ctrl+alt+h", chord::Os::Windows, false),
         // Common terminal shortcut is not OS-reserved on X11.
         ("ctrl+alt+t", chord::Os::X11, false),
-        ("ctrl+alt+v", chord::Os::X11, false),
-        ("ctrl+alt+v", chord::Os::Wayland, false),
+        ("ctrl+alt+h", chord::Os::X11, false),
+        ("ctrl+alt+h", chord::Os::Wayland, false),
     ];
     for (text, os, want_reserved) in cases {
         let ev = chord::parse_chord(text)
@@ -620,7 +620,7 @@ fn config_snapshot() -> Value {
 fn t909_config_doc_reads_config_get_snapshot() {
     let doc = config_model::ConfigDoc::from_snapshot(&config_snapshot());
     assert_eq!(doc.get("history.max_items"), Some(&json!(750)));
-    assert_eq!(doc.get("popup.hotkey"), Some(&json!("ctrl+alt+v")));
+    assert_eq!(doc.get("popup.hotkey"), Some(&json!("ctrl+alt+h")));
     assert_eq!(doc.get("popup.dismiss_on_focus_loss"), Some(&json!(true)));
     // extra-only rows are absent until set (round-trip, not default).
     assert_eq!(doc.get("tray.enabled"), None);
@@ -682,7 +682,7 @@ fn t909_validate_rejects_bad_values_with_string_id() {
     assert!(config_model::validate("popup.preview_width", &json!(80)).is_ok());
     assert!(config_model::validate("popup.placement", &json!("cursor")).is_ok());
     assert!(config_model::validate("popup.placement", &json!("center")).is_ok());
-    assert!(config_model::validate("popup.hotkey", &json!("ctrl+alt+v")).is_ok());
+    assert!(config_model::validate("popup.hotkey", &json!("ctrl+alt+h")).is_ok());
     assert!(config_model::validate("monitor.capture_primary", &json!(true)).is_ok());
     for (key, value) in [
         ("history.max_items", json!(0)),

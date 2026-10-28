@@ -1,14 +1,14 @@
 //! Hotkey chord parser: `MOD[+]MOD...[+]KEY`, case-insensitive.
 //!
 //! Canonical form preserves input modifier order with lowercase names,
-//! e.g. `ctrl+alt+v` and `super+alt+Digit1`.
+//! e.g. `ctrl+alt+h` and `super+alt+Digit1`.
 
 use std::fmt::Display;
 
 use crate::types::{Error, Result};
 
 /// Default popup hotkey on all OS (config-changeable).
-pub const DEFAULT_POPUP_HOTKEY: &str = "ctrl+alt+v";
+pub const DEFAULT_POPUP_HOTKEY: &str = "ctrl+alt+h";
 
 /// v1 reserved-chord tables are empty; the mechanism exists for seg-09 §14.5.
 const RESERVED_WINDOWS: &[&str] = &[];

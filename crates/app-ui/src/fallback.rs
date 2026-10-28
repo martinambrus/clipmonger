@@ -16,6 +16,7 @@ const POPUP_SIZE: (u32, u32) = (480, 360);
 const IDC_SEARCH: i32 = 101;
 const IDC_LIST: i32 = 102;
 const IDC_STATUS: i32 = 103;
+const IDC_CONFIG: i32 = 104;
 const TIMER_IPC: usize = 1;
 struct PopupState {
     vm: popup::PopupVm,
@@ -25,12 +26,14 @@ struct PopupState {
     hwnd_search: HWND,
     hwnd_list: HWND,
     hwnd_status: HWND,
+    hwnd_config: HWND,
     last_poll: Instant,
     should_exit: bool,
 }
 static mut G_STATE: Option<*mut PopupState> = None;
 static mut G_ORIG_EDIT: isize = 0;
 static mut G_ORIG_LIST: isize = 0;
+static mut G_TARGET_HWND: Option<windows::Win32::Foundation::HWND> = None;
 unsafe extern "system" fn edit_subclass(
     hwnd: HWND,
     msg: u32,
@@ -205,6 +208,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 None,
             )
             .unwrap();
+            state.hwnd_config = CreateWindowExW(WINDOW_EX_STYLE::default(), w!("BUTTON"), w!("Config"), WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | 0x00010000 | 0x00000000), 392, 320, 80, 22, Some(hwnd), Some(HMENU(IDC_CONFIG as *mut _)), Some(hinst), None).unwrap();
+            eprintln!("Config button created hwnd={:?}", state.hwnd_config);
             SetTimer(Some(hwnd), TIMER_IPC, 100, None);
             G_ORIG_EDIT = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
                 state.hwnd_search,
@@ -226,6 +231,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             );
             refresh_list(state);
             LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_SHOWWINDOW => {
+            if wparam.0 != 0 {
+                // Popup showing - capture current foreground as target (A)
+                let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+                // Don't capture self
+                if fg != hwnd { G_TARGET_HWND = Some(fg); eprintln!("captured target {:?}", fg); }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_SIZE => {
             if let Some(ptr) = G_STATE {
@@ -298,6 +312,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     }
                     (IDC_LIST, LBN_DBLCLK) => do_paste(state),
+                    (IDC_CONFIG, _) => { state.config.lock().unwrap().open = true; eprintln!("Config opened via keyboard"); }
                     _ => {}
                 }
             }
@@ -534,6 +549,7 @@ pub fn run_fallback(
         hwnd_search: HWND::default(),
         hwnd_list: HWND::default(),
         hwnd_status: HWND::default(),
+        hwnd_config: HWND::default(),
         last_poll: Instant::now(),
         should_exit: false,
     });
@@ -553,7 +569,7 @@ pub fn run_fallback(
             WINDOW_EX_STYLE::default(),
             class_name,
             w!("Clipmonger - Popup (CPU, no OpenGL) - RustDesk OK"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             POPUP_SIZE.0 as i32,
@@ -564,7 +580,8 @@ pub fn run_fallback(
             Some(state_ptr as *const std::ffi::c_void),
         )
         .unwrap();
-        ShowWindow(hwnd, SW_SHOW);
+        let hk_ok = windows::Win32::UI::Input::KeyboardAndMouse::RegisterHotKey(Some(hwnd), 1, windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(windows::Win32::UI::Input::KeyboardAndMouse::MOD_CONTROL.0 | windows::Win32::UI::Input::KeyboardAndMouse::MOD_ALT.0), 0x48);
+        if hk_ok.is_ok() { eprintln!("hotkey Ctrl+Alt+H registered - window hidden until hotkey"); } else { let err = windows::Win32::Foundation::GetLastError(); eprintln!("hotkey register failed err={:?} (degraded) - showing window", err); ShowWindow(hwnd, SW_SHOW); windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd); }
         if let Some(ptr) = G_STATE {
             let s = &mut *ptr;
             let _ = s.cmds.send(ipc_bridge::UiCmd::ListHistory);

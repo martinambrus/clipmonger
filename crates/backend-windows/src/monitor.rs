@@ -175,18 +175,29 @@ impl ClipboardMonitor for WinMonitor {
                         // the deadline so a Timeout never loses the update.
                         // Each attempt self-paces (open retries ~100 ms), so
                         // no extra sleep is needed and the deadline bounds us.
-                        while Instant::now() < deadline {
+                        let mut retries = 15;
+                        while retries > 0 && Instant::now() < deadline {
+                            retries -= 1;
                             let seq = current_seq();
                             if seq == self.last_seq {
-                                break;
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                continue;
                             }
                             match current_event() {
                                 Ok(event) => {
+                                    if event.offers.is_empty() {
+                                        std::thread::sleep(std::time::Duration::from_millis(40));
+                                        continue;
+                                    }
                                     self.last_seq = seq;
                                     events.push(event);
-                                    break;
+                                    std::thread::sleep(std::time::Duration::from_millis(30));
+                                    continue;
                                 }
-                                Err(Error::Timeout(_)) => {}
+                                Err(Error::Timeout(_)) => {
+                                    std::thread::sleep(std::time::Duration::from_millis(20));
+                                    continue;
+                                }
                                 Err(e) => return Err(e),
                             }
                         }
@@ -194,6 +205,20 @@ impl ClipboardMonitor for WinMonitor {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         return Err(Error::Unavailable("monitor pump thread exited".to_string()));
+                    }
+                }
+            }
+            if events.is_empty() {
+                if let Some(seq) = current_seq() {
+                    if Some(seq) != self.last_seq {
+                        match current_event() {
+                            Ok(event) => {
+                                self.last_seq = Some(seq);
+                                events.push(event);
+                            }
+                            Err(Error::Timeout(_)) => {}
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
             }

@@ -2493,7 +2493,7 @@ mod tests {
         state
             .handle(
                 "hotkey.conflict",
-                &serde_json::json!({"chord": "ctrl+alt+v", "reason": "already grabbed"}),
+                &serde_json::json!({"chord": "ctrl+alt+h", "reason": "already grabbed"}),
             )
             .expect("hotkey.conflict");
         let status = state
@@ -2507,7 +2507,7 @@ mod tests {
         assert!(
             notes
                 .iter()
-                .any(|n| n.as_str().unwrap_or_default().contains("ctrl+alt+v")),
+                .any(|n| n.as_str().unwrap_or_default().contains("ctrl+alt+h")),
             "conflict must surface in caps notes, got {notes:?}"
         );
     }
