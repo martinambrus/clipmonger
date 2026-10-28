@@ -203,7 +203,10 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   Open: manual signoffs (T-905…908/GNOME/Ubuntu legs; T-409 PASSED
   2026-10-27 on the Windows host; T-908 Windows Notepad transient
   fix 2026-10-28 a1c36c9 — RustDesk virtual display: monitor empty→data
-  drain + fallback poll, App A/B ingest + stale-target verified),
+  drain + fallback poll, App A/B ingest + stale-target verified;
+  T-907 Windows fallback Tab/Esc/Config verified 2026-10-28 f47bff2
+  — RustDesk: degraded hotkey (daemon owns Ctrl+Alt+H), fallback
+  minimizes to taskbar, Config placeholder),
   zip-crate
   advisory upgrade (documented ignores in deny.toml; extract()
   unused), GitHub release creation (user decision), cargo-packager
