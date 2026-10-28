@@ -663,7 +663,7 @@ fn run_elevated_hotkey_helper(profile: &std::path::Path) -> i32 {
                         }
                     }
                     let _ = clipmonger_backend_windows::elevated_task::notify_popup();
-                    return 1;
+
                 }
             }
         }
