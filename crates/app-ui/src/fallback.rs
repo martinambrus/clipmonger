@@ -279,7 +279,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if wparam.0 != 0 {
                 let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
                 if fg != hwnd { G_TARGET_HWND = Some(fg); eprintln!("captured target {:?}", fg); }
-                if let Some(ptr) = G_STATE { let s = &mut *ptr; let _ = s.cmds.send(crate::ipc_bridge::UiCmd::ListHistory); drain_events(s); }
+                if let Some(ptr) = G_STATE { let s = &mut *ptr; s.vm.query.clear(); s.vm.set_target_valid(true); let _ = s.cmds.send(crate::ipc_bridge::UiCmd::ListHistory); }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -473,7 +473,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else {
                 let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
                 if fg != hwnd { G_TARGET_HWND = Some(fg); }
-                if let Some(ptr) = G_STATE { let s = &mut *ptr; let _ = s.cmds.send(crate::ipc_bridge::UiCmd::ListHistory); drain_events(s); }
+                if let Some(ptr) = G_STATE { let s = &mut *ptr; s.vm.query.clear(); windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(s.hwnd_search, windows::core::w!("")).ok(); s.vm.set_target_valid(true); let _ = s.cmds.send(crate::ipc_bridge::UiCmd::ListHistory); }
                 windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
                 windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_RESTORE);
                 unsafe { let fg_thread = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fg, None); let cur_thread = windows::Win32::System::Threading::GetCurrentThreadId(); if fg_thread != cur_thread { windows::Win32::System::Threading::AttachThreadInput(fg_thread, cur_thread, true); windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(hwnd); windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd); windows::Win32::System::Threading::AttachThreadInput(fg_thread, cur_thread, false); } else { windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(hwnd); windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd); } }
@@ -493,7 +493,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 } else {
                     let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
                     if fg != hwnd { G_TARGET_HWND = Some(fg); }
-                    windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
+                    if let Some(ptr)=G_STATE{let s=&mut *ptr; s.vm.set_target_valid(true);} windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
                     windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_RESTORE);
                     windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(hwnd);
                     windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
