@@ -6,12 +6,9 @@ use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM, WPARAM as WParamInner};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, RegisterClassW,
-    SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE, SW_HIDE,
-    ES_AUTOHSCROLL, HMENU, LBN_DBLCLK, LBN_SELCHANGE, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_SETFOCUS, WM_SIZE, WM_TIMER,
-    WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, KillTimer, RegisterClassW, SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE, SW_HIDE, ES_AUTOHSCROLL, HMENU, LBN_DBLCLK, LBN_SELCHANGE, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, FillRect, GetStockObject, InvalidateRect, PAINTSTRUCT, WHITE_BRUSH};
 const POPUP_SIZE: (u32, u32) = (480, 360);
 const IDC_SEARCH: i32 = 101;
 const IDC_LIST: i32 = 102;
@@ -295,6 +292,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     );
                 }
             }
+            // Force full repaint on resize to avoid grey stripes
+            windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, true);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => {
+            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
+            let mut rc = windows::Win32::Foundation::RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            let brush = windows::Win32::Graphics::Gdi::HBRUSH(GetStockObject(WHITE_BRUSH).0);
+            FillRect(hdc, &rc, brush);
+            LRESULT(1)
+        }
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rc = windows::Win32::Foundation::RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            let brush = windows::Win32::Graphics::Gdi::HBRUSH(GetStockObject(WHITE_BRUSH).0);
+            FillRect(hdc, &rc, brush);
+            EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -623,13 +640,24 @@ pub fn run_fallback(
             ..Default::default()
         };
         RegisterClassW(&wc);
+        // T-905: frameless on-top popup, centered via placement logic
+        let (px, py) = {
+            let monitors = {
+                let w = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN);
+                let h = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN);
+                let rect = crate::placement::Rect { x: 0, y: 0, w: w.max(800), h: h.max(600) };
+                vec![rect]
+            };
+            let (x, y) = crate::placement::place(crate::placement::Placement::Center, (0, 0), &monitors, (POPUP_SIZE.0 as i32, POPUP_SIZE.1 as i32));
+            (x, y)
+        };
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            windows::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST,
             class_name,
             w!("Clipmonger - Popup (CPU, no OpenGL) - RustDesk OK"),
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            windows::Win32::UI::WindowsAndMessaging::WS_POPUP | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WS_THICKFRAME | windows::Win32::UI::WindowsAndMessaging::WS_SYSMENU,
+            px,
+            py,
             POPUP_SIZE.0 as i32,
             POPUP_SIZE.1 as i32,
             None,
