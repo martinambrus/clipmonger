@@ -352,10 +352,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     (IDC_LIST, LBN_DBLCLK) => do_paste(state),
                     (IDC_CONFIG, _) => {
-                        let open = { state.config.lock().unwrap().open = true; true };
-                        if open {
-                            windows::Win32::UI::WindowsAndMessaging::MessageBoxW(None, w!("Config window (maximalist 27 rows) - use main build on real display for full editor.\n\nFallback shows status only."), w!("Clipmonger Config"), windows::Win32::UI::WindowsAndMessaging::MB_OK);
-                        }
+                        let profile = state.config.lock().unwrap().profile.clone();
+                        windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE);
+                        std::thread::spawn(move || crate::fallback_config::run_config_window(profile));
                     }
                     _ => {}
                 }

@@ -17,6 +17,7 @@ use clipmonger_platform::fakes::FakeTray;
 use serde_json::Value;
 #[cfg(all(windows, feature = "software"))]
 mod fallback;
+mod fallback_config;
 
 /// Status re-poll period.
 const STATUS_PERIOD: Duration = Duration::from_secs(30);
