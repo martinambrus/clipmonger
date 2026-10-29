@@ -1,3 +1,7 @@
 /target/
 .agents/tmp/
 dist-release/
+
+# Windows monitor debug artifacts (transient)
+**/monitor.log
+*.log

@@ -119,8 +119,12 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   panicked outside the Tokio runtime, heartbeat/result stream race,
   UAC foreground-settle race. Paste delivery switched to
   clipboard-restore by default (popup.delivery, user decision) and
-  re-verified live on standard + elevated routes. Open: T-410
-  reboot leg, explicit pipe DACL, PNG/DIB conversion.
+  re-verified live on standard + elevated routes. Follow-up fixes
+  through 2026-10-29 (WSL ingest, CF_TEXT/OEMTEXT fallback, Win32
+  CPU fallback, popup restore_clipboard live reload, blink/selection
+  fixes) re-verified on RustDesk host; test infra `ClipmongerHelper`
+  scheduled task ended and deleted 2026-10-29, no daemon running.
+  Open: T-410 reboot-persist leg, explicit pipe DACL, PNG/DIB conversion.
 - **3. X11 backend. (DONE 2026-10-26, WSL Xvfb)** Seg-05 (XFixes + manager role, transfer+INCR,
   hotkeys, enigo paste, KSNI tray, .desktop autostart). Tests T-501…508
   (Xvfb headless).
