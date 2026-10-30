@@ -624,7 +624,11 @@ impl Store {
             perms.set_mode(0o600);
             fs::set_permissions(&tmp, perms).map_err(CoreError::Io)?;
         }
-        let f = fs::File::open(&tmp).map_err(CoreError::Io)?;
+        // Write access: Windows refuses to flush a read-only handle.
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)
+            .map_err(CoreError::Io)?;
         f.sync_all().map_err(CoreError::Io)?;
         drop(f);
         fs::rename(&tmp, &final_path).map_err(CoreError::Io)?;
