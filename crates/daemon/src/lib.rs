@@ -1129,6 +1129,27 @@ fn store_payloads(
     }
 }
 
+/// Retention caps from `[history]` (seg-03 §8), halved under
+/// `privacy.strict`. An item or byte cap of 0 means no cap: only
+/// `max_age_days` documents 0 as off, and a hand-edited 0 must never purge
+/// the whole history.
+fn retention_limits(config: &clipmonger_core::Config) -> clipmonger_core::policy::Limits {
+    let cap = |n: u64| {
+        let n = if n == 0 { u64::MAX } else { n };
+        if config.privacy.strict {
+            (n / 2).max(1)
+        } else {
+            n
+        }
+    };
+    let age = config.history.max_age_days;
+    clipmonger_core::policy::Limits {
+        max_items: cap(config.history.max_items),
+        max_store_bytes: cap(config.history.max_store_bytes),
+        max_age_days: if age == 0 { 0 } else { cap(age) },
+    }
+}
+
 /// Store one headless replay line; returns the JSON report line for it.
 fn process_capture(store: &Store, line: &str, index: u64) -> String {
     let event: Value = match serde_json::from_str(line) {
@@ -1518,13 +1539,23 @@ impl DaemonState {
             }
         }
         let seed = u64::try_from(now_ms().max(0)).unwrap_or_default();
+        // Config before store: never hold both locks.
+        let limits = self.config.lock().map(|cfg| retention_limits(&cfg)).ok();
         let Ok(store) = self.store.read() else {
             return false;
         };
-        matches!(
+        let stored = matches!(
             store_payloads(&store, origin, sensitive, payloads, seed),
             (StoreDecision::Stored, _)
-        )
+        );
+        if let (true, Some(limits)) = (stored, limits) {
+            match store.enforce_retention(&limits) {
+                Ok(0) => {}
+                Ok(purged) => eprintln!("daemon: retention purged {purged} clips"),
+                Err(e) => eprintln!("daemon: retention failed: {e}"),
+            }
+        }
+        stored
     }
 
     /// Find a stored clip id by its string form without naming the id type.
@@ -2691,5 +2722,57 @@ mod tests {
                 .and_then(Value::as_str),
             Some("degraded")
         );
+    }
+
+    #[test]
+    fn retention_limits_halve_under_strict_and_never_zero() {
+        let mut config = clipmonger_core::Config::default();
+        let limits = super::retention_limits(&config);
+        assert_eq!(
+            (
+                limits.max_items,
+                limits.max_store_bytes,
+                limits.max_age_days
+            ),
+            (750, 512 * 1024 * 1024, 0)
+        );
+        config.privacy.strict = true;
+        config.history.max_age_days = 1;
+        let limits = super::retention_limits(&config);
+        assert_eq!(
+            (
+                limits.max_items,
+                limits.max_store_bytes,
+                limits.max_age_days
+            ),
+            (375, 256 * 1024 * 1024, 1)
+        );
+        config.history.max_items = 0;
+        config.history.max_store_bytes = 0;
+        config.history.max_age_days = 0;
+        let limits = super::retention_limits(&config);
+        assert!(limits.max_items > 1 << 60 && limits.max_store_bytes > 1 << 60);
+        assert_eq!(limits.max_age_days, 0);
+    }
+
+    #[test]
+    fn ingest_enforces_max_items_oldest_first() {
+        let dir = std::env::temp_dir().join(format!("cm-retention-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let mut config = clipmonger_core::Config::default();
+        config.history.max_items = 2;
+        let state = DaemonState::with_config(store, config);
+        for text in ["first", "second", "third"] {
+            assert!(state.ingest_capture(
+                "windows",
+                false,
+                &[("text/plain".to_string(), text.as_bytes().to_vec())]
+            ));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut texts = history_texts(&state);
+        texts.sort();
+        assert_eq!(texts, vec!["second".to_string(), "third".to_string()]);
     }
 }
