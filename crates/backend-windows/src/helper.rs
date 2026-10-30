@@ -317,6 +317,15 @@ pub fn random_pipe_segment() -> String {
     }
 }
 
+/// Quote one command-line argument for the standard Windows argv parser.
+/// Paths cannot contain `"`, so only trailing backslashes (which would
+/// escape the closing quote) need doubling.
+#[must_use]
+pub fn quote_arg(value: &str) -> String {
+    let trailing = value.len() - value.trim_end_matches('\\').len();
+    format!("\"{value}{}\"", "\\".repeat(trailing))
+}
+
 #[must_use]
 pub fn persistent_pipe_name(profile: &std::path::Path) -> String {
     let s = profile.to_string_lossy();

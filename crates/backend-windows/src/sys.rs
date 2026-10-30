@@ -46,14 +46,6 @@ fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Quote one command-line argument for the standard Windows argv parser.
-/// Paths cannot contain `"`, so only trailing backslashes (which would
-/// escape the closing quote) need doubling.
-fn quote_arg(value: &str) -> String {
-    let trailing = value.len() - value.trim_end_matches('\\').len();
-    format!("\"{value}{}\"", "\\".repeat(trailing))
-}
-
 // ---------------------------------------------------------------------------
 // Message-only monitor pump
 // ---------------------------------------------------------------------------
@@ -615,7 +607,7 @@ pub fn spawn_elevated_worker(exe: &str, profile: &std::path::Path) -> Result<(),
     let file = to_wide(exe);
     let params = to_wide(&format!(
         "__elevated-worker --profile-dir {}",
-        quote_arg(&profile.to_string_lossy())
+        crate::helper::quote_arg(&profile.to_string_lossy())
     ));
     // Safety: zeroed struct with only documented input fields set; string
     // pointers stay alive for the call; hProcess (when returned) closed below.
@@ -701,12 +693,40 @@ pub fn pipe_client_pid(pipe_handle: *mut std::ffi::c_void) -> Option<u32> {
     }
 }
 
-/// Install `%ProgramFiles%` directory for the protected-path rule.
+/// Install `Program Files` directory for the protected-path rule, from the
+/// shell known-folder store (not `%ProgramFiles%`, which any process can
+/// set for the processes it starts). Empty when it cannot be resolved; an
+/// empty path matches nothing, so the caller falls back to portable mode.
+#[must_use]
 pub fn program_files_dir() -> std::path::PathBuf {
-    std::env::var_os("ProgramFiles").map_or_else(
-        || std::path::PathBuf::from("C:\\Program Files"),
-        std::path::PathBuf::from,
-    )
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
+    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // Safety: valid GUID and out-pointer; the buffer is freed below.
+    let hr = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_ProgramFiles,
+            0,
+            std::ptr::null_mut(),
+            &raw mut raw,
+        )
+    };
+    let mut path = std::path::PathBuf::new();
+    if hr >= 0 && !raw.is_null() {
+        let mut len = 0;
+        // Safety: on success `raw` is a nul-terminated wide string.
+        unsafe {
+            while *raw.add(len) != 0 {
+                len += 1;
+            }
+            path = OsString::from_wide(std::slice::from_raw_parts(raw, len)).into();
+        }
+    }
+    if !raw.is_null() {
+        // Safety: allocated by SHGetKnownFolderPath; freed exactly once.
+        unsafe { CoTaskMemFree(raw.cast()) };
+    }
+    path
 }
 
 /// 32 hex chars of OS randomness for the helper pipe rendezvous name.

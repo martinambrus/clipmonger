@@ -1,13 +1,17 @@
 //! Scheduled-task installer for the elevated helper (one-time UAC).
 //!
 //! Installed (Program Files) builds only: portable mode never touches the
-//! Task Scheduler. Creation uses `schtasks.exe /create /rl HIGHEST` via a
-//! `runas` `ShellExecute` so the single UAC prompt comes from Windows, not
-//! from this code.
+//! Task Scheduler. The task is registered from XML by an elevated (`runas`)
+//! `schtasks.exe`, so the single UAC prompt comes from Windows, not from
+//! this code. Every task created here carries an ASCII identity marker
+//! (hash of binary and arguments) in its description, so matching never
+//! depends on the console code page of `schtasks` output.
 
 use std::path::Path;
 
 const TASK_NAME: &str = "ClipmongerHelper";
+/// Start of the identity marker in the task description.
+const TASK_MARKER_PREFIX: &str = "(clipmonger-task ";
 
 /// `schtasks.exe` command that never opens a console window (the daemon is
 /// windowless, so a console child would otherwise get a window of its own).
@@ -21,50 +25,175 @@ fn schtasks() -> std::process::Command {
     command
 }
 
+/// The registered helper task as XML, or `None` when there is none.
 #[cfg(windows)]
-fn schtasks_exists() -> bool {
-    schtasks()
-        .arg("/query")
-        .arg("/tn")
-        .arg(TASK_NAME)
-        .arg("/nh")
+fn task_xml() -> Option<String> {
+    let output = schtasks()
+        .args(["/query", "/tn", TASK_NAME, "/xml"])
         .output()
-        .is_ok_and(|o| o.status.success())
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-#[cfg(not(windows))]
-fn schtasks_exists() -> bool {
-    false
-}
-
-/// Whether the helper task is registered.
-#[must_use]
-pub fn is_installed() -> bool {
-    schtasks_exists()
-}
-
-#[cfg(windows)]
-fn task_tr(exe: &Path, profile: &Path) -> String {
+/// Action arguments of the helper task for `profile`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn task_arguments(profile: &Path) -> String {
     format!(
-        "\"{}\" --profile-dir \"{}\" __elevated-persistent",
-        exe.display(),
-        profile.display()
+        "--profile-dir {} __elevated-persistent",
+        crate::helper::quote_arg(&profile.to_string_lossy())
     )
 }
 
+/// Identity marker of the task that runs `exe` for `profile`: FNV-1a of
+/// the lowercase binary path and the exact arguments, as ASCII hex.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn task_marker(exe: &Path, profile: &Path) -> String {
+    let source = format!(
+        "{}\n{}",
+        exe.to_string_lossy().to_lowercase(),
+        task_arguments(profile)
+    );
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in source.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{TASK_MARKER_PREFIX}{hash:016x})")
+}
+
+/// Escape text for an XML element.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Task definition: start the helper at this user's logon with highest
+/// privileges; it is a long-lived idle process, so it is never stopped for
+/// battery power or by a time limit, and it runs at normal priority so
+/// pastes stay instant.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn task_definition(exe: &Path, profile: &Path) -> String {
+    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(name)) => {
+            format!(
+                "<UserId>{}</UserId>",
+                xml_escape(&format!("{domain}\\{name}"))
+            )
+        }
+        (_, Ok(name)) => format!("<UserId>{}</UserId>", xml_escape(&name)),
+        _ => String::new(),
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Clipmonger admin-window paste helper {marker}</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      {user}
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      {user}
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>5</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+      <Arguments>{arguments}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        marker = task_marker(exe, profile),
+        command = xml_escape(&exe.to_string_lossy()),
+        arguments = xml_escape(&task_arguments(profile)),
+    )
+}
+
+/// Whether the helper task exists and was created here for exactly `exe`
+/// with `profile` (identity marker match).
+#[must_use]
+pub fn task_matches(exe: &Path, profile: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        task_xml().is_some_and(|xml| xml.contains(&task_marker(exe, profile)))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (exe, profile);
+        false
+    }
+}
+
+/// Delete a helper task that was not created here (no identity marker):
+/// older builds registered tasks that may run a user-writable binary, which
+/// lets any same-user process run code elevated without UAC. Deleting needs
+/// elevation, so the elevated helper calls this when it starts.
+pub fn remove_legacy_task() {
+    #[cfg(windows)]
+    if task_xml().is_some_and(|xml| !xml.contains(TASK_MARKER_PREFIX)) {
+        let _ = uninstall();
+    }
+}
+
 /// Install via elevated `runas` prompt (one-time UAC); returns once the
-/// elevated `schtasks` has finished.
+/// elevated `schtasks` has finished. Replaces any task of the same name.
 ///
 /// # Errors
 ///
-/// Returns a message when the UAC prompt is cancelled, the launch is
-/// blocked, or `schtasks` fails to create the task.
+/// Returns a message when the task file cannot be written, the UAC prompt
+/// is cancelled, the launch is blocked, or `schtasks` rejects the task.
 pub fn install_via_uac(exe: &Path, profile: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let tr = task_tr(exe, profile);
-        let params = format!("/create /tn {TASK_NAME} /tr \"{tr}\" /sc ONLOGON /rl HIGHEST /f");
-        elevate_schtasks(&params)
+        let path =
+            std::env::temp_dir().join(format!("clipmonger-helper-task-{}.xml", std::process::id()));
+        // Task Scheduler reads the file as declared: UTF-16LE with a BOM.
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(
+            task_definition(exe, profile)
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        std::fs::write(&path, bytes).map_err(|e| format!("task file write failed: {e}"))?;
+        let params = format!(
+            "/create /tn {TASK_NAME} /xml {} /f",
+            crate::helper::quote_arg(&path.to_string_lossy())
+        );
+        let created = elevate_schtasks(&params);
+        let _ = std::fs::remove_file(&path);
+        created
     }
     #[cfg(not(windows))]
     {
@@ -148,19 +277,28 @@ fn elevate_schtasks(params: &str) -> Result<(), String> {
     }
 }
 
-/// Remove the helper task (no elevation needed for delete of user task).
+/// Remove the helper task. The task is created elevated, so deleting it
+/// needs an elevated caller too.
+///
+/// # Errors
+///
+/// Returns the `schtasks` message when the task cannot be deleted.
 pub fn uninstall() -> Result<(), String> {
-    let status = std::process::Command::new("schtasks")
-        .arg("/delete")
-        .arg("/tn")
-        .arg(TASK_NAME)
-        .arg("/f")
-        .output()
-        .map_err(|e| format!("schtasks delete failed: {e}"))?;
-    if status.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&status.stderr).into_owned())
+    #[cfg(windows)]
+    {
+        let output = schtasks()
+            .args(["/delete", "/tn", TASK_NAME, "/f"])
+            .output()
+            .map_err(|e| format!("schtasks delete failed: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err("elevated task needs Windows".to_string())
     }
 }
 
@@ -204,4 +342,56 @@ pub fn prompt_consent(installed: bool) -> bool {
 pub fn prompt_consent(installed: bool) -> bool {
     let _ = installed;
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EXE: &str = r"C:\Program Files\Clipmonger\clipmonger-daemon.exe";
+    const PROFILE: &str = r"C:\Users\A B\AppData\Roaming\clipmonger";
+
+    #[test]
+    fn task_arguments_quote_paths_with_spaces() {
+        assert_eq!(
+            task_arguments(Path::new(PROFILE)),
+            r#"--profile-dir "C:\Users\A B\AppData\Roaming\clipmonger" __elevated-persistent"#
+        );
+    }
+
+    #[test]
+    fn task_definition_keeps_the_helper_running() {
+        let xml = task_definition(Path::new(EXE), Path::new(PROFILE));
+        for needle in [
+            "<Command>C:\\Program Files\\Clipmonger\\clipmonger-daemon.exe</Command>",
+            "<Arguments>--profile-dir &quot;C:\\Users\\A B\\AppData\\Roaming\\clipmonger&quot; __elevated-persistent</Arguments>",
+            "<RunLevel>HighestAvailable</RunLevel>",
+            "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+            "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+            "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+        ] {
+            assert!(xml.contains(needle), "missing {needle} in\n{xml}");
+        }
+        assert!(xml.contains(&task_marker(Path::new(EXE), Path::new(PROFILE))));
+    }
+
+    #[test]
+    fn task_marker_tracks_binary_and_profile() {
+        let marker = task_marker(Path::new(EXE), Path::new(PROFILE));
+        assert!(marker.starts_with(TASK_MARKER_PREFIX) && marker.ends_with(')'));
+        assert!(
+            marker.is_ascii(),
+            "matched against code-page console output"
+        );
+        assert_eq!(
+            marker,
+            task_marker(Path::new(&EXE.to_uppercase()), Path::new(PROFILE)),
+            "binary path compares case-insensitively"
+        );
+        assert_ne!(
+            marker,
+            task_marker(Path::new(EXE), Path::new(r"C:\Users\other\clipmonger"))
+        );
+    }
 }

@@ -271,7 +271,7 @@ fn admin_consent_loop(
                 continue;
             }
             last_task_check = Some(Instant::now());
-            if elevated_task::is_installed() {
+            if elevated_task::task_matches(&exe, profile) {
                 if let Err(e) = elevated_task::run_task() {
                     eprintln!("daemon: helper task start failed: {e}");
                 }
@@ -681,6 +681,9 @@ fn serve_helper(profile: &Path, reconnect: bool) -> i32 {
     /// identify this elevated client but never impersonate its token.
     const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 
+    // Elevated now: drop a helper task left by older builds (it may run a
+    // user-writable binary elevated at every logon).
+    clipmonger_backend_windows::elevated_task::remove_legacy_task();
     let pipe_name = clipmonger_backend_windows::helper::persistent_pipe_name(profile);
     let own_exe = std::env::current_exe()
         .map(|exe| exe.to_string_lossy().to_ascii_lowercase())
