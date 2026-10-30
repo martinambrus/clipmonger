@@ -82,11 +82,19 @@ pub(crate) mod imp {
         Error::Io(format!("clipboard {op} failed: {err}"))
     }
 
-    /// Run `body` with the clipboard open, retrying the open 5x20 ms.
+    /// Run `body` with the clipboard open, retrying the open 5x20 ms. A
+    /// window of our own owns the session: an `OpenClipboard(NULL)` session
+    /// is not exclusive, another app opening with NULL can close it under us.
     pub(crate) fn with_open<T>(op: &str, body: impl FnOnce() -> Result<T>) -> Result<T> {
+        let owner = crate::sys::ClipboardWindow::new().ok_or_else(|| {
+            Error::Unavailable(format!(
+                "clipboard {op}: no owner window: {}",
+                crate::sys::last_error()
+            ))
+        })?;
         let mut attempts = OPEN_ATTEMPTS;
         loop {
-            match raw::open() {
+            match raw::open_for(owner.hwnd()) {
                 Ok(()) => break,
                 Err(e) => {
                     attempts -= 1;

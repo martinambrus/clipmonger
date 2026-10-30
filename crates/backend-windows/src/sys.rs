@@ -47,6 +47,55 @@ fn to_wide(value: &str) -> Vec<u16> {
 }
 
 // ---------------------------------------------------------------------------
+// Clipboard session owner
+// ---------------------------------------------------------------------------
+
+/// Message-only window that owns one clipboard session. Opening with a real
+/// window makes the open exclusive: two `OpenClipboard(NULL)` callers do not
+/// exclude each other, and the other side's `CloseClipboard` ends ours
+/// mid-operation. Created, used and destroyed on the calling thread.
+pub(crate) struct ClipboardWindow(HWND);
+
+impl ClipboardWindow {
+    /// Create the window, or `None` when the session refuses one.
+    pub(crate) fn new() -> Option<Self> {
+        let class = to_wide("STATIC");
+        // Safety: "STATIC" is a predefined class; message-only parent, no create params.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                std::ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        (!hwnd.is_null()).then_some(Self(hwnd))
+    }
+
+    /// The window handle, for `OpenClipboard`.
+    pub(crate) fn hwnd(&self) -> HWND {
+        self.0
+    }
+}
+
+impl Drop for ClipboardWindow {
+    fn drop(&mut self) {
+        // Safety: the window was created on this thread and is destroyed exactly once.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(self.0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Message-only monitor pump
 // ---------------------------------------------------------------------------
 
