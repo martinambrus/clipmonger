@@ -44,6 +44,9 @@ everything in this segment except §10 (v3).
 
 ## 3. Hotkeys — `HotkeyManager`
 
+> Amended by ADR-003 (D-025, 2026-10-30): on Windows the popup UI registers
+> the popup hotkey; the daemon registers no popup chord.
+
 - Via `global-hotkey` crate (`RegisterHotKey`, `WM_HOTKEY`, MOD_WIN/
   MOD_CONTROL/MOD_ALT/MOD_SHIFT/MOD_NOREPEAT per MS Learn).
 - Chord syntax (shared, see seg-09): e.g. `win+v`, `ctrl+alt+1`.
@@ -90,6 +93,13 @@ limit = `popup.unicode_limit` (default 64 KiB, review M-18).
   SendInput Remarks): release-safe sequencing (mods down → keys → mods up).
 
 ## 5. Elevated helper — on-demand paste into admin windows (D-011)
+
+> Amended by ADR-003 (D-025, 2026-10-30): consent on first admin-window
+> focus; installed builds keep a logon task, portable builds start a
+> per-run helper and never create a task; one per-profile pipe with mutual
+> binary checks and liveness from the pipe (no heartbeat); every job
+> carries its target window and a 2 s deadline. Where this section
+> conflicts with ADR-003, ADR-003 wins.
 
 Total Commander-style: NOTHING runs elevated until the user actually
 pastes/macros into a high-integrity window.
@@ -162,6 +172,9 @@ trait; query MUST also read the OS disabled/override state
 review M-18). Portable mode (seg-03 §6) MUST skip autostart entirely. Helper
 is NEVER in autostart (D-011).
 
+> Amended by ADR-003 (D-025): after consent, installed builds start the
+> helper from the `ClipmongerHelper` logon task; portable builds never do.
+
 ## 8. Foreground app (v2, AutoSwitch F-304)
 
 `GetForegroundWindow` + `GetWindowText` + process exe basename via
@@ -183,6 +196,9 @@ monitoring). Design placeholder: implement against documented COM API at
 v3 time; MUST NOT affect v1 architecture (separate module).
 
 ## 11. Segment tests (T-4xx)
+
+> ADR-003 (D-025) updates the meaning of T-403, T-409, T-413 and T-414;
+> see its migration / test impact section.
 
 - T-401 `[unit]` HTML Format header parse/serialize vectors (fragments,
   missing offsets, UTF-8/UTF-16 CuttingEdge cases) + malformed/overlong-header fuzz vectors.

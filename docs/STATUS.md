@@ -1,6 +1,6 @@
 # Docs status
 
-## Implementation state (refreshed 2026-10-30, portable admin + focus)
+## Implementation state (refreshed 2026-10-30, admin-window paste rework)
 
 Source of truth for step detail: `plan.md` Steps.
 
@@ -8,15 +8,16 @@ Source of truth for step detail: `plan.md` Steps.
 - Step 5: CODE DONE (GNOME extension); manual legs pending.
 - Step 6: DONE (UI v1 + permanents follow-up); Ubuntu automated suites green on this box 2026-10-27 (app-ui 80/80); `D-024` Win32 CPU fallback now mirrors Ubuntu on this Windows box via RustDesk virtual display (no GPU/OpenGL, `crates/app-ui/src/fallback.rs`); `T-905..T-908` Win32 legs verified 2026-10-28 on RustDesk (popup, config 27-row, keyboard, safety) and re-verified 2026-10-29 (popup.restore_clipboard live reload, WSL ingest, bump_clip).
 - Step 7: release prep done on this box (release gate script, caps golden, `deny.toml`, changelog/notes drafts, `tests/manual/` scripts, dist-release zips + SHA256SUMS). Draft only: no tag/GitHub release.
-- Windows portable 2026-10-30: `C:\Temp\clipmonger-portable` rebuilt with helper fallback + focus fixes; `helper_auto_elevate` stranded-config fallback (`crates/daemon/src/main.rs:200ff` → High IL consent poll), eager `prime_persistent` pipe (`crates/daemon/src/lib.rs:243ff`), portable owns hotkey (`crates/daemon/src/main.rs:135ff`), High IL only helper hotkey (`run_elevated_persistent` gating), `notify_popup` High IL ShowWindow+SetFocus (`crates/backend-windows/src/elevated_task.rs:171ff`) + target capture (`clipmonger-target-hwnd` marker), heartbeat tolerance 10×30s + 5s (`crates/daemon/src/lib.rs:590ff`, `crates/daemon/src/main.rs:757ff`); verified on this Windows box: non-admin + WSL copy/paste + popup focus, admin popup shows + focused via High IL, first-paste stale-target fix in flight.
-- Windows test infra 2026-10-30: portable daemons running (fallback 6320 + daemon 3828 + helper 8184 High IL `__elevated-persistent` `ClipmongerHelper` ONLOGON/HIGHEST Ready→Running on demand); `C:\Temp\clipmonger-portable` profile active, `C:\Temp\cm-soft-test` retained.
+- Windows admin-window paste 2026-10-30 (ADR-003, D-025): elevated helper reworked (single-thread pipe protocol, liveness from the pipe instead of heartbeats, per-job target window + 2 s deadline, popup UI owns the hotkey, windowless daemon/helper/UI, `portable.marker` portable profile). User-verified on this Windows box: portable (`C:\Temp\clipmonger-portable`) consent → one UAC → admin and standard pastes (helper round trip 1-2 ms), 17 min idle, tray Exit stops UI + daemon + helper, no scheduled task; installed (`C:\Program Files\Clipmonger`) consent → one UAC → `ClipmongerHelper` logon task, logoff/logon starts the helper with no visible window, app start reconnects with no prompt. Settings matrix is 28 rows (`windows.helper_auto_elevate` removed, `popup.restore_clipboard` counted); app-ui suite green.
+- Windows test infra 2026-10-30: installed build + marker-tagged `ClipmongerHelper` logon task active for the QA user; portable copy kept in `C:\Temp\clipmonger-portable`; earlier test folders, binaries and the legacy task removed.
 - Manual pending (user/native legs): `T-410`, `T-508`, `T-606`, `T-607`, `T-702..T-705`, `T-1117`, `T-1204` (Windows `T-905..T-908` done via CPU fallback; egui path still needs real GPU display).
-- Known gaps: update-check (`T-1202`, out of `0.1.0`), per-box caps goldens beyond headless, coverage-floor enforcement, cargo-packager installers (native runners), CI matrix.
+- Known gaps: update-check (`T-1202`, out of `0.1.0`), per-box caps goldens beyond headless, coverage-floor enforcement, cargo-packager installers (native runners), CI matrix; Settings `autostart.enabled` is not applied yet (no Run value written, `T-410`); explicit DACL for the helper pipe (default DACL + peer binary checks today); `hotkey.fired` gesture tokens can be minted by any profile-token holder (ADR-003); `store::tests::self_concurrent_burst` is load-sensitive (failed once under a parallel rebuild, passes alone).
 
 ## Document inventory
 - `README.md` — Plan (source of truth)
 - `adr-001-plugins.md` — ADR-001 — Out-of-process IPC plugin system (Notepad++-inspired UX)
 - `adr-002-i18n.md` — ADR-002 — Internationalization: string ids + community catalogs
+- `adr-003-elevated-helper.md` — ADR-003 — Elevated helper: consent per install mode, pipe liveness, paste deadlines
 - `plan.md` — Plan — Clipmonger (cross-platform ArsClip successor)
 - `seg-00-index.md` — Spec index — Clipmonger (cross-platform ArsClip successor)
 - `seg-01-product-scope.md` — Product scope — full ArsClip parity + milestone slices

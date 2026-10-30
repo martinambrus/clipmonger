@@ -21,7 +21,7 @@ Project name: Clipmonger (D-021; the `arsclip-x` working title is retired).
 Status = acceptance state (`Final` = user-accepted 2026-10-16 per
 plan gate 0.8; post-freeze corrections use short ADRs per §5, never
 silent edits — review L-04; ADR-001/002 + D-021/022/023 accepted 2026-10-25
-under a user-authorized reopen).
+under a user-authorized reopen; ADR-003 + D-025 accepted 2026-10-30).
 
 | File | Content | Status |
 |---|---|---|
@@ -41,6 +41,7 @@ under a user-authorized reopen).
 | `plan.md` | Canonical plan (goal, approach, steps, validation, risks, sources) | Final |
 | `adr-001-plugins.md` | ADR: out-of-process IPC plugin system (D-022) | Final |
 | `adr-002-i18n.md` | ADR: string ids + community catalogs (D-023) | Final |
+| `adr-003-elevated-helper.md` | ADR: elevated helper per install mode, pipe liveness, paste deadlines (D-025) | Final |
 
 ## 3. Decision log
 
@@ -55,7 +56,7 @@ under a user-authorized reopen).
 | D-007 | Project license = MIT | DECIDED (user) | Compatible with every reuse-map dependency (all MIT/Apache-2.0); no GPL ingestion per N-003 |
 | D-008 | ArsClip source code is NEVER reused (freeware, non-profit-terms source); behavior reference only | DECIDED | ArsClip license terms as published |
 | D-009 | Roles: user = architecture oversight + QA lead; agents = implementation | DECIDED (user) | — |
-| D-011 | Windows: full paste coverage via ON-DEMAND elevated helper (Total Commander-style). Daemon always runs standard; helper spawns (UAC) only when the paste/macro target is an elevated window, lives for the app run, re-prompts after restart/helper death. | DECIDED (user, Q1) | seg-04 |
+| D-011 | Windows: full paste coverage via ON-DEMAND elevated helper (Total Commander-style). Daemon always runs standard; helper spawns (UAC) only when the paste/macro target is an elevated window, lives for the app run, re-prompts after restart/helper death. Amended by D-025. | DECIDED (user, Q1) | seg-04 |
 | D-012 | Back-compat (Q3a, AMENDED by review finding 24). Rust floors: Win10+/Server 2016+; macOS 11.0+ ARM64 / 10.12+ Intel; Linux kernel 3.2+ / glibc 2.17+. Retro out (would need abandoning Rust std). APP floor (what we ship+test): Win/macOS per above; Linux = oldest TESTED LTS distro (its glibc, asserted in CI per seg-12 §2) — NOT a 2.17 promise, since LTS images ship newer glibc (24.04 verified 2.39). glibc-2.17 sysroot = future track on user demand. GUI/input crates get floor-verification tasks; plan takes the highest verified line. | DECIDED (user, Q3) | Rust platform-support table (inspected); floors matrix in seg-12 |
 | D-013 | GNOME Shell extension IN v1 (Q4b). v1 = full function on GNOME incl. the user's GNOME 46 box; extension is a v1 product surface (own language/version matrix/packaging). seg-01/seg-02 milestones updated. | DECIDED (user, Q4) | seg-06, seg-07 |
 | D-014 | Config UI = ArsClip-maximalist (Q6b). EVERY setting in the config window from the start (tab per area); no file-only settings except env overrides. Raises seg-09 scope + UI QA burden (carried in seg-11). CLARIFIED (review finding 39): every setting for an IMPLEMENTED feature has UI; future-feature controls appear only when that feature lands (no dead UI). | DECIDED (user, Q6) | seg-09 |
@@ -68,6 +69,7 @@ under a user-authorized reopen).
 | D-021 | Project name = Clipmonger (`APP_IDENTITY` = `clipmonger`); `arsclip-x` working title retired pre-v1, no migration (nothing shipped). | DECIDED (user 2026-10-25) | all segments |
 | D-022 | Plugin system = out-of-process IPC plugins, Notepad++-inspired UX (one-click admin, drop-to-install, curated list); v1 reservations, v2 host, v3+ list. | DECIDED (user 2026-10-25) | adr-001 |
 | D-023 | i18n = stable string ids + versioned community catalogs; English-only v1, translations from v2 (Slovak first, user-supplied, non-blocking). | DECIDED (user 2026-10-25) | adr-002 |
+| D-025 | Elevated helper (amends D-011): consent on first admin-window focus; installed builds = one UAC, then a logon task starts the helper silently; portable builds = one UAC per run, never a scheduled task; per-profile pipe with mutual binary checks, liveness from the pipe, per-job target window + 2 s deadline; the popup UI owns the Windows popup hotkey. | DECIDED (user 2026-10-30) | adr-003 |
 
 ### Past decision sessions (Q1–Q9; review L-04)
 

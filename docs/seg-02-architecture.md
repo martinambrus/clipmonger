@@ -40,6 +40,9 @@ Four cooperating programs, one data owner:
   daemon on demand (seg-04 §5), input-only, exits with the daemon
   (self-terminates on pipe disconnect). Never autostarted, never
   shows UI, never touches the store.
+  Amended by ADR-003 (D-025): Program Files builds start the helper from a
+  consented logon task and it reconnects across daemon restarts; portable
+  helpers still exit with the daemon.
 - **GNOME extension (v1, D-013)**: in-Shell relay only (capture events +
   hotkey triggers in, paste/hotkey assists out). It MUST NOT own history;
   on disconnect the daemon marks GNOME capture `Unavailable` (see §7).

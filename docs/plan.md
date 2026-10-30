@@ -124,7 +124,16 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   CPU fallback, popup restore_clipboard live reload, blink/selection
   fixes) re-verified on RustDesk host; test infra `ClipmongerHelper`
   scheduled task ended and deleted 2026-10-29, no daemon running.
-  Open: T-410 reboot-persist leg, explicit pipe DACL, PNG/DIB conversion.
+  Admin-window paste reworked 2026-10-30 (ADR-003, D-025): the idle
+  heartbeat stall (synchronous pipe I/O on one handle from two threads)
+  delayed admin pastes up to 30 s and dropped the helper after ~7.5 min
+  idle; replaced by a single-thread request/response helper with pipe
+  liveness, per-job target window + 2 s deadline, per-run helper for
+  portable builds and a consented logon task for Program Files builds.
+  User-verified on the Windows host (portable, installed, 17 min idle,
+  logoff/logon); T-409 matrix re-run for both modes.
+  Open: T-410 reboot-persist leg (Settings autostart not applied yet),
+  explicit pipe DACL, PNG/DIB conversion.
 - **3. X11 backend. (DONE 2026-10-26, WSL Xvfb)** Seg-05 (XFixes + manager role, transfer+INCR,
   hotkeys, enigo paste, KSNI tray, .desktop autostart). Tests T-501…508
   (Xvfb headless).
@@ -282,7 +291,9 @@ plan.md (this file).
 - R-010 Windows elevated helper → on-demand spawn from protected paths
   only, reverse-connect pipe + mutual peer auth, input-only narrow
   protocol + gesture tokens, self-exit on disconnect, full audit
-  (seg-04 §5; T-409/413/414).
+  (seg-04 §5; T-409/413/414). Amended by ADR-003 (D-025): a logon task
+  only for Program Files binaries (known-folder check), one UAC per run
+  and never a task for portable copies, per-job target window + deadline.
 - R-011 GNOME extension session impact → size-capped async relay with
   backoff, degrade-to-capture-paused on wedge (never hang the session),
   daemon survives silence/disconnect (seg-07 §9; T-702/703).

@@ -22,7 +22,7 @@
 
 ## Evidence to attach
 
-27-row checklist with PASS/FAIL per row, screenshots, config file diff per Apply. Redact paths/window titles/tokens (finding 52).
+28-row checklist with PASS/FAIL per row, screenshots, config file diff per Apply. Redact paths/window titles/tokens (finding 52).
 
 ## Verdict
 

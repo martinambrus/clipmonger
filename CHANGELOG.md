@@ -11,9 +11,34 @@ reserved for the release that passes all seg-11 §5 gates.
   `clipboard_restore` (default — clipboard write + Ctrl+V with
   guarded restore, any size, standard and elevated routes) or
   `unicode_inject` (synthetic keystrokes).
+- Portable mode: a `portable.marker` file next to `clipmonger.exe` keeps
+  the profile beside the binary.
+
+### Changed
+
+- Windows admin-window paste (ADR-003): the app asks once when an
+  elevated window is first focused. Program Files installs then use one
+  UAC prompt to register a logon task that starts the elevated helper
+  silently at every logon; portable copies use one UAC prompt per run and
+  never create a scheduled task. The popup owns the popup hotkey, and
+  daemon, helper and popup run without console windows.
+- Settings: the unused `windows.helper_auto_elevate` row was removed
+  (28 rows).
 
 ### Fixed
 
+- Windows admin-window pastes were delayed by up to 30 s, silently
+  dropped after ~7.5 min idle, or ran late into whatever window had
+  focus: the helper heartbeat stalled on synchronous pipe I/O and jobs
+  had neither a target window nor a deadline. Pastes now go only to the
+  window the hotkey was pressed in, within 2 s of the pick, or fail with
+  a visible reason.
+- Tray Exit in the Windows popup now also stops the daemon (and the
+  portable helper).
+- The helper logon task is no longer stopped on battery power or after
+  72 hours, and task creation works for install paths with spaces.
+- UI test drift: the chord parser test and the settings-row tests match
+  the configured default hotkey and rows again.
 - UI text rendered as squares (tofu) on real displays: eframe's
   `default-features = false` had dropped its embedded/system fonts.
   Restored `default_fonts`/`system_fonts`; regression test pins it.
