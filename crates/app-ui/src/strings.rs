@@ -195,6 +195,7 @@ pub const IDS: &[&str] = &[
     "config.updates_check",
     "config.logging_level",
     "config.popup_delivery",
+    "config.popup_restore_clipboard",
     "config.title",
     "config.apply",
     "config.revert",

@@ -476,10 +476,10 @@ fn u9_perm_strings_exist() {
 }
 
 // U10 config tab model: Permanent Clips tab excludes the permanents.groups
-// ROWS entry while the global 27-row matrix is untouched (P-F1).
+// ROWS entry while the global 28-row matrix is untouched (P-F1).
 #[test]
 fn u10_config_tab_excludes_legacy_groups_row() {
-    assert_eq!(config_model::ROWS.len(), 27, "T-909 matrix stays 27 rows");
+    assert_eq!(config_model::ROWS.len(), 28, "T-909 matrix stays 28 rows");
     assert!(
         config_model::ROWS
             .iter()
@@ -509,5 +509,5 @@ fn u10_config_tab_excludes_legacy_groups_row() {
     ] {
         total += config_model::visible_rows(tab).len();
     }
-    assert_eq!(total, 27, "visible_rows partitions the 27-row matrix");
+    assert_eq!(total, 28, "visible_rows partitions the 28-row matrix");
 }

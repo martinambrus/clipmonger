@@ -231,12 +231,6 @@ pub const ROWS: &[Row] = &[
         kind: Kind::Bool,
         label: "config.popup_restore_clipboard",
     },
-    Row {
-        key: "windows.helper_auto_elevate",
-        tab: Tab::Advanced,
-        kind: Kind::Bool,
-        label: "config.windows_helper_auto_elevate",
-    },
 ];
 
 /// Row indices the config window renders for `tab` (P-F1): the
