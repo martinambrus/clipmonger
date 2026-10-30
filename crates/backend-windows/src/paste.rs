@@ -104,8 +104,6 @@ impl WinPaste {
         #[cfg(windows)]
         {
             let _ = clip;
-            let current = crate::foreground::capture_foreground().ok();
-            check_target(target, current.as_ref())?;
             if crate::foreground::target_integrity(&target.handle)
                 == crate::foreground::Integrity::High
             {
@@ -116,9 +114,12 @@ impl WinPaste {
                     "helper unavailable: elevated target needs the helper route".to_string(),
                 ));
             }
-            // Safety: handle was validated above; focus only queries it.
+            // Safety: handle round-trips through HWND; it is only queried
+            // and activated, never freed.
             let raw = hwnd_of(&target.handle) as windows_sys::Win32::Foundation::HWND;
-            crate::sys::focus_hwnd(raw);
+            settle_foreground(raw)?;
+            let current = crate::foreground::capture_foreground().ok();
+            check_target(target, current.as_ref())?;
             let text = payloads
                 .iter()
                 .find(|(mime, _)| mime == "text/plain")
@@ -151,6 +152,29 @@ fn hwnd_of(handle: &clipmonger_platform::types::PlatformHandle) -> i64 {
         clipmonger_platform::types::PlatformHandle::WinHwnd(hwnd) => *hwnd,
         _ => 0,
     }
+}
+
+/// Wait briefly for `hwnd` to be the foreground window, activating it when
+/// Windows has not settled on it after the popup hid (the popup grants
+/// foreground rights before hiding). Never types into a different window.
+#[cfg(windows)]
+fn settle_foreground(hwnd: windows_sys::Win32::Foundation::HWND) -> Result<()> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut next_activate = Instant::now();
+    while crate::sys::foreground_hwnd() != Some(hwnd) {
+        if Instant::now() >= deadline {
+            return Err(Error::Denied(
+                "target window is not in the foreground".to_string(),
+            ));
+        }
+        if Instant::now() >= next_activate {
+            crate::sys::activate_window(hwnd);
+            next_activate = Instant::now() + Duration::from_millis(250);
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    Ok(())
 }
 
 /// Inject one helper-job payload as synthetic input. Elevated-worker entry

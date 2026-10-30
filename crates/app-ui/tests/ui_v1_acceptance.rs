@@ -971,6 +971,30 @@ fn ipc_bridge_builders_send_clip_not_id() {
     );
     assert_eq!(method, "paste.execute");
     assert_eq!(params, json!({ "clip": id.to_string() }));
+
+    let targeted = ipc_bridge::UiCmd::PasteClipTo(id, Some(0x0003_0838), 1_000);
+    let (method, params) = (
+        ipc_bridge::method_for(&targeted),
+        ipc_bridge::params_for(&targeted),
+    );
+    assert_eq!(method, "paste.execute");
+    assert_eq!(
+        params,
+        json!({ "clip": id.to_string(), "target_hwnd": 0x0003_0838_u64, "picked_ms": 1_000 })
+    );
+    let untargeted = ipc_bridge::UiCmd::PasteClipTo(id, None, 1_000);
+    assert_eq!(
+        ipc_bridge::params_for(&untargeted),
+        json!({ "clip": id.to_string(), "picked_ms": 1_000 }),
+        "no target: the daemon falls back to the foreground window"
+    );
+
+    let (method, params) = (
+        ipc_bridge::method_for(&ipc_bridge::UiCmd::HotkeyFired),
+        ipc_bridge::params_for(&ipc_bridge::UiCmd::HotkeyFired),
+    );
+    assert_eq!(method, "hotkey.fired");
+    assert_eq!(params, json!({ "id": 1 }));
 }
 
 #[test]
@@ -1030,5 +1054,41 @@ fn ipc_bridge_wire_params_recorded_by_fake_transport() {
             ),
         ],
         "wire params must use the daemon clip shape for all three commands"
+    );
+}
+
+#[test]
+fn ipc_bridge_targeted_paste_failure_is_reported_not_dropped() {
+    use ipc_bridge::{UiCmd, UiEvent};
+    // Fake daemon: mints on hotkey.fired, refuses the targeted paste.
+    struct Refuse;
+    impl ipc_bridge::Transport for Refuse {
+        fn call(
+            &mut self,
+            method: &str,
+            _params: &Value,
+        ) -> Result<Value, clipmonger_ipc::proto::IpcError> {
+            match method {
+                "hotkey.fired" => Ok(json!({ "ok": true })),
+                _ => Err(clipmonger_ipc::proto::IpcError::new(
+                    "unavailable",
+                    "paste.execute: unavailable: admin helper is not running".to_string(),
+                )),
+            }
+        }
+    }
+    let (tx, rx) = ipc_bridge::Bridge::spawn(Box::new(Refuse));
+    let id = clip_id(3);
+    tx.send(UiCmd::HotkeyFired).expect("send hotkey");
+    tx.send(UiCmd::PasteClipTo(id, Some(42), 0))
+        .expect("send paste");
+    let first = rx.recv_timeout(Duration::from_secs(2)).expect("ack");
+    let second = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("paste event");
+    assert!(matches!(first, UiEvent::HotkeyAck), "{first:?}");
+    assert!(
+        matches!(&second, UiEvent::PasteFailed(message) if message.contains("admin helper")),
+        "targeted paste refusal must carry the daemon reason: {second:?}"
     );
 }

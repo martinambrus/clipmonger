@@ -1,23 +1,35 @@
 //! Scheduled-task installer for the elevated helper (one-time UAC).
 //!
-//! Portable mode never touches the Task Scheduler. Creation uses
-//! `schtasks.exe /create /rl HIGHEST` via a `runas` `ShellExecute` so the
-//! single UAC prompt comes from Windows, not from this code.
+//! Installed (Program Files) builds only: portable mode never touches the
+//! Task Scheduler. Creation uses `schtasks.exe /create /rl HIGHEST` via a
+//! `runas` `ShellExecute` so the single UAC prompt comes from Windows, not
+//! from this code.
 
 use std::path::Path;
 
 const TASK_NAME: &str = "ClipmongerHelper";
 
+/// `schtasks.exe` command that never opens a console window (the daemon is
+/// windowless, so a console child would otherwise get a window of its own).
+#[cfg(windows)]
+fn schtasks() -> std::process::Command {
+    use std::os::windows::process::CommandExt as _;
+    /// `CREATE_NO_WINDOW` process creation flag.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = std::process::Command::new("schtasks");
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
 #[cfg(windows)]
 fn schtasks_exists() -> bool {
-    std::process::Command::new("schtasks")
+    schtasks()
         .arg("/query")
         .arg("/tn")
         .arg(TASK_NAME)
         .arg("/nh")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 #[cfg(not(windows))]
@@ -40,79 +52,16 @@ fn task_tr(exe: &Path, profile: &Path) -> String {
     )
 }
 
-/// Install the helper task (requires elevation - caller must ensure UAC).
-#[cfg(windows)]
-fn do_install(exe: &Path, profile: &Path) -> Result<(), String> {
-    let tr = task_tr(exe, profile);
-    let status = std::process::Command::new("schtasks")
-        .arg("/create")
-        .arg("/tn")
-        .arg(TASK_NAME)
-        .arg("/tr")
-        .arg(&tr)
-        .arg("/sc")
-        .arg("ONLOGON")
-        .arg("/rl")
-        .arg("HIGHEST")
-        .arg("/f")
-        .output()
-        .map_err(|e| format!("schtasks create failed: {e}"))?;
-    if status.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "schtasks create refused: {}",
-            String::from_utf8_lossy(&status.stderr)
-        ))
-    }
-}
-
-pub fn ensure_persistent_task(exe: &Path, profile: &Path) -> Result<bool, String> {
-    #[cfg(windows)]
-    {
-        let tr_expected = task_tr(exe, profile);
-        if is_installed() {
-            let xml = std::process::Command::new("schtasks")
-                .arg("/query")
-                .arg("/tn")
-                .arg(TASK_NAME)
-                .arg("/XML")
-                .output()
-                .map_err(|e| format!("schtasks query failed: {e}"))?;
-            let xml_str = String::from_utf8_lossy(&xml.stdout);
-            if !xml_str.contains("__elevated-persistent") {
-                let _ = std::process::Command::new("schtasks")
-                    .arg("/delete")
-                    .arg("/tn")
-                    .arg(TASK_NAME)
-                    .arg("/f")
-                    .output();
-            } else if xml_str.contains(&tr_expected) {
-                return Ok(false);
-            } else {
-                let _ = std::process::Command::new("schtasks")
-                    .arg("/delete")
-                    .arg("/tn")
-                    .arg(TASK_NAME)
-                    .arg("/f")
-                    .output();
-            }
-        }
-        do_install(exe, profile)?;
-        Ok(true)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (exe, profile);
-        Ok(false)
-    }
-}
-
-/// Install via elevated `runas` prompt (one-time UAC).
+/// Install via elevated `runas` prompt (one-time UAC); returns once the
+/// elevated `schtasks` has finished.
+///
+/// # Errors
+///
+/// Returns a message when the UAC prompt is cancelled, the launch is
+/// blocked, or `schtasks` fails to create the task.
 pub fn install_via_uac(exe: &Path, profile: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
-        // allow C:\Temp soft-test profile for manual QA
         let tr = task_tr(exe, profile);
         let params = format!("/create /tn {TASK_NAME} /tr \"{tr}\" /sc ONLOGON /rl HIGHEST /f");
         elevate_schtasks(&params)
@@ -124,9 +73,40 @@ pub fn install_via_uac(exe: &Path, profile: &Path) -> Result<(), String> {
     }
 }
 
+/// Start the installed helper task now. Needs no UAC: the task carries the
+/// elevation the user consented to when it was created.
+///
+/// # Errors
+///
+/// Returns a message when `schtasks` cannot run or refuses the task.
+pub fn run_task() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let output = schtasks()
+            .arg("/run")
+            .arg("/tn")
+            .arg(TASK_NAME)
+            .output()
+            .map_err(|e| format!("schtasks run failed: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "schtasks run refused: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err("elevated task needs Windows".to_string())
+    }
+}
+
 #[cfg(windows)]
 fn elevate_schtasks(params: &str) -> Result<(), String> {
     use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
     use windows_sys::Win32::UI::Shell::{
         ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     };
@@ -151,10 +131,21 @@ fn elevate_schtasks(params: &str) -> Result<(), String> {
             crate::sys::last_error()
         ));
     }
-    if !info.hProcess.is_null() {
-        unsafe { CloseHandle(info.hProcess) };
+    if info.hProcess.is_null() {
+        return Ok(());
     }
-    Ok(())
+    // Wait for the elevated schtasks so the caller can start the task next.
+    let mut code: u32 = 1;
+    unsafe {
+        WaitForSingleObject(info.hProcess, 30_000);
+        GetExitCodeProcess(info.hProcess, &raw mut code);
+        CloseHandle(info.hProcess);
+    }
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(format!("schtasks create exited with code {code}"))
+    }
 }
 
 /// Remove the helper task (no elevation needed for delete of user task).
@@ -173,118 +164,44 @@ pub fn uninstall() -> Result<(), String> {
     }
 }
 
-/// Show Yes/No consent dialog for admin-window support.
+/// Show the Yes/No consent dialog for admin-window support, worded for
+/// installed (logon task) or portable (until exit, nothing installed) mode.
 /// Returns true on Yes (on Windows), false on No/cancel/elsewhere.
 #[cfg(windows)]
-pub fn prompt_consent() -> bool {
+#[must_use]
+pub fn prompt_consent(installed: bool) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONQUESTION, MB_SETFOREGROUND, MB_SYSTEMMODAL, MB_TOPMOST, MB_YESNO,
+        MessageBoxW, MB_DEFBUTTON2, MB_ICONQUESTION, MB_SETFOREGROUND, MB_SYSTEMMODAL, MB_TOPMOST,
+        MB_YESNO,
     };
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
-    let text = w("Enable clipboard in admin windows?\n\nYes = one-time UAC to install helper (then silent at logon).\nNo = ask again next restart.");
+    let text = if installed {
+        w("Enable Clipmonger in admin windows?\n\nYes = one-time Windows UAC prompt to install the admin helper; it then starts silently at logon.\nNo = ask again next time Clipmonger starts.")
+    } else {
+        w("Enable Clipmonger in admin windows?\n\nYes = Windows UAC prompt to start the admin helper until Clipmonger exits (portable mode: nothing is installed).\nNo = ask again next time Clipmonger starts.")
+    };
     let cap = w("Clipmonger");
     let ret = unsafe {
         MessageBoxW(
             std::ptr::null_mut(),
             text.as_ptr(),
             cap.as_ptr(),
-            MB_YESNO | MB_ICONQUESTION | MB_SYSTEMMODAL | MB_SETFOREGROUND | MB_TOPMOST,
+            // "No" is the default: a stray Enter must not start elevation.
+            MB_YESNO
+                | MB_DEFBUTTON2
+                | MB_ICONQUESTION
+                | MB_SYSTEMMODAL
+                | MB_SETFOREGROUND
+                | MB_TOPMOST,
         )
     };
     ret == 6 // IDYES
 }
 #[cfg(not(windows))]
 #[must_use]
-pub fn prompt_consent() -> bool {
+pub fn prompt_consent(installed: bool) -> bool {
+    let _ = installed;
     false
-}
-
-#[cfg(windows)]
-pub fn notify_popup() -> Result<(), String> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        BringWindowToTop, FindWindowW, IsWindowVisible, PostMessageW, SetForegroundWindow,
-        SetWindowPos, ShowWindow, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE,
-        SW_SHOW, WM_HOTKEY,
-    };
-    fn w(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-    let cls = w("ClipmongerFallback");
-    let hwnd = unsafe { FindWindowW(cls.as_ptr(), std::ptr::null()) };
-    if hwnd.is_null() {
-        return Err("popup not found".to_string());
-    }
-    unsafe {
-        let visible = IsWindowVisible(hwnd) != 0;
-        if visible {
-            let ok = PostMessageW(hwnd, WM_HOTKEY, 1, 0);
-            if ok != 0 {
-                return Ok(());
-            }
-        } else {
-            // Capture target for admin: fallback (Medium) can't GetForegroundWindow correctly over High IL, so we store it here for fallback to pick up.
-            if let Some(fg) = crate::sys::foreground_hwnd() {
-                let _ = std::fs::write(
-                    "C:\\Temp\\clipmonger-popup-marker",
-                    format!("{}", fg as usize).into_bytes(),
-                );
-                let _ = std::fs::write(
-                    "C:\\Temp\\clipmonger-target-hwnd",
-                    format!("{}", fg as usize).into_bytes(),
-                );
-            } else {
-                let _ = std::fs::write("C:\\Temp\\clipmonger-popup-marker", b"1");
-            }
-            ShowWindow(hwnd, SW_SHOW);
-            ShowWindow(hwnd, SW_RESTORE);
-            SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-            );
-            BringWindowToTop(hwnd);
-            SetForegroundWindow(hwnd);
-            // High IL direct show needs to focus the search box (fallback's WM_HOTKEY would do this from Medium, but UIPI blocks it)
-            {
-                use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
-                use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowExW;
-                let edit = FindWindowExW(
-                    hwnd,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                );
-                let edit_cls = w("EDIT");
-                let child = FindWindowExW(
-                    hwnd,
-                    std::ptr::null_mut(),
-                    edit_cls.as_ptr(),
-                    std::ptr::null(),
-                );
-                if !child.is_null() {
-                    let _ = SetFocus(child);
-                } else if !edit.is_null() {
-                    let _ = SetFocus(edit);
-                }
-            }
-            if IsWindowVisible(hwnd) != 0 {
-                return Ok(());
-            }
-            let ok = PostMessageW(hwnd, WM_HOTKEY, 1, 0);
-            if ok != 0 {
-                return Ok(());
-            }
-        }
-    }
-    Err("PostMessage failed".to_string())
-}
-#[cfg(not(windows))]
-pub fn notify_popup() -> Result<(), String> {
-    Err("needs Windows".to_string())
 }

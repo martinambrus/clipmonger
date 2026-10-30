@@ -46,6 +46,14 @@ fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Quote one command-line argument for the standard Windows argv parser.
+/// Paths cannot contain `"`, so only trailing backslashes (which would
+/// escape the closing quote) need doubling.
+fn quote_arg(value: &str) -> String {
+    let trailing = value.len() - value.trim_end_matches('\\').len();
+    format!("\"{value}{}\"", "\\".repeat(trailing))
+}
+
 // ---------------------------------------------------------------------------
 // Message-only monitor pump
 // ---------------------------------------------------------------------------
@@ -247,10 +255,66 @@ pub fn foreground_hwnd() -> Option<HWND> {
     }
 }
 
-/// Best-effort re-focus of `hwnd`; returns whether the call was accepted.
-pub(crate) fn focus_hwnd(hwnd: HWND) -> bool {
-    // Safety: hwnd names a top-level window; failure only means focus was refused.
-    unsafe { SetForegroundWindow(hwnd) != 0 }
+/// Whether `hwnd` still names an existing window.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[must_use]
+pub fn is_window(hwnd: HWND) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
+    // Safety: IsWindow only validates the handle value.
+    unsafe { IsWindow(hwnd) != 0 }
+}
+
+/// Make `hwnd` the foreground window: attach to the current foreground
+/// thread's input state for the duration of the call (so the request is
+/// honored without our own foreground rights), raise, activate, detach.
+/// Returns whether `hwnd` is the foreground window afterwards.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn activate_window(hwnd: HWND) -> bool {
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{BringWindowToTop, IsHungAppWindow};
+    // Safety: plain window-manager calls on handle values; a failed attach
+    // or activation only leaves the foreground unchanged.
+    unsafe {
+        // Activating a hung window, or sharing input state with a hung
+        // foreground thread, can block this thread indefinitely.
+        if IsHungAppWindow(hwnd) != 0 {
+            return false;
+        }
+        let foreground = GetForegroundWindow();
+        let fg_thread = if foreground.is_null() || IsHungAppWindow(foreground) != 0 {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, std::ptr::null_mut())
+        };
+        let own_thread = GetCurrentThreadId();
+        let attached = fg_thread != 0
+            && fg_thread != own_thread
+            && AttachThreadInput(own_thread, fg_thread, 1) != 0;
+        BringWindowToTop(hwnd);
+        SetForegroundWindow(hwnd);
+        if attached {
+            AttachThreadInput(own_thread, fg_thread, 0);
+        }
+        GetForegroundWindow() == hwnd
+    }
+}
+
+/// Server process id of a connected named-pipe client handle, or `None`
+/// when it cannot be determined (the helper's check that it talks to our
+/// own daemon binary).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[must_use]
+pub fn pipe_server_pid(pipe_handle: *mut std::ffi::c_void) -> Option<u32> {
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    let mut pid: u32 = 0;
+    // Safety: handle is the caller's live pipe client handle; pid slot is
+    // valid for the call.
+    let ok = unsafe { GetNamedPipeServerProcessId(pipe_handle, &raw mut pid) };
+    if ok == 0 {
+        None
+    } else {
+        Some(pid)
+    }
 }
 
 /// Owning process id of a `WinHwnd` handle value (daemon supervisor seam).
@@ -527,27 +591,32 @@ pub(crate) fn run_value_delete() -> Result<(), String> {
 // Elevated-helper spawn + peer authentication (seg-04 S5)
 //
 // The runas/UAC served leg is manual QA only: nothing here is ever called
-// from automated tests. The pipe name is a random 128-bit rendezvous, never
-// a credential; NO secret travels in argv.
+// from automated tests. The helper pipe name derives from the profile path
+// (a rendezvous, never a credential; both sides verify the peer binary);
+// NO secret travels in argv.
 // ---------------------------------------------------------------------------
 
 /// Spawn the elevated helper worker via `ShellExecuteEx` with the `runas`
-/// verb (UAC consent prompt). `exe` must live under a protected install
-/// path (checked by the caller via `helper::protected_path_ok`); `args`
-/// carries only `__elevated-worker <random-pipe-name>`.
+/// verb (UAC consent prompt; the call returns once the prompt is answered).
+/// `args` carries only `__elevated-worker --profile-dir <profile>`: the
+/// worker derives the daemon pipe from the profile and both sides verify
+/// the peer binary, so no secret travels in argv.
 ///
 /// # Errors
 ///
 /// Returns a message when the `runas` launch is refused (UAC cancel, missing
 /// binary, policy block).
-pub fn spawn_elevated_worker(exe: &str, pipe_name: &str) -> Result<(), String> {
+pub fn spawn_elevated_worker(exe: &str, profile: &std::path::Path) -> Result<(), String> {
     use windows_sys::Win32::UI::Shell::{
         ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
     let verb = to_wide("runas");
     let file = to_wide(exe);
-    let params = to_wide(&format!("__elevated-worker {pipe_name}"));
+    let params = to_wide(&format!(
+        "__elevated-worker --profile-dir {}",
+        quote_arg(&profile.to_string_lossy())
+    ));
     // Safety: zeroed struct with only documented input fields set; string
     // pointers stay alive for the call; hProcess (when returned) closed below.
     let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };

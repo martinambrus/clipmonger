@@ -51,25 +51,60 @@ pub(crate) fn capture_foreground() -> Result<PasteTarget> {
     {
         let hwnd = crate::sys::foreground_hwnd()
             .ok_or_else(|| Error::Unavailable("no foreground window".to_string()))?;
-        let pid = crate::sys::window_pid(hwnd);
-        let exe = pid
-            .and_then(crate::sys::process_basename)
-            .unwrap_or_else(|| "unknown".to_string());
-        let title_hash = crate::sys::window_title_hash(hwnd);
-        Ok(PasteTarget {
-            app: AppId { exe, title_hash },
-            window_title_hash: title_hash,
-            // Safety: HWND round-trips through i64 on 64-bit Windows (the
-            // only target this backend supports).
-            handle: PlatformHandle::WinHwnd(hwnd as i64),
-            captured_ms: now_ms(),
-        })
+        Ok(target_of(hwnd))
     }
     #[cfg(not(windows))]
     {
         Err(Error::Unavailable(
             "foreground capture needs a Windows session".to_string(),
         ))
+    }
+}
+
+/// Paste target for an explicit top-level window (`hwnd` as captured when
+/// the popup opened), instead of whatever is foreground right now.
+///
+/// # Errors
+///
+/// Returns [`Error::Unavailable`] when the window no longer exists or
+/// there is no Windows session.
+pub fn target_for_hwnd(hwnd: i64) -> Result<PasteTarget> {
+    #[cfg(windows)]
+    {
+        // Safety: i64 handle round-trips through HWND on 64-bit Windows (the
+        // only target this backend supports); it is only validated/queried.
+        let handle = hwnd as windows_sys::Win32::Foundation::HWND;
+        if hwnd == 0 || !crate::sys::is_window(handle) {
+            return Err(Error::Unavailable(
+                "paste target window is gone".to_string(),
+            ));
+        }
+        Ok(target_of(handle))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        Err(Error::Unavailable(
+            "foreground capture needs a Windows session".to_string(),
+        ))
+    }
+}
+
+/// Describe `hwnd` as a paste target (owner exe, title hash, handle).
+#[cfg(windows)]
+fn target_of(hwnd: windows_sys::Win32::Foundation::HWND) -> PasteTarget {
+    let pid = crate::sys::window_pid(hwnd);
+    let exe = pid
+        .and_then(crate::sys::process_basename)
+        .unwrap_or_else(|| "unknown".to_string());
+    let title_hash = crate::sys::window_title_hash(hwnd);
+    PasteTarget {
+        app: AppId { exe, title_hash },
+        window_title_hash: title_hash,
+        // Safety: HWND round-trips through i64 on 64-bit Windows (the
+        // only target this backend supports).
+        handle: PlatformHandle::WinHwnd(hwnd as i64),
+        captured_ms: now_ms(),
     }
 }
 

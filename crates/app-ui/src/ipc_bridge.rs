@@ -32,6 +32,13 @@ pub enum UiCmd {
     PinClip(Uuid, bool),
     /// Paste one clip through the validated target.
     PasteClip(Uuid),
+    /// Paste one clip picked in the popup: into the target window (HWND
+    /// value captured when the hotkey opened the popup) when known, else
+    /// into the foreground window; the pick time (unix ms) lets the daemon
+    /// refuse a request that would land late.
+    PasteClipTo(Uuid, Option<u64>, i64),
+    /// Mint a single-use gesture token (user picked a clip in the popup).
+    HotkeyFired,
     /// Stop the daemon.
     Stop,
     /// Fetch the full config document.
@@ -85,6 +92,10 @@ pub enum UiEvent {
     PasteDone(Uuid),
     /// Daemon refused paste; the popup stays open.
     PasteUnavailable,
+    /// Targeted paste failed; carries the daemon message.
+    PasteFailed(String),
+    /// Gesture token minted (`hotkey.fired` acknowledged).
+    HotkeyAck,
     /// Daemon acknowledged stop.
     Stopped,
     /// Anything else, carrying the guard message.
@@ -150,7 +161,8 @@ pub fn method_for(cmd: &UiCmd) -> &'static str {
         UiCmd::ListHistory => "history.list",
         UiCmd::DeleteClip(_) => "history.delete",
         UiCmd::PinClip(_, _) => "history.pin",
-        UiCmd::PasteClip(_) => "paste.execute",
+        UiCmd::PasteClip(_) | UiCmd::PasteClipTo(..) => "paste.execute",
+        UiCmd::HotkeyFired => "hotkey.fired",
         UiCmd::Stop => "daemon.stop",
         UiCmd::ConfigGet => "config.get",
         UiCmd::ConfigSet(_, _) => "config.set",
@@ -190,6 +202,14 @@ pub fn params_for(cmd: &UiCmd) -> Value {
         UiCmd::DeleteClip(id) | UiCmd::PasteClip(id) => {
             serde_json::json!({ "clip": id.to_string() })
         }
+        UiCmd::PasteClipTo(id, target, picked_ms) => {
+            let mut params = serde_json::json!({ "clip": id.to_string(), "picked_ms": picked_ms });
+            if let Some(hwnd) = target {
+                params["target_hwnd"] = Value::from(*hwnd);
+            }
+            params
+        }
+        UiCmd::HotkeyFired => serde_json::json!({ "id": 1 }),
         UiCmd::PermDelete(id) | UiCmd::ExecPermanent(id) => {
             serde_json::json!({ "id": id.to_string() })
         }
@@ -262,7 +282,8 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
             }
         }
         (UiCmd::ExecPermanent(id), Ok(_)) => UiEvent::PasteDone(id),
-        (UiCmd::PasteClip(id), Ok(_)) => UiEvent::PasteDone(id),
+        (UiCmd::PasteClip(id) | UiCmd::PasteClipTo(id, ..), Ok(_)) => UiEvent::PasteDone(id),
+        (UiCmd::HotkeyFired, Ok(_)) => UiEvent::HotkeyAck,
         (UiCmd::Stop, Ok(_)) => UiEvent::Stopped,
         (UiCmd::ConfigGet, Ok(body)) => UiEvent::Config(body),
         (UiCmd::CapsGet, Ok(body)) => UiEvent::Caps(body),
@@ -337,6 +358,8 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
             UiEvent::PasteUnavailable
         }
         (UiCmd::PasteClip(_), Err(error)) => UiEvent::Error(error.message),
+        (UiCmd::PasteClipTo(..), Err(error)) => UiEvent::PasteFailed(error.message),
+        (UiCmd::HotkeyFired, Err(error)) => UiEvent::Error(error.message),
         (UiCmd::ExecPermanent(_), Err(error)) => UiEvent::Error(error.message),
     }
 }

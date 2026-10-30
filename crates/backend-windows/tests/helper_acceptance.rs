@@ -34,6 +34,8 @@ fn t403_job_roundtrip() {
         target_pid: 1234,
         op: JobOp::SendInputBatch,
         payload: "hello".to_string(),
+        target_hwnd: None,
+        expires_ms: None,
     };
     let line = encode_job(&job).unwrap_or_else(|e| panic!("{T}: encode failed: {e:?}"));
     assert!(
@@ -59,6 +61,8 @@ fn t403_job_roundtrip() {
         target_pid: 1234,
         op: JobOp::SendInputBatch,
         payload: "a".repeat(MAX_PAYLOAD),
+        target_hwnd: None,
+        expires_ms: None,
     };
     let max_line =
         encode_job(&max_job).unwrap_or_else(|e| panic!("{T}: 64 KiB encode failed: {e:?}"));
@@ -92,6 +96,8 @@ fn t403_job_oversize_rejected() {
         target_pid: 99,
         op: JobOp::SendInputBatch,
         payload: "b".repeat(MAX_PAYLOAD + 1),
+        target_hwnd: None,
+        expires_ms: None,
     };
     assert!(
         encode_job(&big).is_err(),
@@ -116,6 +122,8 @@ fn t403_result_echo_job_id() {
         target_pid: 55,
         op: JobOp::SendInputBatch,
         payload: String::new(),
+        target_hwnd: None,
+        expires_ms: None,
     };
     let ok_result = JobResult {
         job_id: job.job_id,

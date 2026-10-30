@@ -105,8 +105,6 @@ pub fn read_rendezvous(profile_dir: &Path) -> Result<(PathBuf, String), CoreErro
 /// Gesture-token TTL in ms (matches the backend helper contract; kept as a
 /// literal here so the daemon builds without the backend on non-Windows).
 pub const GESTURE_TTL_MS: i64 = 30_000;
-/// Helper heartbeat deadline: 3 missed 15 s beats.
-pub const HELPER_DEAD_AFTER_MS: i64 = 45_000;
 
 /// Append one JSONL audit event to `<profile>/audit.log`.
 ///
@@ -137,18 +135,38 @@ pub fn append_audit(profile_dir: &Path, event: Value) {
     }
 }
 
-/// Elevated-helper supervisor: on-demand runas spawn from a protected path
-/// only, reverse-connect pipe, peer verification, 15 s heartbeat with
-/// 45 s death, audit entries, refusal latching into caps paste Degraded.
+/// Paste refusal while no verified elevated helper is connected.
+#[cfg(all(windows, feature = "backend-windows"))]
+const HELPER_NOT_RUNNING: &str = "unavailable: admin helper is not running";
+/// The helper connection dropped during a job.
+#[cfg(all(windows, feature = "backend-windows"))]
+const HELPER_LOST: &str = "helper connection lost";
+/// The helper did not answer within the job deadline (treated as hung).
+#[cfg(all(windows, feature = "backend-windows"))]
+const HELPER_TIMED_OUT: &str = "helper result timed out";
+/// Refusal for a paste whose deadline passed before it could run.
+#[cfg(all(windows, feature = "backend-windows"))]
+const PASTE_EXPIRED: &str = "unavailable: paste request expired";
+/// Paste deadline: a clip picked in the popup (or a paste request without a
+/// pick time) must be delivered within this many ms, else it is refused;
+/// the helper enforces the same absolute deadline before injecting.
+#[cfg(all(windows, feature = "backend-windows"))]
+const PASTE_DEADLINE_MS: i64 = 2_000;
+
+/// Elevated-helper supervisor: an always-listening pipe server for the
+/// elevated helper (UAC-launched worker or logon-task helper), peer
+/// verification, liveness from the pipe itself (helper exit closes it, no
+/// heartbeat needed), per-job deadlines, audit entries, refusal latching
+/// into caps paste Degraded.
 ///
-/// The runas/UAC served leg is manual QA by the user; automated runs never
-/// spawn (no spawn call exists outside the Windows supervisor thread).
+/// The library never launches the helper; the daemon binary's consent flow
+/// does (manual QA leg, never automated).
 pub struct HelperSupervisor {
-    /// Last worker heartbeat (unix ms), shared with the supervisor thread.
-    beat: std::sync::Arc<Mutex<Option<i64>>>,
-    /// Live job channel to the supervisor thread (Windows only).
+    /// Whether a verified helper is connected right now.
+    connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Job queue of the supervisor thread (Windows only; `None` until started).
     #[cfg(all(windows, feature = "backend-windows"))]
-    link: Option<HelperLink>,
+    jobs: Option<tokio::sync::mpsc::UnboundedSender<SupervisorJob>>,
 }
 
 /// One helper job handed to the supervisor thread.
@@ -156,98 +174,48 @@ pub struct HelperSupervisor {
 struct SupervisorJob {
     /// Validated high-integrity target process id.
     target_pid: u32,
+    /// Target top-level window the helper must paste into.
+    target_hwnd: Option<i64>,
     /// Helper operation (text injection or paste chord).
     op: clipmonger_backend_windows::helper::JobOp,
     /// Input text bytes (UTF-8); empty for a paste-chord job.
     payload: String,
+    /// Absolute deadline (unix ms); the job never runs after it.
+    expires_ms: i64,
     /// Outcome channel back to the IPC handler.
     reply: std::sync::mpsc::Sender<Result<(), String>>,
 }
 
-/// Live channel to the Windows supervisor thread.
-#[cfg(all(windows, feature = "backend-windows"))]
-struct HelperLink {
-    /// Job queue owned by the supervisor thread.
-    jobs: std::sync::mpsc::Sender<SupervisorJob>,
-}
-
 impl HelperSupervisor {
-    /// Idle supervisor with no helper and no heartbeat.
+    /// Idle supervisor with no helper connected.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            beat: std::sync::Arc::new(Mutex::new(None)),
+            connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(all(windows, feature = "backend-windows"))]
-            link: None,
+            jobs: None,
         }
     }
 
-    /// Record a worker heartbeat at `at_ms`.
-    pub fn note_beat(&self, at_ms: i64) {
-        if let Ok(mut slot) = self.beat.lock() {
-            *slot = Some(at_ms);
-        }
-    }
-
-    /// True while within [`HELPER_DEAD_AFTER_MS`] of the last heartbeat.
+    /// True while a verified helper is connected.
     #[must_use]
-    pub fn alive(&self, at_ms: i64) -> bool {
-        self.beat
-            .lock()
-            .ok()
-            .and_then(|slot| *slot)
-            .is_some_and(|beat| at_ms >= beat && at_ms - beat <= HELPER_DEAD_AFTER_MS)
+    pub fn connected(&self) -> bool {
+        self.connected.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Ensure the supervisor thread exists (Windows only); elsewhere there
-    /// is no helper channel and every elevated paste stays `Unavailable`.
+    /// Start the supervisor thread once (Windows only). It listens on the
+    /// profile's helper pipe for the whole daemon lifetime, so a helper can
+    /// attach whenever it starts (logon task or UAC consent).
     #[cfg(all(windows, feature = "backend-windows"))]
-    fn ensure_link(&mut self, profile: &Path) -> std::sync::mpsc::Sender<SupervisorJob> {
-        if let Some(link) = &self.link {
-            return link.jobs.clone();
+    pub fn start(&mut self, profile: &Path) {
+        if self.jobs.is_some() {
+            return;
         }
-        // Prefer persistent helper when the scheduled task is installed (High IL helper
-        // already running at logon). This avoids per-paste UAC. The persistent path
-        // makes the daemon the pipe server (Medium IL) so the High IL helper can
-        // connect as client without mandatory-integrity blocks.
-        if clipmonger_backend_windows::elevated_task::is_installed() {
-            let persist_pipe = clipmonger_backend_windows::helper::persistent_pipe_name(profile);
-            let beat = std::sync::Arc::clone(&self.beat);
-            let profile_path = profile.to_path_buf();
-            let (jobs_tx, jobs_rx) = std::sync::mpsc::channel::<SupervisorJob>();
-            std::thread::spawn(move || {
-                persistent_supervisor_thread(persist_pipe, beat, profile_path, jobs_rx)
-            });
-            self.link = Some(HelperLink {
-                jobs: jobs_tx.clone(),
-            });
-            return jobs_tx;
-        }
-        let (jobs_tx, jobs_rx) = std::sync::mpsc::channel::<SupervisorJob>();
-        let beat = std::sync::Arc::clone(&self.beat);
+        let (jobs_tx, jobs_rx) = tokio::sync::mpsc::unbounded_channel::<SupervisorJob>();
+        let connected = std::sync::Arc::clone(&self.connected);
         let profile = profile.to_path_buf();
-        std::thread::spawn(move || supervisor_thread(profile, beat, jobs_rx));
-        self.link = Some(HelperLink {
-            jobs: jobs_tx.clone(),
-        });
-        jobs_tx
-    }
-
-    /// Drop a dead channel so the next elevated paste re-spawns (+prompt).
-    #[cfg(all(windows, feature = "backend-windows"))]
-    fn drop_link(&mut self) {
-        self.link = None;
-    }
-
-    /// Eagerly start the persistent pipe server if the scheduled task is
-    /// installed. Call once at startup so the High IL helper can connect
-    /// before the first admin paste; otherwise the helper polls with no
-    /// server and the first paste pays a 90 s timeout.
-    #[cfg(all(windows, feature = "backend-windows"))]
-    pub fn prime_persistent(&mut self, profile: &Path) {
-        if clipmonger_backend_windows::elevated_task::is_installed() && self.link.is_none() {
-            let _ = self.ensure_link(profile);
-        }
+        std::thread::spawn(move || helper_supervisor_thread(&profile, &connected, jobs_rx));
+        self.jobs = Some(jobs_tx);
     }
 }
 
@@ -257,448 +225,298 @@ impl Default for HelperSupervisor {
     }
 }
 
-/// Supervisor thread body (Windows only): create the reverse-connect pipe,
-/// runas-spawn the worker, verify the peer, then serve jobs with a 15 s
-/// heartbeat watch (3 misses = dead). Every wait is bounded; UAC cancel or
-/// peer mismatch fails jobs with an `elevation refused` message.
-///
-/// One long state machine by design (owned thread entry takes its channels
-/// by value), so length and by-value lints are allowed here.
+/// Supervisor thread body (Windows only): one current-thread runtime that
+/// serves helper sessions back to back for the daemon lifetime.
 #[cfg(all(windows, feature = "backend-windows"))]
-#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
-fn supervisor_thread(
-    profile: PathBuf,
-    beat: std::sync::Arc<Mutex<Option<i64>>>,
-    jobs: std::sync::mpsc::Receiver<SupervisorJob>,
+#[allow(clippy::needless_pass_by_value)]
+fn helper_supervisor_thread(
+    profile: &Path,
+    connected: &std::sync::atomic::AtomicBool,
+    mut jobs: tokio::sync::mpsc::UnboundedReceiver<SupervisorJob>,
 ) {
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-    use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
-
-    let fail_all = |jobs: &std::sync::mpsc::Receiver<SupervisorJob>, message: &str| {
-        append_audit(
-            &profile,
-            serde_json::json!({"kind": "helper", "action": "refused", "result": message}),
-        );
-        while let Ok(job) = jobs.try_recv() {
-            let _ = job.reply.send(Err(message.to_string()));
-        }
-    };
-
-    let note_beat = |at_ms: i64| {
-        if let Ok(mut slot) = beat.lock() {
-            *slot = Some(at_ms);
-        }
-    };
-
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
         Err(e) => {
-            fail_all(
-                &jobs,
-                &format!("elevation refused: helper runtime failed: {e}"),
+            append_audit(
+                profile,
+                serde_json::json!({
+                    "kind": "helper",
+                    "action": "refused",
+                    "result": format!("helper runtime failed: {e}"),
+                }),
             );
             return;
         }
     };
+    runtime.block_on(supervise_helper(profile, connected, &mut jobs));
+}
 
+/// Listen for the helper, verify it, serve one session, repeat. While no
+/// verified helper is connected every job fails at once, so no paste can
+/// queue up and run later against whatever window is focused by then.
+#[cfg(all(windows, feature = "backend-windows"))]
+async fn supervise_helper(
+    profile: &Path,
+    connected: &std::sync::atomic::AtomicBool,
+    jobs: &mut tokio::sync::mpsc::UnboundedReceiver<SupervisorJob>,
+) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
+
+    let pipe_name = clipmonger_backend_windows::helper::persistent_pipe_name(profile);
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
-    // allow C:\Temp soft-test profile for manual QA
-    // allow soft-test profile (C:\Temp) for manual QA - will require Program Files in release
-
-    let pipe_name = format!(
-        r"\\.\pipe\clipmonger-help-{}",
-        clipmonger_backend_windows::helper::random_pipe_segment()
-    );
-    // Listener creation registers with the Tokio reactor, so it must run
-    // inside the runtime context (creating it outside panics the thread).
-    let spawn_profile = profile.clone();
-    let exe_for_spawn = exe.clone();
-    let server = match runtime.block_on(async move {
-        let listener = match ServerOptions::new()
+    let mut job_id: u64 = 0;
+    let mut last_error = String::new();
+    let mut mismatch_logged = false;
+    loop {
+        let server = match ServerOptions::new()
             .first_pipe_instance(true)
+            .max_instances(1)
             .reject_remote_clients(true)
             .pipe_mode(PipeMode::Byte)
             .create(&pipe_name)
         {
-            Ok(listener) => listener,
-            Err(e) => return Err(format!("elevation refused: helper pipe failed: {e}")),
+            Ok(server) => server,
+            Err(e) => {
+                // The previous instance may still be closing, or another
+                // process holds the name; report each distinct error once.
+                let message = format!("helper pipe failed: {e}");
+                if message != last_error {
+                    append_audit(
+                        profile,
+                        serde_json::json!({"kind": "helper", "action": "pipe_error", "result": message}),
+                    );
+                    last_error = message;
+                }
+                if !fail_jobs_for(jobs, Duration::from_millis(500)).await {
+                    return;
+                }
+                continue;
+            }
         };
+        last_error.clear();
+        match wait_for_helper(&server, jobs).await {
+            None => return,
+            Some(false) => {
+                if !fail_jobs_for(jobs, Duration::from_millis(50)).await {
+                    return;
+                }
+                continue;
+            }
+            Some(true) => {}
+        }
+        if !helper_peer_ok(&server, &exe) {
+            // A foreign or stale helper keeps retrying; audit it once per
+            // streak instead of once per attempt.
+            if !mismatch_logged {
+                append_audit(
+                    profile,
+                    serde_json::json!({"kind": "helper", "action": "alert", "result": "peer mismatch"}),
+                );
+                mismatch_logged = true;
+            }
+            drop(server);
+            if !fail_jobs_for(jobs, Duration::from_secs(2)).await {
+                return;
+            }
+            continue;
+        }
+        mismatch_logged = false;
+        connected.store(true, Ordering::SeqCst);
         append_audit(
-            &spawn_profile,
-            serde_json::json!({"kind": "helper", "action": "spawn", "result": "runas prompt"}),
+            profile,
+            serde_json::json!({"kind": "helper", "action": "connected", "result": "ok"}),
         );
-        if let Err(e) = clipmonger_backend_windows::spawn_elevated_worker(
-            &exe_for_spawn.to_string_lossy(),
-            &pipe_name,
-        ) {
-            return Err(format!("elevation refused: helper spawn refused: {e}"));
-        }
-        match tokio::time::timeout(std::time::Duration::from_secs(90), listener.connect()).await {
-            Ok(Ok(())) => Ok(listener),
-            Ok(Err(e)) => Err(format!("elevation refused: helper connect failed: {e}")),
-            Err(_) => Err("elevation refused: helper connect timed out (UAC consent?)".to_string()),
-        }
-    }) {
-        Ok(server) => server,
-        Err(message) => {
-            fail_all(&jobs, &message);
+        let keep_running = serve_helper_session(server, profile, jobs, &mut job_id).await;
+        connected.store(false, Ordering::SeqCst);
+        append_audit(
+            profile,
+            serde_json::json!({"kind": "helper", "action": "disconnected", "result": "pipe closed"}),
+        );
+        if !keep_running {
             return;
-        }
-    };
-    if !helper_peer_ok(&server, &exe) {
-        append_audit(
-            &profile,
-            serde_json::json!({"kind": "helper", "action": "alert", "result": "peer mismatch"}),
-        );
-        fail_all(&jobs, "elevation refused: helper peer mismatch");
-        return;
-    }
-    note_beat(now_ms());
-    let (read_half, mut write_half) = tokio::io::split(server);
-    let mut reader = tokio::io::BufReader::new(read_half);
-    let mut missed: u32 = 0;
-    loop {
-        match jobs.recv_timeout(std::time::Duration::from_secs(15)) {
-            Ok(job) => {
-                let line = match clipmonger_backend_windows::helper::encode_job(
-                    &clipmonger_backend_windows::helper::Job {
-                        job_id: 1,
-                        target_pid: job.target_pid,
-                        op: job.op,
-                        payload: job.payload.clone(),
-                    },
-                ) {
-                    Ok(line) => line,
-                    Err(e) => {
-                        let _ = job.reply.send(Err(format!("backend: {e}")));
-                        continue;
-                    }
-                };
-                let outcome = runtime.block_on(async {
-                    if tokio::time::timeout(
-                        std::time::Duration::from_secs(120),
-                        write_half.write_all(line.as_bytes()),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return Err("helper write timed out".to_string());
-                    }
-                    let deadline =
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-                    loop {
-                        let remaining =
-                            deadline.saturating_duration_since(tokio::time::Instant::now());
-                        if remaining.is_zero() {
-                            return Err("helper result timed out".to_string());
-                        }
-                        let mut result_line = String::new();
-                        let read = match tokio::time::timeout(
-                            remaining,
-                            reader.read_line(&mut result_line),
-                        )
-                        .await
-                        {
-                            Ok(read) => read,
-                            Err(_) => return Err("helper result timed out".to_string()),
-                        };
-                        let bytes = match read {
-                            Ok(bytes) => bytes,
-                            Err(_) => return Err("helper result unreadable".to_string()),
-                        };
-                        if bytes == 0 {
-                            return Err("helper result unreadable".to_string());
-                        }
-                        match serde_json::from_str::<Value>(&result_line) {
-                            // Heartbeats share the result stream; they prove
-                            // liveness but are not this job's result.
-                            Ok(value) if value.get("heartbeat").is_some() => continue,
-                            Ok(value) => {
-                                if value.get("ok").and_then(Value::as_bool) == Some(true) {
-                                    return Ok(String::new());
-                                }
-                                return Err(value
-                                    .get("error")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("helper refused")
-                                    .to_string());
-                            }
-                            Err(_) => return Err("helper result unreadable".to_string()),
-                        }
-                    }
-                });
-                match &outcome {
-                    Ok(marker) if marker == "heartbeat" => {
-                        note_beat(now_ms());
-                        let _ = job.reply.send(Err("helper busy: retry".to_string()));
-                    }
-                    Ok(marker) if marker.is_empty() => {
-                        note_beat(now_ms());
-                        append_audit(
-                            &profile,
-                            serde_json::json!({
-                                "kind": "helper",
-                                "action": "job",
-                                "op_hash": fnv_hex(job.payload.as_bytes()),
-                                "result": "ok",
-                            }),
-                        );
-                        let _ = job.reply.send(Ok(()));
-                    }
-                    _ => {
-                        let message = match &outcome {
-                            Ok(marker) => format!("helper protocol error: {marker:?}"),
-                            Err(e) => e.clone(),
-                        };
-                        append_audit(
-                            &profile,
-                            serde_json::json!({
-                                "kind": "helper",
-                                "action": "job",
-                                "op_hash": fnv_hex(job.payload.as_bytes()),
-                                "result": message,
-                            }),
-                        );
-                        let _ = job.reply.send(Err(message.clone()));
-                        // A helper-returned refusal (for example, the target
-                        // was not foreground) ends only this job. Pipe I/O
-                        // and protocol failures are fatal to the link.
-                        if message.contains("timed out") || message.contains("unreadable") {
-                            return;
-                        }
-                    }
-                }
-                missed = 0;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let mut heartbeat = String::new();
-                let got = runtime.block_on(async {
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(20),
-                        reader.read_line(&mut heartbeat),
-                    )
-                    .await
-                });
-                match got {
-                    Ok(Ok(0) | Err(_)) | Err(_) => {
-                        missed += 1;
-                        if missed >= 3 {
-                            append_audit(
-                                &profile,
-                                serde_json::json!({
-                                    "kind": "helper",
-                                    "action": "dead",
-                                    "result": "3 missed heartbeats",
-                                }),
-                            );
-                            return;
-                        }
-                    }
-                    Ok(Ok(_)) => {
-                        missed = 0;
-                        note_beat(now_ms());
-                    }
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
 }
 
+/// Wait for a helper to connect; jobs arriving meanwhile fail at once.
+/// `None` means the job queue closed (daemon stopping).
 #[cfg(all(windows, feature = "backend-windows"))]
-fn persistent_supervisor_thread(
-    pipe_name: String,
-    beat: std::sync::Arc<Mutex<Option<i64>>>,
-    profile: PathBuf,
-    jobs: std::sync::mpsc::Receiver<SupervisorJob>,
-) {
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
-    use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
-    let note_beat = |at_ms: i64| {
-        if let Ok(mut slot) = beat.lock() {
-            *slot = Some(at_ms);
-        }
-    };
-    let fail_all = |jobs: &std::sync::mpsc::Receiver<SupervisorJob>, message: &str| {
-        append_audit(
-            &profile,
-            serde_json::json!({"kind": "helper", "action": "refused", "result": message}),
-        );
-        while let Ok(job) = jobs.try_recv() {
-            let _ = job.reply.send(Err(message.to_string()));
-        }
-    };
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(r) => r,
-        Err(e) => {
-            fail_all(
-                &jobs,
-                &format!("elevation refused: helper runtime failed: {e}"),
-            );
-            return;
-        }
-    };
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
-    let profile_clone = profile.clone();
-    let server = match runtime.block_on(async move {
-        let listener = match ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).pipe_mode(PipeMode::Byte).create(&pipe_name) {
-            Ok(l) => l,
-            Err(e) => return Err(format!("elevation refused: helper pipe failed: {e}")),
-        };
-        append_audit(&profile_clone, serde_json::json!({"kind": "helper", "action": "persistent_wait", "result": "awaiting High IL client"}));
-        match tokio::time::timeout(std::time::Duration::from_secs(90), listener.connect()).await {
-            Ok(Ok(())) => Ok(listener),
-            Ok(Err(e)) => Err(format!("elevation refused: helper connect failed: {e}")),
-            Err(_) => Err("elevation refused: persistent helper connect timed out (helper not running?)".to_string()),
-        }
-    }) {
-        Ok(s) => s,
-        Err(msg) => { fail_all(&jobs, &msg); return; }
-    };
-    if !helper_peer_ok(&server, &exe) {
-        append_audit(
-            &profile,
-            serde_json::json!({"kind": "helper", "action": "alert", "result": "peer mismatch"}),
-        );
-        fail_all(&jobs, "elevation refused: helper peer mismatch");
-        return;
-    }
-    note_beat(now_ms());
-    append_audit(
-        &profile,
-        serde_json::json!({"kind": "helper", "action": "persistent_connected", "result": "ok"}),
-    );
-    let (read_half, mut write_half) = tokio::io::split(server);
-    let mut reader = tokio::io::BufReader::new(read_half);
-    let mut missed: u32 = 0;
+async fn wait_for_helper(
+    server: &tokio::net::windows::named_pipe::NamedPipeServer,
+    jobs: &mut tokio::sync::mpsc::UnboundedReceiver<SupervisorJob>,
+) -> Option<bool> {
+    let connect = server.connect();
+    tokio::pin!(connect);
     loop {
-        match jobs.recv_timeout(std::time::Duration::from_secs(15)) {
-            Ok(job) => {
-                let line = match clipmonger_backend_windows::helper::encode_job(
-                    &clipmonger_backend_windows::helper::Job {
-                        job_id: 1,
-                        target_pid: job.target_pid,
-                        op: job.op,
-                        payload: job.payload.clone(),
-                    },
-                ) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        let _ = job.reply.send(Err(format!("backend: {e}")));
-                        continue;
-                    }
-                };
-                let outcome = runtime.block_on(async {
-                    if tokio::time::timeout(
-                        std::time::Duration::from_secs(120),
-                        write_half.write_all(line.as_bytes()),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return Err("helper write timed out".to_string());
-                    }
-                    let deadline =
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-                    loop {
-                        let remaining =
-                            deadline.saturating_duration_since(tokio::time::Instant::now());
-                        if remaining.is_zero() {
-                            return Err("helper result timed out".to_string());
-                        }
-                        let mut result_line = String::new();
-                        let read = match tokio::time::timeout(
-                            remaining,
-                            reader.read_line(&mut result_line),
-                        )
-                        .await
-                        {
-                            Ok(r) => r,
-                            Err(_) => return Err("helper result timed out".to_string()),
-                        };
-                        let bytes = match read {
-                            Ok(b) => b,
-                            Err(_) => return Err("helper result unreadable".to_string()),
-                        };
-                        if bytes == 0 {
-                            return Err("helper result unreadable".to_string());
-                        }
-                        match serde_json::from_str::<serde_json::Value>(&result_line) {
-                            Ok(v) if v.get("heartbeat").is_some() => continue,
-                            Ok(v) => {
-                                if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
-                                    return Ok(String::new());
-                                }
-                                return Err(v
-                                    .get("error")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("helper refused")
-                                    .to_string());
-                            }
-                            Err(_) => return Err("helper result unreadable".to_string()),
-                        }
-                    }
-                });
-                match &outcome {
-                    Ok(m) if m.is_empty() => {
-                        note_beat(now_ms());
-                        append_audit(
-                            &profile,
-                            serde_json::json!({"kind": "helper", "action": "job", "op_hash": fnv_hex(job.payload.as_bytes()), "result": "ok"}),
-                        );
-                        let _ = job.reply.send(Ok(()));
-                    }
-                    _ => {
-                        let message = match &outcome {
-                            Ok(m) => format!("helper protocol error: {m:?}"),
-                            Err(e) => e.clone(),
-                        };
-                        append_audit(
-                            &profile,
-                            serde_json::json!({"kind": "helper", "action": "job", "op_hash": fnv_hex(job.payload.as_bytes()), "result": message}),
-                        );
-                        let _ = job.reply.send(Err(message.clone()));
-                        if message.contains("timed out") || message.contains("unreadable") {
-                            return;
-                        }
-                    }
-                }
-                missed = 0;
+        tokio::select! {
+            result = &mut connect => return Some(result.is_ok()),
+            job = jobs.recv() => {
+                let job = job?;
+                let _ = job.reply.send(Err(HELPER_NOT_RUNNING.to_string()));
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let mut heartbeat = String::new();
-                let got = runtime.block_on(async {
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        reader.read_line(&mut heartbeat),
-                    )
-                    .await
-                });
-                match got {
-                    Ok(Ok(0) | Err(_)) | Err(_) => {
-                        missed += 1;
-                        if missed >= 10 {
-                            append_audit(
-                                &profile,
-                                serde_json::json!({"kind": "helper", "action": "dead", "result": "10 missed heartbeats"}),
-                            );
-                            return;
-                        }
-                    }
-                    Ok(Ok(_)) => {
-                        missed = 0;
-                        note_beat(now_ms());
-                    }
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+/// Fail every job for `wait` (no helper to serve them); false when the job
+/// queue closed.
+#[cfg(all(windows, feature = "backend-windows"))]
+async fn fail_jobs_for(
+    jobs: &mut tokio::sync::mpsc::UnboundedReceiver<SupervisorJob>,
+    wait: std::time::Duration,
+) -> bool {
+    let pause = tokio::time::sleep(wait);
+    tokio::pin!(pause);
+    loop {
+        tokio::select! {
+            () = &mut pause => return true,
+            job = jobs.recv() => {
+                let Some(job) = job else {
+                    return false;
+                };
+                let _ = job.reply.send(Err(HELPER_NOT_RUNNING.to_string()));
+            }
+        }
+    }
+}
+
+/// Serve jobs over one verified helper connection until it closes; returns
+/// false only when the job queue closed (daemon stopping).
+#[cfg(all(windows, feature = "backend-windows"))]
+async fn serve_helper_session(
+    server: tokio::net::windows::named_pipe::NamedPipeServer,
+    profile: &Path,
+    jobs: &mut tokio::sync::mpsc::UnboundedReceiver<SupervisorJob>,
+    job_id: &mut u64,
+) -> bool {
+    use tokio::io::AsyncBufReadExt as _;
+
+    let (read_half, mut write_half) = tokio::io::split(server);
+    // A dedicated reader turns the stream into whole lines; the helper
+    // exiting closes the pipe, which closes this channel.
+    let (lines_tx, mut lines) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let reader = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(read_half);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    if lines_tx.send(line).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    let keep_running = loop {
+        tokio::select! {
+            job = jobs.recv() => {
+                let Some(job) = job else {
+                    break false;
+                };
+                if clipmonger_backend_windows::helper::job_expired(Some(job.expires_ms), now_ms()) {
+                    // Queued behind a slow job: never deliver it late.
+                    let _ = job.reply.send(Err(PASTE_EXPIRED.to_string()));
+                    continue;
+                }
+                *job_id = job_id.wrapping_add(1);
+                let started = std::time::Instant::now();
+                let outcome = run_helper_job(&mut write_half, &mut lines, *job_id, &job).await;
+                append_audit(
+                    profile,
+                    serde_json::json!({
+                        "kind": "helper",
+                        "action": "job",
+                        "op_hash": fnv_hex(job.payload.as_bytes()),
+                        "ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "result": match &outcome {
+                            Ok(()) => "ok".to_string(),
+                            Err(e) => e.clone(),
+                        },
+                    }),
+                );
+                // A helper that misses its deadline is treated as hung: end
+                // the session so status and the consent flow see it gone.
+                let lost = matches!(&outcome, Err(e) if e == HELPER_LOST || e == HELPER_TIMED_OUT);
+                let _ = job.reply.send(outcome);
+                if lost {
+                    break true;
+                }
+            }
+            line = lines.recv() => {
+                // Only late results of timed-out jobs land here; EOF ends
+                // the session.
+                if line.is_none() {
+                    break true;
+                }
+            }
+        }
+    };
+    reader.abort();
+    // Let the aborted reader drop its pipe half before the caller creates
+    // the next first-instance pipe under the same name.
+    let _ = reader.await;
+    keep_running
+}
+
+/// Send one job and wait for its matching result. The helper enforces the
+/// same deadline, so nothing is injected after this side gives up.
+#[cfg(all(windows, feature = "backend-windows"))]
+async fn run_helper_job(
+    write_half: &mut tokio::io::WriteHalf<tokio::net::windows::named_pipe::NamedPipeServer>,
+    lines: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    job_id: u64,
+    job: &SupervisorJob,
+) -> Result<(), String> {
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt as _;
+
+    let line =
+        clipmonger_backend_windows::helper::encode_job(&clipmonger_backend_windows::helper::Job {
+            job_id,
+            target_pid: job.target_pid,
+            op: job.op,
+            payload: job.payload.clone(),
+            target_hwnd: job.target_hwnd,
+            expires_ms: Some(job.expires_ms),
+        })
+        .map_err(|e| format!("backend: {e}"))?;
+    let written = tokio::time::timeout(Duration::from_secs(1), async {
+        write_half.write_all(line.as_bytes()).await?;
+        write_half.flush().await
+    })
+    .await;
+    if !matches!(written, Ok(Ok(()))) {
+        return Err(HELPER_LOST.to_string());
+    }
+    let remaining_ms = u64::try_from(job.expires_ms - now_ms()).unwrap_or(0);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(remaining_ms + 1_500);
+    loop {
+        let line = match tokio::time::timeout_at(deadline, lines.recv()).await {
+            Ok(Some(line)) => line,
+            Ok(None) => return Err(HELPER_LOST.to_string()),
+            Err(_) => return Err(HELPER_TIMED_OUT.to_string()),
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("job_id").and_then(Value::as_u64) != Some(job_id) {
+            continue;
+        }
+        if value.get("ok").and_then(Value::as_bool) == Some(true) {
+            return Ok(());
+        }
+        return Err(value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("helper refused")
+            .to_string());
     }
 }
 
@@ -1481,7 +1299,7 @@ impl DaemonState {
         }
         #[cfg(all(windows, feature = "backend-windows"))]
         if let Ok(mut sup) = self.helper.lock() {
-            sup.prime_persistent(dir);
+            sup.start(dir);
         }
     }
 
@@ -1570,13 +1388,18 @@ impl DaemonState {
         self.elevation_refused.lock().is_ok_and(|flag| *flag)
     }
 
+    /// Whether a verified elevated helper is connected right now.
+    #[must_use]
+    pub fn helper_connected(&self) -> bool {
+        self.helper
+            .lock()
+            .is_ok_and(|supervisor| supervisor.connected())
+    }
+
     /// Helper route state for `status`: route, liveness, refusal latch.
     #[must_use]
     pub fn helper_route_state(&self) -> Value {
-        let alive = self
-            .helper
-            .lock()
-            .is_ok_and(|supervisor| supervisor.alive(now_ms()));
+        let alive = self.helper_connected();
         serde_json::json!({
             "route": if alive { "helper" } else { "unavailable" },
             "alive": alive,
@@ -2290,9 +2113,30 @@ impl DaemonState {
             .with_dwell_ms(dwell_ms)
             .with_clipboard_first(delivery == clipmonger_core::PasteDelivery::ClipboardRestore)
             .with_restore_clipboard(restore);
-            let target = paste
-                .capture_target()
-                .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
+            // Deadline counted from the pick in the popup (or from this
+            // request): a paste that cannot happen promptly is refused, never
+            // performed late into whatever window has focus by then.
+            let now = now_ms();
+            let deadline_ms = params
+                .get("picked_ms")
+                .and_then(Value::as_i64)
+                .map_or(now, |picked| picked.min(now))
+                + PASTE_DEADLINE_MS;
+            if now > deadline_ms {
+                return Err(IpcError::new(
+                    "unavailable",
+                    format!("paste.execute: {PASTE_EXPIRED}"),
+                ));
+            }
+            let target = match params.get("target_hwnd").and_then(Value::as_u64) {
+                // The window that was foreground when the popup opened; the
+                // foreground right now may still be settling after the hide.
+                Some(hwnd) => {
+                    clipmonger_backend_windows::foreground::target_for_hwnd(hwnd.cast_signed())
+                }
+                None => paste.capture_target(),
+            }
+            .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
             if clipmonger_backend_windows::target_integrity(&target.handle) == Integrity::High {
                 let token = params.get("gesture").and_then(Value::as_u64);
                 let token_ok = token.is_some_and(|t| self.consume_gesture_token(t, now_ms()))
@@ -2304,7 +2148,7 @@ impl DaemonState {
                         "paste.execute: elevation refused (gesture required)".to_string(),
                     ));
                 }
-                let res = self.paste_via_helper(&target, payloads);
+                let res = self.paste_via_helper(&target, payloads, deadline_ms);
                 if res.is_ok() {
                     let _ = self
                         .store
@@ -2361,15 +2205,16 @@ impl DaemonState {
     }
 
     /// Paste into a high-integrity target via the elevated helper
-    /// (Windows only): resolve the target pid, hand one `send_input_batch`
-    /// job to the supervisor thread, and wait bounded for its result.
-    /// Refusals latch caps paste Degraded; portable/unprotected layouts
-    /// stay `Unavailable` with no spawn attempt.
+    /// (Windows only): resolve the target pid, hand one job to the
+    /// supervisor thread, and wait bounded for its result. Without a
+    /// connected helper this fails at once, before the clipboard is touched.
+    /// Refusals latch caps paste Degraded.
     #[cfg(all(windows, feature = "backend-windows"))]
     fn paste_via_helper(
         &self,
         target: &clipmonger_platform::types::PasteTarget,
         payloads: &[(String, Vec<u8>)],
+        deadline_ms: i64,
     ) -> Result<Value, IpcError> {
         use clipmonger_platform::types::PlatformHandle;
         let hwnd = match &target.handle {
@@ -2387,6 +2232,9 @@ impl DaemonState {
                 "paste.execute: helper route cannot resolve target".to_string(),
             )
         })?;
+        if !self.helper_connected() {
+            return Err(helper_ipc_error(self, target, HELPER_NOT_RUNNING));
+        }
         let (_, dwell_ms, delivery) = self.paste_budget();
         let restore = self
             .config
@@ -2399,6 +2247,8 @@ impl DaemonState {
             let outcome = self.send_helper_job(
                 target,
                 pid,
+                hwnd,
+                deadline_ms,
                 clipmonger_backend_windows::helper::JobOp::PasteChord,
                 String::new(),
             );
@@ -2430,24 +2280,26 @@ impl DaemonState {
         self.send_helper_job(
             target,
             pid,
+            hwnd,
+            deadline_ms,
             clipmonger_backend_windows::helper::JobOp::SendInputBatch,
             payload,
         )
     }
 
-    /// Hand one job to the supervisor thread and wait bounded for its result.
+    /// Hand one job to the supervisor thread and wait bounded for its result
+    /// (the job carries its own deadline, so a slow answer never turns into
+    /// a late paste).
     #[cfg(all(windows, feature = "backend-windows"))]
     fn send_helper_job(
         &self,
         target: &clipmonger_platform::types::PasteTarget,
         pid: u32,
+        hwnd: i64,
+        deadline_ms: i64,
         op: clipmonger_backend_windows::helper::JobOp,
         payload: String,
     ) -> Result<Value, IpcError> {
-        let profile = self
-            .profile_dir
-            .lock()
-            .map_or_else(|_| PathBuf::new(), |dir| dir.clone());
         let jobs_tx = self
             .helper
             .lock()
@@ -2457,40 +2309,29 @@ impl DaemonState {
                     "paste.execute: helper state poisoned".to_string(),
                 )
             })?
-            .ensure_link(&profile);
+            .jobs
+            .clone();
+        let Some(jobs_tx) = jobs_tx else {
+            return Err(helper_ipc_error(self, target, HELPER_NOT_RUNNING));
+        };
         let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let job = SupervisorJob {
             target_pid: pid,
+            target_hwnd: Some(hwnd),
             op,
             payload,
+            expires_ms: deadline_ms,
             reply: reply_tx,
         };
         if jobs_tx.send(job).is_err() {
-            if let Ok(mut supervisor) = self.helper.lock() {
-                supervisor.drop_link();
-            }
-            return Err(IpcError::new(
-                "backend",
-                "paste.execute: helper channel lost".to_string(),
-            ));
+            return Err(helper_ipc_error(self, target, HELPER_NOT_RUNNING));
         }
-        match reply_rx.recv_timeout(std::time::Duration::from_secs(150)) {
-            Ok(Ok(())) => {
-                if let Ok(supervisor) = self.helper.lock() {
-                    supervisor.note_beat(now_ms());
-                }
-                Ok(serde_json::json!({"pasted": true}))
-            }
+        // The supervisor answers by the deadline plus its 1.5 s result grace.
+        let remaining_ms = u64::try_from(deadline_ms - now_ms()).unwrap_or(0);
+        match reply_rx.recv_timeout(std::time::Duration::from_millis(remaining_ms + 2_500)) {
+            Ok(Ok(())) => Ok(serde_json::json!({"pasted": true})),
             Ok(Err(e)) => Err(helper_ipc_error(self, target, &e)),
-            Err(_) => {
-                if let Ok(mut supervisor) = self.helper.lock() {
-                    supervisor.drop_link();
-                }
-                Err(IpcError::new(
-                    "backend",
-                    "paste.execute: helper result timed out".to_string(),
-                ))
-            }
+            Err(_) => Err(helper_ipc_error(self, target, HELPER_TIMED_OUT)),
         }
     }
 

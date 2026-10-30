@@ -1,4 +1,6 @@
 //! Launcher shell: ensure the daemon, own the IPC link, render the popup.
+// Tray app: no console window on Windows (closing one would kill the app).
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -147,13 +149,15 @@ fn parse_args() -> (Option<PathBuf>, bool) {
     (profile, minimized)
 }
 
-/// Default profile dir from the OS data dir.
+/// Default profile dir: beside the binary in portable mode (a
+/// `portable.marker` file next to it, seg-03 S6), else the OS data dir.
 fn default_profile() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     let dir = exe
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    Config::resolve_paths(false, &dir).data_dir
+    let portable = dir.join("portable.marker").is_file();
+    Config::resolve_paths(portable, &dir).data_dir
 }
 
 /// Real OS tray (Windows/macOS via tray-icon); creation failure is
@@ -369,6 +373,9 @@ impl ShellApp {
                 ipc_bridge::UiEvent::PasteUnavailable => {
                     self.error = strings::text("popup.paste_blocked").to_string();
                 }
+                ipc_bridge::UiEvent::PasteFailed(message) => {
+                    self.error = message;
+                }
                 ipc_bridge::UiEvent::Config(body) => {
                     let doc = config_model::ConfigDoc::from_snapshot(&body);
                     // Theme prefs live in the ui.theme extra key.
@@ -464,7 +471,7 @@ impl ShellApp {
                     self.send(ipc_bridge::UiCmd::ListPermanents);
                     self.send(ipc_bridge::UiCmd::PermGroups);
                 }
-                ipc_bridge::UiEvent::Purged(_) => {}
+                ipc_bridge::UiEvent::Purged(_) | ipc_bridge::UiEvent::HotkeyAck => {}
                 ipc_bridge::UiEvent::BackupDone(path) => {
                     if let Ok(mut config) = self.config.lock() {
                         config.error = format!("{} {path}", strings::text("config.backup_saved"));
@@ -504,7 +511,13 @@ impl ShellApp {
     fn apply_effect(&mut self, effect: popup::VmEffect) {
         match effect {
             popup::VmEffect::None => {}
-            popup::VmEffect::Paste(id) => self.send(ipc_bridge::UiCmd::PasteClip(id)),
+            popup::VmEffect::Paste(id) => {
+                // Picking a clip is the user gesture an admin-window paste
+                // requires (the daemon no longer owns the popup hotkey).
+                #[cfg(windows)]
+                self.send(ipc_bridge::UiCmd::HotkeyFired);
+                self.send(ipc_bridge::UiCmd::PasteClip(id));
+            }
             popup::VmEffect::Dismiss => self.open = false,
             popup::VmEffect::Remove(id) => self.send(ipc_bridge::UiCmd::DeleteClip(id)),
             popup::VmEffect::Pin(id) => {

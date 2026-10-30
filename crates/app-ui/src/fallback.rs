@@ -31,6 +31,7 @@ const IDC_LIST: i32 = 102;
 const IDC_STATUS: i32 = 103;
 const IDC_CONFIG: i32 = 104;
 const TIMER_IPC: usize = 1;
+const TIMER_QUIT: usize = 2;
 const WM_TRAY: u32 = WM_APP + 1;
 const ID_TRAY_SHOW: usize = 1001;
 const ID_TRAY_SETTINGS: usize = 1002;
@@ -386,11 +387,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         windows::Win32::UI::WindowsAndMessaging::WM_SHOWWINDOW => {
             if wparam.0 != 0 {
-                let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
-                if fg != hwnd {
-                    G_TARGET_HWND = Some(fg);
-                    eprintln!("captured target {:?}", fg);
-                }
                 if let Some(ptr) = G_STATE {
                     let s = &mut *ptr;
                     s.vm.query.clear();
@@ -465,11 +461,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as i32;
             if id as usize == ID_TRAY_SHOW {
-                let fg = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
-                if fg != hwnd {
-                    unsafe {
-                        G_TARGET_HWND = Some(fg);
-                    }
+                // Opened from the tray: the foreground is the taskbar, not a
+                // paste target; paste goes to whatever Windows activates.
+                unsafe {
+                    G_TARGET_HWND = None;
                 }
                 unsafe {
                     ShowWindow(hwnd, SW_SHOW);
@@ -501,9 +496,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         nid.hWnd = th;
                         nid.uID = 1;
                         let _ = Shell_NotifyIconW(NIM_DELETE, &mut nid);
+                        G_TRAY_HWND = None;
                     }
                 }
-                windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
+                // Exit stops the daemon too (like the main shell's tray Quit),
+                // which also ends an elevated helper session. Quit on the
+                // Stopped reply; the timer only covers a daemon that never
+                // answers (it outlasts the longest in-flight paste call).
+                if let Some(ptr) = G_STATE {
+                    let s = &mut *ptr;
+                    let _ = s.cmds.send(crate::ipc_bridge::UiCmd::Stop);
+                }
+                SetTimer(Some(hwnd), TIMER_QUIT, 6000, None);
                 return LRESULT(0);
             }
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
@@ -623,6 +627,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_TIMER => {
+            if wparam.0 == TIMER_QUIT {
+                windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
+            }
             if wparam.0 == TIMER_IPC {
                 if let Some(ptr) = G_STATE {
                     let state = &mut *ptr;
@@ -649,43 +656,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool();
             let minimized = windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool();
             if visible && !minimized {
-                // If helper just showed us (High IL direct ShowWindow within 800 ms), don't hide — it's our first admin show.
-                let helper_recent = std::fs::metadata("C:\\Temp\\clipmonger-popup-marker")
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
-                    .map_or(false, |d| d.as_millis() < 800);
-                if helper_recent {
-                    // Admin High IL path: helper already ShowWindow'd us; adopt its captured target hwnd
-                    if let Ok(txt) = std::fs::read_to_string("C:\\Temp\\clipmonger-target-hwnd") {
-                        if let Ok(v) = txt.trim().parse::<usize>() {
-                            if v != 0 {
-                                G_TARGET_HWND = Some(HWND(v as *mut _));
-                            }
-                        }
-                    }
-                    if let Some(ptr) = G_STATE {
-                        let s = &mut *ptr;
-                        s.vm.query.clear();
-                        windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
-                            s.hwnd_search,
-                            windows::core::w!(""),
-                        )
-                        .ok();
-                        s.vm.set_target_valid(true);
-                        let _ = s.cmds.send(crate::ipc_bridge::UiCmd::ListHistory);
-                    }
-                    return LRESULT(0);
-                }
                 windows::Win32::UI::WindowsAndMessaging::ShowWindow(
                     hwnd,
                     windows::Win32::UI::WindowsAndMessaging::SW_HIDE,
                 );
             } else {
+                // The window the user pressed the hotkey in is the paste
+                // target (also for elevated windows: reading the handle is
+                // not subject to UIPI).
                 let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
-                if fg != hwnd {
-                    G_TARGET_HWND = Some(fg);
-                }
+                G_TARGET_HWND = if fg.0.is_null() || fg == hwnd {
+                    None
+                } else {
+                    Some(fg)
+                };
                 if let Some(ptr) = G_STATE {
                     let s = &mut *ptr;
                     s.vm.query.clear();
@@ -744,10 +728,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         windows::Win32::UI::WindowsAndMessaging::SW_HIDE,
                     );
                 } else {
-                    let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
-                    if fg != hwnd {
-                        G_TARGET_HWND = Some(fg);
-                    }
+                    // Opened from the tray: no paste target (see ID_TRAY_SHOW).
+                    G_TARGET_HWND = None;
                     if let Some(ptr) = G_STATE {
                         let s = &mut *ptr;
                         s.vm.set_target_valid(true);
@@ -900,6 +882,24 @@ fn drain_events(state: &mut PopupState) {
                 refresh_list(state);
             }
             ipc_bridge::UiEvent::Stopped => state.should_exit = true,
+            ipc_bridge::UiEvent::PasteFailed(message) => {
+                // Own thread: a modal box here would re-enter this timer handler.
+                std::thread::spawn(move || unsafe {
+                    let text: Vec<u16> = format!("Paste failed.\n\n{message}")
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect();
+                    windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                        None,
+                        windows::core::PCWSTR(text.as_ptr()),
+                        w!("Clipmonger"),
+                        windows::Win32::UI::WindowsAndMessaging::MB_OK
+                            | windows::Win32::UI::WindowsAndMessaging::MB_ICONWARNING
+                            | windows::Win32::UI::WindowsAndMessaging::MB_TOPMOST
+                            | windows::Win32::UI::WindowsAndMessaging::MB_SETFOREGROUND,
+                    );
+                });
+            }
             ipc_bridge::UiEvent::PasteUnavailable => unsafe {
                 windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
                     Some(state.hwnd_list),
@@ -1018,56 +1018,55 @@ fn do_paste(state: &mut PopupState) {
     };
     let id = clip.id;
     eprintln!("  paste id={} preview={}", id, clip.preview);
-    let target = unsafe { G_TARGET_HWND };
-    let cmds = state.cmds.clone();
     let hwnd_main = unsafe {
         windows::Win32::UI::WindowsAndMessaging::GetParent(state.hwnd_search)
             .unwrap_or(HWND(std::ptr::null_mut()))
     };
-    let hwnd_main_usize = hwnd_main.0 as usize;
+    // Target: the window the hotkey was pressed in. Sent even if it has
+    // closed meanwhile, so the daemon refuses visibly instead of pasting
+    // into whatever window is in front.
+    let target = unsafe { G_TARGET_HWND }.filter(|t| *t != hwnd_main);
+    let picked_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    unsafe {
+        // Still the foreground window here: let the daemon (or the elevated
+        // helper) hand focus back to the target if Windows activates some
+        // other window when the popup hides.
+        let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
+            windows::Win32::UI::WindowsAndMessaging::ASFW_ANY,
+        );
+    }
     // Hide popup first so paste goes to previous window, not filter input (SW_HIDE for frameless POPUP, not MINIMIZE)
-    if hwnd_main_usize != 0 {
-        let h = HWND(hwnd_main_usize as *mut _);
+    if !hwnd_main.0.is_null() {
         let ok = unsafe {
             windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-                h,
+                hwnd_main,
                 windows::Win32::UI::WindowsAndMessaging::SW_HIDE,
             )
         };
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("C:\\Temp\\clipmonger-hide.log")
-            .and_then(|mut f| {
-                use std::io::Write;
-                writeln!(
-                    f,
-                    "hide hwnd={:?} ok={} visible={}",
-                    hwnd_main_usize,
-                    ok.as_bool(),
-                    unsafe {
-                        windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(h).as_bool()
-                    }
-                )
-            });
         eprintln!("  hide ok={}", ok.as_bool());
-    } else {
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("C:\\Temp\\clipmonger-hide.log")
-            .and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "hide hwnd_main=0")
-            });
     }
-    // Restore focus to target, then paste after delay
-    let _target_usize = target.map(|h| h.0 as usize);
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        let _ = cmds.send(ipc_bridge::UiCmd::PasteClip(id));
-        eprintln!("  paste sent after hide");
-    });
+    // Picking a clip is the user gesture an admin-window paste requires.
+    let _ = state.cmds.send(ipc_bridge::UiCmd::HotkeyFired);
+    if let Some(target) = target {
+        // The daemon waits for (or restores) focus on exactly this window,
+        // so no fixed delay is needed and a paste never lands elsewhere.
+        let _ = state.cmds.send(ipc_bridge::UiCmd::PasteClipTo(
+            id,
+            Some(target.0 as usize as u64),
+            picked_ms,
+        ));
+        eprintln!("  paste sent to target {target:?}");
+    } else {
+        // Tray-opened popup: let Windows activate the previous window first.
+        let cmds = state.cmds.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let _ = cmds.send(ipc_bridge::UiCmd::PasteClipTo(id, None, picked_ms));
+            eprintln!("  paste sent after hide");
+        });
+    }
 }
 pub fn run_fallback(
     cmds: mpsc::Sender<ipc_bridge::UiCmd>,

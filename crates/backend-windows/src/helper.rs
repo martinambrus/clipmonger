@@ -19,7 +19,7 @@ pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Gesture-token time to live: 30 000 ms after minting.
 pub const GESTURE_TTL_MS: i64 = 30_000;
 /// Heartbeat deadline: 3 missed 15 s beats (45 s) since the last beat.
-pub const HEARTBEAT_DEAD_AFTER_MS: i64 = 300_000;
+pub const HEARTBEAT_DEAD_AFTER_MS: i64 = 45_000;
 
 /// Narrow helper operation: input injection only. The helper receives one
 /// job's bytes and can never read history, config, or the DB.
@@ -43,6 +43,20 @@ pub struct Job {
     pub op: JobOp,
     /// Input bytes (UTF-8 text), at most [`MAX_PAYLOAD_BYTES`] bytes.
     pub payload: String,
+    /// Target top-level window (HWND value) captured when the popup opened;
+    /// `None` falls back to the current foreground window.
+    #[serde(default)]
+    pub target_hwnd: Option<i64>,
+    /// Absolute deadline (unix ms). The helper refuses to inject after it,
+    /// so a late job can never type into whatever window is focused by then.
+    #[serde(default)]
+    pub expires_ms: Option<i64>,
+}
+
+/// Whether a job deadline has passed at `at_ms` (no deadline never expires).
+#[must_use]
+pub fn job_expired(expires_ms: Option<i64>, at_ms: i64) -> bool {
+    expires_ms.is_some_and(|deadline| at_ms > deadline)
 }
 
 /// Outcome of one [`Job`], echoing its `job_id`.
@@ -343,112 +357,59 @@ impl Drop for PinnedTarget {
     }
 }
 
-/// Revalidate the job target: it must be the current foreground window's
-/// process AND high-integrity, then pin it by open process HANDLE held
-/// across the injection. Anything else is a refusal, never blind input.
+/// Revalidate the job target and pin it by open process HANDLE held across
+/// the injection: the job must be unexpired, the target window alive and
+/// owned by `target_pid`, the process high-integrity, and the window the
+/// foreground window. Anything else is a refusal, never blind input.
 ///
-/// The UAC secure-desktop switch can leave Windows with no foreground
-/// window for a short transition after consent. Wait briefly for the
-/// already-captured target to become foreground; do not relax the PID or
-/// integrity checks.
+/// The popup hands focus back as it hides; if Windows has not settled on
+/// the target yet, the helper (high integrity, so UIPI does not apply)
+/// activates exactly that window and waits briefly. The wait is capped by
+/// the job deadline, so a late job can never steal focus.
 ///
 /// # Errors
 ///
-/// Returns the last refusal message when no foreground window settles on
-/// the target, the target is not high-integrity, or it cannot be pinned.
+/// Returns the refusal reason when the job expired, the target window is
+/// gone or not high-integrity, it never became foreground, or it cannot be
+/// pinned.
 #[cfg(windows)]
-pub fn pin_helper_target(target_pid: u32) -> Result<PinnedTarget, String> {
+pub fn pin_helper_target(job: &Job) -> Result<PinnedTarget, String> {
     use std::time::{Duration, Instant};
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        match try_pin_helper_target(target_pid) {
-            Ok(target) => return Ok(target),
-            Err(reason) => {
-                if Instant::now() >= deadline {
-                    return Err(reason);
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-#[cfg(windows)]
-fn try_pin_helper_target(target_pid: u32) -> Result<PinnedTarget, String> {
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    let hwnd =
-        crate::sys::foreground_hwnd().ok_or_else(|| "refused: no foreground window".to_string())?;
-    let pid = crate::sys::window_pid(hwnd)
-        .ok_or_else(|| "refused: foreground owner unknown".to_string())?;
-    if pid != target_pid {
-        // Hide popup first (it is topmost and may be foreground), then bring target (High IL can over High)
-        let cls_w: Vec<u16> = "ClipmongerFallback"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        unsafe {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, ShowWindow, SW_HIDE};
-            let pop = FindWindowW(cls_w.as_ptr(), std::ptr::null());
-            if !pop.is_null() {
-                ShowWindow(pop, SW_HIDE);
+
+    if job_expired(job.expires_ms, unix_ms()) {
+        return Err("refused: job expired".to_string());
+    }
+    let hwnd = match job.target_hwnd {
+        Some(raw) => {
+            let hwnd = raw as windows_sys::Win32::Foundation::HWND;
+            if !crate::sys::is_window(hwnd) {
+                return Err("refused: target window is gone".to_string());
             }
+            hwnd
         }
-        // Bring target to foreground from High IL (Medium fallback can't foreground High IL).
-        unsafe {
-            use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-            use windows_sys::Win32::UI::WindowsAndMessaging::{
-                BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowThreadProcessId,
-                IsWindowVisible, LockSetForegroundWindow, SetForegroundWindow, SwitchToThisWindow,
-            };
-            unsafe extern "system" fn enum_cb(hwnd: *mut std::ffi::c_void, lparam: isize) -> i32 {
-                let target = lparam as u32;
-                let mut pid: u32 = 0;
-                GetWindowThreadProcessId(hwnd, &mut pid);
-                if pid == target && IsWindowVisible(hwnd) != 0 {
-                    let fg = GetForegroundWindow();
-                    let fg_thread = GetWindowThreadProcessId(fg, std::ptr::null_mut());
-                    let cur_thread = GetCurrentThreadId();
-                    LockSetForegroundWindow(1);
-                    if fg_thread != cur_thread {
-                        AttachThreadInput(fg_thread, cur_thread, 1);
-                        BringWindowToTop(hwnd);
-                        SetForegroundWindow(hwnd);
-                        SwitchToThisWindow(hwnd, 1);
-                        AttachThreadInput(fg_thread, cur_thread, 0);
-                    } else {
-                        BringWindowToTop(hwnd);
-                        SetForegroundWindow(hwnd);
-                        SwitchToThisWindow(hwnd, 1);
-                    }
-                    LockSetForegroundWindow(0);
-                    return 0;
-                }
-                1
-            }
-            EnumWindows(Some(enum_cb), target_pid as isize);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(80));
-        if let Some(fg) = crate::sys::foreground_hwnd() {
-            if let Some(fg_pid) = crate::sys::window_pid(fg) {
-                if fg_pid == target_pid {
-                    if crate::sys::process_token_high(fg_pid) == Some(true) {
-                        let handle =
-                            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, fg_pid) };
-                        if !handle.is_null() {
-                            return Ok(PinnedTarget {
-                                pid: fg_pid,
-                                handle,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        return Err("refused: target is not the foreground process".to_string());
+        None => crate::sys::foreground_hwnd()
+            .ok_or_else(|| "refused: no foreground window".to_string())?,
+    };
+    let pid =
+        crate::sys::window_pid(hwnd).ok_or_else(|| "refused: target owner unknown".to_string())?;
+    if pid != job.target_pid {
+        return Err("refused: target window does not belong to target process".to_string());
     }
     if crate::sys::process_token_high(pid) != Some(true) {
         return Err("refused: target is not high-integrity".to_string());
+    }
+    let settle = Instant::now() + Duration::from_secs(1);
+    let mut next_activate = Instant::now();
+    while crate::sys::foreground_hwnd() != Some(hwnd) {
+        if job_expired(job.expires_ms, unix_ms()) || Instant::now() >= settle {
+            return Err("refused: target is not the foreground window".to_string());
+        }
+        if Instant::now() >= next_activate {
+            crate::sys::activate_window(hwnd);
+            next_activate = Instant::now() + Duration::from_millis(250);
+        }
+        std::thread::sleep(Duration::from_millis(15));
     }
     // Safety: OpenProcess with a query flag; closed by `PinnedTarget::drop`.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -456,6 +417,15 @@ fn try_pin_helper_target(target_pid: u32) -> Result<PinnedTarget, String> {
         return Err("refused: cannot pin target process".to_string());
     }
     Ok(PinnedTarget { pid, handle })
+}
+
+/// Wall clock in unix ms (job deadlines are wall-clock values shared by the
+/// daemon and the helper on the same machine).
+#[cfg(windows)]
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]
@@ -469,6 +439,8 @@ mod tests {
             target_pid: 42,
             op: JobOp::PasteChord,
             payload: String::new(),
+            target_hwnd: Some(0x0003_0838),
+            expires_ms: Some(1_000),
         };
         let line = encode_job(&job).unwrap();
         let back = decode_job(&line).unwrap();
@@ -484,9 +456,27 @@ mod tests {
             target_pid: 2,
             op: JobOp::SendInputBatch,
             payload: "hi".to_string(),
+            target_hwnd: None,
+            expires_ms: None,
         };
         let line = encode_job(&job).unwrap();
         assert!(line.contains("\"SendInputBatch\""), "{line}");
         assert_eq!(decode_job(&line).unwrap(), job);
+    }
+
+    #[test]
+    fn job_without_target_or_deadline_still_decodes() {
+        let line = "{\"job_id\":3,\"target_pid\":9,\"op\":\"PasteChord\",\"payload\":\"\"}\n";
+        let job = decode_job(line).unwrap();
+        assert_eq!(job.target_hwnd, None);
+        assert_eq!(job.expires_ms, None);
+    }
+
+    #[test]
+    fn job_expiry_is_strictly_after_deadline() {
+        assert!(!job_expired(None, i64::MAX));
+        assert!(!job_expired(Some(1_000), 999));
+        assert!(!job_expired(Some(1_000), 1_000));
+        assert!(job_expired(Some(1_000), 1_001));
     }
 }
