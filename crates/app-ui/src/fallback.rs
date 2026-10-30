@@ -1062,18 +1062,9 @@ fn do_paste(state: &mut PopupState) {
             });
     }
     // Restore focus to target, then paste after delay
-    let target_usize = target.map(|h| h.0 as usize);
+    let _target_usize = target.map(|h| h.0 as usize);
     std::thread::spawn(move || {
-        if let Some(tu) = target_usize {
-            let t = HWND(tu as *mut _);
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(t);
-                let _ = windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(t);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(120));
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(60));
-        }
+        std::thread::sleep(std::time::Duration::from_millis(60));
         let _ = cmds.send(ipc_bridge::UiCmd::PasteClip(id));
         eprintln!("  paste sent after hide");
     });

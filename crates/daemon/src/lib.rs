@@ -2007,7 +2007,7 @@ impl DaemonState {
                 .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?;
             apply_config_key(&mut config, key, &value)
                 .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
-            
+
             config.clone()
         };
         updated

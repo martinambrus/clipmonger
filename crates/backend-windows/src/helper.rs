@@ -382,6 +382,69 @@ fn try_pin_helper_target(target_pid: u32) -> Result<PinnedTarget, String> {
     let pid = crate::sys::window_pid(hwnd)
         .ok_or_else(|| "refused: foreground owner unknown".to_string())?;
     if pid != target_pid {
+        // Hide popup first (it is topmost and may be foreground), then bring target (High IL can over High)
+        let cls_w: Vec<u16> = "ClipmongerFallback"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, ShowWindow, SW_HIDE};
+            let pop = FindWindowW(cls_w.as_ptr(), std::ptr::null());
+            if !pop.is_null() {
+                ShowWindow(pop, SW_HIDE);
+            }
+        }
+        // Bring target to foreground from High IL (Medium fallback can't foreground High IL).
+        unsafe {
+            use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowThreadProcessId,
+                IsWindowVisible, LockSetForegroundWindow, SetForegroundWindow, SwitchToThisWindow,
+            };
+            unsafe extern "system" fn enum_cb(hwnd: *mut std::ffi::c_void, lparam: isize) -> i32 {
+                let target = lparam as u32;
+                let mut pid: u32 = 0;
+                GetWindowThreadProcessId(hwnd, &mut pid);
+                if pid == target && IsWindowVisible(hwnd) != 0 {
+                    let fg = GetForegroundWindow();
+                    let fg_thread = GetWindowThreadProcessId(fg, std::ptr::null_mut());
+                    let cur_thread = GetCurrentThreadId();
+                    LockSetForegroundWindow(1);
+                    if fg_thread != cur_thread {
+                        AttachThreadInput(fg_thread, cur_thread, 1);
+                        BringWindowToTop(hwnd);
+                        SetForegroundWindow(hwnd);
+                        SwitchToThisWindow(hwnd, 1);
+                        AttachThreadInput(fg_thread, cur_thread, 0);
+                    } else {
+                        BringWindowToTop(hwnd);
+                        SetForegroundWindow(hwnd);
+                        SwitchToThisWindow(hwnd, 1);
+                    }
+                    LockSetForegroundWindow(0);
+                    return 0;
+                }
+                1
+            }
+            EnumWindows(Some(enum_cb), target_pid as isize);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        if let Some(fg) = crate::sys::foreground_hwnd() {
+            if let Some(fg_pid) = crate::sys::window_pid(fg) {
+                if fg_pid == target_pid {
+                    if crate::sys::process_token_high(fg_pid) == Some(true) {
+                        let handle =
+                            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, fg_pid) };
+                        if !handle.is_null() {
+                            return Ok(PinnedTarget {
+                                pid: fg_pid,
+                                handle,
+                            });
+                        }
+                    }
+                }
+            }
+        }
         return Err("refused: target is not the foreground process".to_string());
     }
     if crate::sys::process_token_high(pid) != Some(true) {
