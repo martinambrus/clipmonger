@@ -2242,7 +2242,7 @@ impl DaemonState {
             .map(|cfg| cfg.popup.restore_clipboard)
             .unwrap_or(true);
         if delivery == clipmonger_core::PasteDelivery::ClipboardRestore {
-            let swap = clipmonger_backend_windows::paste::ClipboardSwap::begin(payloads)
+            let swap = clipmonger_backend_windows::paste::ClipboardSwap::begin(payloads, restore)
                 .map_err(|e| IpcError::new("backend", format!("paste.execute: {e}")))?;
             let outcome = self.send_helper_job(
                 target,

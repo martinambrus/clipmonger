@@ -24,18 +24,49 @@ impl WinTransfer {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] for unknown formats (before touching
-    /// the clipboard), [`Error::Timeout`] when the shared lock cannot be
-    /// opened, or [`Error::Unavailable`] without a Windows session.
+    /// Returns [`Error::Unsupported`] for unknown formats or a file list
+    /// without Windows paths (before touching the clipboard),
+    /// [`Error::Timeout`] when the shared lock cannot be opened, or
+    /// [`Error::Unavailable`] without a Windows session.
     pub fn write(&self, payload: &[(String, Vec<u8>)]) -> Result<()> {
         #[cfg(windows)]
         {
-            // Pre-validate every MIME before touching the clipboard so a bad
-            // entry fails without clobbering the current content.
-            let mut ops: Vec<(u32, &str, &[u8])> = Vec::with_capacity(payload.len());
+            use std::borrow::Cow;
+            // Pre-validate every MIME (and build the bitmap for a PNG) before
+            // touching the clipboard so a bad entry fails without clobbering
+            // the current content.
+            let mut ops: Vec<(u32, &str, Cow<'_, [u8]>)> = Vec::with_capacity(payload.len() + 1);
             for (mime, bytes) in payload {
                 let id = imp::id_for_mime(mime)?;
-                ops.push((id, mime.as_str(), bytes.as_slice()));
+                ops.push((id, mime.as_str(), Cow::Borrowed(bytes.as_slice())));
+                if mime == "image/png" {
+                    // Apps without PNG support paste the bitmap instead;
+                    // an image over the decode guard goes out as PNG only.
+                    if let Ok(dib) = crate::dib::png_to_dib(bytes) {
+                        ops.push((imp::CF_DIB, mime.as_str(), Cow::Owned(dib)));
+                    }
+                }
+                if mime == "text/uri-list" {
+                    if std::str::from_utf8(bytes)
+                        .map(crate::uri::uri_list_to_paths)
+                        .unwrap_or_default()
+                        .is_empty()
+                    {
+                        return Err(Error::Unsupported(
+                            "text/uri-list names no Windows file".to_string(),
+                        ));
+                    }
+                    // Pair the file list with its drop effect like Explorer
+                    // does: a lone CF_HDROP overflows the clipboard sync of
+                    // FreeRDP-based tools (RustDesk 1.4.9). Paste copies.
+                    if !payload.iter().any(|(m, _)| m == imp::DROP_EFFECT_MIME) {
+                        ops.push((
+                            imp::register(imp::DROP_EFFECT_FORMAT)?,
+                            imp::DROP_EFFECT_MIME,
+                            Cow::Owned(imp::DROPEFFECT_COPY.to_le_bytes().to_vec()),
+                        ));
+                    }
+                }
             }
             imp::with_open("write", || {
                 clipboard_win::raw::empty().map_err(|e| imp::clip_error("empty", e))?;
@@ -73,10 +104,19 @@ pub(crate) mod imp {
     /// Standard (predefined, nameless) format ids we understand.
     pub(crate) const CF_TEXT: u32 = 1;
     pub(crate) const CF_OEMTEXT: u32 = 7;
-    const CF_DIB: u32 = 8;
+    pub(crate) const CF_DIB: u32 = 8;
     const CF_DIBV5: u32 = 17;
-    const CF_HDROP: u32 = 15;
+    pub(crate) const CF_HDROP: u32 = 15;
     pub(crate) const CF_UNICODETEXT: u32 = 13;
+
+    /// Registered format most apps use for PNG bytes.
+    pub(crate) const PNG_FORMAT: &str = "PNG";
+    const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+    /// Copy-or-move hint Explorer publishes beside every `CF_HDROP`.
+    pub(crate) const DROP_EFFECT_FORMAT: &str = "Preferred DropEffect";
+    pub(crate) const DROP_EFFECT_MIME: &str = "x-os/Preferred DropEffect";
+    pub(crate) const DROPEFFECT_COPY: u32 = 1;
 
     pub(crate) fn clip_error(op: &str, err: impl std::fmt::Display) -> Error {
         Error::Io(format!("clipboard {op} failed: {err}"))
@@ -134,24 +174,137 @@ pub(crate) mod imp {
     }
 
     /// Resolve a canonical or `x-os/` MIME to a clipboard format id.
+    /// Standard formats have fixed ids and no registered name (registering
+    /// `CF_HDROP` would create an unrelated private format); `image/png`
+    /// is the registered "PNG" format (writes add `CF_DIB`).
     pub(crate) fn id_for_mime(mime: &str) -> Result<u32> {
-        if mime == "text/plain" {
-            return Ok(CF_UNICODETEXT);
+        match mime {
+            "text/plain" | "text/plain;charset=utf-8" => return Ok(CF_UNICODETEXT),
+            "text/uri-list" => return Ok(CF_HDROP),
+            "image/png" => return register(PNG_FORMAT),
+            _ => {}
         }
         if let Some(windows) = crate::formats::canonical_to_windows(mime) {
-            return raw::register_format(windows)
-                .map(std::num::NonZeroU32::get)
-                .ok_or_else(|| Error::Io(format!("cannot register clipboard format '{windows}'")));
+            return register(windows);
         }
         if let Some(name) = mime.strip_prefix("x-os/") {
             if name.is_empty() {
                 return Err(Error::Unsupported(format!("bad format name '{mime}'")));
             }
-            return raw::register_format(name)
-                .map(std::num::NonZeroU32::get)
-                .ok_or_else(|| Error::Io(format!("cannot register clipboard format '{name}'")));
+            return register(name);
         }
         Err(Error::Unsupported(format!("unsupported format '{mime}'")))
+    }
+
+    pub(crate) fn register(name: &str) -> Result<u32> {
+        raw::register_format(name)
+            .map(std::num::NonZeroU32::get)
+            .ok_or_else(|| Error::Io(format!("cannot register clipboard format '{name}'")))
+    }
+
+    fn check_cap(len: usize, max_bytes: u64) -> Result<()> {
+        if len as u64 > max_bytes {
+            return Err(Error::TooLarge(format!(
+                "clipboard payload {len} bytes over cap {max_bytes}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// `image/png`: the "PNG" format when it holds a real PNG, else a
+    /// bitmap converted to PNG (`CF_DIBV5` first: it states its alpha).
+    pub(crate) fn read_png(max_bytes: u64) -> Result<Vec<u8>> {
+        let png_id = register(PNG_FORMAT)?;
+        if raw::is_format_avail(png_id) {
+            match read_one(png_id, "image/png", max_bytes) {
+                Ok(png) if png.starts_with(PNG_SIGNATURE) => return Ok(png),
+                Err(e @ Error::TooLarge(_)) => return Err(e),
+                _ => {}
+            }
+        }
+        let mut failure = Error::Unavailable("image/png not available".to_string());
+        for id in [CF_DIBV5, CF_DIB] {
+            if !raw::is_format_avail(id) {
+                continue;
+            }
+            // Checked before reading: a bitmap can be hundreds of MB.
+            if raw::size(id).is_some_and(|n| n.get() as u64 > crate::dib::MAX_DIB_BYTES) {
+                return Err(Error::TooLarge(
+                    "clipboard bitmap over the decode limit".to_string(),
+                ));
+            }
+            let mut dib = Vec::new();
+            if let Err(e) = raw::get_vec(id, &mut dib) {
+                failure = clip_error("read bitmap", e);
+                continue;
+            }
+            match crate::dib::dib_to_png(&dib) {
+                Ok(png) => {
+                    check_cap(png.len(), max_bytes)?;
+                    return Ok(png);
+                }
+                Err(e) => failure = Error::Unsupported(e),
+            }
+        }
+        Err(failure)
+    }
+
+    /// `text/uri-list` from the `CF_HDROP` file list.
+    pub(crate) fn read_uri_list(max_bytes: u64) -> Result<Vec<u8>> {
+        let mut paths = Vec::new();
+        raw::get_file_list(&mut paths).map_err(|e| clip_error("read file list", e))?;
+        if paths.is_empty() {
+            return Err(Error::Unavailable(
+                "text/uri-list not available".to_string(),
+            ));
+        }
+        let list = crate::uri::paths_to_uri_list(&paths).into_bytes();
+        check_cap(list.len(), max_bytes)?;
+        Ok(list)
+    }
+
+    /// Raw bytes of the formats in `ids` that the clipboard holds, in
+    /// clipboard order, for [`restore`]. `None` when one is over
+    /// `max_bytes` or reading outlasts `budget` (owners render delayed
+    /// formats on demand, and the paste waits for this).
+    pub(crate) fn snapshot(
+        ids: &[u32],
+        max_bytes: u64,
+        budget: std::time::Duration,
+    ) -> Option<Vec<(u32, Vec<u8>)>> {
+        let started = std::time::Instant::now();
+        with_open("snapshot", || {
+            let mut saved = Vec::new();
+            for id in raw::EnumFormats::new() {
+                if !ids.contains(&id) {
+                    continue;
+                }
+                if started.elapsed() > budget
+                    || raw::size(id).is_some_and(|n| n.get() as u64 > max_bytes)
+                {
+                    return Err(Error::TooLarge(
+                        "clipboard snapshot over budget".to_string(),
+                    ));
+                }
+                let mut bytes = Vec::new();
+                if raw::get_vec(id, &mut bytes).is_ok() {
+                    saved.push((id, bytes));
+                }
+            }
+            Ok(saved)
+        })
+        .ok()
+    }
+
+    /// Put a [`snapshot`] back in one atomic write.
+    pub(crate) fn restore(saved: &[(u32, Vec<u8>)]) -> Result<()> {
+        with_open("restore", || {
+            raw::empty().map_err(|e| clip_error("empty", e))?;
+            for (id, bytes) in saved {
+                raw::set_without_clear(*id, bytes).map_err(|e| clip_error("restore", e))?;
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn read_one(id: u32, mime: &str, max_bytes: u64) -> Result<Vec<u8>> {
@@ -170,18 +323,13 @@ pub(crate) mod imp {
         } else {
             raw::get_vec(id, &mut out).map_err(|e| clip_error("read", e))?;
         }
-        if out.len() as u64 > max_bytes {
-            return Err(Error::TooLarge(format!(
-                "clipboard payload {} bytes over cap {max_bytes}",
-                out.len()
-            )));
-        }
+        check_cap(out.len(), max_bytes)?;
         Ok(out)
     }
 
     pub(crate) fn write_one(id: u32, mime: &str, bytes: &[u8]) -> Result<()> {
         use clipboard_win::{options::NoClear, raw};
-        if mime == "text/plain" {
+        if mime == "text/plain" || mime == "text/plain;charset=utf-8" {
             let text = std::str::from_utf8(bytes)
                 .map_err(|e| Error::Internal(format!("text payload is not UTF-8: {e}")))?;
             return raw::set_string_with(text, NoClear).map_err(|e| clip_error("write text", e));
@@ -198,18 +346,8 @@ pub(crate) mod imp {
         if mime == "text/uri-list" {
             let text = std::str::from_utf8(bytes)
                 .map_err(|e| Error::Internal(format!("uri-list payload is not UTF-8: {e}")))?;
-            let paths: Vec<String> = text
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(|line| {
-                    line.strip_prefix("file://")
-                        .unwrap_or(line)
-                        .replace('/', "\\")
-                })
-                .collect();
-            let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-            return raw::set_file_list_with(&refs, NoClear)
+            let paths = crate::uri::uri_list_to_paths(text);
+            return raw::set_file_list_with(&paths, NoClear)
                 .map_err(|e| clip_error("write uri-list", e));
         }
         raw::set_without_clear(id, bytes).map_err(|e| clip_error("write", e))
@@ -246,15 +384,21 @@ impl ClipboardTransfer for WinTransfer {
         #[cfg(windows)]
         {
             imp::with_open("read", || {
-                if mime == "text/plain" {
+                if mime == "text/plain" || mime == "text/plain;charset=utf-8" {
                     for cand in [imp::CF_UNICODETEXT, imp::CF_TEXT, imp::CF_OEMTEXT] {
-                        if let Ok(bytes) = imp::read_one(cand, mime, max_bytes) {
+                        if let Ok(bytes) = imp::read_one(cand, "text/plain", max_bytes) {
                             if !bytes.is_empty() {
                                 return Ok(bytes);
                             }
                         }
                     }
                     return Err(Error::Unavailable("text/plain not available".to_string()));
+                }
+                if mime == "image/png" {
+                    return imp::read_png(max_bytes);
+                }
+                if mime == "text/uri-list" {
+                    return imp::read_uri_list(max_bytes);
                 }
                 let id = imp::id_for_mime(mime)?;
                 imp::read_one(id, mime, max_bytes)

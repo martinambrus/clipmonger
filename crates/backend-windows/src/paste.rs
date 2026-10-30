@@ -219,12 +219,36 @@ pub fn worker_press_paste_chord() -> std::result::Result<(), String> {
     }
 }
 
+/// Formats a guarded restore puts back, by registered name (text, bitmaps
+/// and file lists have fixed ids). The opt-out markers come back too, so a
+/// restored secret stays out of clipboard histories, ours included.
+#[cfg(windows)]
+const RESTORE_FORMATS: [&str; 8] = [
+    "HTML Format",
+    "Rich Text Format",
+    crate::transfer::imp::PNG_FORMAT,
+    crate::transfer::imp::DROP_EFFECT_FORMAT,
+    crate::optout::EXCLUDE_FORMAT,
+    crate::optout::HISTORY_OPT_OUT,
+    crate::optout::CLOUD_OPT_OUT,
+    crate::optout::VIEWER_IGNORE,
+];
+
+/// Largest single format the restore snapshot keeps: a raw 32-bit bitmap
+/// of three 4K screens (about 100 MB) still fits.
+#[cfg(windows)]
+const RESTORE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Longest the snapshot may delay a paste before the restore is dropped.
+#[cfg(windows)]
+const RESTORE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Clipboard swap for the helper route: the daemon writes the payloads,
 /// the helper presses Ctrl+V, then [`ClipboardSwap::finish`] restores the
 /// saved clipboard only while it still equals the temporary write.
 pub struct ClipboardSwap {
     #[cfg_attr(not(windows), allow(dead_code))]
-    saved: Option<Vec<u8>>,
+    saved: Option<Vec<(u32, Vec<u8>)>>,
     #[cfg_attr(not(windows), allow(dead_code))]
     pre_state: Option<String>,
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -234,16 +258,17 @@ pub struct ClipboardSwap {
 }
 
 impl ClipboardSwap {
-    /// Save the current clipboard, then write `payloads` over it.
+    /// Save the current clipboard when `restore` is set, then write
+    /// `payloads` over it.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Unsupported`] when there are no payload bytes, or
     /// the transfer layer's error when the write fails.
-    pub fn begin(payloads: &[(String, Vec<u8>)]) -> Result<Self> {
+    pub fn begin(payloads: &[(String, Vec<u8>)], restore: bool) -> Result<Self> {
         #[cfg(windows)]
         {
-            use super::transfer::WinTransfer;
+            use super::transfer::{imp, WinTransfer};
             use clipmonger_platform::traits::ClipboardTransfer as _;
             if payloads.is_empty() {
                 return Err(Error::Unsupported(
@@ -251,7 +276,18 @@ impl ClipboardSwap {
                 ));
             }
             let transfer = WinTransfer::new();
-            let saved = transfer.read("text/plain", 4 * 1024 * 1024).ok();
+            let saved = if restore {
+                let mut ids = vec![imp::CF_UNICODETEXT, imp::CF_DIB, imp::CF_HDROP];
+                ids.extend(
+                    RESTORE_FORMATS
+                        .iter()
+                        .filter_map(|name| imp::register(name).ok()),
+                );
+                imp::snapshot(&ids, RESTORE_MAX_BYTES, RESTORE_BUDGET)
+                    .filter(|saved| !saved.is_empty())
+            } else {
+                None
+            };
             let pre_state = transfer.unchanged_indicator();
             transfer.write(&payloads.to_vec())?;
             let post_state = transfer.unchanged_indicator();
@@ -268,7 +304,7 @@ impl ClipboardSwap {
         }
         #[cfg(not(windows))]
         {
-            let _ = payloads;
+            let _ = (payloads, restore);
             Err(Error::Unavailable(
                 "clipboard swap needs a Windows session".to_string(),
             ))
@@ -308,9 +344,8 @@ fn guarded_restore(swap: &ClipboardSwap) {
         _ => false,
     };
     if clipmonger_platform::paste_policy::guarded_restore_decision(unchanged, hash_same) {
-        if let Some(bytes) = &swap.saved {
-            let saved_map = vec![("text/plain".to_string(), bytes.clone())];
-            let _ = transfer.write(&saved_map);
+        if let Some(saved) = &swap.saved {
+            let _ = super::transfer::imp::restore(saved);
         }
         let _ = &swap.pre_state;
     }
@@ -333,7 +368,7 @@ fn inject_text(bytes: &[u8]) -> std::result::Result<(), String> {
 /// slot still equals our temporary write (user copies always win).
 #[cfg(windows)]
 fn clipboard_restore(payloads: &[(String, Vec<u8>)], dwell_ms: u64, restore: bool) -> Result<()> {
-    let swap = ClipboardSwap::begin(payloads)?;
+    let swap = ClipboardSwap::begin(payloads, restore)?;
     worker_press_paste_chord().map_err(|e| Error::Io(format!("paste chord failed: {e}")))?;
     swap.finish(dwell_ms, restore);
     Ok(())

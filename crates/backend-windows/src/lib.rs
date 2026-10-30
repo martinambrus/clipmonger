@@ -11,6 +11,7 @@
 pub mod autostart;
 pub mod autostart_logic;
 pub mod caps;
+pub mod dib;
 pub mod elevated_task;
 pub mod foreground;
 pub mod formats;
@@ -23,6 +24,7 @@ pub mod paste;
 #[cfg(windows)]
 pub mod sys;
 pub mod transfer;
+pub mod uri;
 
 pub use autostart::WinAutostart;
 pub use foreground::{current_process_integrity, target_integrity, Integrity};
@@ -39,7 +41,7 @@ pub use sys::{
 pub use transfer::WinTransfer;
 
 /// Healthy capability matrix for this backend (carries the `image/png`
-/// passthrough FNF note via [`caps::normal_caps`]).
+/// note via [`caps::normal_caps`]).
 #[must_use]
 pub fn caps() -> clipmonger_platform::types::BackendCaps {
     caps::normal_caps()

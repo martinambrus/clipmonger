@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 clipmonger-core = { path = "../core" }
 clipmonger-platform = { path = "../platform" }
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
 serde.workspace = true
 serde_json.workspace = true
 
