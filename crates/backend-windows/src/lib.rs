@@ -11,6 +11,7 @@
 pub mod autostart;
 pub mod autostart_logic;
 pub mod caps;
+pub mod elevated_task;
 pub mod foreground;
 pub mod formats;
 pub mod helper;
@@ -19,7 +20,6 @@ pub mod html;
 pub mod monitor;
 pub mod optout;
 pub mod paste;
-pub mod elevated_task;
 #[cfg(windows)]
 pub mod sys;
 pub mod transfer;

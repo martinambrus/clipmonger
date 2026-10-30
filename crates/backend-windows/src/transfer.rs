@@ -241,7 +241,9 @@ impl ClipboardTransfer for WinTransfer {
                 if mime == "text/plain" {
                     for cand in [imp::CF_UNICODETEXT, imp::CF_TEXT, imp::CF_OEMTEXT] {
                         if let Ok(bytes) = imp::read_one(cand, mime, max_bytes) {
-                            if !bytes.is_empty() { return Ok(bytes); }
+                            if !bytes.is_empty() {
+                                return Ok(bytes);
+                            }
                         }
                     }
                     return Err(Error::Unavailable("text/plain not available".to_string()));

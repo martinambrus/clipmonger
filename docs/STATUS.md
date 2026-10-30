@@ -1,6 +1,6 @@
 # Docs status
 
-## Implementation state (refreshed 2026-10-29, post-Windows hardening + cleanup)
+## Implementation state (refreshed 2026-10-30, portable admin + focus)
 
 Source of truth for step detail: `plan.md` Steps.
 
@@ -8,7 +8,8 @@ Source of truth for step detail: `plan.md` Steps.
 - Step 5: CODE DONE (GNOME extension); manual legs pending.
 - Step 6: DONE (UI v1 + permanents follow-up); Ubuntu automated suites green on this box 2026-10-27 (app-ui 80/80); `D-024` Win32 CPU fallback now mirrors Ubuntu on this Windows box via RustDesk virtual display (no GPU/OpenGL, `crates/app-ui/src/fallback.rs`); `T-905..T-908` Win32 legs verified 2026-10-28 on RustDesk (popup, config 27-row, keyboard, safety) and re-verified 2026-10-29 (popup.restore_clipboard live reload, WSL ingest, bump_clip).
 - Step 7: release prep done on this box (release gate script, caps golden, `deny.toml`, changelog/notes drafts, `tests/manual/` scripts, dist-release zips + SHA256SUMS). Draft only: no tag/GitHub release.
-- Windows test infra 2026-10-29: all Clipmonger daemons stopped, `ClipmongerHelper` scheduled task (elevated helper, ONLOGON/HIGHEST) ended and deleted via elevated `schtasks` after admin-app copy/paste/hotkey verification; `C:\Temp\cm-soft-test` profile retained for reference, no process running.
+- Windows portable 2026-10-30: `C:\Temp\clipmonger-portable` rebuilt with helper fallback + focus fixes; `helper_auto_elevate` stranded-config fallback (`crates/daemon/src/main.rs:200ff` → High IL consent poll), eager `prime_persistent` pipe (`crates/daemon/src/lib.rs:243ff`), portable owns hotkey (`crates/daemon/src/main.rs:135ff`), High IL only helper hotkey (`run_elevated_persistent` gating), `notify_popup` High IL ShowWindow+SetFocus (`crates/backend-windows/src/elevated_task.rs:171ff`) + target capture (`clipmonger-target-hwnd` marker), heartbeat tolerance 10×30s + 5s (`crates/daemon/src/lib.rs:590ff`, `crates/daemon/src/main.rs:757ff`); verified on this Windows box: non-admin + WSL copy/paste + popup focus, admin popup shows + focused via High IL, first-paste stale-target fix in flight.
+- Windows test infra 2026-10-30: portable daemons running (fallback 6320 + daemon 3828 + helper 8184 High IL `__elevated-persistent` `ClipmongerHelper` ONLOGON/HIGHEST Ready→Running on demand); `C:\Temp\clipmonger-portable` profile active, `C:\Temp\cm-soft-test` retained.
 - Manual pending (user/native legs): `T-410`, `T-508`, `T-606`, `T-607`, `T-702..T-705`, `T-1117`, `T-1204` (Windows `T-905..T-908` done via CPU fallback; egui path still needs real GPU display).
 - Known gaps: update-check (`T-1202`, out of `0.1.0`), per-box caps goldens beyond headless, coverage-floor enforcement, cargo-packager installers (native runners), CI matrix.
 

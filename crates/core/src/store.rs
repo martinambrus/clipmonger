@@ -804,9 +804,21 @@ impl Store {
         }
     }
 
+    /// Bump clip to top of history.
+    ///
+    /// # Errors
+    /// Returns error if store is read-only or SQLite fails.
     pub fn bump_clip(&self, id: Uuid, now_ms: i64) -> Result<bool, CoreError> {
-        if self.read_only { return Err(readonly_err()); }
-        let changed = self.lock().execute("UPDATE clips SET last_used_ms=?1 WHERE id=?2", params![now_ms, id.to_string()]).map_err(|e| db_err(&e))?;
+        if self.read_only {
+            return Err(readonly_err());
+        }
+        let changed = self
+            .lock()
+            .execute(
+                "UPDATE clips SET last_used_ms=?1 WHERE id=?2",
+                params![now_ms, id.to_string()],
+            )
+            .map_err(|e| db_err(&e))?;
         Ok(changed > 0)
     }
 

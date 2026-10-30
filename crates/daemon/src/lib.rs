@@ -215,8 +215,12 @@ impl HelperSupervisor {
             let beat = std::sync::Arc::clone(&self.beat);
             let profile_path = profile.to_path_buf();
             let (jobs_tx, jobs_rx) = std::sync::mpsc::channel::<SupervisorJob>();
-            std::thread::spawn(move || persistent_supervisor_thread(persist_pipe, beat, profile_path, jobs_rx));
-            self.link = Some(HelperLink { jobs: jobs_tx.clone() });
+            std::thread::spawn(move || {
+                persistent_supervisor_thread(persist_pipe, beat, profile_path, jobs_rx)
+            });
+            self.link = Some(HelperLink {
+                jobs: jobs_tx.clone(),
+            });
             return jobs_tx;
         }
         let (jobs_tx, jobs_rx) = std::sync::mpsc::channel::<SupervisorJob>();
@@ -233,6 +237,17 @@ impl HelperSupervisor {
     #[cfg(all(windows, feature = "backend-windows"))]
     fn drop_link(&mut self) {
         self.link = None;
+    }
+
+    /// Eagerly start the persistent pipe server if the scheduled task is
+    /// installed. Call once at startup so the High IL helper can connect
+    /// before the first admin paste; otherwise the helper polls with no
+    /// server and the first paste pays a 90 s timeout.
+    #[cfg(all(windows, feature = "backend-windows"))]
+    pub fn prime_persistent(&mut self, profile: &Path) {
+        if clipmonger_backend_windows::elevated_task::is_installed() && self.link.is_none() {
+            let _ = self.ensure_link(profile);
+        }
     }
 }
 
@@ -494,17 +509,40 @@ fn supervisor_thread(
 }
 
 #[cfg(all(windows, feature = "backend-windows"))]
-fn persistent_supervisor_thread(pipe_name: String, beat: std::sync::Arc<Mutex<Option<i64>>>, profile: PathBuf, jobs: std::sync::mpsc::Receiver<SupervisorJob>) {
+fn persistent_supervisor_thread(
+    pipe_name: String,
+    beat: std::sync::Arc<Mutex<Option<i64>>>,
+    profile: PathBuf,
+    jobs: std::sync::mpsc::Receiver<SupervisorJob>,
+) {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
     use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
-    let note_beat = |at_ms: i64| { if let Ok(mut slot) = beat.lock() { *slot = Some(at_ms); } };
-    let fail_all = |jobs: &std::sync::mpsc::Receiver<SupervisorJob>, message: &str| {
-        append_audit(&profile, serde_json::json!({"kind": "helper", "action": "refused", "result": message}));
-        while let Ok(job) = jobs.try_recv() { let _ = job.reply.send(Err(message.to_string())); }
+    let note_beat = |at_ms: i64| {
+        if let Ok(mut slot) = beat.lock() {
+            *slot = Some(at_ms);
+        }
     };
-    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let fail_all = |jobs: &std::sync::mpsc::Receiver<SupervisorJob>, message: &str| {
+        append_audit(
+            &profile,
+            serde_json::json!({"kind": "helper", "action": "refused", "result": message}),
+        );
+        while let Ok(job) = jobs.try_recv() {
+            let _ = job.reply.send(Err(message.to_string()));
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(r) => r,
-        Err(e) => { fail_all(&jobs, &format!("elevation refused: helper runtime failed: {e}")); return; }
+        Err(e) => {
+            fail_all(
+                &jobs,
+                &format!("elevation refused: helper runtime failed: {e}"),
+            );
+            return;
+        }
     };
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
     let profile_clone = profile.clone();
@@ -524,37 +562,84 @@ fn persistent_supervisor_thread(pipe_name: String, beat: std::sync::Arc<Mutex<Op
         Err(msg) => { fail_all(&jobs, &msg); return; }
     };
     if !helper_peer_ok(&server, &exe) {
-        append_audit(&profile, serde_json::json!({"kind": "helper", "action": "alert", "result": "peer mismatch"}));
+        append_audit(
+            &profile,
+            serde_json::json!({"kind": "helper", "action": "alert", "result": "peer mismatch"}),
+        );
         fail_all(&jobs, "elevation refused: helper peer mismatch");
         return;
     }
     note_beat(now_ms());
-    append_audit(&profile, serde_json::json!({"kind": "helper", "action": "persistent_connected", "result": "ok"}));
+    append_audit(
+        &profile,
+        serde_json::json!({"kind": "helper", "action": "persistent_connected", "result": "ok"}),
+    );
     let (read_half, mut write_half) = tokio::io::split(server);
     let mut reader = tokio::io::BufReader::new(read_half);
     let mut missed: u32 = 0;
     loop {
         match jobs.recv_timeout(std::time::Duration::from_secs(15)) {
             Ok(job) => {
-                let line = match clipmonger_backend_windows::helper::encode_job(&clipmonger_backend_windows::helper::Job { job_id: 1, target_pid: job.target_pid, op: job.op, payload: job.payload.clone() }) {
+                let line = match clipmonger_backend_windows::helper::encode_job(
+                    &clipmonger_backend_windows::helper::Job {
+                        job_id: 1,
+                        target_pid: job.target_pid,
+                        op: job.op,
+                        payload: job.payload.clone(),
+                    },
+                ) {
                     Ok(l) => l,
-                    Err(e) => { let _ = job.reply.send(Err(format!("backend: {e}"))); continue; }
+                    Err(e) => {
+                        let _ = job.reply.send(Err(format!("backend: {e}")));
+                        continue;
+                    }
                 };
                 let outcome = runtime.block_on(async {
-                    if tokio::time::timeout(std::time::Duration::from_secs(120), write_half.write_all(line.as_bytes())).await.is_err() { return Err("helper write timed out".to_string()); }
-                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+                    if tokio::time::timeout(
+                        std::time::Duration::from_secs(120),
+                        write_half.write_all(line.as_bytes()),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return Err("helper write timed out".to_string());
+                    }
+                    let deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(120);
                     loop {
-                        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                        if remaining.is_zero() { return Err("helper result timed out".to_string()); }
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            return Err("helper result timed out".to_string());
+                        }
                         let mut result_line = String::new();
-                        let read = match tokio::time::timeout(remaining, reader.read_line(&mut result_line)).await { Ok(r) => r, Err(_) => return Err("helper result timed out".to_string()) };
-                        let bytes = match read { Ok(b) => b, Err(_) => return Err("helper result unreadable".to_string()) };
-                        if bytes == 0 { return Err("helper result unreadable".to_string()); }
+                        let read = match tokio::time::timeout(
+                            remaining,
+                            reader.read_line(&mut result_line),
+                        )
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => return Err("helper result timed out".to_string()),
+                        };
+                        let bytes = match read {
+                            Ok(b) => b,
+                            Err(_) => return Err("helper result unreadable".to_string()),
+                        };
+                        if bytes == 0 {
+                            return Err("helper result unreadable".to_string());
+                        }
                         match serde_json::from_str::<serde_json::Value>(&result_line) {
                             Ok(v) if v.get("heartbeat").is_some() => continue,
                             Ok(v) => {
-                                if v.get("ok").and_then(|x| x.as_bool()) == Some(true) { return Ok(String::new()); }
-                                return Err(v.get("error").and_then(|x| x.as_str()).unwrap_or("helper refused").to_string());
+                                if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
+                                    return Ok(String::new());
+                                }
+                                return Err(v
+                                    .get("error")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("helper refused")
+                                    .to_string());
                             }
                             Err(_) => return Err("helper result unreadable".to_string()),
                         }
@@ -563,30 +648,53 @@ fn persistent_supervisor_thread(pipe_name: String, beat: std::sync::Arc<Mutex<Op
                 match &outcome {
                     Ok(m) if m.is_empty() => {
                         note_beat(now_ms());
-                        append_audit(&profile, serde_json::json!({"kind": "helper", "action": "job", "op_hash": fnv_hex(job.payload.as_bytes()), "result": "ok"}));
+                        append_audit(
+                            &profile,
+                            serde_json::json!({"kind": "helper", "action": "job", "op_hash": fnv_hex(job.payload.as_bytes()), "result": "ok"}),
+                        );
                         let _ = job.reply.send(Ok(()));
                     }
                     _ => {
-                        let message = match &outcome { Ok(m) => format!("helper protocol error: {m:?}"), Err(e) => e.clone() };
-                        append_audit(&profile, serde_json::json!({"kind": "helper", "action": "job", "op_hash": fnv_hex(job.payload.as_bytes()), "result": message}));
+                        let message = match &outcome {
+                            Ok(m) => format!("helper protocol error: {m:?}"),
+                            Err(e) => e.clone(),
+                        };
+                        append_audit(
+                            &profile,
+                            serde_json::json!({"kind": "helper", "action": "job", "op_hash": fnv_hex(job.payload.as_bytes()), "result": message}),
+                        );
                         let _ = job.reply.send(Err(message.clone()));
-                        if message.contains("timed out") || message.contains("unreadable") { return; }
+                        if message.contains("timed out") || message.contains("unreadable") {
+                            return;
+                        }
                     }
                 }
                 missed = 0;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let mut heartbeat = String::new();
-                let got = runtime.block_on(async { tokio::time::timeout(std::time::Duration::from_secs(20), reader.read_line(&mut heartbeat)).await });
+                let got = runtime.block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        reader.read_line(&mut heartbeat),
+                    )
+                    .await
+                });
                 match got {
                     Ok(Ok(0) | Err(_)) | Err(_) => {
                         missed += 1;
-                        if missed >= 3 {
-                            append_audit(&profile, serde_json::json!({"kind": "helper", "action": "dead", "result": "3 missed heartbeats"}));
+                        if missed >= 10 {
+                            append_audit(
+                                &profile,
+                                serde_json::json!({"kind": "helper", "action": "dead", "result": "10 missed heartbeats"}),
+                            );
                             return;
                         }
                     }
-                    Ok(Ok(_)) => { missed = 0; note_beat(now_ms()); }
+                    Ok(Ok(_)) => {
+                        missed = 0;
+                        note_beat(now_ms());
+                    }
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
@@ -1371,6 +1479,10 @@ impl DaemonState {
         if let Ok(mut slot) = self.profile_dir.lock() {
             *slot = dir.to_path_buf();
         }
+        #[cfg(all(windows, feature = "backend-windows"))]
+        if let Ok(mut sup) = self.helper.lock() {
+            sup.prime_persistent(dir);
+        }
     }
 
     /// Mint one single-use gesture token. HOTKEY/POPUP TRIGGER PATH ONLY:
@@ -1889,13 +2001,21 @@ impl DaemonState {
             .ok_or_else(|| IpcError::new("backend", "config.set: key required".to_string()))?;
         let value = params.get("value").cloned().unwrap_or(Value::Null);
         let updated = {
-            let mut config = self.config.lock().map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?;
-            apply_config_key(&mut config, key, &value).map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
-            let cloned = config.clone();
-            cloned
+            let mut config = self
+                .config
+                .lock()
+                .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?;
+            apply_config_key(&mut config, key, &value)
+                .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
+            
+            config.clone()
         };
-        updated.save(&profile.join("config.toml")).map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
-        if let Ok(mut cfg) = self.config.lock() { *cfg = updated.clone(); }
+        updated
+            .save(&profile.join("config.toml"))
+            .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
+        if let Ok(mut cfg) = self.config.lock() {
+            *cfg = updated.clone();
+        }
         self.set_paste_limits(updated.popup.unicode_limit, updated.popup.delivery_dwell_ms);
         self.caps.set_paste_strategy(
             "windows",
@@ -2159,8 +2279,17 @@ impl DaemonState {
             use clipmonger_backend_windows::Integrity;
             use clipmonger_platform::traits::PasteEngine as _;
             let (unicode_limit, dwell_ms, delivery) = self.paste_budget();
-            let restore = self.config.lock().map(|cfg| cfg.popup.restore_clipboard).unwrap_or(true);
-            let paste = clipmonger_backend_windows::WinPaste::new(usize::try_from(unicode_limit).unwrap_or(65536)).with_dwell_ms(dwell_ms).with_clipboard_first(delivery == clipmonger_core::PasteDelivery::ClipboardRestore).with_restore_clipboard(restore);
+            let restore = self
+                .config
+                .lock()
+                .map(|cfg| cfg.popup.restore_clipboard)
+                .unwrap_or(true);
+            let paste = clipmonger_backend_windows::WinPaste::new(
+                usize::try_from(unicode_limit).unwrap_or(65536),
+            )
+            .with_dwell_ms(dwell_ms)
+            .with_clipboard_first(delivery == clipmonger_core::PasteDelivery::ClipboardRestore)
+            .with_restore_clipboard(restore);
             let target = paste
                 .capture_target()
                 .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
@@ -2176,7 +2305,13 @@ impl DaemonState {
                     ));
                 }
                 let res = self.paste_via_helper(&target, payloads);
-                if res.is_ok() { let _ = self.store.read().ok().and_then(|s| s.bump_clip(clip.0, now_ms()).ok()); }
+                if res.is_ok() {
+                    let _ = self
+                        .store
+                        .read()
+                        .ok()
+                        .and_then(|s| s.bump_clip(clip.0, now_ms()).ok());
+                }
                 return res;
             }
             paste
@@ -2189,7 +2324,11 @@ impl DaemonState {
                         IpcError::new("backend", format!("paste.execute: {e}"))
                     }
                 })?;
-            let _ = self.store.read().ok().and_then(|s| s.bump_clip(clip.0, now_ms()).ok());
+            let _ = self
+                .store
+                .read()
+                .ok()
+                .and_then(|s| s.bump_clip(clip.0, now_ms()).ok());
             Ok(serde_json::json!({"pasted": true}))
         }
         #[cfg(all(unix, feature = "backend-wayland"))]
@@ -2249,12 +2388,29 @@ impl DaemonState {
             )
         })?;
         let (_, dwell_ms, delivery) = self.paste_budget();
-        let restore = self.config.lock().map(|cfg| cfg.popup.restore_clipboard).unwrap_or(true);
+        let restore = self
+            .config
+            .lock()
+            .map(|cfg| cfg.popup.restore_clipboard)
+            .unwrap_or(true);
         if delivery == clipmonger_core::PasteDelivery::ClipboardRestore {
             let swap = clipmonger_backend_windows::paste::ClipboardSwap::begin(payloads)
                 .map_err(|e| IpcError::new("backend", format!("paste.execute: {e}")))?;
-            let outcome = self.send_helper_job(target, pid, clipmonger_backend_windows::helper::JobOp::PasteChord, String::new());
-            let dwell = if restore { if outcome.is_ok() { dwell_ms } else { 0 } } else { 0 };
+            let outcome = self.send_helper_job(
+                target,
+                pid,
+                clipmonger_backend_windows::helper::JobOp::PasteChord,
+                String::new(),
+            );
+            let dwell = if restore {
+                if outcome.is_ok() {
+                    dwell_ms
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
             if restore {
                 swap.finish(dwell, true);
             }

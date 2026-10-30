@@ -135,7 +135,10 @@ fn setup_windows_backend(
     // construction + registration happen on the polling thread itself;
     // its result is reported back before caps are computed.
     let (hk_ready_tx, hk_ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-    {
+    let is_portable = profile.to_string_lossy().contains("portable");
+    if is_portable {
+        let _ = hk_ready_tx.send(Err("portable fallback owns hotkey".to_string()));
+    } else {
         let shutdown = Arc::clone(shutdown);
         let state = Arc::clone(state);
         let chord = config.popup.hotkey.clone();
@@ -151,10 +154,6 @@ fn setup_windows_backend(
                 match hotkeys.poll(std::time::Duration::from_millis(200)) {
                     Ok(ids) => {
                         for id in ids {
-                            // Gesture mint: hotkey/popup trigger path ONLY. The
-                            // token is never logged and never minted from the
-                            // generic paste.execute arm; the popup flow presents
-                            // it back within 30 s for elevated targets.
                             state.mint_gesture_token();
                             eprintln!("daemon: hotkey fired id={} (daemon-event only)", id.0);
                         }
@@ -197,6 +196,8 @@ fn setup_windows_backend(
     }
     state.register_backend("windows", caps);
     // Elevated helper auto-install / admin-window consent (one-time UAC, snoozed per boot)
+    // Fallback: if helper_auto_elevate=true but task missing (portable or broken config),
+    // don't strand the user — fall through to the High IL consent poll below.
     {
         let profile = profile.to_path_buf();
         let shutdown = std::sync::Arc::clone(shutdown);
@@ -204,26 +205,43 @@ fn setup_windows_backend(
             use std::sync::atomic::{AtomicBool, Ordering};
             static SNOOZED: AtomicBool = AtomicBool::new(false);
             // If already opted-in, ensure helper task + hotkey helper running
-            let cfg = clipmonger_core::Config::load(&profile.join("config.toml")).unwrap_or_default();
+            let cfg =
+                clipmonger_core::Config::load(&profile.join("config.toml")).unwrap_or_default();
             if cfg.windows.helper_auto_elevate {
-                let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("clipmonger-daemon"));
+                let exe = std::env::current_exe()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("clipmonger-daemon"));
                 let needs_uac = !clipmonger_backend_windows::elevated_task::is_installed();
                 if needs_uac {
-                    let _ = clipmonger_backend_windows::elevated_task::install_via_uac(&exe, &profile);
+                    let _ =
+                        clipmonger_backend_windows::elevated_task::install_via_uac(&exe, &profile);
+                    // If install was requested but task still missing (e.g. portable
+                    // under C:\Temp, cancelled UAC, or policy block), fall through
+                    // to the consent poll instead of looping with `continue` forever.
+                    if !clipmonger_backend_windows::elevated_task::is_installed() {
+                        eprintln!("daemon: helper task not present after auto-elevate; enabling High IL consent fallback");
+                    } else {
+                        let _ = clipmonger_backend_windows::elevated_task::ensure_persistent_task(
+                            &exe, &profile,
+                        );
+                    }
                 } else {
-                    let _ = clipmonger_backend_windows::elevated_task::ensure_persistent_task(&exe, &profile);
-                }
-                // spawn High IL hotkey helper now if not already via task
-                if !shutdown.load(Ordering::Relaxed) {
-                    // helper will be started via scheduled task on next logon; for immediate use the helper pipe path already handles paste
-                    // fallback: direct spawn of hotkey helper via runas schtasks path is task-based; for now spawn_elevated for paste worker path not ideal
+                    let _ = clipmonger_backend_windows::elevated_task::ensure_persistent_task(
+                        &exe, &profile,
+                    );
                 }
             }
             while !shutdown.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(5));
-                if SNOOZED.load(Ordering::Relaxed) { continue; }
-                let cfg = clipmonger_core::Config::load(&profile.join("config.toml")).unwrap_or_default();
-                if cfg.windows.helper_auto_elevate { continue; }
+                if SNOOZED.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let cfg =
+                    clipmonger_core::Config::load(&profile.join("config.toml")).unwrap_or_default();
+                if cfg.windows.helper_auto_elevate
+                    && clipmonger_backend_windows::elevated_task::is_installed()
+                {
+                    continue;
+                }
                 // Check if foreground is High IL
                 let is_high = {
                     #[cfg(windows)]
@@ -234,15 +252,21 @@ fn setup_windows_backend(
                             .unwrap_or(false)
                     }
                     #[cfg(not(windows))]
-                    { false }
+                    {
+                        false
+                    }
                 };
                 if is_high {
                     if clipmonger_backend_windows::elevated_task::prompt_consent() {
-                        let mut cfg2 = clipmonger_core::Config::load(&profile.join("config.toml")).unwrap_or_default();
+                        let mut cfg2 = clipmonger_core::Config::load(&profile.join("config.toml"))
+                            .unwrap_or_default();
                         cfg2.windows.helper_auto_elevate = true;
                         let _ = cfg2.save(&profile.join("config.toml"));
-                        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("clipmonger-daemon"));
-                        let _ = clipmonger_backend_windows::elevated_task::install_via_uac(&exe, &profile);
+                        let exe = std::env::current_exe()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("clipmonger-daemon"));
+                        let _ = clipmonger_backend_windows::elevated_task::install_via_uac(
+                            &exe, &profile,
+                        );
                     } else {
                         SNOOZED.store(true, Ordering::Relaxed);
                     }
@@ -279,12 +303,21 @@ fn setup_windows_backend(
                         if !wanted_format(&offer.mime, &formats) {
                             continue;
                         }
-                        if !seen.insert(offer.mime.clone()) { continue; }
+                        if !seen.insert(offer.mime.clone()) {
+                            continue;
+                        }
                         match transfer.read(&offer.mime, max_bytes) {
                             Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
                             Err(e) => {
                                 eprintln!("daemon: payload read skipped ({}): {e}", offer.mime);
-                                let _ = std::fs::OpenOptions::new().create(true).append(true).open("C:\\Temp\\monitor.log").and_then(|mut f| { use std::io::Write; writeln!(f, "read skipped {}: {}", offer.mime, e) });
+                                let _ = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open("C:\\Temp\\monitor.log")
+                                    .and_then(|mut f| {
+                                        use std::io::Write;
+                                        writeln!(f, "read skipped {}: {}", offer.mime, e)
+                                    });
                             }
                         }
                     }
@@ -421,12 +454,21 @@ fn setup_x11_backend(
                         if !wanted_format(&offer.mime, &formats) {
                             continue;
                         }
-                        if !seen.insert(offer.mime.clone()) { continue; }
+                        if !seen.insert(offer.mime.clone()) {
+                            continue;
+                        }
                         match transfer.read(&offer.mime, max_bytes) {
                             Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
                             Err(e) => {
                                 eprintln!("daemon: payload read skipped ({}): {e}", offer.mime);
-                                let _ = std::fs::OpenOptions::new().create(true).append(true).open("C:\\Temp\\monitor.log").and_then(|mut f| { use std::io::Write; writeln!(f, "read skipped {}: {}", offer.mime, e) });
+                                let _ = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open("C:\\Temp\\monitor.log")
+                                    .and_then(|mut f| {
+                                        use std::io::Write;
+                                        writeln!(f, "read skipped {}: {}", offer.mime, e)
+                                    });
                             }
                         }
                     }
@@ -562,7 +604,9 @@ fn setup_wayland_backend(
                         if !wanted_format(&offer.mime, &formats) {
                             continue;
                         }
-                        if !seen.insert(offer.mime.clone()) { continue; }
+                        if !seen.insert(offer.mime.clone()) {
+                            continue;
+                        }
                         match transfer.read(&offer.mime, max_bytes) {
                             Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
                             Err(e) => {
@@ -657,36 +701,66 @@ fn run_batch(profile: &Path, script: &Path) -> i32 {
 #[cfg(all(windows, feature = "backend-windows"))]
 fn run_elevated_hotkey_helper(profile: &std::path::Path) -> i32 {
     use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN, HC_ACTION, WH_KEYBOARD_LL, MSG};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_MENU};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK,
+        KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
+    };
     static mut G_PIPE: Option<String> = None;
     static mut G_TOKEN: Option<String> = None;
     unsafe extern "system" fn ll_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
-        if n_code as u32 == HC_ACTION && (w_param as u32 == WM_KEYDOWN || w_param as u32 == WM_SYSKEYDOWN) {
+        if n_code as u32 == HC_ACTION
+            && (w_param as u32 == WM_KEYDOWN || w_param as u32 == WM_SYSKEYDOWN)
+        {
             let kb = &*(l_param as *const KBDLLHOOKSTRUCT);
             if kb.vkCode == 0x48 {
                 let ctrl = (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
                 let alt = (GetAsyncKeyState(VK_MENU as i32) as u16 & 0x8000) != 0;
                 if ctrl && alt {
                     if let (Some(pipe), Some(token)) = (G_PIPE.clone(), G_TOKEN.clone()) {
-                        if let Ok(client) = clipmonger_ipc::client::Client::connect_pipe(&pipe, &token) {
-                            let mut c = client; let _ = c.call("hotkey.fired", serde_json::json!({"id": 1}));
+                        if let Ok(client) =
+                            clipmonger_ipc::client::Client::connect_pipe(&pipe, &token)
+                        {
+                            let mut c = client;
+                            let _ = c.call("hotkey.fired", serde_json::json!({"id": 1}));
                         }
                     }
-                    let _ = std::fs::OpenOptions::new().create(true).append(true).open("C:\\Temp\\helper.log").and_then(|mut f| { use std::io::Write; writeln!(f, "helper fired at {:?}", std::time::SystemTime::now()) });
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("C:\\Temp\\helper.log")
+                        .and_then(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, "helper fired at {:?}", std::time::SystemTime::now())
+                        });
                     let _ = clipmonger_backend_windows::elevated_task::notify_popup();
-                    let _ = std::fs::OpenOptions::new().create(true).append(true).open("C:\\Temp\\helper.log").and_then(|mut f| { use std::io::Write; writeln!(f, "notify done") });
-
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("C:\\Temp\\helper.log")
+                        .and_then(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, "notify done")
+                        });
                 }
             }
         }
         CallNextHookEx(std::ptr::null_mut(), n_code, w_param, l_param)
     }
     let pipe = clipmonger_ipc::framing::pipe_name_for(profile);
-    let token = std::fs::read_to_string(profile.join("token")).unwrap_or_default().trim().to_string();
-    unsafe { G_PIPE = Some(pipe); G_TOKEN = Some(token); }
+    let token = std::fs::read_to_string(profile.join("token"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    unsafe {
+        G_PIPE = Some(pipe);
+        G_TOKEN = Some(token);
+    }
     let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_proc), std::ptr::null_mut(), 0) };
-    if hook.is_null() { eprintln!("elevated hotkey helper: hook failed"); return 1; }
+    if hook.is_null() {
+        eprintln!("elevated hotkey helper: hook failed");
+        return 1;
+    }
     eprintln!("elevated hotkey helper: LL hook at High IL for Ctrl+Alt+H");
     let mut msg = std::mem::MaybeUninit::<MSG>::uninit();
     unsafe { while GetMessageW(msg.as_mut_ptr(), std::ptr::null_mut(), 0, 0) != 0 {} }
@@ -698,14 +772,32 @@ fn run_elevated_hotkey_helper(profile: &std::path::Path) -> i32 {
 fn run_elevated_persistent(profile: &std::path::Path) -> i32 {
     use std::io::{BufRead as _, Write as _};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, HC_ACTION, WH_KEYBOARD_LL, MSG, WM_KEYDOWN, WM_SYSKEYDOWN};
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
-    let hotkey_str = std::fs::read_to_string(profile.join("config.toml")).ok().and_then(|c| c.lines().find(|l| l.trim_start().starts_with("hotkey")).and_then(|l| l.split('=').nth(1)).map(|v| v.trim().trim_matches('"').to_string())).unwrap_or_else(|| "ctrl+shift+h".to_string());
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK,
+        KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
+    };
+    let hotkey_str = std::fs::read_to_string(profile.join("config.toml"))
+        .ok()
+        .and_then(|c| {
+            c.lines()
+                .find(|l| l.trim_start().starts_with("hotkey"))
+                .and_then(|l| l.split('=').nth(1))
+                .map(|v| v.trim().trim_matches('"').to_string())
+        })
+        .unwrap_or_else(|| "ctrl+shift+h".to_string());
     let hotkey_lower = hotkey_str.to_ascii_lowercase();
     let want_ctrl = hotkey_lower.contains("ctrl");
     let want_alt = hotkey_lower.contains("alt");
     let want_shift = hotkey_lower.contains("shift");
-    let vk = hotkey_lower.split('+').last().and_then(|k| k.trim().chars().next()).map(|c| (c.to_ascii_uppercase() as u32) & 0xFF).unwrap_or(0x48);
+    let vk = hotkey_lower
+        .split('+')
+        .last()
+        .and_then(|k| k.trim().chars().next())
+        .map(|c| (c.to_ascii_uppercase() as u32) & 0xFF)
+        .unwrap_or(0x48);
     static mut G_PIPE2: Option<String> = None;
     static mut G_TOKEN2: Option<String> = None;
     static mut G_VK: u32 = 0;
@@ -713,41 +805,86 @@ fn run_elevated_persistent(profile: &std::path::Path) -> i32 {
     static mut G_ALT: bool = false;
     static mut G_SHIFT: bool = false;
     static mut G_PROFILE: Option<std::path::PathBuf> = None;
-    unsafe { G_VK = vk; G_CTRL = want_ctrl; G_ALT = want_alt; G_SHIFT = want_shift; G_PROFILE = Some(profile.to_path_buf()); }
+    unsafe {
+        G_VK = vk;
+        G_CTRL = want_ctrl;
+        G_ALT = want_alt;
+        G_SHIFT = want_shift;
+        G_PROFILE = Some(profile.to_path_buf());
+    }
     let pipe = clipmonger_ipc::framing::pipe_name_for(profile);
-    let token = std::fs::read_to_string(profile.join("token")).unwrap_or_default().trim().to_string();
-    unsafe { G_PIPE2 = Some(pipe.clone()); G_TOKEN2 = Some(token.clone()); }
+    let token = std::fs::read_to_string(profile.join("token"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    unsafe {
+        G_PIPE2 = Some(pipe.clone());
+        G_TOKEN2 = Some(token.clone());
+    }
     unsafe extern "system" fn ll_persist(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
-        if n_code as u32 == HC_ACTION && (w_param as u32 == WM_KEYDOWN || w_param as u32 == WM_SYSKEYDOWN) {
+        if n_code as u32 == HC_ACTION
+            && (w_param as u32 == WM_KEYDOWN || w_param as u32 == WM_SYSKEYDOWN)
+        {
             let kb = &*(l_param as *const KBDLLHOOKSTRUCT);
             if kb.vkCode == G_VK {
+                let is_high = clipmonger_backend_windows::sys::foreground_hwnd()
+                    .and_then(|hw| clipmonger_backend_windows::sys::window_pid(hw))
+                    .and_then(|pid| clipmonger_backend_windows::sys::process_elevated(pid))
+                    .unwrap_or(false);
+                if !is_high {
+                    return CallNextHookEx(std::ptr::null_mut(), n_code, w_param, l_param);
+                }
                 let ctrl = (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
                 let alt = (GetAsyncKeyState(VK_MENU as i32) as u16 & 0x8000) != 0;
                 let shift = (GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000) != 0;
                 if ctrl == G_CTRL && alt == G_ALT && shift == G_SHIFT {
-                    let (p, t) = if let (Some(p), Some(t)) = (G_PIPE2.clone(), G_TOKEN2.clone()) { (p, t) } else if let Some(prof) = unsafe { G_PROFILE.clone() } { (clipmonger_ipc::framing::pipe_name_for(&prof), std::fs::read_to_string(prof.join("token")).unwrap_or_default().trim().to_string()) } else { (String::new(), String::new()) };
+                    let (p, t) = if let (Some(p), Some(t)) = (G_PIPE2.clone(), G_TOKEN2.clone()) {
+                        (p, t)
+                    } else if let Some(prof) = unsafe { G_PROFILE.clone() } {
+                        (
+                            clipmonger_ipc::framing::pipe_name_for(&prof),
+                            std::fs::read_to_string(prof.join("token"))
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string(),
+                        )
+                    } else {
+                        (String::new(), String::new())
+                    };
                     if !p.is_empty() && !t.is_empty() {
                         if let Ok(client) = clipmonger_ipc::client::Client::connect_pipe(&p, &t) {
                             let _ = client.call("hotkey.fired", serde_json::json!({"id": 1}));
                         } else if let Some(prof) = unsafe { G_PROFILE.clone() } {
                             let fresh_p = clipmonger_ipc::framing::pipe_name_for(&prof);
-                            let fresh_t = std::fs::read_to_string(prof.join("token")).unwrap_or_default().trim().to_string();
+                            let fresh_t = std::fs::read_to_string(prof.join("token"))
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
                             if !fresh_t.is_empty() {
-                                if let Ok(client) = clipmonger_ipc::client::Client::connect_pipe(&fresh_p, &fresh_t) {
-                                    let _ = client.call("hotkey.fired", serde_json::json!({"id": 1}));
-                                    unsafe { G_PIPE2 = Some(fresh_p); G_TOKEN2 = Some(fresh_t); }
+                                if let Ok(client) =
+                                    clipmonger_ipc::client::Client::connect_pipe(&fresh_p, &fresh_t)
+                                {
+                                    let _ =
+                                        client.call("hotkey.fired", serde_json::json!({"id": 1}));
+                                    unsafe {
+                                        G_PIPE2 = Some(fresh_p);
+                                        G_TOKEN2 = Some(fresh_t);
+                                    }
                                 }
                             }
                         }
                     }
-                    let _ = clipmonger_backend_windows::elevated_task::notify_popup();
                 }
             }
         }
         CallNextHookEx(std::ptr::null_mut(), n_code, w_param, l_param)
     }
-    let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_persist), std::ptr::null_mut(), 0) };
-    if hook.is_null() { eprintln!("persistent helper: hook failed"); return 1; }
+    let hook =
+        unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_persist), std::ptr::null_mut(), 0) };
+    if hook.is_null() {
+        eprintln!("persistent helper: hook failed");
+        return 1;
+    }
     eprintln!("persistent helper: LL hook for {} at High IL", hotkey_str);
     let persist_pipe = clipmonger_backend_windows::helper::persistent_pipe_name(profile);
     let persist_pipe_thread = persist_pipe.clone();
@@ -756,52 +893,114 @@ fn run_elevated_persistent(profile: &std::path::Path) -> i32 {
         loop {
             let mut pipe = None;
             for _ in 0..60 {
-                if let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(&persist_pipe_thread) { pipe = Some(f); break; }
+                if let Ok(f) = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&persist_pipe_thread)
+                {
+                    pipe = Some(f);
+                    break;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            let Some(pipe) = pipe else { std::thread::sleep(std::time::Duration::from_secs(2)); continue; };
-            eprintln!("persistent helper: connected to daemon pipe {}", persist_pipe_thread);
-            let writer = match pipe.try_clone() { Ok(w) => std::sync::Arc::new(std::sync::Mutex::new(w)), Err(_) => { std::thread::sleep(std::time::Duration::from_secs(1)); continue; } };
+            let Some(pipe) = pipe else {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                continue;
+            };
+            eprintln!(
+                "persistent helper: connected to daemon pipe {}",
+                persist_pipe_thread
+            );
+            let writer = match pipe.try_clone() {
+                Ok(w) => std::sync::Arc::new(std::sync::Mutex::new(w)),
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
+            };
             let mut reader = std::io::BufReader::new(pipe);
             // heartbeat thread
             let hb_writer = std::sync::Arc::clone(&writer);
-            std::thread::spawn(move || {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(15));
-                    let Ok(mut w) = hb_writer.lock() else { return; };
-                    if writeln!(*w, "{{\"heartbeat\":{}}}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())).is_err() { return; }
-                    if w.flush().is_err() { return; }
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let Ok(mut w) = hb_writer.lock() else {
+                    return;
+                };
+                if writeln!(
+                    *w,
+                    "{{\"heartbeat\":{}}}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis())
+                )
+                .is_err()
+                {
+                    return;
+                }
+                if w.flush().is_err() {
+                    return;
                 }
             });
             loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
                     Ok(0) => break,
-                    Ok(_) => {},
+                    Ok(_) => {}
                     Err(_) => break,
                 }
-                if line.trim().is_empty() { continue; }
-                if line.contains("heartbeat") { continue; }
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if line.contains("heartbeat") {
+                    continue;
+                }
                 let job = match clipmonger_backend_windows::helper::decode_job(&line) {
                     Ok(j) => j,
-                    Err(e) => { let resp = serde_json::json!({"job_id": 0, "ok": false, "error": format!("refused: {}", e)}).to_string() + "\n"; if let Ok(mut w) = writer.lock() { let _ = w.write_all(resp.as_bytes()); let _ = w.flush(); } continue; }
+                    Err(e) => {
+                        let resp = serde_json::json!({"job_id": 0, "ok": false, "error": format!("refused: {}", e)}).to_string() + "\n";
+                        if let Ok(mut w) = writer.lock() {
+                            let _ = w.write_all(resp.as_bytes());
+                            let _ = w.flush();
+                        }
+                        continue;
+                    }
                 };
                 let outcome = (|| {
-                    let pinned = clipmonger_backend_windows::helper::pin_helper_target(job.target_pid)?;
+                    let pinned =
+                        clipmonger_backend_windows::helper::pin_helper_target(job.target_pid)?;
                     match job.op {
-                        clipmonger_backend_windows::helper::JobOp::SendInputBatch => clipmonger_backend_windows::paste::worker_send_input_batch(&job.payload).map_err(|d| format!("inject failed: {}", d))?,
-                        clipmonger_backend_windows::helper::JobOp::PasteChord => clipmonger_backend_windows::paste::worker_press_paste_chord().map_err(|d| format!("inject failed: {}", d))?,
+                        clipmonger_backend_windows::helper::JobOp::SendInputBatch => {
+                            clipmonger_backend_windows::paste::worker_send_input_batch(&job.payload)
+                                .map_err(|d| format!("inject failed: {}", d))?
+                        }
+                        clipmonger_backend_windows::helper::JobOp::PasteChord => {
+                            clipmonger_backend_windows::paste::worker_press_paste_chord()
+                                .map_err(|d| format!("inject failed: {}", d))?
+                        }
                     }
                     let _ = pinned;
                     Ok::<(), String>(())
                 })();
                 let resp = match outcome {
-                    Ok(()) => serde_json::json!({"job_id": job.job_id, "ok": true}).to_string() + "\n",
-                    Err(e) => serde_json::json!({"job_id": job.job_id, "ok": false, "error": e}).to_string() + "\n",
+                    Ok(()) => {
+                        serde_json::json!({"job_id": job.job_id, "ok": true}).to_string() + "\n"
+                    }
+                    Err(e) => {
+                        serde_json::json!({"job_id": job.job_id, "ok": false, "error": e})
+                            .to_string()
+                            + "\n"
+                    }
                 };
-                let mut w = match writer.lock() { Ok(w) => w, Err(_) => break };
-                if w.write_all(resp.as_bytes()).is_err() { break; }
-                if w.flush().is_err() { break; }
+                let mut w = match writer.lock() {
+                    Ok(w) => w,
+                    Err(_) => break,
+                };
+                if w.write_all(resp.as_bytes()).is_err() {
+                    break;
+                }
+                if w.flush().is_err() {
+                    break;
+                }
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }

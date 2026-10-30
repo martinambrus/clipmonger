@@ -130,7 +130,9 @@ impl WinPaste {
             ) {
                 DeliveryRoute::Inject => inject_text(&text.unwrap_or_default())
                     .map_err(|detail| Error::Io(format!("unicode inject failed: {detail}"))),
-                DeliveryRoute::Clipboard => clipboard_restore(payloads, self.dwell_ms, self.restore_clipboard),
+                DeliveryRoute::Clipboard => {
+                    clipboard_restore(payloads, self.dwell_ms, self.restore_clipboard)
+                }
             }
         }
         #[cfg(not(windows))]
@@ -253,7 +255,9 @@ impl ClipboardSwap {
     pub fn finish(self, dwell_ms: u64, restore: bool) {
         #[cfg(windows)]
         {
-            if !restore { return; }
+            if !restore {
+                return;
+            }
             std::thread::sleep(std::time::Duration::from_millis(dwell_ms));
             guarded_restore(&self);
         }

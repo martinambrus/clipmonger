@@ -127,8 +127,7 @@ fn enumerate_offers() -> Result<Offers> {
 #[cfg(windows)]
 fn current_event() -> Result<CaptureEvent> {
     let (offers, probe) = enumerate_offers()?;
-    
-    
+
     let sensitive = crate::optout::should_skip(&probe);
     Ok(CaptureEvent {
         offers,
@@ -146,11 +145,15 @@ fn content_fingerprint(event: &CaptureEvent) -> String {
             return Ok(out);
         }
         out.clear();
-        if clipboard_win::raw::get_vec(crate::transfer::imp::CF_TEXT, &mut out).is_ok() && !out.is_empty() {
+        if clipboard_win::raw::get_vec(crate::transfer::imp::CF_TEXT, &mut out).is_ok()
+            && !out.is_empty()
+        {
             return Ok(out);
         }
         out.clear();
-        if clipboard_win::raw::get_vec(crate::transfer::imp::CF_OEMTEXT, &mut out).is_ok() && !out.is_empty() {
+        if clipboard_win::raw::get_vec(crate::transfer::imp::CF_OEMTEXT, &mut out).is_ok()
+            && !out.is_empty()
+        {
             return Ok(out);
         }
         Err(Error::Unavailable("no text".to_string()))

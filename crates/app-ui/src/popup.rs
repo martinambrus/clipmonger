@@ -196,7 +196,13 @@ impl PopupVm {
         let Ok(list) = serde_json::from_value::<Vec<Clip>>(clips.clone()) else {
             return false;
         };
-        if self.clips.len() == list.len() && self.clips.iter().zip(list.iter()).all(|(a, b)| a.id == b.id && a.preview == b.preview && a.pinned == b.pinned) {
+        if self.clips.len() == list.len()
+            && self
+                .clips
+                .iter()
+                .zip(list.iter())
+                .all(|(a, b)| a.id == b.id && a.preview == b.preview && a.pinned == b.pinned)
+        {
             return false;
         }
         let prev_len = self.clips.len();

@@ -238,6 +238,7 @@ pub struct WindowsConfig {
     pub extra: BTreeMap<String, toml::Value>,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for WindowsConfig {
     fn default() -> Self {
         Self {
@@ -246,7 +247,6 @@ impl Default for WindowsConfig {
         }
     }
 }
-
 
 /// Top-level config. Unknown root keys (e.g. future `[tray]`, `[ui]`
 /// sections) survive in `extra`.
