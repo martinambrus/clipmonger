@@ -63,6 +63,9 @@ reserved for the release that passes all seg-11 §5 gates.
   72 hours, and task creation works for install paths with spaces.
 - UI test drift: the chord parser test and the settings-row tests match
   the configured default hotkey and rows again.
+- The IPC acceptance suite did not compile for Windows (its socket tests
+  use Unix-only APIs), so `cargo test -p clipmonger-ipc` failed there;
+  those tests are now Unix-only and the protocol tests run on Windows.
 - UI text rendered as squares (tofu) on real displays: eframe's
   `default-features = false` had dropped its embedded/system fonts.
   Restored `default_fonts`/`system_fonts`; regression test pins it.

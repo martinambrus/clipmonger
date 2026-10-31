@@ -24,21 +24,21 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 use clipmonger_ipc::client::Client;
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 use clipmonger_ipc::server::{EventBus, Server};
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 use std::collections::BTreeMap;
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 use std::io::{BufRead, BufReader, Write};
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 use std::os::unix::net::UnixStream;
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 use std::sync::{mpsc, Arc, Mutex};
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -227,12 +227,12 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Fresh tempdir-scoped Unix socket path (short; never triggers the >100-char
 /// fallback). No external tempdir crate: plain std + pid + counter.
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 fn unique_sock(tag: &str) -> PathBuf {
     let n = SOCK_COUNTER.fetch_add(1, Ordering::SeqCst);
     let mut dir = std::env::temp_dir();
@@ -785,11 +785,11 @@ fn t210_socket_fallback_over_100() {
 // Gated on the `server` feature; run with `--features server`.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 const TEST_TOKEN: &str = "harness-token-1";
 
 /// Build a request envelope (client-chosen id).
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 fn req(id: &str, method: &str, params: Value) -> Envelope {
     Envelope {
         v: clipmonger_ipc::proto::IPC_VERSION.to_string(),
@@ -804,7 +804,7 @@ fn req(id: &str, method: &str, params: Value) -> Envelope {
 }
 
 /// Build a cancel envelope for a previously sent request id.
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 fn cancel_env(target_id: &str) -> Envelope {
     Envelope {
         v: clipmonger_ipc::proto::IPC_VERSION.to_string(),
@@ -820,7 +820,7 @@ fn cancel_env(target_id: &str) -> Envelope {
 
 /// Shared handler for live tests: echo + blob accumulation + blocking call.
 /// Blob state and the unblock channel are per-test (fresh per bind).
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 fn test_handler(
     store: Arc<Mutex<BTreeMap<u64, Vec<u8>>>>,
     unblock: mpsc::Receiver<()>,
@@ -876,7 +876,7 @@ fn test_handler(
 
 /// Bind a server on a fresh tempdir socket. The returned handle is kept alive
 /// by the caller until the test ends; no shutdown API is assumed.
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 async fn bind_test_server(sock: &Path) -> (mpsc::Sender<()>, Arc<Mutex<BTreeMap<u64, Vec<u8>>>>) {
     let store: Arc<Mutex<BTreeMap<u64, Vec<u8>>>> = Arc::new(Mutex::new(BTreeMap::new()));
     let (tx, rx) = mpsc::channel::<()>();
@@ -891,7 +891,7 @@ async fn bind_test_server(sock: &Path) -> (mpsc::Sender<()>, Arc<Mutex<BTreeMap<
 
 /// Connect the real std client. `#[allow(unused_mut)]` tolerates both
 /// `call(&self)` and `call(&mut self)` builder choices.
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 fn connect_client(sock: &Path, token: &str) -> Client {
     match Client::connect(sock, token) {
         Ok(c) => c,
@@ -899,7 +899,7 @@ fn connect_client(sock: &Path, token: &str) -> Client {
     }
 }
 
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 #[tokio::test(flavor = "multi_thread")]
 async fn t205_echo_call() {
     let sock = unique_sock("echo");
@@ -918,7 +918,7 @@ async fn t205_echo_call() {
     );
 }
 
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 #[tokio::test(flavor = "multi_thread")]
 async fn t205_blob_chunk_frames() {
     // 3 MiB through chunk frames over a real socket; server reassembles.
@@ -969,7 +969,7 @@ async fn t205_blob_chunk_frames() {
     );
 }
 
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 #[tokio::test(flavor = "multi_thread")]
 async fn t205_bad_token() {
     // D-F20: wrong token -> auth_failed, connection not established.
@@ -993,7 +993,7 @@ async fn t205_bad_token() {
 
 /// Write one envelope as a JSONL line (tolerates builders whose `encode_line`
 /// does or does not append the newline).
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 fn send_env(stream: &mut UnixStream, env: &Envelope) {
     let mut bytes = framing::encode_line(env).expect("encode_line must succeed");
     if !bytes.ends_with(b"\n") {
@@ -1004,7 +1004,7 @@ fn send_env(stream: &mut UnixStream, env: &Envelope) {
 }
 
 /// Read one envelope; None on EOF or read timeout (used to assert "no res").
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 fn recv_env(reader: &mut BufReader<UnixStream>) -> Option<Envelope> {
     let mut line = String::new();
     match reader.read_line(&mut line) {
@@ -1024,7 +1024,7 @@ fn recv_env(reader: &mut BufReader<UnixStream>) -> Option<Envelope> {
 }
 
 /// Raw hello handshake; returns (writer, reader, welcome frame).
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 fn raw_hello(sock: &Path, id: &str, token: &str) -> (UnixStream, BufReader<UnixStream>, Envelope) {
     let writer = UnixStream::connect(sock).expect("raw connect must succeed");
     writer
@@ -1044,7 +1044,7 @@ fn raw_hello(sock: &Path, id: &str, token: &str) -> (UnixStream, BufReader<UnixS
     (w, r, welcome)
 }
 
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 #[tokio::test(flavor = "multi_thread")]
 async fn t205_cancel_wire() {
     // Cancel semantics (builder picks the outcome): after cancel{id} the
@@ -1118,7 +1118,7 @@ async fn t205_cancel_wire() {
     );
 }
 
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 #[tokio::test(flavor = "multi_thread")]
 async fn t205_oversize_drop() {
     // Oversize line -> server drops THAT connection, but stays up.
@@ -1170,7 +1170,7 @@ async fn t205_oversize_drop() {
 // No wall-clock sleeps anywhere: the eviction clock is injected.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 fn bus_event(id: &str) -> Envelope {
     Envelope {
         v: clipmonger_ipc::proto::IPC_VERSION.to_string(),
@@ -1184,7 +1184,7 @@ fn bus_event(id: &str) -> Envelope {
     }
 }
 
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 #[test]
 fn t205_eventbus_overflow_resync() {
     // D-F18: per-subscriber queue holds 128; overflow drops events and emits
@@ -1219,7 +1219,7 @@ fn t205_eventbus_overflow_resync() {
     );
 }
 
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 #[test]
 fn t205_eventbus_capacity_no_false_resync() {
     // Boundary: exactly 128 queued events fit with NO resync-required.
@@ -1237,7 +1237,7 @@ fn t205_eventbus_capacity_no_false_resync() {
     );
 }
 
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 #[test]
 fn t205_eventbus_idle_evict_tick() {
     // Idle eviction is driven by the injected clock: tick(now), no sleeps.
