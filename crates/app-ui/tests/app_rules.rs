@@ -3414,3 +3414,29 @@ fn fix_x7_single_and_double_tray_click_each_toggle_once() {
         assert_eq!(rig.cmds(), open_commands());
     }
 }
+
+#[test]
+fn fix_fc3_closing_settings_clears_old_messages_before_reopening() {
+    for visible in [false, true] {
+        for event in [
+            UiEvent::Error("old command error".to_string()),
+            UiEvent::ConfigError("old configuration error".to_string()),
+            UiEvent::BackupDone("old backup path".to_string()),
+        ] {
+            let mut rig = Rig::closed();
+            rig.tray(&[TrayAction::OpenConfig]);
+            rig.tick();
+            rig.push(event);
+            rig.tick();
+            let old = rig.app.config().lock().expect("settings").error.clone();
+            assert!(!old.is_empty());
+            rig.close_request(WindowKind::Settings);
+            rig.pass(WindowKind::Settings, visible);
+            assert!(!rig.desired().settings_open);
+            assert_eq!(rig.app.config().lock().expect("settings").error, "");
+            rig.tray(&[TrayAction::OpenConfig]);
+            rig.tick();
+            assert!(!rig.show_settings().painted(&old));
+        }
+    }
+}

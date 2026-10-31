@@ -718,6 +718,9 @@ impl runner::App for PopupApp {
                 self.apply_theme(ctx, kind);
                 if close_requested {
                     self.feed(Event::SettingsClose);
+                    if let Ok(mut config) = self.config.lock() {
+                        config.error.clear();
+                    }
                 }
             }
         }
