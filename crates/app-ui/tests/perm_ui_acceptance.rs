@@ -280,14 +280,16 @@ fn u4_exec_result_mapping() {
         let (tx, rx, _s) = spawn_canned(Err(IpcError::new(code, "no paste".to_string())));
         tx.send(UiCmd::ExecPermanent(id)).expect("send exec");
         assert!(
-            matches!(recv(&rx), UiEvent::PasteUnavailable),
-            "code {code} must map to PasteUnavailable"
+            matches!(recv(&rx), UiEvent::ExecFailed(got, error)
+                if got == id && error == IpcError::new(code, "no paste".to_string())),
+            "code {code} must map to ExecFailed"
         );
     }
     let (tx, rx, _s) = spawn_canned(Err(IpcError::new("backend", "boom".to_string())));
     tx.send(UiCmd::ExecPermanent(id)).expect("send exec");
     assert!(
-        matches!(recv(&rx), UiEvent::PasteFailed(_)),
+        matches!(recv(&rx), UiEvent::ExecFailed(got, error)
+            if got == id && error == IpcError::new("backend", "boom".to_string())),
         "backend error must map to Error"
     );
     let (tx, rx, seen) = spawn_canned(Ok(json!({ "ok": true })));

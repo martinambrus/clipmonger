@@ -1359,7 +1359,10 @@ fn fix_x3_permanent_error_reopens_and_traces_the_painted_error_once() {
 #[test]
 fn fix_x3_permanent_unavailable_reopens_and_traces_the_painted_error_once() {
     permanent_failure_reopens(
-        UiEvent::PasteUnavailable,
+        UiEvent::ExecFailed(
+            Uuid::from_u128(77),
+            clipmonger_ipc::proto::IpcError::new("unavailable", "no paste".to_string()),
+        ),
         clipmonger_app_ui::strings::text("popup.paste_blocked"),
     );
 }
@@ -1530,5 +1533,94 @@ fn fix_n1_unrelated_error_does_not_steal_a_pending_permanent_failure() {
                 .count(),
             1
         );
+    }
+}
+
+#[test]
+fn fix_c3_clip_failure_does_not_hide_a_later_exec_failure() {
+    use clipmonger_app_ui::ipc_bridge::{Bridge, Transport};
+    use clipmonger_ipc::proto::IpcError;
+
+    struct FailedPastes(&'static str);
+    impl Transport for FailedPastes {
+        fn call(&mut self, method: &str, params: &Value) -> Result<Value, IpcError> {
+            match method {
+                "paste.execute" => {
+                    assert_eq!(params["clip"], Uuid::from_u128(1).to_string());
+                    Err(IpcError::new("backend", "clip paste failed".to_string()))
+                }
+                "permanent.exec" => {
+                    assert_eq!(params["id"], Uuid::from_u128(77).to_string());
+                    Err(IpcError::new(self.0, "exec failed".to_string()))
+                }
+                other => panic!("unexpected method {other}"),
+            }
+        }
+    }
+
+    for code in ["unavailable", "denied", "backend"] {
+        for settings in [false, true] {
+            let mut rig = Rig::new(false);
+            rig.push(hotkey(Some(1), Some(2)));
+            rig.push(history(&[clip(1, "Earlier clip")]));
+            rig.tick();
+            let _ = rig.cmds();
+            rig.key(egui::Key::Enter);
+            rig.show();
+            assert!(!rig.is_open());
+            let commands = rig.cmds();
+            assert!(matches!(commands.as_slice(), [UiCmd::PasteClipTo(..)]));
+
+            let (tx, rx) = Bridge::spawn(Box::new(FailedPastes(code)));
+            tx.send(commands[0].clone()).expect("earlier clip paste");
+            rig.push(request());
+            rig.tick();
+            send_permanent(&mut rig);
+            tx.send(UiCmd::ExecPermanent(Uuid::from_u128(77)))
+                .expect("later exec");
+            if settings {
+                rig.tray(TrayAction::OpenConfig);
+                rig.tick();
+                let _ = rig.cmds();
+            }
+
+            rig.push(rx.recv_timeout(Duration::from_secs(2)).expect("clip reply"));
+            rig.tick();
+            assert!(rig.is_open(), "the earlier clip failure reopens");
+            assert_eq!(rig.app.shell().error(), Some("clip paste failed"));
+            let _ = rig.cmds();
+            rig.key(egui::Key::Escape);
+            rig.show();
+            assert!(
+                !rig.is_open(),
+                "dismiss the earlier failure before exec replies"
+            );
+
+            let before = rig.trace();
+            rig.push(rx.recv_timeout(Duration::from_secs(2)).expect("exec reply"));
+            rig.tick();
+            let message = if code == "backend" {
+                "exec failed"
+            } else {
+                clipmonger_app_ui::strings::text("popup.paste_blocked")
+            };
+            assert!(
+                rig.is_open(),
+                "{code}, settings={settings}: exec failure reopens"
+            );
+            assert_eq!(rig.app.shell().error(), Some(message));
+            assert_eq!(rig.app.desired().settings_open, settings);
+            assert_eq!(rig.app.config().lock().expect("settings").error, "");
+            assert_eq!(
+                rig.cmds(),
+                vec![UiCmd::ListHistory, UiCmd::ListPermanents, UiCmd::PermGroups]
+            );
+            rig.show().centre_of(message);
+            let mut expected = before;
+            expected.extend([open_line("paste_failed", false, false), error_line()]);
+            assert_eq!(rig.trace(), expected);
+            rig.tick();
+            assert_eq!(rig.trace(), expected, "no repeated error on a later pass");
+        }
     }
 }

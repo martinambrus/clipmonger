@@ -95,6 +95,8 @@ pub enum UiEvent {
     PasteUnavailable,
     /// Targeted paste failed; carries the daemon message.
     PasteFailed(String),
+    /// Permanent execution failed; carries its id and the daemon error.
+    ExecFailed(Uuid, IpcError),
     /// Daemon acknowledged stop.
     Stopped,
     /// The stop request failed; carries the message.
@@ -411,13 +413,13 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
             UiEvent::Offline(error.message)
         }
         (UiCmd::Status | UiCmd::ListHistory, Err(error)) => UiEvent::Error(error.message),
-        (UiCmd::PasteClip(_) | UiCmd::ExecPermanent(_), Err(error))
+        (UiCmd::PasteClip(_), Err(error))
             if error.code == "unavailable" || error.code == "denied" =>
         {
             UiEvent::PasteUnavailable
         }
         (UiCmd::PasteClip(_), Err(error)) => UiEvent::Error(error.message),
         (UiCmd::PasteClipTo(..), Err(error)) => UiEvent::PasteFailed(error.message),
-        (UiCmd::ExecPermanent(_), Err(error)) => UiEvent::PasteFailed(error.message),
+        (UiCmd::ExecPermanent(id), Err(error)) => UiEvent::ExecFailed(id, error),
     }
 }

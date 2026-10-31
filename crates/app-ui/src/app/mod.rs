@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 
 use clipmonger_ipc::proto::methods::ShowPopupEvent;
 use serde_json::Value;
-use uuid::Uuid;
 
 pub use settings_ui::{render_config_viewport, ConfigWindowState};
 pub use trace::{Trace, TraceEvent};
@@ -90,8 +89,6 @@ pub struct PopupApp {
     centered: bool,
     /// Put the keyboard focus into the search box at the next render.
     focus_search: bool,
-    /// A permanent exec was sent and is waiting for its paste result.
-    exec_in_flight: Option<Uuid>,
     /// Theme last applied to the contexts: popup, settings (dark, font scale bits).
     theme_applied: [Option<(bool, u32)>; 2],
 }
@@ -137,7 +134,6 @@ impl PopupApp {
             seen_focus: false,
             centered: false,
             focus_search: open,
-            exec_in_flight: None,
             theme_applied: [None, None],
         };
         app.apply_effects(Shell::start());
@@ -262,8 +258,7 @@ impl PopupApp {
                         UiCmd::PasteClipTo(_, target, _, _) => self.record(&TraceEvent::Paste {
                             target: target.is_some(),
                         }),
-                        UiCmd::ExecPermanent(id) => {
-                            self.exec_in_flight = Some(*id);
+                        UiCmd::ExecPermanent(_) => {
                             self.record(&TraceEvent::Paste { target: false });
                         }
                         _ => {}
@@ -313,32 +308,22 @@ impl PopupApp {
     ///   (`pending_apply` not empty) the text goes to the Settings error line
     ///   and `pending_apply` is cleared, and the shell does not hear it;
     ///   otherwise the shell hears it (popup error line).
-    /// - A sent `ExecPermanent` consumes its success or paste failure reply.
-    ///   `PasteUnavailable` becomes `PasteFailed` so the shell reopens with
-    ///   the error even when Settings is open. Generic errors keep their
-    ///   normal routing and cannot complete an exec.
+    /// - `ExecFailed`: becomes `PasteFailed` so the shell reopens even when
+    ///   Settings is open; unavailable or denied uses `popup.paste_blocked`,
+    ///   other failures use the daemon message. No in-flight state is needed.
     /// - `ShowPopup`, `PasteFailed`, `PasteUnavailable`, `Offline`,
     ///   `StopFailed`, `Stopped`, `AnotherInstance`: the shell hears them.
     #[allow(clippy::too_many_lines)]
     fn on_bridge(&mut self, event: UiEvent) {
-        let event = match event {
-            UiEvent::PasteFailed(message) => {
-                self.exec_in_flight = None;
-                UiEvent::PasteFailed(message)
-            }
-            UiEvent::PasteUnavailable if self.exec_in_flight.is_some() => {
-                self.exec_in_flight = None;
-                UiEvent::PasteFailed(strings::text("popup.paste_blocked").to_string())
-            }
-            UiEvent::PasteDone(id) => {
-                if self.exec_in_flight == Some(id) {
-                    self.exec_in_flight = None;
-                }
-                UiEvent::PasteDone(id)
-            }
-            event => event,
-        };
         match event {
+            UiEvent::ExecFailed(_, error) => {
+                let message = if error.code == "unavailable" || error.code == "denied" {
+                    strings::text("popup.paste_blocked").to_string()
+                } else {
+                    error.message
+                };
+                self.feed(Event::Bridge(UiEvent::PasteFailed(message)));
+            }
             UiEvent::Status(body) => {
                 let paused = body
                     .get("monitoring_paused")
