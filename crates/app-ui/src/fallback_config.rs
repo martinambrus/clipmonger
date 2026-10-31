@@ -172,7 +172,7 @@ unsafe fn update_value(state: &mut CfgState) {
                 .doc
                 .as_ref()
                 .and_then(|d| d.staged(row.key).or(d.get(row.key)))
-                .map(|v| v.to_string())
+                .map(|v| config_model::value_text(row.kind, v))
                 .unwrap_or_default();
             let wide: Vec<u16> = v.encode_utf16().chain(std::iter::once(0)).collect();
             windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
@@ -601,17 +601,9 @@ unsafe extern "system" fn cfg_proc(
                                     &mut buf,
                                 );
                                 let text = String::from_utf16_lossy(&buf[..len as usize]);
-                                // Parse based on kind - for now treat as string/int via json
-                                let val = match row.kind {
-                                    config_model::Kind::Int => text
-                                        .parse::<i64>()
-                                        .map(|n| serde_json::Value::Number(n.into()))
-                                        .unwrap_or(serde_json::Value::String(text)),
-                                    config_model::Kind::Bool => {
-                                        serde_json::Value::Bool(text == "true" || text == "1")
-                                    }
-                                    _ => serde_json::Value::String(text),
-                                };
+                                // Unparsable text stays a string so stage() reports it.
+                                let val = config_model::parse_edit(row.kind, &text)
+                                    .unwrap_or(serde_json::Value::String(text));
                                 if let Some(doc) = s.doc.as_mut() {
                                     match doc.stage(row.key, val) {
                                         Ok(()) => update_status(s),

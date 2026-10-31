@@ -448,6 +448,41 @@ pub fn filter_rows(query: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Text form of a config value for an edit field; `parse_edit` reads it
+/// back unchanged (string lists as comma-separated text).
+#[must_use]
+pub fn value_text(kind: Kind, value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::Array(items) if kind == Kind::StringList => items
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
+    }
+}
+
+/// Parse an edit field back into a value for one row kind.
+#[must_use]
+pub fn parse_edit(kind: Kind, text: &str) -> Option<Value> {
+    match kind {
+        Kind::Bool => text.parse::<bool>().ok().map(Value::from),
+        Kind::Int => text.trim().parse::<i64>().ok().map(Value::from),
+        Kind::Text | Kind::Chord | Kind::Enum => Some(Value::String(text.trim().to_string())),
+        Kind::StringList => Some(Value::Array(
+            text.split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(|part| Value::String(part.to_string()))
+                .collect(),
+        )),
+        Kind::ChordMap | Kind::PasteChords => serde_json::from_str(text).ok(),
+    }
+}
+
 /// Staged config document: saved snapshot plus pending edits.
 #[derive(Debug, Clone, Default)]
 pub struct ConfigDoc {

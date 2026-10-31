@@ -358,34 +358,6 @@ struct ShellApp {
     linux_tray: linux_tray::LinuxTray,
 }
 
-/// Text form of a config value for an edit field.
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Bool(flag) => flag.to_string(),
-        Value::Number(number) => number.to_string(),
-        other => other.to_string(),
-    }
-}
-
-/// Parse an edit field back into a value for one row kind.
-fn parse_edit(kind: config_model::Kind, text: &str) -> Option<Value> {
-    use config_model::Kind as K;
-    match kind {
-        K::Bool => text.parse::<bool>().ok().map(Value::from),
-        K::Int => text.trim().parse::<i64>().ok().map(Value::from),
-        K::Text | K::Chord | K::Enum => Some(Value::String(text.trim().to_string())),
-        K::StringList => Some(Value::Array(
-            text.split(',')
-                .map(str::trim)
-                .filter(|part| !part.is_empty())
-                .map(|part| Value::String(part.to_string()))
-                .collect(),
-        )),
-        K::ChordMap | K::PasteChords => serde_json::from_str(text).ok(),
-    }
-}
-
 impl ShellApp {
     /// Send one bridge command, ignoring a torn-down bridge.
     fn send(&self, cmd: ipc_bridge::UiCmd) {
@@ -1003,7 +975,9 @@ impl ShellApp {
                     let saved = doc.get(row.key);
                     let staged = doc.staged(row.key);
                     let current = staged.or(saved);
-                    let text = current.map_or_else(String::new, value_text);
+                    let text = current.map_or_else(String::new, |value| {
+                        config_model::value_text(row.kind, value)
+                    });
                     rows.push((
                         row.key.to_string(),
                         row.kind,
@@ -1030,12 +1004,14 @@ impl ShellApp {
                                     .entry(key.clone())
                                     .or_insert_with(|| current.clone());
                                 if ui.add(egui::TextEdit::singleline(entry)).changed() {
-                                    if let Some(value) = parse_edit(*kind, entry) {
+                                    if let Some(value) = config_model::parse_edit(*kind, entry) {
                                         stage_edits.push((key.clone(), value));
                                     }
                                 }
                             }
-                                                        if key == "popup.hotkey" {
+                            // The Windows daemon applies a new chord live.
+                            #[cfg(not(windows))]
+                            if key == "popup.hotkey" {
                                 ui.label(strings::text("config.applies_on_restart"));
                             }
                         }
