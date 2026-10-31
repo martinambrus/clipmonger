@@ -540,6 +540,11 @@ impl PopupApp {
             return;
         }
         self.theme_applied[slot] = wanted;
+        ctx.set_theme(if dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        });
         ctx.set_visuals(if dark {
             egui::Visuals::dark()
         } else {
@@ -669,6 +674,8 @@ impl runner::App for PopupApp {
     /// closed (the daemon shows the window before the push arrives, so a
     /// closed shell must not paint stale rows). Settings: the Settings body.
     fn ui(&mut self, ui: &mut egui::Ui, kind: WindowKind) {
+        // The runner creates this Ui before logic applies the configured theme.
+        ui.set_style(ui.ctx().global_style());
         match kind {
             WindowKind::Popup => {
                 if self.shell.desired().popup_open {

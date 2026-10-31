@@ -68,6 +68,7 @@ struct Win {
     ctx: egui::Context,
     info: egui::ViewportInfo,
     events: Vec<egui::Event>,
+    system_theme: Option<egui::Theme>,
 }
 
 impl Win {
@@ -76,6 +77,7 @@ impl Win {
             ctx: egui::Context::default(),
             info: egui::ViewportInfo::default(),
             events: Vec::new(),
+            system_theme: None,
         }
     }
 }
@@ -86,6 +88,7 @@ struct Pass {
     commands: Vec<egui::ViewportCommand>,
     /// Every text the pass painted (empty for a hidden pass).
     texts: Vec<String>,
+    fills: Vec<egui::Color32>,
 }
 
 impl Pass {
@@ -111,6 +114,18 @@ fn collect_text(shape: &egui::Shape, out: &mut Vec<String>) {
         egui::Shape::Vec(shapes) => {
             for shape in shapes {
                 collect_text(shape, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_fills(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+    match shape {
+        egui::Shape::Rect(rect) => out.push(rect.fill),
+        egui::Shape::Vec(shapes) => {
+            for shape in shapes {
+                collect_fills(shape, out);
             }
         }
         _ => {}
@@ -304,6 +319,7 @@ impl Rig {
         };
         let mut raw = egui::RawInput {
             viewports: std::iter::once((egui::ViewportId::ROOT, win.info.clone())).collect(),
+            system_theme: win.system_theme,
             ..egui::RawInput::default()
         };
         win.info.events.clear();
@@ -329,8 +345,10 @@ impl Rig {
             } = output;
             textures_delta.clear();
             let mut texts = Vec::new();
+            let mut fills = Vec::new();
             for clipped in &shapes {
                 collect_text(&clipped.shape, &mut texts);
+                collect_fills(&clipped.shape, &mut fills);
             }
             Pass {
                 commands: viewport_output
@@ -338,6 +356,7 @@ impl Rig {
                     .map(|viewport| viewport.commands)
                     .unwrap_or_default(),
                 texts,
+                fills,
             }
         } else {
             let mut output = win.ctx.run_logic(&raw, |ctx| app.logic(ctx, kind));
@@ -347,6 +366,7 @@ impl Rig {
                     .remove(&egui::ViewportId::ROOT)
                     .unwrap_or_default(),
                 texts: Vec::new(),
+                fills: Vec::new(),
             }
         }
     }
@@ -2278,6 +2298,35 @@ fn light_config(scale: f64) -> UiEvent {
 
 fn is_dark(ctx: &egui::Context) -> bool {
     ctx.global_style().visuals.dark_mode
+}
+
+#[test]
+fn fix_x2_hidden_theme_wins_over_the_visible_system_theme() {
+    for (mode, system_theme, visuals) in [
+        ("dark", egui::Theme::Light, egui::Visuals::dark()),
+        ("light", egui::Theme::Dark, egui::Visuals::light()),
+    ] {
+        let mut rig = Rig::opened();
+        rig.push(config_reply(&json!({"ui": {"theme": {"mode": mode}}})));
+        rig.tick();
+        rig.popup.system_theme = Some(system_theme);
+        rig.settings.system_theme = Some(system_theme);
+        for kind in [WindowKind::Popup, WindowKind::Settings] {
+            for _ in 0..2 {
+                let pass = rig.pass(kind, true);
+                assert_eq!(
+                    is_dark(&rig.win_mut(kind).ctx),
+                    visuals.dark_mode,
+                    "{kind:?}: configured {mode} with system {system_theme:?}"
+                );
+                assert!(
+                    pass.fills.contains(&visuals.panel_fill),
+                    "{kind:?} must paint the configured {mode} panel: {:?}",
+                    pass.fills
+                );
+            }
+        }
+    }
 }
 
 fn assert_zoom(ctx: &egui::Context, expected: f32, what: &str) {
