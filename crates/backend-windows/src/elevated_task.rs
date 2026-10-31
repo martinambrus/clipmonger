@@ -248,8 +248,7 @@ fn elevate_schtasks(params: &str) -> Result<(), String> {
     let file = to_wide("schtasks.exe");
     let pars = to_wide(params);
     let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
-    info.cbSize = u32::try_from(std::mem::size_of::<SHELLEXECUTEINFOW>())
-        .expect("SHELLEXECUTEINFOW size fits in u32");
+    info.cbSize = u32::try_from(std::mem::size_of::<SHELLEXECUTEINFOW>()).unwrap_or(u32::MAX);
     info.fMask = SEE_MASK_NOCLOSEPROCESS;
     info.lpVerb = verb.as_ptr();
     info.lpFile = file.as_ptr();
