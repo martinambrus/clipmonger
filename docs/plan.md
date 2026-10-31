@@ -132,6 +132,12 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   portable builds and a consented logon task for Program Files builds.
   User-verified on the Windows host (portable, installed, 17 min idle,
   logoff/logon); T-409 matrix re-run for both modes.
+  Popup hotkey moved to the daemon 2026-10-30 (ADR-004, D-026): one
+  daemon thread owns the chord, raises the UI's popup during the press
+  and applies `popup.hotkey` changes without a restart; a press mints the
+  only admin-paste gesture (bound to the press target) and pushes it with
+  `ui.show_popup`; one UI per profile. Verified with synthesized presses
+  on the Windows host; hands-on checklist passed 2026-10-31.
   Open: T-410 reboot-persist leg (Settings autostart not applied yet),
   explicit pipe DACL, PNG/DIB conversion.
 - **3. X11 backend. (DONE 2026-10-26, WSL Xvfb)** Seg-05 (XFixes + manager role, transfer+INCR,
@@ -143,8 +149,9 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   primary policy, hotkey conflict+fire, paste transfer/restore,
   autostart, caps); daemon smoke under Xvfb ingests with x11 caps.
   Open: T-508 real-DE manual pass (Ubuntu box), t507 keystroke leg
-  under a real WM, reboot leg. Note: this box needed /tmp/.X11-unix
-  remounted rw for Xvfb.
+  under a real WM, reboot leg, live popup-hotkey change and a desktop
+  check of the popup push (ADR-004 open items 1 and 4). Note: this box
+  needed /tmp/.X11-unix remounted rw for Xvfb.
 - **4. Wayland backend. (DONE 2026-10-26, WSL + nested sway)** Seg-06: paste SPIKE first (§7 exit criteria),
   then data-control backends, portal hotkeys + fallbacks, dual-backend
   merge. Tests T-601…607.
@@ -155,7 +162,8 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   to one entry; paste = write+toast fallback (W-F7). Open: T-606/607
   per-compositor manual matrix + real injection (Ubuntu GNOME/KDE
   box), t609 primary positive legs (needs primary-capable peer),
-  X11-on-local-Xvfb connect hang noted in smoke (WSLg :0 used).
+  X11-on-local-Xvfb connect hang noted in smoke (WSLg :0 used), portal
+  rebind on a popup-hotkey change (ADR-004 open item 2).
 - **5. GNOME extension. (CODE DONE 2026-10-26, WSL headless; T-702…705 manual pending)**
   Seg-07 (relay, keybindings, IPC, matrix, packaging). Tests T-701…704.
   Evidence: T-701 node:test 30/30 (codec incl. 3MiB→12 chunks + sha256
@@ -167,8 +175,9 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   lifecycle callback flips extension_connected. Freeze G-F1…G-F8 in
   working notes. Open: T-702…705 + Phase-0 MetaSelection rich-format
   PoC on Ubuntu 24.04 GNOME 46 box (VERIFY-marked APIs in
-  gnome-ext/src), config.changed broadcast + hotkey popup push
-  (Step 6).
+  gnome-ext/src), config.changed broadcast (also needed for live
+  popup-hotkey changes, ADR-004 open item 3). Hotkey popup push done
+  2026-10-30 (ADR-004).
 - **6. UI v1. (CODE DONE 2026-10-27, WSL headless; T-905…908 manual pending)**
   Seg-09 (popup, tray, maximalist config for v1 scope,
   keymap). Tests T-901…907 subset.
@@ -294,6 +303,8 @@ plan.md (this file).
   (seg-04 §5; T-409/413/414). Amended by ADR-003 (D-025): a logon task
   only for Program Files binaries (known-folder check), one UAC per run
   and never a task for portable copies, per-job target window + deadline.
+  ADR-004 (D-026): the gesture is minted only by a hotkey press, bound to
+  its target window and pushed only to the verified UI binary.
 - R-011 GNOME extension session impact → size-capped async relay with
   backoff, degrade-to-capture-paused on wedge (never hang the session),
   daemon survives silence/disconnect (seg-07 §9; T-702/703).

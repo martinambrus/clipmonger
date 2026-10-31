@@ -13,6 +13,11 @@ reserved for the release that passes all seg-11 §5 gates.
   `unicode_inject` (synthetic keystrokes).
 - Portable mode: a `portable.marker` file next to `clipmonger.exe` keeps
   the profile beside the binary.
+- One UI per profile (ADR-004): starting Clipmonger again brings up the
+  running popup instead of a second copy with a second tray icon.
+- Daemon-to-UI push (`events.subscribe`, `ui.show_popup`):
+  `clipmonger-cli show-popup` opens the popup through the daemon, which
+  starts the UI when none is running.
 
 ### Changed
 
@@ -20,13 +25,28 @@ reserved for the release that passes all seg-11 §5 gates.
   elevated window is first focused. Program Files installs then use one
   UAC prompt to register a logon task that starts the elevated helper
   silently at every logon; portable copies use one UAC prompt per run and
-  never create a scheduled task. The popup owns the popup hotkey, and
-  daemon, helper and popup run without console windows.
+  never create a scheduled task. Daemon, helper and popup run without
+  console windows.
+- The daemon owns the popup hotkey on every OS (ADR-004): presses on X11,
+  through the Wayland portal and from the GNOME extension now open the
+  popup. On Windows a changed popup hotkey applies without a restart; a
+  refused chord keeps the previous one and shows in caps. Admin-window
+  pastes need the hotkey press that opened the popup: from popups opened
+  by the tray, the CLI or a second launch they are refused with a
+  visible reason.
 - Settings: the unused `windows.helper_auto_elevate` row was removed
   (28 rows).
 
 ### Fixed
 
+- Any process holding the profile token could obtain an admin-paste
+  gesture through `hotkey.fired` (ADR-003 known limitation); gestures now
+  come only from hotkey presses and go only to the verified UI.
+- Settings: the Windows settings window showed text values in JSON
+  quotes, so an edited value (for example `popup.hotkey`) failed
+  validation and was never applied; list values in both settings windows
+  were shown as JSON but read back as comma-separated text. Both windows
+  now show and read the same text form for every row kind.
 - Windows admin-window pastes were delayed by up to 30 s, silently
   dropped after ~7.5 min idle, or ran late into whatever window had
   focus: the helper heartbeat stalled on synchronous pipe I/O and jobs

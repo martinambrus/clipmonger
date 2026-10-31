@@ -51,6 +51,13 @@ binding or GNOME-extension event ONLY (no global grabs exist). UI
 forewarns the system approval dialog where binding is OS-mediated
 (review C-04/H-07).
 
+> Amended by ADR-004 (D-026, 2026-10-30): the daemon owns the popup hotkey
+> on every OS and pushes `ui.show_popup`; the UI subscribes once per
+> profile (`<profile>/ui.lock`). A press opens the popup for the window it
+> was pressed in (on Windows a press while the popup is in front hides
+> it); a `popup.open` request (CLI, second launch) while it is open only
+> raises it and keeps the target; the tray opens it without a target.
+
 ## 4. Config window (F-601/602, D-014 MAXIMALIST)
 
 Tabs: History | Permanent Clips/Macros | Databases | About/Help (+ Plugins

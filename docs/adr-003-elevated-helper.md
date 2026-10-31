@@ -5,6 +5,8 @@ host: portable and Program Files installs, 17 min idle, logoff/logon).
 Decision: D-025 (amends D-011; supersedes the seg-04 §5 spawn, lifetime,
 channel and heartbeat rules, the §3 popup-hotkey owner and the §7 helper
 autostart ban).
+Partly superseded by ADR-004 (D-026): the popup-hotkey owner and gesture
+minting lines below no longer apply.
 
 ## Decision
 

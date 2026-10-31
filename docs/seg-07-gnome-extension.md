@@ -42,6 +42,10 @@ daemon flips GNOME caps without crashing.
   on `config.changed`). Shell-level conflicts → report to daemon → caps
   note + UI hint.
 
+> Amended by ADR-004 (D-026, 2026-10-30): `hotkey.fired{id:1}` makes the
+> daemon show the popup (`ui.show_popup` push) and answers
+> `{ok, delivered}`; it returns no gesture token.
+
 ## 4. Paste-assist (with seg-06 §7 spike on GNOME)
 
 - In-Shell injection path for popup-paste/macros (VERIFY API at

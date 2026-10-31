@@ -30,6 +30,8 @@ Four cooperating programs, one data owner:
   in one egui/eframe process in v1 (simpler single-binary story); the IPC
   protocol MUST still be used between UI and daemon (no in-process
   shortcuts), so headless-daemon + remote-UI keeps working.
+  Amended by ADR-004 (D-026): one UI per profile (`<profile>/ui.lock`); a
+  second launch sends `popup.open` to the running UI and exits.
 - **CLI**: one-shot commands (`show-popup`, `list`, `paste <id>`, `toggle-
   monitor`, `exec-permanent <id>`, `status`) used by compositor key
   bindings, scripts, and QA. Every command MUST also exist as an IPC call
@@ -64,6 +66,8 @@ Four cooperating programs, one data owner:
   none (UI offers relaunch; no service — session isolation). Version
   skew: UI/CLI check daemon version in `hello`; mismatch → refuse with
   "restart required" (covers upgrades over a running daemon).
+  Amended by ADR-004 (D-026): the UI restarts a missing daemon itself;
+  after a UI crash the next popup press or `popup.open` starts the UI.
 - **Profile rendezvous (review finding 40):** clients discover the daemon
   via `<config>/clipmonger/rendezvous.json` (default profile socket path,
   protocol version; token stays in the 0600 token file, never here) or
@@ -230,6 +234,9 @@ metadata only (seg-15 logging rules; review O-02).
   `paste.execute(target)` → `PasteEngine::paste_to` (target revalidated;
   stale → clear error) → optional explicit re-store on top (a direct
   store call subject to normal dedupe — NOT a monitor event, f H-02).
+  Amended by ADR-004 (D-026): the daemon pushes `ui.show_popup` with the
+  target and the press's gesture; on Windows it raises the popup during
+  the press; the pick sends `paste.execute` with that target and gesture.
 - **Hotkey exec**: backend poll → `hotkey.fired` → daemon runs Permanent
   Clip (paste or macro, v2) without UI (target = foreground at fire time).
 - **Macro (v2)**: expander resolves `[VAR]`s (needs popup/clipboard
@@ -340,6 +347,14 @@ threading: affinity violations are a code-review blocker.
   `popup.open` request with NO UI attached makes the daemon SPAWN the UI
   (launcher path) instead of failing — so CLI/compositor bindings always
   work (review H-06/O-01). Extension↔daemon uses the same methods.
+  Amended by ADR-004 (D-026): the server answers `events.subscribe{topics}`
+  with `{ok:true}` before any event; event frames carry the topic as
+  `method`. `ui.show_popup{source, toggle, target?, gesture?, x11_time?,
+  activation_token?}` is exclusive (`already_subscribed`), limited to the
+  UI binary beside the daemon, held 10 s when nobody is subscribed, and
+  its subscription ends with the connection (no idle eviction).
+  `popup.open` returns `{delivered}` and never mints a gesture;
+  `hotkey.fired` takes the popup trigger path (ignored on Windows).
   v2 adds: `macro.run/test`, `permanent.create/update/delete/move`,
   `group.*`, `autoswitch.state`, `bar.*`,
   `plugin.list/install/remove/enable/disable`, `plugin.permissions`

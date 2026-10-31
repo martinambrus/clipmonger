@@ -57,6 +57,11 @@ for `TIMESTAMP` (ICCCM-correct subdivision, prevents races).
   grab every lock combo, recompute after keymap changes.
 - `AlreadyGrabbed` → that hotkey `Degraded` + UI warning (never crash).
 
+> Amended by ADR-004 (D-026, 2026-10-30): a popup-hotkey press triggers
+> the popup through the daemon (`ui.show_popup` push); the grab and XI2
+> raw paths report one press once. A changed `popup.hotkey` still needs a
+> daemon restart on X11 (ADR-004 open item 1).
+
 ## 4. Paste engine — `PasteEngine`
 
 - All simulation via `enigo` (default `x11rb` feature — pure Rust, no

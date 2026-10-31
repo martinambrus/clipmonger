@@ -15,7 +15,7 @@
 4. Copy a synthetic image, then synthetic files in Files.
    - Expected: Image and file clips appear with correct formats.
 5. Press the popup hotkey chord.
-   - Expected: Hotkey fires (daemon event/popup path).
+   - Expected: The popup opens (daemon `ui.show_popup` push, ADR-004).
 6. Disable the extension; copy text again.
    - Expected: caps flips to disconnected; capture pauses honestly, daemon stays up.
 7. Re-enable the extension and copy again.

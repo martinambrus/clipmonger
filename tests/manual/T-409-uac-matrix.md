@@ -16,8 +16,8 @@ Portable (user folder + `portable.marker`):
    - Expected: every paste instant and into the window the hotkey was pressed in; `audit.log` `job` entries with single-digit `ms`.
 4. Leave everything idle for more than 8 minutes, then paste into the elevated app.
    - Expected: instant paste, no prompt.
-5. Open the popup from the tray icon and pick a clip.
-   - Expected: pastes into the previously active window, or a "Paste failed" box with the reason; never silent.
+5. Open the popup from the tray icon and pick a clip; repeat with `clipmonger-cli show-popup`.
+   - Expected: pastes into the previously active standard window; for an elevated window a "Paste failed" box with the reason (popups not opened by the hotkey carry no gesture, ADR-004); never silent.
 6. On a fresh app start answer No; on another, cancel the UAC prompt.
    - Expected: no further question until the next app start; after a cancel caps paste is Degraded; elevated pastes fail visibly, standard pastes work.
 7. Tray → Exit.
@@ -43,6 +43,13 @@ Both:
 ## Evidence to attach
 
 Caps dumps before/after each leg, audit.log excerpt, screenshots of the UAC prompt and Degraded caps state. Redact paths/window titles/tokens (finding 52).
+
+## Verdict (2026-10-31, ADR-004 design)
+
+- Verdict: **PASS** for portable legs 1-3 and 5; legs 4 and 6-12 were not re-run (ADR-004 changed only the leg 5 expectation).
+- Notes: hotkey-opened admin pastes went through the helper (`job` 2 ms, twice); a tray-opened popup's admin paste was refused with a visible reason (`elevation_refused`, "missing or invalid gesture token"); a `clipmonger-cli show-popup` popup pasted into a standard terminal. After a daemon restart the app asked again and the helper reconnected. Same session: ADR-004 checklist (hold, toggle, live `popup.hotkey` change, second launch, UI and daemon restart) passed over RustDesk.
+- Signature: user (interactive session)
+- Date: 2026-10-31
 
 ## Verdict (2026-10-30, ADR-003 design)
 

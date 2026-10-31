@@ -47,6 +47,14 @@ everything in this segment except §10 (v3).
 > Amended by ADR-003 (D-025, 2026-10-30): on Windows the popup UI registers
 > the popup hotkey; the daemon registers no popup chord.
 
+> Amended by ADR-004 (D-026, 2026-10-30; supersedes the note above): the
+> daemon registers the popup hotkey on one thread that owns all daemon
+> hotkeys and raises the UI's popup itself during the press; the UI
+> registers no chord and installs no keyboard hook. A changed
+> `popup.hotkey` applies without a restart: the new chord is registered
+> before the old one is dropped; a refused chord keeps the old one, is
+> retried every 5 s and shows as `hotkey: degraded` with a note.
+
 - Via `global-hotkey` crate (`RegisterHotKey`, `WM_HOTKEY`, MOD_WIN/
   MOD_CONTROL/MOD_ALT/MOD_SHIFT/MOD_NOREPEAT per MS Learn).
 - Chord syntax (shared, see seg-09): e.g. `win+v`, `ctrl+alt+1`.
@@ -100,6 +108,12 @@ limit = `popup.unicode_limit` (default 64 KiB, review M-18).
 > binary checks and liveness from the pipe (no heartbeat); every job
 > carries its target window and a 2 s deadline. Where this section
 > conflicts with ADR-003, ADR-003 wins.
+
+> Amended by ADR-004 (D-026, 2026-10-30): the gesture token is minted
+> only for a hotkey press, bound to the window captured at that press,
+> pushed only to the verified UI and sent back with the paste. Popups
+> opened from the tray, the CLI or a second launch carry none, so their
+> admin-window pastes are refused with a visible reason.
 
 Total Commander-style: NOTHING runs elevated until the user actually
 pastes/macros into a high-integrity window.
@@ -198,7 +212,10 @@ v3 time; MUST NOT affect v1 architecture (separate module).
 ## 11. Segment tests (T-4xx)
 
 > ADR-003 (D-025) updates the meaning of T-403, T-409, T-413 and T-414;
-> see its migration / test impact section.
+> see its migration / test impact section. ADR-004 (D-026) extends T-406
+> (a refused chord change keeps the old chord) and T-413 (gestures bound to
+> the press target; `popup.open` never mints, `hotkey.fired` mints nothing
+> on Windows).
 
 - T-401 `[unit]` HTML Format header parse/serialize vectors (fragments,
   missing offsets, UTF-8/UTF-16 CuttingEdge cases) + malformed/overlong-header fuzz vectors.

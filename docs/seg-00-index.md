@@ -21,7 +21,9 @@ Project name: Clipmonger (D-021; the `arsclip-x` working title is retired).
 Status = acceptance state (`Final` = user-accepted 2026-10-16 per
 plan gate 0.8; post-freeze corrections use short ADRs per §5, never
 silent edits — review L-04; ADR-001/002 + D-021/022/023 accepted 2026-10-25
-under a user-authorized reopen; ADR-003 + D-025 accepted 2026-10-30).
+under a user-authorized reopen; ADR-003 + D-025 accepted 2026-10-30;
+ADR-004 + D-026 accepted 2026-10-30, Windows hands-on QA passed
+2026-10-31, Linux open items pending).
 
 | File | Content | Status |
 |---|---|---|
@@ -42,6 +44,7 @@ under a user-authorized reopen; ADR-003 + D-025 accepted 2026-10-30).
 | `adr-001-plugins.md` | ADR: out-of-process IPC plugin system (D-022) | Final |
 | `adr-002-i18n.md` | ADR: string ids + community catalogs (D-023) | Final |
 | `adr-003-elevated-helper.md` | ADR: elevated helper per install mode, pipe liveness, paste deadlines (D-025) | Final |
+| `adr-004-daemon-popup-hotkey.md` | ADR: daemon-owned popup hotkey, `ui.show_popup` push, press-bound gestures, one UI per profile (D-026) | Final (Linux open items) |
 
 ## 3. Decision log
 
@@ -69,7 +72,8 @@ under a user-authorized reopen; ADR-003 + D-025 accepted 2026-10-30).
 | D-021 | Project name = Clipmonger (`APP_IDENTITY` = `clipmonger`); `arsclip-x` working title retired pre-v1, no migration (nothing shipped). | DECIDED (user 2026-10-25) | all segments |
 | D-022 | Plugin system = out-of-process IPC plugins, Notepad++-inspired UX (one-click admin, drop-to-install, curated list); v1 reservations, v2 host, v3+ list. | DECIDED (user 2026-10-25) | adr-001 |
 | D-023 | i18n = stable string ids + versioned community catalogs; English-only v1, translations from v2 (Slovak first, user-supplied, non-blocking). | DECIDED (user 2026-10-25) | adr-002 |
-| D-025 | Elevated helper (amends D-011): consent on first admin-window focus; installed builds = one UAC, then a logon task starts the helper silently; portable builds = one UAC per run, never a scheduled task; per-profile pipe with mutual binary checks, liveness from the pipe, per-job target window + 2 s deadline; the popup UI owns the Windows popup hotkey. | DECIDED (user 2026-10-30) | adr-003 |
+| D-025 | Elevated helper (amends D-011): consent on first admin-window focus; installed builds = one UAC, then a logon task starts the helper silently; portable builds = one UAC per run, never a scheduled task; per-profile pipe with mutual binary checks, liveness from the pipe, per-job target window + 2 s deadline; the popup UI owns the Windows popup hotkey (superseded by D-026). | DECIDED (user 2026-10-30) | adr-003 |
+| D-026 | Popup hotkey + push (supersedes the D-025 popup-hotkey line): the daemon owns the popup hotkey on every OS and pushes `ui.show_popup` to the one UI per profile (`ui.lock`); a press captures the paste target and mints the only gesture that allows an admin-window paste; `popup.open` never mints, nor does `hotkey.fired` on Windows; Windows applies a changed chord without a restart. | DECIDED (user 2026-10-30) | adr-004 |
 
 ### Past decision sessions (Q1–Q9; review L-04)
 

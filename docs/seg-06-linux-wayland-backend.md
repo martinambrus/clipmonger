@@ -57,6 +57,11 @@ record (no external tooling needed).
    shortcuts, Hyprland `bind` — document per compositor, QA-owned).
 3. **GNOME extension keybindings** (seg-07) where neither applies.
 
+> Amended by ADR-004 (D-026, 2026-10-30): portal `Activated` triggers the
+> popup through the daemon (`ui.show_popup` push); presses less than
+> 300 ms apart (portal and extension reporting one chord) count once. The
+> chord is bound once per daemon run (ADR-004 open item 2).
+
 ## 5. Tray / autostart
 
 Tray = seg-09 §7 menu on the single KSNI-preferring Linux build

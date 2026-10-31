@@ -1,7 +1,7 @@
 # Plan (source of truth)
 
 This folder holds the full specification: `plan.md` + `seg-00`…`seg-12`
-+ `adr-001`…`adr-003`.
++ `adr-001`…`adr-004`.
 Start at `seg-00-index.md`.
 
 - **Reviewers (agents + humans): work on THESE files.** This folder is
