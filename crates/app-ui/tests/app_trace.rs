@@ -1350,3 +1350,122 @@ fn fix_x1_group_activation_does_not_pick_a_clip() {
         assert_eq!(rig.trace(), vec![open_line("hotkey", true, true)]);
     }
 }
+
+#[test]
+fn fix_x3_permanent_error_reopens_and_traces_the_painted_error_once() {
+    permanent_failure_reopens(UiEvent::Error("exec failed".to_string()), "exec failed");
+}
+
+#[test]
+fn fix_x3_permanent_unavailable_reopens_and_traces_the_painted_error_once() {
+    permanent_failure_reopens(
+        UiEvent::PasteUnavailable,
+        clipmonger_app_ui::strings::text("popup.paste_blocked"),
+    );
+}
+
+fn permanent_failure_reopens(failure: UiEvent, message: &str) {
+    let mut rig = Rig::new(true);
+    send_permanent(&mut rig);
+    rig.push(failure);
+    rig.tick();
+    assert!(rig.is_open(), "{message}: a failed exec reopens the popup");
+    assert_eq!(rig.app.shell().error(), Some(message));
+    assert_eq!(
+        rig.cmds(),
+        vec![UiCmd::ListHistory, UiCmd::ListPermanents, UiCmd::PermGroups]
+    );
+    rig.show().centre_of(message);
+    let expected = vec![
+        open_line("start", false, false),
+        hide_line("pick"),
+        paste_line(false),
+        open_line("paste_failed", false, false),
+        error_line(),
+    ];
+    assert_eq!(rig.trace(), expected);
+    rig.tick();
+    rig.show().centre_of(message);
+    assert_eq!(
+        rig.trace(),
+        expected,
+        "a later pass does not repeat the error"
+    );
+    rig.tray(TrayAction::Toggle);
+    rig.tick();
+    let hidden_trace = rig.trace();
+    rig.push(UiEvent::Error("unrelated later error".to_string()));
+    rig.tick();
+    assert!(!rig.is_open(), "the failed exec was already handled");
+    assert_eq!(rig.trace(), hidden_trace);
+}
+
+fn send_permanent(rig: &mut Rig) {
+    show_permanents(rig);
+    let row = rig.show().centre_of("Signature");
+    let _ = rig.cmds();
+    click(rig, row);
+    assert!(!rig.is_open());
+    rig.tick();
+    thread::sleep(Duration::from_millis(170));
+    rig.tick();
+    assert_eq!(rig.cmds(), vec![UiCmd::ExecPermanent(Uuid::from_u128(77))]);
+}
+
+#[test]
+fn fix_x3_successful_permanent_does_not_reopen_for_a_later_error() {
+    let mut rig = Rig::new(true);
+    send_permanent(&mut rig);
+    rig.push(UiEvent::PasteDone(Uuid::from_u128(77)));
+    rig.tick();
+    let before = rig.trace();
+    rig.push(UiEvent::Error("unrelated later error".to_string()));
+    rig.tick();
+    assert!(!rig.is_open());
+    assert_eq!(rig.trace(), before);
+}
+
+#[test]
+fn fix_x3_permanent_error_reopens_even_with_settings_open() {
+    let mut rig = Rig::new(true);
+    send_permanent(&mut rig);
+    rig.tray(TrayAction::OpenConfig);
+    rig.tick();
+    rig.push(UiEvent::Error("exec failed".to_string()));
+    rig.tick();
+    assert!(rig.is_open());
+    assert!(rig.app.desired().settings_open);
+    assert_eq!(rig.app.shell().error(), Some("exec failed"));
+    assert_eq!(rig.app.config().lock().expect("settings").error, "");
+    rig.show().centre_of("exec failed");
+    assert_eq!(
+        rig.trace()
+            .iter()
+            .filter(|line| **line == error_line())
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn fix_x3_closed_errors_without_an_exec_are_not_traced_or_reopened() {
+    for failure in [
+        UiEvent::Error("background".to_string()),
+        UiEvent::PasteUnavailable,
+    ] {
+        let mut rig = Rig::new(false);
+        rig.push(failure);
+        rig.tick();
+        assert!(!rig.is_open());
+        assert!(rig.app.shell().error().is_some());
+        assert_eq!(
+            rig.trace(),
+            Vec::<Value>::new(),
+            "a hidden error is not shown"
+        );
+        rig.push(request());
+        rig.tick();
+        assert!(rig.app.shell().error().is_none());
+        assert_eq!(rig.trace(), vec![open_line("request", false, false)]);
+    }
+}
