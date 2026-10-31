@@ -74,7 +74,7 @@ impl PopupApp {
             ];
             for (key, name) in pairs {
                 // egui activates the focused widget without consuming its key.
-                if widget_focused && matches!(key, egui::Key::Enter | egui::Key::Space) {
+                if widget_focused && key == egui::Key::Enter {
                     continue;
                 }
                 if input.key_pressed(key) {
