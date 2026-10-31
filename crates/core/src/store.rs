@@ -1515,8 +1515,10 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Unsupported`] for traversal, symlink, or oversize
-    /// entries, [`CoreError::Config`] for bad manifests, or
+    /// Returns [`CoreError::Unsupported`] for traversal, absolute or
+    /// drive-prefixed names, symlinks, or entries whose declared size is over
+    /// the cap, [`CoreError::Io`] when entry data exceeds its declared size,
+    /// [`CoreError::Config`] for bad manifests, or
     /// [`CoreError::Corrupt`] when the embedded DB fails validation.
     pub fn restore_zip(src: &Path, profile: &Path) -> Result<(), CoreError> {
         let tag = TMP_CTR.fetch_add(1, Ordering::SeqCst);
@@ -1760,7 +1762,7 @@ fn enforce_bytes(tx: &rusqlite::Transaction<'_>, blobs: &Path, max: u64) -> Resu
     Ok(purged)
 }
 
-/// Reject symlinks via Unix mode bits (portable across `zip` versions).
+/// Reject symlinks via file type bits 0o12 in the Unix mode `zip` reports.
 fn is_symlink_entry<R: std::io::Read + std::io::Seek>(e: &zip::read::ZipFile<'_, R>) -> bool {
     e.unix_mode().is_some_and(|m| m >> 12 == 0o12)
 }
