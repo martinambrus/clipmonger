@@ -40,8 +40,7 @@ confidence-threshold = 0.8
 # Their license texts are retained in licenses/fonts/ for release shipping.
 # Pinned to the version whose notices are in licenses/fonts/; re-check them when egui updates it.
 [[licenses.exceptions]]
-name = "epaint_default_fonts"
-version = "=0.37.0"
+crate = "epaint_default_fonts@0.37.0"
 allow = ["OFL-1.1", "Ubuntu-font-1.0"]
 
 [bans]
