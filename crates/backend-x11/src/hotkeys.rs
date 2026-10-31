@@ -327,8 +327,13 @@ impl HotkeyManager for X11Hotkeys {
             match event {
                 Some(x11rb14::protocol::Event::KeyPress(press)) => {
                     self.last_grab.insert(press.detail, Instant::now());
+                    // The XI2 raw path may have reported this press already.
+                    let raw_fired = self
+                        .last_raw_at
+                        .get(&press.detail)
+                        .is_some_and(|at| at.elapsed() < Duration::from_millis(300));
                     for (id, grab) in &self.by_id {
-                        if grab.keycode == press.detail && !fired.contains(id) {
+                        if grab.keycode == press.detail && !raw_fired && !fired.contains(id) {
                             fired.push(*id);
                         }
                     }
@@ -350,6 +355,10 @@ impl HotkeyManager for X11Hotkeys {
                 }
                 Some(_) => {}
                 None => std::thread::sleep(Duration::from_millis(5)),
+            }
+            if !fired.is_empty() {
+                // Report the press now, not at the deadline.
+                break;
             }
         }
         Ok(fired)

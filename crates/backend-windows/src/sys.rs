@@ -358,6 +358,38 @@ pub fn pipe_server_pid(pipe_handle: *mut std::ffi::c_void) -> Option<u32> {
     }
 }
 
+/// Foreground window as a handle value (daemon seam, no Win32 types).
+#[must_use]
+pub fn foreground_window_id() -> Option<i64> {
+    foreground_hwnd().map(|hwnd| hwnd as i64)
+}
+
+/// Show `hwnd` and make it the foreground window, but only when it belongs
+/// to `owner_pid` (the verified UI's popup). Returns whether it is in front
+/// afterwards.
+#[must_use]
+pub fn show_owned_window(hwnd: i64, owner_pid: u32) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW};
+    // i64 handle round-trips through HWND on 64-bit Windows.
+    let window = hwnd as HWND;
+    if window_pid(window) != Some(owner_pid) {
+        return false;
+    }
+    // Safety: plain window-manager call on a window of the UI process.
+    unsafe {
+        ShowWindow(window, SW_SHOW);
+    }
+    activate_window(window)
+}
+
+/// Pass this process's right to set the foreground window on to `pid`.
+#[must_use]
+pub fn allow_set_foreground(pid: u32) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+    // Safety: no pointers; without the right the call just fails.
+    unsafe { AllowSetForegroundWindow(pid) != 0 }
+}
+
 /// Owning process id of a `WinHwnd` handle value (daemon supervisor seam).
 #[must_use]
 pub fn hwnd_owner_pid(hwnd: i64) -> Option<u32> {

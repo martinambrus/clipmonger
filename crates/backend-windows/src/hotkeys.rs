@@ -223,13 +223,19 @@ impl HotkeyManager for WinHotkeys {
             let parsed = chord::parse(chord_text)?;
             let (mods, code) = to_ghk(&parsed)?;
             let manager = self.manager.as_ref().ok_or_else(unavailable)?;
-            if let Some(old) = self.by_id.remove(&id) {
-                self.by_ghk.remove(&old.id());
-                let _ = manager.unregister(old);
-            }
             let hotkey = global_hotkey::hotkey::HotKey::new(Some(mods), code);
+            let old = self.by_id.get(&id).copied();
+            if old.is_some_and(|old| old.id() == hotkey.id()) {
+                return Ok(());
+            }
+            // The new chord goes in before the old one is dropped, so a
+            // refused change keeps the working chord.
             match manager.register(hotkey) {
                 Ok(()) => {
+                    if let Some(old) = old {
+                        self.by_ghk.remove(&old.id());
+                        let _ = manager.unregister(old);
+                    }
                     self.by_ghk.insert(hotkey.id(), id);
                     self.by_id.insert(id, hotkey);
                     Ok(())
@@ -303,6 +309,10 @@ impl HotkeyManager for WinHotkeys {
                         }
                     }
                     Err(_) => {
+                        if !fired.is_empty() {
+                            // Report the press now, not at the deadline.
+                            break;
+                        }
                         std::thread::sleep(Duration::from_millis(5));
                     }
                 }

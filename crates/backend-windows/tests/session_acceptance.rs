@@ -183,6 +183,31 @@ fn t406_hotkey_fire() {
     );
 }
 
+/// T-406 live chord change: a refused change keeps the working chord, and
+/// re-registering the same chord is a no-op.
+#[test]
+fn t406_refused_change_keeps_chord() {
+    const T: &str = "t406_refused_change_keeps_chord";
+    let mut holder = WinHotkeys::new();
+    guard!(holder.register(HotkeyId(51), "ctrl+alt+F7"), T);
+    let mut hk = WinHotkeys::new();
+    guard!(hk.register(HotkeyId(52), "ctrl+alt+F6"), T);
+
+    let refused = hk
+        .register(HotkeyId(52), "ctrl+alt+F7")
+        .expect_err("a chord held elsewhere is refused");
+    assert_conflict(&refused, T);
+    let mut probe = WinHotkeys::new();
+    let kept = probe
+        .register(HotkeyId(53), "ctrl+alt+F6")
+        .expect_err("the old chord is still registered");
+    assert_conflict(&kept, T);
+
+    guard!(hk.register(HotkeyId(52), "ctrl+alt+F6"), T);
+    guard!(hk.unregister(HotkeyId(52)), T);
+    guard!(holder.unregister(HotkeyId(51)), T);
+}
+
 /// T-411 guarded restore: a user copy during the dwell must NOT restore;
 /// an unchanged slot MUST restore. Decided through the real platform
 /// `guarded_restore_decision` predicate fed with real transfer state.

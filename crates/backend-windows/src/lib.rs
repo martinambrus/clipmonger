@@ -35,8 +35,9 @@ pub use paste::WinPaste;
 /// leg is manual QA, never automated).
 #[cfg(windows)]
 pub use sys::{
-    hwnd_owner_pid, pipe_client_pid, pipe_server_pid, process_image_path, process_token_high,
-    program_files_dir, spawn_elevated_worker,
+    allow_set_foreground, foreground_window_id, hwnd_owner_pid, pipe_client_pid, pipe_server_pid,
+    process_image_path, process_token_high, program_files_dir, show_owned_window,
+    spawn_elevated_worker,
 };
 pub use transfer::WinTransfer;
 
