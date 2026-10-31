@@ -1787,7 +1787,7 @@ fn unsupported(msg: &str) -> CoreError {
 fn extract_zip(src: &Path, tmp: &Path) -> Result<(), CoreError> {
     let file = fs::File::open(src).map_err(CoreError::Io)?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| zip_err(&e))?;
-    let mut names: Vec<String> = Vec::with_capacity(zip.len());
+    let mut indices = Vec::with_capacity(zip.len());
     let mut total = 0_u64;
     for i in 0..zip.len() {
         let e = zip.by_index(i).map_err(|e| zip_err(&e))?;
@@ -1811,11 +1811,11 @@ fn extract_zip(src: &Path, tmp: &Path) -> Result<(), CoreError> {
             if total > RESTORE_MAX_TOTAL {
                 return Err(unsupported("zip archive exceeds size cap"));
             }
-            names.push(e.name().map_err(|e| zip_err(&e))?.into_owned());
+            indices.push(i);
         }
     }
-    for name in &names {
-        let mut e = zip.by_name(name).map_err(|e| zip_err(&e))?;
+    for i in indices {
+        let mut e = zip.by_index(i).map_err(|e| zip_err(&e))?;
         let out = tmp.join(
             e.enclosed_name()
                 .ok_or_else(|| unsupported("zip entry escapes target directory"))?,
