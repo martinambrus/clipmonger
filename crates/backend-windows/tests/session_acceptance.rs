@@ -1,9 +1,9 @@
 //! WINBACK interop acceptance harness (ruler only).
 //!
 //! Windows-session tests for the frozen `clipmonger_backend_windows` API
-//! (see `../../harness-spec.md`). This file is `#![cfg(windows)]` for the
-//! whole test crate, so it compiles to an empty (passing) crate on Linux
-//! and only runs on a real Windows session.
+//! (see `.agents/tmp/windows-v1/winback/harness-spec.md`). This file is
+//! `#![cfg(windows)]` for the whole test crate, so it compiles to an empty
+//! (passing) crate on Linux and only runs on a real Windows session.
 //!
 //! SKIP contract: every test first probes clipboard/OS availability. When
 //! the session cannot provide clipboard APIs (RDP-restricted, headless CI,
