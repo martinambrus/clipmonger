@@ -70,6 +70,8 @@ pub struct PopupApp {
     config: Arc<Mutex<ConfigWindowState>>,
     cmds: mpsc::Sender<UiCmd>,
     events: mpsc::Receiver<UiEvent>,
+    /// One event peeked after the drain cap; handled first on the next pass.
+    pending_event: Option<UiEvent>,
     tray: Box<dyn FnMut() -> Vec<TrayAction>>,
     _hold: Option<Box<dyn Any>>,
     allow_foreground: Box<dyn Fn()>,
@@ -121,6 +123,7 @@ impl PopupApp {
             config: Arc::new(Mutex::new(ConfigWindowState::new(profile))),
             cmds,
             events,
+            pending_event: None,
             tray,
             _hold: hold,
             allow_foreground,
@@ -661,10 +664,18 @@ impl runner::App for PopupApp {
                     self.feed(Event::CloseRequest);
                 }
                 for _ in 0..DRAIN_CAP {
-                    let Ok(event) = self.events.try_recv() else {
+                    let Some(event) = self
+                        .pending_event
+                        .take()
+                        .or_else(|| self.events.try_recv().ok())
+                    else {
                         break;
                     };
                     self.on_bridge(event);
+                }
+                self.pending_event = self.events.try_recv().ok();
+                if self.pending_event.is_some() {
+                    ctx.request_repaint();
                 }
                 for action in (self.tray)() {
                     self.on_tray(&action);

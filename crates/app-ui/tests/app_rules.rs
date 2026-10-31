@@ -3347,3 +3347,41 @@ fn rule_config_applied_popup_keys_settles_the_wildcard_edit() {
     assert!(!doc.is_dirty("popup.keys.*"));
     assert_eq!(doc.get("popup.keys"), Some(&json!({"refresh": "F7"})));
 }
+
+#[test]
+fn fix_x4_capped_queue_requests_one_follow_up_without_losing_order() {
+    let mut rig = Rig::closed();
+    rig.warm_up();
+    // Count explicit requests; egui also calls the integration callback while
+    // consuming the previous zero-delay request at the start of a pass.
+    rig.popup.ctx.set_request_repaint_callback(|_| {});
+    let requests = Arc::clone(&rig.requests);
+    rig.popup.ctx.set_repaint_observer(move |info| {
+        requests
+            .lock()
+            .expect("requests")
+            .push(Request { delay: info.delay });
+    });
+    for index in 0..(DRAIN_CAP + 3) {
+        rig.push(UiEvent::ConfigError(format!("queued {index}")));
+    }
+    rig.tick();
+    assert_eq!(
+        rig.app.config().lock().expect("settings").error,
+        format!("queued {}", DRAIN_CAP - 1)
+    );
+    let requests = rig.requests();
+    assert_eq!(requests.iter().filter(|r| r.delay.is_zero()).count(), 1);
+    rig.tick();
+    assert_eq!(
+        rig.app.config().lock().expect("settings").error,
+        format!("queued {}", DRAIN_CAP + 2)
+    );
+    assert!(rig.requests().iter().all(|r| !r.delay.is_zero()));
+    for _ in 0..DRAIN_CAP {
+        rig.push(UiEvent::RestoreDone);
+    }
+    rig.tick();
+    assert_eq!(rig.cmds().len(), DRAIN_CAP);
+    assert!(rig.requests().iter().all(|r| !r.delay.is_zero()));
+}
