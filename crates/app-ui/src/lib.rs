@@ -1,7 +1,10 @@
 //! Popup, tray and lifecycle logic plus the IPC bridge.
 
+#[cfg(feature = "gui")]
+pub mod app;
 pub mod chord;
 pub mod config_model;
+pub mod foreground;
 pub mod ipc_bridge;
 pub mod keymap;
 pub mod lifecycle;

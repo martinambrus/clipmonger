@@ -1,7 +1,7 @@
-//! The runner: our own event loop for egui on winit with a CPU rasterizer,
-//! replacing eframe. A popup window and an optional settings window, each with
-//! its own egui context. App logic runs on every pass, visible or hidden; the
-//! ui runs only while the window is shown. Not wired into the app yet.
+//! The runner: our own event loop for egui on winit with a CPU rasterizer.
+//! A popup window and an optional settings window, each with its own egui
+//! context. App logic runs on every pass, visible or hidden; the ui runs only
+//! while the window is shown.
 
 pub mod render;
 pub mod sched;
@@ -10,8 +10,12 @@ pub mod window;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui::{Context, RawInput, ViewportBuilder, ViewportEvent, ViewportId, ViewportInfo};
+use egui::{
+    ClippedPrimitive, Color32, Context, RawInput, ViewportBuilder, ViewportEvent, ViewportId,
+    ViewportInfo,
+};
 use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy, OwnedDisplayHandle};
 use winit::window::{Window, WindowId};
@@ -157,6 +161,7 @@ struct Host {
     window: Arc<Window>,
     state: egui_winit::State,
     presenter: render::Presenter,
+    present_error_logged: bool,
     info: ViewportInfo,
     visibility: Visibility,
 }
@@ -191,9 +196,33 @@ impl Host {
             window,
             state,
             presenter,
+            present_error_logged: false,
             info,
             visibility,
         })
+    }
+}
+
+impl Host {
+    /// Present one frame. The first error of this window is printed, later
+    /// ones are dropped.
+    fn present(
+        &mut self,
+        rasterizer: &mut render::Rasterizer,
+        size: PhysicalSize<u32>,
+        pixels_per_point: f32,
+        clear: Color32,
+        primitives: &[ClippedPrimitive],
+    ) {
+        if let Err(error) =
+            self.presenter
+                .present(rasterizer, size, pixels_per_point, clear, primitives)
+        {
+            if !self.present_error_logged {
+                self.present_error_logged = true;
+                eprintln!("cannot present a frame: {error}");
+            }
+        }
     }
 }
 
@@ -208,11 +237,13 @@ struct Slot {
 }
 
 impl Slot {
-    fn new(kind: WindowKind, proxy: &EventLoopProxy<UserEvent>) -> Self {
+    fn new(
+        kind: WindowKind,
+        proxy: &EventLoopProxy<UserEvent>,
+        fonts: &Arc<egui_system_font_provider::SystemFontProvider>,
+    ) -> Self {
         let ctx = Context::default();
-        ctx.add_font_provider(Arc::new(
-            egui_system_font_provider::SystemFontProvider::new(),
-        ));
+        ctx.add_font_provider(fonts.clone());
         let proxy = proxy.clone();
         ctx.set_request_repaint_callback(move |info| {
             let _ = proxy.send_event(UserEvent::Repaint {
@@ -263,6 +294,7 @@ impl Slot {
 struct Runner<A: App> {
     config: Config,
     proxy: EventLoopProxy<UserEvent>,
+    fonts: Arc<egui_system_font_provider::SystemFontProvider>,
     make_app: Option<Box<dyn FnOnce(Startup) -> A>>,
     app: Option<A>,
     surface_context: Option<softbuffer::Context<OwnedDisplayHandle>>,
@@ -279,10 +311,12 @@ impl<A: App> Runner<A> {
         proxy: EventLoopProxy<UserEvent>,
         make_app: Box<dyn FnOnce(Startup) -> A>,
     ) -> Self {
-        let popup = Slot::new(WindowKind::Popup, &proxy);
+        let fonts = Arc::new(egui_system_font_provider::SystemFontProvider::new());
+        let popup = Slot::new(WindowKind::Popup, &proxy, &fonts);
         Self {
             config,
             proxy,
+            fonts,
             make_app: Some(make_app),
             app: None,
             surface_context: None,
@@ -446,7 +480,7 @@ impl<A: App> Runner<A> {
                 let clear = ctx.global_style().visuals.panel_fill;
                 if let Some(host) = slot.host.as_mut() {
                     let size = host.window.inner_size();
-                    let _ = host.presenter.present(
+                    host.present(
                         &mut slot.rasterizer,
                         size,
                         pixels_per_point,
@@ -569,7 +603,7 @@ impl<A: App> Runner<A> {
     ) -> Result<(), RunError> {
         if open {
             if self.settings.is_none() {
-                let slot = Slot::new(WindowKind::Settings, &self.proxy);
+                let slot = Slot::new(WindowKind::Settings, &self.proxy, &self.fonts);
                 self.settings = Some(slot);
             }
             let needs_host = self

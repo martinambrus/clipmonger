@@ -22,6 +22,8 @@ pub enum TrayUiState {
 pub enum TrayAction {
     /// Open the popup.
     OpenPopup,
+    /// Left click on the tray icon: hide the popup when it is open, else open it.
+    Toggle,
     /// Flip the monitoring-paused flag.
     TogglePause,
     /// Pause monitoring for one hour.
