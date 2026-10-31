@@ -200,6 +200,11 @@ impl PopupApp {
     ///    sends only `ListHistory`) and clears `seen_focus`; open to closed:
     ///    sets `hide_unconfirmed` and clears `seen_focus`.
     fn feed(&mut self, event: Event) {
+        self.feed_at(event, self.millis());
+    }
+
+    /// Feed an event with its occurrence time on the shell clock.
+    fn feed_at(&mut self, event: Event, at: Millis) {
         let was_open = self.shell.desired().popup_open;
         let old_error = self.shell.error().map(str::to_owned);
         let error_kind = matches!(
@@ -208,7 +213,7 @@ impl PopupApp {
         );
         let source = trace::open_source(&event);
         let reason = trace::hide_reason(&event);
-        let effects = self.shell.handle(event, self.millis());
+        let effects = self.shell.handle(event, at);
         let is_open = self.shell.desired().popup_open;
         if !was_open && is_open {
             let context = self.shell.context();
@@ -487,6 +492,11 @@ impl PopupApp {
     fn on_tray(&mut self, action: &TrayAction) {
         match action {
             TrayAction::Toggle => self.feed(Event::TrayToggle),
+            TrayAction::ToggleAt(pressed) => {
+                let at = u64::try_from(pressed.saturating_duration_since(self.start).as_millis())
+                    .unwrap_or(u64::MAX);
+                self.feed_at(Event::TrayToggle, at);
+            }
             TrayAction::OpenPopup => self.feed(Event::Bridge(UiEvent::ShowPopup(ShowPopupEvent {
                 source: "request".to_string(),
                 ..ShowPopupEvent::default()
@@ -795,5 +805,41 @@ mod tests {
             vec![Duration::from_millis(1)],
             "a deadline that elapsed after tick must still wake the runner"
         );
+    }
+    #[test]
+    fn fix_x7_held_tray_press_does_not_reopen_a_focus_loss_hide() {
+        use crate::tray_logic::{left_button_action, LeftButtonEvent};
+        for focus_first in [true, false] {
+            let (cmds, _) = mpsc::channel();
+            let (_, events) = mpsc::channel();
+            let mut app = PopupApp::new(AppParts {
+                profile: PathBuf::from("tray-rig"),
+                cmds,
+                events,
+                tray: Box::new(Vec::new),
+                hold: None,
+                open: true,
+                status_period: STATUS_PERIOD,
+                trace: None,
+                allow_foreground: Box::new(|| {}),
+            });
+            app.start = Instant::now() - Duration::from_secs(1);
+            let pressed = app.start + Duration::from_millis(10);
+            if focus_first {
+                app.feed_at(Event::FocusLost, 10);
+            }
+            if let Some(action) = left_button_action(LeftButtonEvent::Down, pressed) {
+                app.on_tray(&action);
+            }
+            if !focus_first {
+                app.feed_at(Event::FocusLost, 10);
+            }
+            if let Some(action) =
+                left_button_action(LeftButtonEvent::Up, pressed + Duration::from_secs(1))
+            {
+                app.on_tray(&action);
+            }
+            assert!(!app.shell.desired().popup_open, "focus_first={focus_first}");
+        }
     }
 }

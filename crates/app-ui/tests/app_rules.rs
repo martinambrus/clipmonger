@@ -3385,3 +3385,32 @@ fn fix_x4_capped_queue_requests_one_follow_up_without_losing_order() {
     assert_eq!(rig.cmds().len(), DRAIN_CAP);
     assert!(rig.requests().iter().all(|r| !r.delay.is_zero()));
 }
+
+#[test]
+fn fix_x7_single_and_double_tray_click_each_toggle_once() {
+    use clipmonger_app_ui::tray_logic::{left_button_action, LeftButtonEvent};
+    for sequence in [
+        vec![LeftButtonEvent::Down, LeftButtonEvent::Up],
+        vec![
+            LeftButtonEvent::Down,
+            LeftButtonEvent::Up,
+            LeftButtonEvent::DoubleClick,
+            LeftButtonEvent::Up,
+        ],
+    ] {
+        let mut rig = Rig::closed();
+        let start = Instant::now();
+        let actions: Vec<_> = sequence
+            .iter()
+            .enumerate()
+            .filter_map(|(i, event)| {
+                left_button_action(*event, start + Duration::from_millis(i as u64 * 50))
+            })
+            .collect();
+        assert_eq!(actions.len(), 1, "{sequence:?}");
+        rig.tray(&actions);
+        rig.tick();
+        assert!(rig.is_open(), "{sequence:?}");
+        assert_eq!(rig.cmds(), open_commands());
+    }
+}

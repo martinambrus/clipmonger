@@ -242,13 +242,27 @@ fn create_tray(wake: push::Wake, online: bool) -> TrayParts {
     let click_tx = tx.clone();
     let click_wake = wake.clone();
     TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-        if let TrayIconEvent::Click {
-            button: MouseButton::Left,
-            button_state: MouseButtonState::Up,
-            ..
-        } = event
+        let button_event = match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Down,
+                ..
+            } => Some(tray_logic::LeftButtonEvent::Down),
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } => Some(tray_logic::LeftButtonEvent::Up),
+            TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => Some(tray_logic::LeftButtonEvent::DoubleClick),
+            _ => None,
+        };
+        if let Some(action) =
+            button_event.and_then(|event| tray_logic::left_button_action(event, Instant::now()))
         {
-            let _ = click_tx.send(TrayAction::Toggle);
+            let _ = click_tx.send(action);
             click_wake();
         }
     }));
