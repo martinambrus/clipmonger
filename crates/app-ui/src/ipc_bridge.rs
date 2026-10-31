@@ -418,6 +418,6 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
         }
         (UiCmd::PasteClip(_), Err(error)) => UiEvent::Error(error.message),
         (UiCmd::PasteClipTo(..), Err(error)) => UiEvent::PasteFailed(error.message),
-        (UiCmd::ExecPermanent(_), Err(error)) => UiEvent::Error(error.message),
+        (UiCmd::ExecPermanent(_), Err(error)) => UiEvent::PasteFailed(error.message),
     }
 }

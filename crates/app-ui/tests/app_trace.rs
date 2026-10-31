@@ -1353,7 +1353,7 @@ fn fix_x1_group_activation_does_not_pick_a_clip() {
 
 #[test]
 fn fix_x3_permanent_error_reopens_and_traces_the_painted_error_once() {
-    permanent_failure_reopens(UiEvent::Error("exec failed".to_string()), "exec failed");
+    permanent_failure_reopens(permanent_backend_failure("exec failed"), "exec failed");
 }
 
 #[test]
@@ -1431,7 +1431,7 @@ fn fix_x3_permanent_error_reopens_even_with_settings_open() {
     send_permanent(&mut rig);
     rig.tray(TrayAction::OpenConfig);
     rig.tick();
-    rig.push(UiEvent::Error("exec failed".to_string()));
+    rig.push(permanent_backend_failure("exec failed"));
     rig.tick();
     assert!(rig.is_open());
     assert!(rig.app.desired().settings_open);
@@ -1467,5 +1467,65 @@ fn fix_x3_closed_errors_without_an_exec_are_not_traced_or_reopened() {
         rig.tick();
         assert!(rig.app.shell().error().is_none());
         assert_eq!(rig.trace(), vec![open_line("request", false, false)]);
+    }
+}
+
+/// Get the actual bridge reply to a failed permanent execution.
+fn permanent_backend_failure(message: &str) -> UiEvent {
+    use clipmonger_app_ui::ipc_bridge::{Bridge, Transport};
+    use clipmonger_ipc::proto::IpcError;
+    struct FailedExec(String);
+    impl Transport for FailedExec {
+        fn call(&mut self, method: &str, _: &Value) -> Result<Value, IpcError> {
+            assert_eq!(method, "permanent.exec");
+            Err(IpcError::new("backend", self.0.clone()))
+        }
+    }
+    let (tx, rx) = Bridge::spawn(Box::new(FailedExec(message.to_string())));
+    tx.send(UiCmd::ExecPermanent(Uuid::from_u128(77)))
+        .expect("exec");
+    rx.recv_timeout(Duration::from_secs(2)).expect("exec reply")
+}
+
+#[test]
+fn fix_n1_unrelated_error_does_not_steal_a_pending_permanent_failure() {
+    for settings in [false, true] {
+        let mut rig = Rig::new(true);
+        send_permanent(&mut rig);
+        if settings {
+            rig.tray(TrayAction::OpenConfig);
+            rig.tick();
+            rig.app
+                .config()
+                .lock()
+                .expect("settings")
+                .pending_apply
+                .push("popup.font_scale".to_string());
+        }
+        let before = rig.trace();
+        rig.push(UiEvent::Error("earlier command failed".to_string()));
+        rig.tick();
+        assert!(
+            !rig.is_open(),
+            "an earlier command must not reopen the popup"
+        );
+        assert_eq!(rig.trace(), before);
+        if settings {
+            let config = rig.app.config().lock().expect("settings");
+            assert_eq!(config.error, "earlier command failed");
+            assert!(config.pending_apply.is_empty());
+        }
+        rig.push(permanent_backend_failure("exec failed"));
+        rig.tick();
+        assert!(rig.is_open());
+        assert_eq!(rig.app.shell().error(), Some("exec failed"));
+        rig.show().centre_of("exec failed");
+        assert_eq!(
+            rig.trace()
+                .iter()
+                .filter(|line| **line == error_line())
+                .count(),
+            1
+        );
     }
 }

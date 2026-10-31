@@ -313,15 +313,16 @@ impl PopupApp {
     ///   (`pending_apply` not empty) the text goes to the Settings error line
     ///   and `pending_apply` is cleared, and the shell does not hear it;
     ///   otherwise the shell hears it (popup error line).
-    /// - A sent `ExecPermanent` consumes its success or failure reply. Its
-    ///   `Error` or `PasteUnavailable` becomes `PasteFailed` so the shell
-    ///   reopens the popup with the error, even when Settings is open.
+    /// - A sent `ExecPermanent` consumes its success or paste failure reply.
+    ///   `PasteUnavailable` becomes `PasteFailed` so the shell reopens with
+    ///   the error even when Settings is open. Generic errors keep their
+    ///   normal routing and cannot complete an exec.
     /// - `ShowPopup`, `PasteFailed`, `PasteUnavailable`, `Offline`,
     ///   `StopFailed`, `Stopped`, `AnotherInstance`: the shell hears them.
     #[allow(clippy::too_many_lines)]
     fn on_bridge(&mut self, event: UiEvent) {
         let event = match event {
-            UiEvent::Error(message) if self.exec_in_flight.is_some() => {
+            UiEvent::PasteFailed(message) => {
                 self.exec_in_flight = None;
                 UiEvent::PasteFailed(message)
             }

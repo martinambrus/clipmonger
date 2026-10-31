@@ -287,7 +287,7 @@ fn u4_exec_result_mapping() {
     let (tx, rx, _s) = spawn_canned(Err(IpcError::new("backend", "boom".to_string())));
     tx.send(UiCmd::ExecPermanent(id)).expect("send exec");
     assert!(
-        matches!(recv(&rx), UiEvent::Error(_)),
+        matches!(recv(&rx), UiEvent::PasteFailed(_)),
         "backend error must map to Error"
     );
     let (tx, rx, seen) = spawn_canned(Ok(json!({ "ok": true })));
