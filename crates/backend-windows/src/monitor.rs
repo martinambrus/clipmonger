@@ -82,11 +82,7 @@ fn current_seq() -> Option<u32> {
 fn read_format_string(id: u32) -> Option<String> {
     let mut out = Vec::new();
     clipboard_win::raw::get_vec(id, &mut out).ok()?;
-    if out.len() > 64 {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out).into_owned();
-    Some(text.trim_matches('\0').trim().to_string())
+    crate::optout::decode_marker(&out)
 }
 
 /// Enumerate current offers plus opt-out `(name, value)` pairs.
