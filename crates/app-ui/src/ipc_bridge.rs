@@ -93,7 +93,7 @@ pub enum UiEvent {
     PasteDone(Uuid),
     /// Daemon refused paste.
     PasteUnavailable,
-    /// Targeted paste failed; carries the daemon message.
+    /// Popup paste failed; carries the error message.
     PasteFailed(String),
     /// Permanent execution failed; carries its id and the daemon error.
     ExecFailed(Uuid, IpcError),

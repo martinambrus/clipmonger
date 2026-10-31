@@ -468,6 +468,7 @@ impl PopupApp {
 
     /// Handle one tray action:
     /// - `Toggle`: `feed(Event::TrayToggle)`.
+    /// - `ToggleAt`: `feed_at(Event::TrayToggle, press time on the shell clock)`.
     /// - `OpenPopup`: a request push, `feed(Event::Bridge(UiEvent::ShowPopup(
     ///   ShowPopupEvent { source: "request", ..Default::default() })))`.
     /// - `TogglePause`: clear the pause deadline, send `MonitorToggle`.
