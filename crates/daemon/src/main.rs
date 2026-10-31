@@ -46,6 +46,99 @@ fn flag_value(args: &[String], name: &str) -> Option<PathBuf> {
     None
 }
 
+/// The popup UI binary next to this daemon.
+fn sibling_ui_exe() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
+    let dir = exe
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    dir.join(format!("clipmonger{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// Whether process `pid` runs the binary at `exe`.
+fn process_runs(pid: u32, exe: &Path) -> bool {
+    #[cfg(all(windows, feature = "backend-windows"))]
+    {
+        clipmonger_backend_windows::process_image_path(pid)
+            .is_some_and(|path| path.eq_ignore_ascii_case(&exe.to_string_lossy()))
+    }
+    #[cfg(unix)]
+    {
+        fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|path| path == exe)
+    }
+    #[cfg(not(any(all(windows, feature = "backend-windows"), unix)))]
+    {
+        let _ = (pid, exe);
+        false
+    }
+}
+
+/// Only the sibling UI binary may receive popup pushes (they carry gesture
+/// tokens), and only with a popup window it owns.
+fn ui_subscribe_guard() -> clipmonger_ipc::server::SubscribeGuard {
+    use clipmonger_ipc::proto::methods::SHOW_POPUP_TOPIC;
+    let ui_exe = sibling_ui_exe();
+    Arc::new(move |topic, peer_pid, params| {
+        if topic != SHOW_POPUP_TOPIC {
+            return true;
+        }
+        let Some(pid) = peer_pid else {
+            return false;
+        };
+        if !process_runs(pid, &ui_exe) {
+            return false;
+        }
+        #[cfg(all(windows, feature = "backend-windows"))]
+        if let Some(hwnd) = params.get("popup_hwnd").and_then(serde_json::Value::as_u64) {
+            if clipmonger_backend_windows::hwnd_owner_pid(hwnd.cast_signed()) != Some(pid) {
+                return false;
+            }
+        }
+        let _ = params;
+        true
+    })
+}
+
+/// Start the sibling UI with its popup showing. `CLIPMONGER_NO_UI_SPAWN`
+/// turns this off (binary tests).
+fn ui_launcher(profile: PathBuf) -> clipmonger_daemon::popup::UiLauncher {
+    Arc::new(move || {
+        if std::env::var_os("CLIPMONGER_NO_UI_SPAWN").is_some() {
+            return false;
+        }
+        let spawned = std::process::Command::new(sibling_ui_exe())
+            .arg("--profile-dir")
+            .arg(&profile)
+            .arg("--popup")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(child) => {
+                // A press gave this process the foreground right; pass it on.
+                #[cfg(all(windows, feature = "backend-windows"))]
+                let _ = clipmonger_backend_windows::allow_set_foreground(child.id());
+                // Reap the child when it exits (no zombies).
+                #[cfg(unix)]
+                {
+                    let mut child = child;
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                }
+                #[cfg(not(unix))]
+                drop(child);
+                true
+            }
+            Err(e) => {
+                eprintln!("daemon: UI start failed: {e}");
+                false
+            }
+        }
+    })
+}
+
 /// Generate a single-line token for `<profile>/token`.
 fn generate_token() -> String {
     if let Ok(raw) = fs::read_to_string("/proc/sys/kernel/random/uuid") {
@@ -98,8 +191,8 @@ fn wanted_format(mime: &str, formats: &[String]) -> bool {
 }
 
 /// Construct the live Windows backend: typed caps, monitor thread (real
-/// payloads via transfer honoring opt-out + privacy counter), and the
-/// admin-window consent watcher. The popup hotkey belongs to the UI.
+/// payloads via transfer honoring opt-out + privacy counter), the popup
+/// chord thread, and the admin-window consent watcher.
 #[cfg(all(windows, feature = "backend-windows"))]
 #[allow(clippy::too_many_lines)]
 fn setup_windows_backend(
@@ -129,13 +222,6 @@ fn setup_windows_backend(
         }
     };
 
-    // The popup UI owns the popup hotkey: it is the process that shows the
-    // popup, and its RegisterHotKey keeps firing while an elevated window is
-    // focused. Registering the same chord here would take it from the UI
-    // (first registration wins) and leave the UI on a keyboard-hook
-    // fallback that is blind in elevated windows.
-    let hotkey_conflict = false;
-
     // Autostart handle for future UI wiring; never enabled at startup.
     // Portable when the profile lives beside the daemon binary.
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
@@ -145,13 +231,22 @@ fn setup_windows_backend(
     let autostart = WinAutostart::new(exe, profile.starts_with(&exe_dir));
     let _ = autostart.is_enabled();
 
-    let mut caps = backend_caps::caps_for(hotkey_conflict, false);
+    let mut caps = backend_caps::caps_for(false, false);
     if !monitor_ok {
         caps.monitor = Level::Degraded;
         caps.notes
             .push("monitor Degraded: session clipboard unavailable".to_string());
     }
-    state.register_backend("windows", caps);
+    {
+        // The chord thread registers the caps with its hotkey state; wait
+        // for its first try so `status` reports a refused chord from the
+        // start.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let state = Arc::clone(state);
+        let shutdown = Arc::clone(shutdown);
+        std::thread::spawn(move || popup_chord_loop(&state, &caps, &shutdown, ready_tx));
+        let _ = ready_rx.recv_timeout(std::time::Duration::from_secs(5));
+    }
     {
         let profile = profile.to_path_buf();
         let state = Arc::clone(state);
@@ -211,6 +306,55 @@ fn setup_windows_backend(
                 }
             }
         });
+    }
+}
+
+/// Popup chord (Windows), the one owner of the daemon's hotkeys. A press
+/// lands here, so the daemon may raise the UI's popup (seg-02 §9).
+/// `popup.hotkey` is read live; a refused chord keeps the previous one and
+/// is retried; caps carry the result. `ready` fires after the first try.
+#[cfg(all(windows, feature = "backend-windows"))]
+fn popup_chord_loop(
+    state: &DaemonState,
+    base_caps: &clipmonger_platform::types::BackendCaps,
+    shutdown: &std::sync::atomic::AtomicBool,
+    ready: std::sync::mpsc::Sender<()>,
+) {
+    use clipmonger_backend_windows::WinHotkeys;
+    use clipmonger_daemon::popup::{ChordStatus, PopupChord, PopupSource};
+    use clipmonger_platform::traits::HotkeyManager;
+    use clipmonger_platform::types::{HotkeyId, Level};
+
+    // The `global-hotkey` window belongs to the thread that builds the
+    // manager and fires only while that thread pumps (inside `poll`).
+    let mut hotkeys = WinHotkeys::new();
+    let mut chord = PopupChord::default();
+    let mut ready = Some(ready);
+    while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        let wanted = state.popup_hotkey();
+        if let Some(status) = chord.sync(&mut hotkeys, &wanted, std::time::Instant::now()) {
+            let mut caps = base_caps.clone();
+            if let ChordStatus::Refused(why) = status {
+                eprintln!("daemon: popup hotkey unavailable: {why}");
+                caps.hotkey = Level::Degraded;
+                caps.notes.push(format!("hotkey Degraded: {why}"));
+            }
+            state.register_backend("windows", caps);
+        }
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(());
+        }
+        match hotkeys.poll(std::time::Duration::from_millis(200)) {
+            Ok(ids) => {
+                if ids.contains(&HotkeyId(1)) {
+                    state.trigger_popup(PopupSource::Press);
+                }
+            }
+            Err(e) => {
+                eprintln!("daemon: hotkey poll failed: {e}");
+                break;
+            }
+        }
     }
 }
 
@@ -301,7 +445,7 @@ fn admin_consent_loop(
 
 /// Construct the live X11 backend: typed caps, monitor thread (real
 /// payloads via transfer honoring the denylist + privacy counter), and
-/// the popup-hotkey listener (daemon-event only, like Windows).
+/// the popup-hotkey listener (presses trigger the popup, like Windows).
 #[cfg(all(unix, feature = "backend-x11"))]
 #[allow(clippy::too_many_lines)]
 fn setup_x11_backend(
@@ -364,6 +508,8 @@ fn setup_x11_backend(
     };
     let mut hotkey_conflict = false;
     if let Some(hotkeys) = hotkeys.as_mut() {
+        // Registered once: a `popup.hotkey` change needs a daemon restart on
+        // X11 (live on Windows via `popup_chord_loop`; ADR-004 open item 1).
         if let Err(e) = hotkeys.register(HotkeyId(1), &config.popup.hotkey) {
             eprintln!("daemon: popup hotkey unavailable: {e}");
             hotkey_conflict = true;
@@ -456,9 +602,8 @@ fn setup_x11_backend(
             while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 match hotkeys.poll(std::time::Duration::from_millis(200)) {
                     Ok(ids) => {
-                        for id in ids {
-                            state.mint_gesture_token();
-                            eprintln!("daemon: hotkey fired id={} (daemon-event only)", id.0);
+                        if ids.contains(&HotkeyId(1)) {
+                            state.trigger_popup(clipmonger_daemon::popup::PopupSource::Press);
                         }
                     }
                     Err(e) => {
@@ -486,8 +631,8 @@ fn want_backends(display: Option<&str>, wayland_display: Option<&str>) -> (bool,
 
 /// Construct the live Wayland backend: probe-driven caps, monitor thread
 /// (real payloads via transfer honoring the config formats), and the
-/// `GlobalShortcuts` portal session for the popup hotkey (daemon-event only,
-/// like X11/Windows). A missing compositor only degrades caps; the daemon
+/// `GlobalShortcuts` portal session for the popup hotkey (presses trigger
+/// the popup, like X11/Windows). A missing compositor only degrades caps; the daemon
 /// keeps running (offline rule, seg-02 S7).
 #[cfg(all(unix, feature = "backend-wayland"))]
 #[allow(clippy::too_many_lines)]
@@ -841,6 +986,14 @@ async fn main() {
     state.set_profile_dir(&profile);
     state.set_config(config.clone());
     state.set_paste_limits(config.popup.unicode_limit, config.popup.delivery_dwell_ms);
+    // Before the backends start: a hotkey thread may trigger the popup at once.
+    let hub = clipmonger_ipc::server::EventHub::new(vec![clipmonger_ipc::server::TopicRule {
+        topic: clipmonger_ipc::proto::methods::SHOW_POPUP_TOPIC.to_string(),
+        exclusive: true,
+    }])
+    .with_guard(ui_subscribe_guard());
+    state.attach_event_hub(hub.clone());
+    state.set_ui_launcher(ui_launcher(profile.clone()));
     let backend_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     setup_session_backends(&profile, &state, &config, &backend_shutdown);
     let stop: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
@@ -876,24 +1029,29 @@ async fn main() {
         }
     });
 
+    let options = clipmonger_ipc::server::ServeOptions {
+        lifecycle: Some(lifecycle),
+        hub: Some(hub),
+        #[cfg(all(windows, feature = "backend-windows"))]
+        pipe_peer_pid: Some(Arc::new(|handle| {
+            clipmonger_backend_windows::pipe_client_pid(handle as *mut std::ffi::c_void)
+        })),
+        #[cfg(not(all(windows, feature = "backend-windows")))]
+        pipe_peer_pid: None,
+    };
     #[cfg(unix)]
-    if let Err(e) = clipmonger_ipc::server::Server::bind_with_lifecycle(
-        &socket,
-        token,
-        handler,
-        Some(lifecycle.clone()),
-    )
-    .await
+    if let Err(e) =
+        clipmonger_ipc::server::Server::bind_with(&socket, token, handler, options).await
     {
         eprintln!("daemon: bind failed: {e}");
         std::process::exit(1);
     }
     #[cfg(windows)]
-    if let Err(e) = clipmonger_ipc::server::Server::bind_pipe_with_lifecycle(
+    if let Err(e) = clipmonger_ipc::server::Server::bind_pipe_with(
         &socket.to_string_lossy(),
         token,
         handler,
-        Some(lifecycle),
+        options,
     ) {
         eprintln!("daemon: bind failed: {e}");
         std::process::exit(1);

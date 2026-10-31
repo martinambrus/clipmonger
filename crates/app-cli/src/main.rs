@@ -155,7 +155,7 @@ fn main() -> ExitCode {
         Cmd::List => ("history.list", serde_json::json!({}), false),
         Cmd::Get { id } => ("history.get", serde_json::json!({"clip": id}), false),
         Cmd::Paste { id } => ("paste.execute", serde_json::json!({"clip": id}), false),
-        Cmd::ShowPopup => ("ui.show_popup", serde_json::json!({}), false),
+        Cmd::ShowPopup => ("popup.open", serde_json::json!({}), false),
         Cmd::ToggleMonitor => ("monitor.set", serde_json::json!({"toggle": true}), false),
         Cmd::ExecPermanent { id } => ("permanent.exec", serde_json::json!({"id": id}), false),
         Cmd::PermanentList => ("permanent.list", serde_json::json!({}), false),

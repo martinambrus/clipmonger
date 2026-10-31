@@ -656,6 +656,7 @@ dependencies = [
  "serde_json",
  "softbuffer",
  "tiny-skia 0.12.0",
+ "tokio",
  "tray-icon",
  "uuid",
  "windows 0.61.3",

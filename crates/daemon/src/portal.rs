@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// (the portal may show a system dialog; the UI forewarns from the
 /// `portal_bind_pending` status field). Success re-registers the wayland
 /// caps with the portal hotkey live; failure re-registers them degraded
-/// with a portal note. `Activated` fires mint a gesture token like the
+/// with a portal note. `Activated` fires trigger the popup like the
 /// X11/Windows hotkey threads.
 #[cfg(all(unix, feature = "backend-wayland"))]
 pub fn spawn_portal_session(state: Arc<crate::DaemonState>, chord: String, capture_primary: bool) {
@@ -104,8 +104,7 @@ async fn run_session(state: Arc<crate::DaemonState>, chord: String, capture_prim
     while let Some(signal) = futures_util::StreamExt::next(&mut activated).await {
         let payload = serde_json::json!({"shortcut_id": signal.shortcut_id()});
         if parse_activated(&payload).is_some() {
-            state.mint_gesture_token();
-            eprintln!("daemon: portal hotkey fired (daemon-event only)");
+            state.trigger_popup(crate::popup::PopupSource::Press);
         }
     }
 }

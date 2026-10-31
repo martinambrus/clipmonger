@@ -8,8 +8,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clipmonger_app_ui::{
-    config_model, ipc_bridge, keymap, lifecycle, linux_tray, permanents, placement, popup, strings,
-    tray_logic,
+    config_model, ipc_bridge, keymap, lifecycle, linux_tray, permanents, placement, popup, push,
+    strings, tray_logic,
 };
 use clipmonger_core::config::Config;
 use clipmonger_ipc::client::Client;
@@ -30,6 +30,8 @@ const SPAWN_TRIES: u32 = 50;
 const SPAWN_WAIT: Duration = Duration::from_millis(100);
 /// Max bridge events drained per frame.
 const DRAIN_CAP: usize = 32;
+/// Least time between reconnect attempts while the daemon is away.
+const RECONNECT_EVERY: Duration = Duration::from_secs(2);
 /// Popup window size.
 const POPUP_SIZE: (i32, i32) = (480, 360);
 
@@ -46,30 +48,88 @@ fn popup_position_for_monitor(monitor_size: Option<egui::Vec2>) -> Option<egui::
     Some(egui::pos2(px as f32, py as f32))
 }
 
-/// Blocking client wrapped as bridge transport.
-struct ClientTransport {
-    client: Client,
+/// Bridge transport to the daemon. Without a link (daemon not up yet, or
+/// gone) a call first reconnects, starting the daemon if needed, at most
+/// every [`RECONNECT_EVERY`]. A failed call is never retried, so a paste can
+/// never run twice; while offline every call fails as unavailable and the
+/// window stays open.
+struct DaemonTransport {
+    profile: PathBuf,
+    client: Option<Client>,
+    last_attempt: Option<Instant>,
 }
 
-impl ipc_bridge::Transport for ClientTransport {
+impl DaemonTransport {
+    fn new(profile: PathBuf, client: Option<Client>) -> Self {
+        Self {
+            profile,
+            client,
+            last_attempt: Option::None,
+        }
+    }
+}
+
+impl ipc_bridge::Transport for DaemonTransport {
     fn call(&mut self, method: &str, params: &Value) -> Result<Value, IpcError> {
-        self.client.call(method, params.clone())
+        if self.client.is_none()
+            && self
+                .last_attempt
+                .is_none_or(|at| at.elapsed() >= RECONNECT_EVERY)
+        {
+            self.last_attempt = Some(Instant::now());
+            self.client = try_connect(&self.profile).or_else(|| {
+                if spawn_daemon(&self.profile) {
+                    try_connect(&self.profile)
+                } else {
+                    Option::None
+                }
+            });
+        }
+        let Some(client) = &self.client else {
+            return Err(IpcError {
+                code: "unavailable".to_string(),
+                message: "daemon not running".to_string(),
+                retryable: true,
+                backend: Option::None,
+            });
+        };
+        let outcome = client.call(method, params.clone());
+        if outcome
+            .as_ref()
+            .is_err_and(|e| matches!(e.code.as_str(), "io_failed" | "connection_closed"))
+        {
+            self.client = Option::None;
+        }
+        outcome
     }
 }
 
-/// Transport used when no daemon is reachable: every call fails as
-/// unavailable so the window opens offline instead of exiting.
-struct OfflineTransport;
+/// Listen for daemon pushes (popup requests) on their own connection.
+fn start_push_listener(
+    profile: PathBuf,
+    extra: Value,
+    events: mpsc::Sender<ipc_bridge::UiEvent>,
+    wake: push::Wake,
+) {
+    push::spawn_listener(move || try_connect(&profile), extra, events, wake);
+}
 
-impl ipc_bridge::Transport for OfflineTransport {
-    fn call(&mut self, _method: &str, _params: &Value) -> Result<Value, IpcError> {
-        Err(IpcError {
-            code: "unavailable".to_string(),
-            message: "daemon not running".to_string(),
-            retryable: true,
-            backend: Option::None,
-        })
+/// Another UI holds the profile: have the daemon show that UI's popup.
+fn hand_over_to_running_ui(profile: &Path) {
+    // Started by the user, this process may pass on the foreground right,
+    // so the running popup can come to the front.
+    #[cfg(all(windows, feature = "software"))]
+    fallback::allow_foreground_handoff();
+    if let Some(client) = try_connect(profile) {
+        let _ = client.call("popup.open", serde_json::json!({}));
     }
+}
+
+/// Unix milliseconds now (paste pick time).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Read the profile token file.
@@ -142,6 +202,9 @@ fn parse_args() -> (Option<PathBuf>, bool) {
             profile = args.next().map(PathBuf::from);
         } else if arg == "--minimized" {
             minimized = true;
+        } else if arg == "--popup" {
+            // Started by the daemon for a popup request: start open.
+            minimized = false;
         } else if arg == "--fallback" {
             std::env::set_var("CLIPMONGER_FORCE_FALLBACK", "1");
         }
@@ -283,6 +346,12 @@ struct ShellApp {
     pause_deadline: Option<Instant>,
     viewport_corrected: bool,
     exit_requested: bool,
+    /// Window the popup was opened for (from the daemon's hotkey push).
+    paste_target: Option<u64>,
+    /// Gesture minted with that press (admin-window pastes need it).
+    paste_gesture: Option<u64>,
+    /// Bring the window to the front on the next frame.
+    focus_requested: bool,
     #[cfg(any(windows, target_os = "macos"))]
     real_tray: Option<RealTray>,
     #[cfg(target_os = "linux")]
@@ -365,6 +434,8 @@ impl ShellApp {
                 ipc_bridge::UiEvent::Pinned(id, pinned) => self.vm.apply_pin(id, pinned),
                 ipc_bridge::UiEvent::PasteDone(_) => {
                     self.open = false;
+                    self.paste_target = Option::None;
+                    self.paste_gesture = Option::None;
                 }
                 ipc_bridge::UiEvent::Stopped => {
                     self.open = false;
@@ -471,7 +542,9 @@ impl ShellApp {
                     self.send(ipc_bridge::UiCmd::ListPermanents);
                     self.send(ipc_bridge::UiCmd::PermGroups);
                 }
-                ipc_bridge::UiEvent::Purged(_) | ipc_bridge::UiEvent::HotkeyAck => {}
+                ipc_bridge::UiEvent::Purged(_) => {}
+                ipc_bridge::UiEvent::ShowPopup(show) => self.on_show_popup(&show),
+                ipc_bridge::UiEvent::AnotherInstance => self.exit_requested = true,
                 ipc_bridge::UiEvent::BackupDone(path) => {
                     if let Ok(mut config) = self.config.lock() {
                         config.error = format!("{} {path}", strings::text("config.backup_saved"));
@@ -507,18 +580,42 @@ impl ShellApp {
         self.tray.sync(&mut self.fake_tray, &self.inputs);
     }
 
+    /// Daemon push: open the popup, or hide it when the press toggles it.
+    fn on_show_popup(&mut self, show: &clipmonger_ipc::proto::methods::ShowPopupEvent) {
+        if show.toggle {
+            self.open = false;
+            return;
+        }
+        // A request (tray, CLI, second launch) keeps an open popup's target.
+        if show.source == "hotkey" || !self.open {
+            self.paste_target = show.target;
+            self.paste_gesture = show.gesture;
+        }
+        self.run_tray_action(tray_logic::TrayAction::OpenPopup);
+        self.focus_requested = true;
+    }
+
     /// Apply one view-model effect to commands and window state.
     fn apply_effect(&mut self, effect: popup::VmEffect) {
         match effect {
             popup::VmEffect::None => {}
-            popup::VmEffect::Paste(id) => {
-                // Picking a clip is the user gesture an admin-window paste
-                // requires (the daemon no longer owns the popup hotkey).
-                #[cfg(windows)]
-                self.send(ipc_bridge::UiCmd::HotkeyFired);
-                self.send(ipc_bridge::UiCmd::PasteClip(id));
+            popup::VmEffect::Paste(id) => match self.paste_target {
+                Some(target) => {
+                    let gesture = self.paste_gesture.take();
+                    self.send(ipc_bridge::UiCmd::PasteClipTo(
+                        id,
+                        Some(target),
+                        now_ms(),
+                        gesture,
+                    ));
+                }
+                Option::None => self.send(ipc_bridge::UiCmd::PasteClip(id)),
+            },
+            popup::VmEffect::Dismiss => {
+                self.open = false;
+                self.paste_target = Option::None;
+                self.paste_gesture = Option::None;
             }
-            popup::VmEffect::Dismiss => self.open = false,
             popup::VmEffect::Remove(id) => self.send(ipc_bridge::UiCmd::DeleteClip(id)),
             popup::VmEffect::Pin(id) => {
                 let pinned = !self.vm.is_pinned(id);
@@ -938,7 +1035,7 @@ impl ShellApp {
                                     }
                                 }
                             }
-                            if key == "popup.hotkey" {
+                                                        if key == "popup.hotkey" {
                                 ui.label(strings::text("config.applies_on_restart"));
                             }
                         }
@@ -1256,6 +1353,9 @@ impl eframe::App for ShellApp {
             self.send(ipc_bridge::UiCmd::Stop);
         }
         self.drain_events();
+        if std::mem::take(&mut self.focus_requested) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         if self.exit_requested {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -1318,6 +1418,14 @@ impl eframe::App for ShellApp {
 fn main() -> ExitCode {
     let (profile_arg, minimized) = parse_args();
     let profile = profile_arg.unwrap_or_else(default_profile);
+    // One UI per profile; a second launch shows the running UI's popup.
+    let _instance = match lifecycle::claim_single_instance(&profile) {
+        lifecycle::InstanceClaim::Primary(lock) => lock,
+        lifecycle::InstanceClaim::Secondary => {
+            hand_over_to_running_ui(&profile);
+            return ExitCode::SUCCESS;
+        }
+    };
     let client = try_connect(&profile).or_else(|| {
         if spawn_daemon(&profile) {
             try_connect(&profile)
@@ -1326,12 +1434,10 @@ fn main() -> ExitCode {
         }
     });
     let mode = lifecycle::start_mode(client.is_some());
-    let transport: Box<dyn ipc_bridge::Transport> = match client {
-        Some(client) => Box::new(ClientTransport { client }),
-        Option::None => Box::new(OfflineTransport),
-    };
+    let transport: Box<dyn ipc_bridge::Transport> =
+        Box::new(DaemonTransport::new(profile.clone(), client));
     let online = mode == lifecycle::StartMode::Attached;
-    let (cmds, events) = ipc_bridge::Bridge::spawn(transport);
+    let (cmds, push_events, events) = ipc_bridge::Bridge::spawn_shared(transport);
     let _ = cmds.send(ipc_bridge::UiCmd::Status);
     let _ = cmds.send(ipc_bridge::UiCmd::ListHistory);
     let _ = cmds.send(ipc_bridge::UiCmd::ListPermanents);
@@ -1370,6 +1476,9 @@ fn main() -> ExitCode {
         pause_deadline: None,
         viewport_corrected: false,
         exit_requested: false,
+        paste_target: Option::None,
+        paste_gesture: Option::None,
+        focus_requested: false,
         #[cfg(any(windows, target_os = "macos"))]
         real_tray: match RealTray::create(&tray_logic::TrayInputs::default()) {
             Some(tray) => Some(tray),
@@ -1384,17 +1493,23 @@ fn main() -> ExitCode {
     #[cfg(all(windows, feature = "software"))]
     if std::env::var("CLIPMONGER_FORCE_FALLBACK").as_deref() == Ok("1") {
         eprintln!("forced fallback mode (virtual display / RustDesk)");
-        let fb_transport: Box<dyn ipc_bridge::Transport> = match try_connect(&profile) {
-            Some(c) => Box::new(ClientTransport { client: c }),
-            None => Box::new(OfflineTransport),
-        };
-        let fallback_cfg = Arc::new(Mutex::new(ConfigWindowState::new(profile.clone())));
-        let (f_cmds, f_events) = ipc_bridge::Bridge::spawn(fb_transport);
-        let _ = f_cmds.send(ipc_bridge::UiCmd::Status);
-        let _ = f_cmds.send(ipc_bridge::UiCmd::ListHistory);
-        return fallback::run_fallback(f_cmds, f_events, fallback_cfg);
+        return run_fallback_ui(&profile);
     }
-    let eframe_res = eframe::run_native("clipmonger", options, Box::new(|_| Ok(Box::new(app))));
+    let listener_profile = profile.clone();
+    let eframe_res = eframe::run_native(
+        "clipmonger",
+        options,
+        Box::new(move |cc| {
+            let ctx = cc.egui_ctx.clone();
+            start_push_listener(
+                listener_profile,
+                serde_json::json!({}),
+                push_events,
+                Arc::new(move || ctx.request_repaint()),
+            );
+            Ok(Box::new(app))
+        }),
+    );
     match eframe_res {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -1404,19 +1519,28 @@ fn main() -> ExitCode {
                 let msg = error.to_string();
                 if msg.contains("opengl") || msg.contains("OpenGL") || msg.contains("glow") {
                     eprintln!("eframe glow unavailable (virtual display), falling back to softbuffer (CPU)");
-                    let fb_transport: Box<dyn ipc_bridge::Transport> = match try_connect(&profile) {
-                        Some(c) => Box::new(ClientTransport { client: c }),
-                        None => Box::new(OfflineTransport),
-                    };
-                    let fallback_cfg =
-                        Arc::new(Mutex::new(ConfigWindowState::new(profile.clone())));
-                    let (f_cmds, f_events) = ipc_bridge::Bridge::spawn(fb_transport);
-                    let _ = f_cmds.send(ipc_bridge::UiCmd::Status);
-                    let _ = f_cmds.send(ipc_bridge::UiCmd::ListHistory);
-                    return fallback::run_fallback(f_cmds, f_events, fallback_cfg);
+                    return run_fallback_ui(&profile);
                 }
             }
             ExitCode::from(1)
         }
     }
+}
+
+/// Run the Win32 popup with its own daemon link and push listener.
+#[cfg(all(windows, feature = "software"))]
+fn run_fallback_ui(profile: &Path) -> ExitCode {
+    let transport = Box::new(DaemonTransport::new(
+        profile.to_path_buf(),
+        try_connect(profile),
+    ));
+    let fallback_cfg = Arc::new(Mutex::new(ConfigWindowState::new(profile.to_path_buf())));
+    let (cmds, push_events, events) = ipc_bridge::Bridge::spawn_shared(transport);
+    let _ = cmds.send(ipc_bridge::UiCmd::Status);
+    let _ = cmds.send(ipc_bridge::UiCmd::ListHistory);
+    let push = fallback::PushLink {
+        profile: profile.to_path_buf(),
+        events: push_events,
+    };
+    fallback::run_fallback(cmds, events, fallback_cfg, push)
 }

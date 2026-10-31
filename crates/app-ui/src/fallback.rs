@@ -21,8 +21,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     EN_CHANGE, ES_AUTOHSCROLL, HMENU, LBN_DBLCLK, LBN_SELCHANGE, MSG, SW_HIDE, SW_SHOW,
     WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_APP, WM_CLOSE,
-    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP,
-    WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD,
+    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_PAINT,
+    WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD,
     WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 const POPUP_SIZE: (u32, u32) = (480, 360);
@@ -33,6 +33,8 @@ const IDC_CONFIG: i32 = 104;
 const TIMER_IPC: usize = 1;
 const TIMER_QUIT: usize = 2;
 const WM_TRAY: u32 = WM_APP + 1;
+/// A daemon push was queued; drain events now.
+const WM_APP_PUSH: u32 = WM_APP + 2;
 const ID_TRAY_SHOW: usize = 1001;
 const ID_TRAY_SETTINGS: usize = 1002;
 const ID_TRAY_EXIT: usize = 1003;
@@ -49,42 +51,31 @@ struct PopupState {
     last_poll: Instant,
     should_exit: bool,
 }
+/// Where daemon pushes for this popup come from and go to.
+pub struct PushLink {
+    pub profile: std::path::PathBuf,
+    pub events: mpsc::Sender<ipc_bridge::UiEvent>,
+}
+
+/// Let any process take the foreground once (until the next input): a
+/// second launch passes its right on so the running popup can come to
+/// the front.
+pub fn allow_foreground_handoff() {
+    // Safety: no pointers; without the right the call just fails.
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
+            windows::Win32::UI::WindowsAndMessaging::ASFW_ANY,
+        );
+    }
+}
+
 static mut G_STATE: Option<*mut PopupState> = None;
 static mut G_ORIG_EDIT: isize = 0;
 static mut G_ORIG_LIST: isize = 0;
 static mut G_TARGET_HWND: Option<windows::Win32::Foundation::HWND> = None;
-static mut G_HOTKEY_FALLBACK: bool = false;
-static mut G_HOTKEY_HOOK: Option<windows::Win32::UI::WindowsAndMessaging::HHOOK> = None;
-static mut G_HOTKEY_HWND: Option<HWND> = None;
+/// Gesture minted with the hotkey press that opened the popup.
+static mut G_GESTURE: Option<u64> = None;
 static mut G_TRAY_HWND: Option<HWND> = None;
-static mut G_HOTKEY_PREV_DOWN: bool = false;
-static mut G_HOTKEY_VK: u32 = 0x48;
-static mut G_HOTKEY_CTRL: bool = true;
-static mut G_HOTKEY_ALT: bool = true;
-static mut G_HOTKEY_SHIFT: bool = false;
-fn parse_hotkey(hotkey: &str) -> (u32, bool, bool, bool) {
-    let lower = hotkey.to_ascii_lowercase();
-    let mut ctrl = false;
-    let mut alt = false;
-    let mut shift = false;
-    let mut vk: u32 = 0x48;
-    for part in lower.split('+') {
-        let p = part.trim();
-        match p {
-            "ctrl" | "control" => ctrl = true,
-            "alt" => alt = true,
-            "shift" => shift = true,
-            "win" | "super" | "meta" => {}
-            key if key.len() == 1 => {
-                if let Some(c) = key.chars().next() {
-                    vk = (c.to_ascii_uppercase() as u32) & 0xFF;
-                }
-            }
-            _ => {}
-        }
-    }
-    (vk, ctrl, alt, shift)
-}
 unsafe extern "system" fn edit_subclass(
     hwnd: HWND,
     msg: u32,
@@ -251,46 +242,6 @@ unsafe extern "system" fn list_subclass(
         wparam,
         lparam,
     )
-}
-unsafe extern "system" fn ll_hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
-    if n_code >= 0
-        && (w_param.0 as u32 == windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN
-            || w_param.0 as u32 == windows::Win32::UI::WindowsAndMessaging::WM_SYSKEYDOWN)
-    {
-        let kb = &*(l_param.0 as *const windows::Win32::UI::WindowsAndMessaging::KBDLLHOOKSTRUCT);
-        if kb.vkCode == unsafe { G_HOTKEY_VK } {
-            let ctrl = (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
-                windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32,
-            ) as u16
-                & 0x8000)
-                != 0;
-            let alt = (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
-                windows::Win32::UI::Input::KeyboardAndMouse::VK_MENU.0 as i32,
-            ) as u16
-                & 0x8000)
-                != 0;
-            let shift = (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
-                windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT.0 as i32,
-            ) as u16
-                & 0x8000)
-                != 0;
-            let want_ctrl = unsafe { G_HOTKEY_CTRL };
-            let want_alt = unsafe { G_HOTKEY_ALT };
-            let want_shift = unsafe { G_HOTKEY_SHIFT };
-            if ctrl == want_ctrl && alt == want_alt && shift == want_shift {
-                if let Some(hwnd) = unsafe { G_HOTKEY_HWND } {
-                    windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                        Some(hwnd),
-                        windows::Win32::UI::WindowsAndMessaging::WM_HOTKEY,
-                        WPARAM(1),
-                        LPARAM(0),
-                    );
-                    return LRESULT(1);
-                }
-            }
-        }
-    }
-    windows::Win32::UI::WindowsAndMessaging::CallNextHookEx(None, n_code, w_param, l_param)
 }
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
@@ -465,6 +416,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // paste target; paste goes to whatever Windows activates.
                 unsafe {
                     G_TARGET_HWND = None;
+                    G_GESTURE = None;
                 }
                 unsafe {
                     ShowWindow(hwnd, SW_SHOW);
@@ -626,6 +578,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_APP_PUSH => {
+            if let Some(ptr) = G_STATE {
+                let state = &mut *ptr;
+                drain_events(state);
+                if state.should_exit {
+                    windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
+                }
+            }
+            LRESULT(0)
+        }
         WM_TIMER => {
             if wparam.0 == TIMER_QUIT {
                 windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
@@ -637,80 +599,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if state.should_exit {
                         windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
                     }
-                }
-            }
-            LRESULT(0)
-        }
-        WM_HOTKEY => {
-            static mut LAST_TOGGLE: Option<std::time::Instant> = None;
-            let now = std::time::Instant::now();
-            if let Some(last) = unsafe { LAST_TOGGLE } {
-                if now.duration_since(last) < std::time::Duration::from_millis(300) {
-                    return LRESULT(0);
-                }
-            }
-            unsafe {
-                LAST_TOGGLE = Some(now);
-            }
-            // ArsClip-style foreground steal: AttachThreadInput to foreground thread
-            let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool();
-            let minimized = windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool();
-            if visible && !minimized {
-                windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-                    hwnd,
-                    windows::Win32::UI::WindowsAndMessaging::SW_HIDE,
-                );
-            } else {
-                // The window the user pressed the hotkey in is the paste
-                // target (also for elevated windows: reading the handle is
-                // not subject to UIPI).
-                let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
-                G_TARGET_HWND = if fg.0.is_null() || fg == hwnd {
-                    None
-                } else {
-                    Some(fg)
-                };
-                if let Some(ptr) = G_STATE {
-                    let s = &mut *ptr;
-                    s.vm.query.clear();
-                    windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
-                        s.hwnd_search,
-                        windows::core::w!(""),
-                    )
-                    .ok();
-                    s.vm.set_target_valid(true);
-                    let _ = s.cmds.send(crate::ipc_bridge::UiCmd::ListHistory);
-                }
-                windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-                    hwnd,
-                    windows::Win32::UI::WindowsAndMessaging::SW_SHOW,
-                );
-                windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-                    hwnd,
-                    windows::Win32::UI::WindowsAndMessaging::SW_RESTORE,
-                );
-                unsafe {
-                    let fg_thread =
-                        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fg, None);
-                    let cur_thread = windows::Win32::System::Threading::GetCurrentThreadId();
-                    if fg_thread != cur_thread {
-                        windows::Win32::System::Threading::AttachThreadInput(
-                            fg_thread, cur_thread, true,
-                        );
-                        windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(hwnd);
-                        windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-                        windows::Win32::System::Threading::AttachThreadInput(
-                            fg_thread, cur_thread, false,
-                        );
-                    } else {
-                        windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(hwnd);
-                        windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-                    }
-                }
-                if let Some(ptr) = G_STATE {
-                    let s = &mut *ptr;
-                    let _ =
-                        windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(s.hwnd_search));
                 }
             }
             LRESULT(0)
@@ -730,6 +618,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 } else {
                     // Opened from the tray: no paste target (see ID_TRAY_SHOW).
                     G_TARGET_HWND = None;
+                    G_GESTURE = None;
                     if let Some(ptr) = G_STATE {
                         let s = &mut *ptr;
                         s.vm.set_target_valid(true);
@@ -813,10 +702,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = Shell_NotifyIconW(NIM_DELETE, &mut nid);
                     G_TRAY_HWND = None;
                 }
-                if let Some(hook) = G_HOTKEY_HOOK {
-                    windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx(hook);
-                    G_HOTKEY_HOOK = None;
-                }
             }
             if let Some(ptr) = G_STATE {
                 KillTimer(Some(hwnd), TIMER_IPC);
@@ -829,6 +714,88 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
+/// Show the popup for a new pick: remember `target` and its `gesture`,
+/// clear the search, refresh the list, then show and focus the window
+/// (ArsClip-style foreground steal through the foreground thread's input
+/// state).
+unsafe fn open_popup(hwnd: HWND, target: Option<HWND>, gesture: Option<u64>) {
+    let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+    G_TARGET_HWND = target;
+    G_GESTURE = gesture;
+    if let Some(ptr) = G_STATE {
+        let s = &mut *ptr;
+        s.vm.query.clear();
+        windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+            s.hwnd_search,
+            windows::core::w!(""),
+        )
+        .ok();
+        s.vm.set_target_valid(true);
+        let _ = s.cmds.send(crate::ipc_bridge::UiCmd::ListHistory);
+    }
+    let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+        hwnd,
+        windows::Win32::UI::WindowsAndMessaging::SW_SHOW,
+    );
+    let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+        hwnd,
+        windows::Win32::UI::WindowsAndMessaging::SW_RESTORE,
+    );
+    let fg_thread = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fg, None);
+    let cur_thread = windows::Win32::System::Threading::GetCurrentThreadId();
+    if fg_thread == cur_thread {
+        let _ = windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(hwnd);
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+    } else {
+        let _ = windows::Win32::System::Threading::AttachThreadInput(fg_thread, cur_thread, true);
+        let _ = windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(hwnd);
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+        let _ = windows::Win32::System::Threading::AttachThreadInput(fg_thread, cur_thread, false);
+    }
+    if let Some(ptr) = G_STATE {
+        let s = &mut *ptr;
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(s.hwnd_search));
+    }
+}
+
+/// Daemon push: show the popup for a press or a request, or hide it when
+/// the press toggles it (the popup was in front).
+unsafe fn on_show_push(
+    state: &mut PopupState,
+    show: &clipmonger_ipc::proto::methods::ShowPopupEvent,
+) {
+    // `hwnd_main` is never filled in; the search box's parent is the popup.
+    let Ok(hwnd) = windows::Win32::UI::WindowsAndMessaging::GetParent(state.hwnd_search) else {
+        return;
+    };
+    let visible = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool();
+    if show.toggle {
+        if visible {
+            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                hwnd,
+                windows::Win32::UI::WindowsAndMessaging::SW_HIDE,
+            );
+        }
+        return;
+    }
+    if show.source != "hotkey" && visible {
+        // A request while open keeps the target and the search: raise only.
+        let _ = windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(hwnd);
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+        return;
+    }
+    let (target, gesture) = if show.source == "hotkey" {
+        let target = show
+            .target
+            .and_then(|target| usize::try_from(target).ok())
+            .map(|target| HWND(target as *mut std::ffi::c_void));
+        (target, show.gesture)
+    } else {
+        (None, None)
+    };
+    open_popup(hwnd, target, gesture);
+}
+
 fn drain_events(state: &mut PopupState) {
     unsafe {
         static mut LH: Option<Instant> = None;
@@ -881,7 +848,10 @@ fn drain_events(state: &mut PopupState) {
                 state.vm.apply_pin(id, p);
                 refresh_list(state);
             }
-            ipc_bridge::UiEvent::Stopped => state.should_exit = true,
+            // Stopped, or another UI instance owns the popup.
+            ipc_bridge::UiEvent::Stopped | ipc_bridge::UiEvent::AnotherInstance => {
+                state.should_exit = true;
+            }
             ipc_bridge::UiEvent::PasteFailed(message) => {
                 // Own thread: a modal box here would re-enter this timer handler.
                 std::thread::spawn(move || unsafe {
@@ -908,6 +878,7 @@ fn drain_events(state: &mut PopupState) {
                     windows::Win32::UI::WindowsAndMessaging::MB_OK,
                 );
             },
+            ipc_bridge::UiEvent::ShowPopup(show) => unsafe { on_show_push(state, &show) },
             _ => {}
         }
     }
@@ -1047,8 +1018,11 @@ fn do_paste(state: &mut PopupState) {
         };
         eprintln!("  hide ok={}", ok.as_bool());
     }
-    // Picking a clip is the user gesture an admin-window paste requires.
-    let _ = state.cmds.send(ipc_bridge::UiCmd::HotkeyFired);
+    // Spent by this paste; the next one needs a new press.
+    let gesture = unsafe { G_GESTURE };
+    unsafe {
+        G_GESTURE = None;
+    }
     if let Some(target) = target {
         // The daemon waits for (or restores) focus on exactly this window,
         // so no fixed delay is needed and a paste never lands elsewhere.
@@ -1056,6 +1030,7 @@ fn do_paste(state: &mut PopupState) {
             id,
             Some(target.0 as usize as u64),
             picked_ms,
+            gesture,
         ));
         eprintln!("  paste sent to target {target:?}");
     } else {
@@ -1063,7 +1038,7 @@ fn do_paste(state: &mut PopupState) {
         let cmds = state.cmds.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(150));
-            let _ = cmds.send(ipc_bridge::UiCmd::PasteClipTo(id, None, picked_ms));
+            let _ = cmds.send(ipc_bridge::UiCmd::PasteClipTo(id, None, picked_ms, None));
             eprintln!("  paste sent after hide");
         });
     }
@@ -1072,6 +1047,7 @@ pub fn run_fallback(
     cmds: mpsc::Sender<ipc_bridge::UiCmd>,
     events: mpsc::Receiver<ipc_bridge::UiEvent>,
     config: Arc<Mutex<crate::ConfigWindowState>>,
+    push: PushLink,
 ) -> std::process::ExitCode {
     let mut vm = popup::PopupVm::new();
     vm.set_offline(false);
@@ -1144,6 +1120,23 @@ pub fn run_fallback(
             Some(state_ptr as *const std::ffi::c_void),
         )
         .unwrap();
+        // Daemon pushes (popup requests) wake this window. The daemon raises
+        // the registered popup itself on a hotkey press.
+        let popup_hwnd = hwnd.0 as usize;
+        crate::start_push_listener(
+            push.profile,
+            serde_json::json!({ "popup_hwnd": popup_hwnd }),
+            push.events,
+            Arc::new(move || {
+                // Posting to the popup window; a dead handle just fails.
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(popup_hwnd as *mut std::ffi::c_void)),
+                    WM_APP_PUSH,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }),
+        );
         let hotkey_str = {
             let cfg = std::fs::read_to_string(
                 (*(*state_ptr).config.lock().unwrap())
@@ -1159,23 +1152,6 @@ pub fn run_fallback(
                 .unwrap_or_else(|| "ctrl+alt+h".to_string());
             hotkey
         };
-        let (vk, want_ctrl, want_alt, want_shift) = parse_hotkey(&hotkey_str);
-        unsafe {
-            G_HOTKEY_VK = vk;
-            G_HOTKEY_CTRL = want_ctrl;
-            G_HOTKEY_ALT = want_alt;
-            G_HOTKEY_SHIFT = want_shift;
-        }
-        let mut mods = windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(0);
-        if want_ctrl {
-            mods.0 |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_CONTROL.0;
-        }
-        if want_alt {
-            mods.0 |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_ALT.0;
-        }
-        if want_shift {
-            mods.0 |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_SHIFT.0;
-        }
         unsafe {
             G_TRAY_HWND = Some(hwnd);
             let mut nid = NOTIFYICONDATAW::default();
@@ -1199,45 +1175,6 @@ pub fn run_fallback(
                 }
             }
             let _ = Shell_NotifyIconW(NIM_ADD, &mut nid);
-        }
-        let hk_ok =
-            windows::Win32::UI::Input::KeyboardAndMouse::RegisterHotKey(Some(hwnd), 1, mods, vk);
-        if hk_ok.is_ok() {
-            eprintln!(
-                "hotkey {} registered - window hidden until hotkey",
-                hotkey_str
-            );
-            unsafe {
-                G_HOTKEY_FALLBACK = false;
-            }
-        } else {
-            let err = windows::Win32::Foundation::GetLastError();
-            eprintln!(
-                "hotkey {} register failed err={:?} (degraded, LL hook, start hidden)",
-                hotkey_str, err
-            );
-            unsafe {
-                G_HOTKEY_FALLBACK = true;
-                G_HOTKEY_HWND = Some(hwnd);
-                match windows::Win32::UI::WindowsAndMessaging::SetWindowsHookExW(
-                    windows::Win32::UI::WindowsAndMessaging::WH_KEYBOARD_LL,
-                    Some(ll_hook_proc),
-                    None,
-                    0,
-                ) {
-                    Ok(hook) => {
-                        if hook.is_invalid() {
-                            eprintln!("LL hook invalid");
-                        } else {
-                            eprintln!("LL hook installed for {}", hotkey_str);
-                            G_HOTKEY_HOOK = Some(hook);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("LL hook install failed {:?}", e);
-                    }
-                }
-            }
         }
         ShowWindow(hwnd, SW_HIDE);
         if let Some(ptr) = G_STATE {

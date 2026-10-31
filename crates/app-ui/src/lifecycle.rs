@@ -142,6 +142,35 @@ pub fn start_mode(connected: bool) -> StartMode {
     }
 }
 
+/// Outcome of claiming the one-UI-per-profile slot.
+#[derive(Debug)]
+pub enum InstanceClaim {
+    /// This is the UI; the lock lives as long as the file (`None` when the
+    /// lock file cannot be used, which leaves no protection, not no UI).
+    Primary(Option<std::fs::File>),
+    /// Another UI holds the profile.
+    Secondary,
+}
+
+/// Claim the profile's UI slot: an exclusive lock on `<profile>/ui.lock`.
+#[must_use]
+pub fn claim_single_instance(profile: &std::path::Path) -> InstanceClaim {
+    let _ = std::fs::create_dir_all(profile);
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(profile.join("ui.lock"))
+    else {
+        return InstanceClaim::Primary(None);
+    };
+    match file.try_lock() {
+        Ok(()) => InstanceClaim::Primary(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => InstanceClaim::Secondary,
+        Err(std::fs::TryLockError::Error(_)) => InstanceClaim::Primary(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{start_mode, StartMode};

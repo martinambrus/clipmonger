@@ -41,6 +41,10 @@ default = ["gui"]
 gui = ["dep:eframe", "dep:egui"]
 software = ["dep:softbuffer", "dep:tiny-skia", "dep:winit", "dep:egui-winit", "dep:windows", "gui"]
 
+[dev-dependencies]
+# Live push-listener tests run a real IPC server.
+clipmonger-ipc = { path = "../ipc", features = ["server"] }
+tokio.workspace = true
 
 [lints]
 workspace = true

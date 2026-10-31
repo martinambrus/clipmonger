@@ -9,6 +9,7 @@ pub mod linux_tray;
 pub mod permanents;
 pub mod placement;
 pub mod popup;
+pub mod push;
 pub mod search;
 pub mod strings;
 pub mod target_session;

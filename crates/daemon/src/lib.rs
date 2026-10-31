@@ -19,6 +19,7 @@ use serde_json::Value;
 /// Protocol tag written to the rendezvous file.
 pub const PROTOCOL: &str = "ipc/v1";
 /// Daemon crate version reported by `status`.
+pub mod popup;
 #[cfg(all(unix, feature = "backend-wayland"))]
 pub mod portal;
 
@@ -1150,6 +1151,31 @@ fn retention_limits(config: &clipmonger_core::Config) -> clipmonger_core::policy
     }
 }
 
+/// Paste target named by `paste.execute` / `permanent.exec`: `target` (an
+/// integer window handle) or its older alias `target_hwnd`. A malformed
+/// value, or the two disagreeing, is refused instead of silently falling
+/// back to whatever window is in front.
+#[cfg_attr(not(all(windows, feature = "backend-windows")), allow(dead_code))]
+fn requested_target(params: &Value) -> Result<Option<u64>, IpcError> {
+    let read = |key: &str| match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            IpcError::new(
+                "invalid_params",
+                format!("paste: {key} must be a window handle number"),
+            )
+        }),
+    };
+    match (read("target")?, read("target_hwnd")?) {
+        (Some(target), Some(alias)) if target != alias => Err(IpcError::new(
+            "invalid_params",
+            "paste: target and target_hwnd disagree".to_string(),
+        )),
+        (Some(target), _) | (None, Some(target)) => Ok(Some(target)),
+        (None, None) => Ok(None),
+    }
+}
+
 /// Store one headless replay line; returns the JSON report line for it.
 fn process_capture(store: &Store, line: &str, index: u64) -> String {
     let event: Value = match serde_json::from_str(line) {
@@ -1244,8 +1270,9 @@ pub struct DaemonState {
     paste_limits: Mutex<(u64, u64)>,
     /// Profile dir for the audit log (set once at startup).
     profile_dir: Mutex<PathBuf>,
-    /// Live single-use gesture tokens (hotkey/popup trigger path only).
-    gesture_tokens: Mutex<HashMap<u64, i64>>,
+    /// Live single-use gesture tokens (hotkey/popup trigger path only):
+    /// token -> (minted at, paste target it was minted for).
+    gesture_tokens: Mutex<HashMap<u64, (i64, Option<u64>)>>,
     /// Gesture mint sequence mixed into every token.
     gesture_counter: Mutex<u64>,
     /// Elevation-refusal latch (caps paste Degraded until restart).
@@ -1260,6 +1287,8 @@ pub struct DaemonState {
     blob_buf: Mutex<HashMap<(String, String), BlobAsm>>,
     /// Latest `hotkey.conflict` note surfaced in caps notes.
     hotkey_conflict_note: Mutex<Option<String>>,
+    /// Popup trigger path: event hub, UI launcher, debounce state.
+    popup: Mutex<popup::PopupTrigger>,
     /// Dual-backend merge window state (seg-06 S8, W-F5: 2000 ms).
     #[cfg(all(unix, feature = "backend-wayland"))]
     merger: Mutex<clipmonger_backend_wayland::merge::Merger>,
@@ -1289,6 +1318,7 @@ impl DaemonState {
             config: Mutex::new(config),
             blob_buf: Mutex::new(HashMap::new()),
             hotkey_conflict_note: Mutex::new(None),
+            popup: Mutex::new(popup::PopupTrigger::default()),
             #[cfg(all(unix, feature = "backend-wayland"))]
             merger: Mutex::new(clipmonger_backend_wayland::merge::Merger::new(2000)),
         }
@@ -1304,6 +1334,15 @@ impl DaemonState {
     /// Flip the GNOME extension link state in caps.
     pub fn set_extension_connected(&self, connected: bool) {
         self.caps.set_extension_connected(connected);
+    }
+
+    /// The configured popup chord, read live so a `config.set` applies
+    /// without a restart.
+    #[must_use]
+    pub fn popup_hotkey(&self) -> String {
+        self.config
+            .lock()
+            .map_or_else(|_| String::new(), |config| config.popup.hotkey.clone())
     }
 
     /// Stored config as JSON (full document).
@@ -1324,11 +1363,11 @@ impl DaemonState {
         }
     }
 
-    /// Mint one single-use gesture token. HOTKEY/POPUP TRIGGER PATH ONLY:
-    /// the generic `paste.execute` IPC arm must never call this (a
-    /// same-user caller driving `paste.execute` gets standard-user paste
-    /// at most).
-    pub fn mint_gesture_token(&self) -> u64 {
+    /// Mint one single-use gesture token, bound to `target` when the press
+    /// captured one. HOTKEY/POPUP TRIGGER PATH ONLY: the generic
+    /// `paste.execute` IPC arm must never call this (a same-user caller
+    /// driving `paste.execute` gets standard-user paste at most).
+    pub fn mint_gesture_token(&self, target: Option<u64>) -> u64 {
         let at_ms = now_ms();
         let seq = if let Ok(mut counter) = self.gesture_counter.lock() {
             *counter = counter.wrapping_add(1);
@@ -1344,43 +1383,26 @@ impl DaemonState {
             token = 0x9E37_79B9_7F4A_7C15;
         }
         if let Ok(mut tokens) = self.gesture_tokens.lock() {
-            tokens.retain(|_, minted| at_ms >= *minted && at_ms - *minted <= GESTURE_TTL_MS);
-            tokens.insert(token, at_ms);
+            tokens.retain(|_, (minted, _)| at_ms >= *minted && at_ms - *minted <= GESTURE_TTL_MS);
+            tokens.insert(token, (at_ms, target));
         }
         token
     }
 
-    /// Consume the newest unexpired trigger token (daemon-side spend: the
-    /// popup presents no token in v1, so a paste within the trigger window
-    /// spends the trigger's token once; generic callers still cannot mint).
+    /// Consume one gesture token: true exactly once while unexpired, and
+    /// only for the target it was minted for (an unbound token fits any).
     #[cfg_attr(not(all(windows, feature = "backend-windows")), allow(dead_code))]
-    fn consume_trigger_token(&self, at_ms: i64) -> bool {
-        let Ok(mut tokens) = self.gesture_tokens.lock() else {
-            return false;
-        };
-        let newest = tokens
-            .iter()
-            .filter(|(_, minted)| at_ms >= **minted && at_ms - **minted <= GESTURE_TTL_MS)
-            .max_by_key(|(_, minted)| **minted)
-            .map(|(token, _)| *token);
-        match newest {
-            Some(token) => {
-                tokens.remove(&token);
-                true
-            }
-            Option::None => false,
-        }
-    }
-
-    /// Consume one gesture token: true exactly once while unexpired.
-    #[cfg_attr(not(all(windows, feature = "backend-windows")), allow(dead_code))]
-    fn consume_gesture_token(&self, token: u64, at_ms: i64) -> bool {
+    fn consume_gesture_token(&self, token: u64, at_ms: i64, target: Option<u64>) -> bool {
         let minted = self
             .gesture_tokens
             .lock()
             .ok()
             .and_then(|mut tokens| tokens.remove(&token));
-        minted.is_some_and(|minted| at_ms >= minted && at_ms - minted <= GESTURE_TTL_MS)
+        minted.is_some_and(|(minted, bound)| {
+            at_ms >= minted
+                && at_ms - minted <= GESTURE_TTL_MS
+                && bound.is_none_or(|bound| Some(bound) == target)
+        })
     }
 
     /// Latch elevation refusal: caps paste Degraded plus an audit entry.
@@ -2159,7 +2181,7 @@ impl DaemonState {
                     format!("paste.execute: {PASTE_EXPIRED}"),
                 ));
             }
-            let target = match params.get("target_hwnd").and_then(Value::as_u64) {
+            let target = match requested_target(params)? {
                 // The window that was foreground when the popup opened; the
                 // foreground right now may still be settling after the hide.
                 Some(hwnd) => {
@@ -2169,9 +2191,15 @@ impl DaemonState {
             }
             .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
             if clipmonger_backend_windows::target_integrity(&target.handle) == Integrity::High {
+                let target_id = match target.handle {
+                    clipmonger_platform::types::PlatformHandle::WinHwnd(hwnd) => {
+                        Some(hwnd.cast_unsigned())
+                    }
+                    _ => None,
+                };
                 let token = params.get("gesture").and_then(Value::as_u64);
-                let token_ok = token.is_some_and(|t| self.consume_gesture_token(t, now_ms()))
-                    || self.consume_trigger_token(now_ms());
+                let token_ok =
+                    token.is_some_and(|t| self.consume_gesture_token(t, now_ms(), target_id));
                 if !token_ok {
                     self.note_elevation_refused("missing or invalid gesture token");
                     return Err(IpcError::new(
@@ -2392,11 +2420,21 @@ impl DaemonState {
             "capture.report" => Ok(self.handle_capture(params)),
             "blob.put" => self.handle_blob_put(params),
             "hotkey.fired" => {
-                let id = params.get("id").and_then(Value::as_u64);
-                if id.is_none() || id == Some(1) {
-                    self.mint_gesture_token();
+                // The GNOME extension reporting a press. On Windows the daemon
+                // owns the chord, so a report proves no press: ignored.
+                #[cfg(not(all(windows, feature = "backend-windows")))]
+                {
+                    let id = params.get("id").and_then(Value::as_u64);
+                    if id.is_none() || id == Some(1) {
+                        let delivered = self.trigger_popup(popup::PopupSource::Press);
+                        return Ok(serde_json::json!({"ok": true, "delivered": delivered}));
+                    }
                 }
                 Ok(serde_json::json!({"ok": true}))
+            }
+            "popup.open" => {
+                let delivered = self.trigger_popup(popup::PopupSource::Request);
+                Ok(serde_json::json!({"delivered": delivered}))
             }
             "hotkey.conflict" => {
                 let chord = params
@@ -2437,20 +2475,32 @@ mod tests {
     use super::{now_ms, CapsAggregator, DaemonState};
 
     #[test]
-    fn trigger_token_spends_once_daemon_side() {
+    fn gesture_token_spends_once_and_only_for_its_target() {
         let dir = std::env::temp_dir().join(format!("cm-gesture-{}", std::process::id()));
         let store = clipmonger_core::Store::open(&dir).expect("store");
         let state = DaemonState::new(store);
         assert!(
-            !state.consume_trigger_token(now_ms()),
-            "no trigger, no spend"
+            !state.consume_gesture_token(12345, now_ms(), None),
+            "an unknown token never spends"
         );
-        state.mint_gesture_token();
+        let bound = state.mint_gesture_token(Some(0x30838));
         assert!(
-            state.consume_trigger_token(now_ms()),
-            "trigger token spends"
+            !state.consume_gesture_token(bound, now_ms(), Some(0x99)),
+            "a token minted for one window refuses another"
         );
-        assert!(!state.consume_trigger_token(now_ms()), "single use only");
+        let bound = state.mint_gesture_token(Some(0x30838));
+        assert!(state.consume_gesture_token(bound, now_ms(), Some(0x30838)));
+        assert!(
+            !state.consume_gesture_token(bound, now_ms(), Some(0x30838)),
+            "single use only"
+        );
+        let unbound = state.mint_gesture_token(None);
+        assert!(state.consume_gesture_token(unbound, now_ms(), Some(0x77)));
+        let expired = state.mint_gesture_token(None);
+        assert!(
+            !state.consume_gesture_token(expired, now_ms() + super::GESTURE_TTL_MS + 1, None),
+            "an expired token never spends"
+        );
     }
 
     fn fresh_state(name: &str) -> (std::path::PathBuf, DaemonState) {
@@ -2597,15 +2647,43 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_fired_mints_and_conflict_notes_caps() {
+    fn paste_target_is_an_integer_or_refused() {
+        use super::requested_target;
+        use serde_json::json;
+        assert_eq!(requested_target(&json!({})).expect("none"), None);
+        assert_eq!(requested_target(&json!({"target": 7})).expect("t"), Some(7));
+        assert_eq!(
+            requested_target(&json!({"target_hwnd": 7})).expect("alias"),
+            Some(7)
+        );
+        assert_eq!(
+            requested_target(&json!({"target": 7, "target_hwnd": 7})).expect("same"),
+            Some(7)
+        );
+        for bad in [
+            json!({"target": {"app": "xterm"}}),
+            json!({"target": "7"}),
+            json!({"target": -7}),
+            json!({"target": 7, "target_hwnd": 8}),
+        ] {
+            let err = requested_target(&bad).expect_err("never a silent fallback");
+            assert_eq!(err.code, "invalid_params", "{bad}");
+        }
+    }
+
+    #[test]
+    fn hotkey_fired_and_conflict_notes_caps() {
         let (_dir, state) = fresh_state("hotkey-ipc");
-        state
+        let fired = state
             .handle("hotkey.fired", &serde_json::json!({"id": 1}))
             .expect("hotkey.fired");
-        assert!(
-            state.consume_trigger_token(now_ms()),
-            "hotkey.fired id=1 must mint a gesture token"
-        );
+        // Windows: the daemon owns the chord; a report mints nothing.
+        #[cfg(all(windows, feature = "backend-windows"))]
+        assert_eq!(fired, serde_json::json!({"ok": true}));
+        // Elsewhere it is the extension's press report: it triggers the
+        // popup (no event hub here, so nothing is delivered).
+        #[cfg(not(all(windows, feature = "backend-windows")))]
+        assert_eq!(fired, serde_json::json!({"ok": true, "delivered": false}));
         state
             .handle(
                 "hotkey.conflict",
