@@ -87,3 +87,89 @@ fn restore_symlink_rejected_as_unsupported() {
     let err = Store::restore_zip(&archive, &scratch.0.join("profile")).unwrap_err();
     assert!(matches!(err, CoreError::Unsupported { .. }), "{err:?}");
 }
+
+fn profile_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn visit(root: &Path, dir: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else {
+                files.push((
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(&path).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    visit(root, root, &mut files);
+    files.sort();
+    files
+}
+
+fn assert_prefixed_name_rejected(name: &str) {
+    let scratch = Scratch::new();
+    let profile = scratch.0.join("profile");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/backup-zip4.zip");
+    Store::restore_zip(&fixture, &profile).unwrap();
+    let before = profile_files(&profile);
+    let archive = scratch.0.join("prefixed.zip");
+    let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.start_file("must-not-extract.txt", options).unwrap();
+    writer
+        .write_all(b"validation must finish before extraction")
+        .unwrap();
+    writer.start_file(name, options).unwrap();
+    writer.write_all(b"unsafe name").unwrap();
+    writer.finish().unwrap();
+
+    // Corrupt the first entry's CRC in both headers. Any extraction would
+    // fail with Io before reaching the unsafe name, rather than Unsupported.
+    let mut bytes = std::fs::read(&archive).unwrap();
+    let central = bytes.windows(4).position(|b| b == b"PK\x01\x02").unwrap();
+    for offset in [14, central + 16] {
+        bytes[offset] ^= 1;
+    }
+    std::fs::write(&archive, bytes).unwrap();
+
+    let err = Store::restore_zip(&archive, &profile).unwrap_err();
+    assert_eq!(
+        profile_files(&profile),
+        before,
+        "profile changed for {name:?}"
+    );
+    assert!(!profile.join("abs.txt").exists());
+    assert!(!profile.join("must-not-extract.txt").exists());
+    assert!(
+        matches!(err, CoreError::Unsupported { .. }),
+        "{name:?}: {err:?}"
+    );
+}
+
+#[test]
+fn restore_prefixed_name_posix_root_rejected_before_extraction() {
+    assert_prefixed_name_rejected("/abs.txt");
+}
+
+#[test]
+fn restore_prefixed_name_windows_root_rejected_before_extraction() {
+    assert_prefixed_name_rejected(r"\abs.txt");
+}
+
+#[test]
+fn restore_prefixed_name_drive_rejected_before_extraction() {
+    assert_prefixed_name_rejected(r"C:\abs.txt");
+}
+
+#[test]
+fn restore_prefixed_name_unc_rejected_before_extraction() {
+    assert_prefixed_name_rejected(r"\\srv\share\abs.txt");
+}
+
+#[test]
+fn restore_prefixed_name_verbatim_rejected_before_extraction() {
+    assert_prefixed_name_rejected(r"\\?\C:\abs.txt");
+}

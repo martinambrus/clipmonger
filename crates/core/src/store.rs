@@ -1791,6 +1791,13 @@ fn extract_zip(src: &Path, tmp: &Path) -> Result<(), CoreError> {
     let mut total = 0_u64;
     for i in 0..zip.len() {
         let e = zip.by_index(i).map_err(|e| zip_err(&e))?;
+        let name = e.name().map_err(|e| zip_err(&e))?;
+        let bytes = name.as_bytes();
+        if name.starts_with(['/', '\\'])
+            || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        {
+            return Err(unsupported("zip absolute or drive-prefixed entry rejected"));
+        }
         e.enclosed_name()
             .ok_or_else(|| unsupported("zip entry escapes target directory"))?;
         if is_symlink_entry(&e) {
