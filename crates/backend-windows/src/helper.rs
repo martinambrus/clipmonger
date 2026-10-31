@@ -329,10 +329,10 @@ pub fn quote_arg(value: &str) -> String {
 #[must_use]
 pub fn persistent_pipe_name(profile: &std::path::Path) -> String {
     let s = profile.to_string_lossy();
-    let mut h: u64 = 0xcbf29ce484222325;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
         h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100000001b3);
+        h = h.wrapping_mul(0x0100_0000_01b3);
     }
     format!(r"\\.\pipe\clipmonger-persist-{h:016x}")
 }

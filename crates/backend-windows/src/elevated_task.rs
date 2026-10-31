@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+#[cfg(windows)]
 const TASK_NAME: &str = "ClipmongerHelper";
 /// Start of the identity marker in the task description.
 const TASK_MARKER_PREFIX: &str = "(clipmonger-task ";

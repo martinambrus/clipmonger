@@ -2243,19 +2243,8 @@ impl DaemonState {
         }
         #[cfg(all(unix, feature = "backend-wayland"))]
         {
-            use clipmonger_backend_wayland::{probe_current, WlPaste};
             let _ = (clip, params);
-            let has_data =
-                probe_current().protocol != clipmonger_backend_wayland::probe::Protocol::None;
-            let paste = WlPaste::new(has_data);
-            let outcome = paste
-                .paste_payloads(&payloads.to_vec())
-                .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
-            let mut result = serde_json::json!({"pasted": true});
-            if let Some(toast) = outcome.toast {
-                result["toast"] = Value::from(toast);
-            }
-            Ok(result)
+            Self::paste_wayland_payloads(payloads)
         }
         #[cfg(not(any(
             all(windows, feature = "backend-windows"),
@@ -2268,6 +2257,23 @@ impl DaemonState {
                 format!("paste unavailable: {SKELETON_NOTE}"),
             ))
         }
+    }
+
+    /// Deliver payloads through the Wayland backend and report its toast.
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    fn paste_wayland_payloads(payloads: &[(String, Vec<u8>)]) -> Result<Value, IpcError> {
+        use clipmonger_backend_wayland::{probe_current, WlPaste};
+        let has_data =
+            probe_current().protocol != clipmonger_backend_wayland::probe::Protocol::None;
+        let paste = WlPaste::new(has_data);
+        let outcome = paste
+            .paste_payloads(&payloads.to_vec())
+            .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
+        let mut result = serde_json::json!({"pasted": true});
+        if let Some(toast) = outcome.toast {
+            result["toast"] = Value::from(toast);
+        }
+        Ok(result)
     }
 
     /// Paste into a high-integrity target via the elevated helper
