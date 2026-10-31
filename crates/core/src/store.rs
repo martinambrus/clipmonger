@@ -1804,7 +1804,7 @@ fn extract_zip(src: &Path, tmp: &Path) -> Result<(), CoreError> {
             if total > RESTORE_MAX_TOTAL {
                 return Err(unsupported("zip archive exceeds size cap"));
             }
-            names.push(e.name().to_string());
+            names.push(e.name().map_err(|e| zip_err(&e))?.into_owned());
         }
     }
     for name in &names {
