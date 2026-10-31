@@ -365,19 +365,32 @@ pub fn foreground_window_id() -> Option<i64> {
 }
 
 /// Show `hwnd` and make it the foreground window, but only when it belongs
-/// to `owner_pid` (the verified UI's popup). Returns whether it is in front
-/// afterwards.
+/// to `owner_pid` (the verified UI's popup). A hung window is left alone and
+/// a minimized one is restored. Returns whether it is in front afterwards.
 #[must_use]
 pub fn show_owned_window(hwnd: i64, owner_pid: u32) -> bool {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsHungAppWindow, IsIconic, ShowWindow, SW_RESTORE, SW_SHOW,
+    };
     // i64 handle round-trips through HWND on 64-bit Windows.
     let window = hwnd as HWND;
     if window_pid(window) != Some(owner_pid) {
         return false;
     }
-    // Safety: plain window-manager call on a window of the UI process.
+    // Safety: plain window-manager calls on a window of the UI process.
     unsafe {
-        ShowWindow(window, SW_SHOW);
+        // ShowWindow waits for the window's thread, so a hung window would
+        // block the caller (the daemon's hotkey thread).
+        if IsHungAppWindow(window) != 0 {
+            return false;
+        }
+        // SW_SHOW leaves a minimized window minimized.
+        let command = if IsIconic(window) == 0 {
+            SW_SHOW
+        } else {
+            SW_RESTORE
+        };
+        ShowWindow(window, command);
     }
     activate_window(window)
 }
