@@ -3,6 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/platform", "crates/ipc", "crates/daemon", "crates/app-cli", "crates/app-ui", "crates/backend-windows", "crates/backend-x11", "crates/backend-wayland"]
 
 [workspace.package]
+publish = false
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"

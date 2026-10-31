@@ -47,6 +47,7 @@ allow = ["OFL-1.1", "Ubuntu-font-1.0"]
 [bans]
 multiple-versions = "warn"
 wildcards = "warn"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
