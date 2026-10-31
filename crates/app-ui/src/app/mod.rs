@@ -582,15 +582,18 @@ impl PopupApp {
         ctx.set_zoom_factor(scale);
     }
 
-    /// Ask the runner for one pass at the earliest future deadline: the status
+    /// Ask the runner for one pass at the earliest deadline: the status
     /// poll (`last_poll + status_period`), the pause deadline while paused, and
     /// `Shell::next_deadline()` (shell clock, origin `start`). One
-    /// `ctx.request_repaint_after(delay)`; no request when none is in the
-    /// future; never `request_repaint()` and no fixed heartbeat (a hidden pass is
-    /// not throttled).
+    /// `ctx.request_repaint_after(delay)`; clamp elapsed deadlines to 1 ms so
+    /// a deadline that passed after tick is still served. No fixed heartbeat;
+    /// a zero status period arms no timer (manual per-pass polling).
     fn schedule_wake(&self, ctx: &egui::Context) {
         let now = Instant::now();
-        let mut deadlines = vec![self.last_poll.checked_add(self.status_period)];
+        // A zero poll period is a manual per-pass mode and arms no timer.
+        let mut deadlines = vec![(!self.status_period.is_zero())
+            .then(|| self.last_poll.checked_add(self.status_period))
+            .flatten()];
         if self.paused {
             deadlines.push(self.pause_deadline);
         }
@@ -602,8 +605,11 @@ impl PopupApp {
         let next = deadlines
             .into_iter()
             .flatten()
-            .filter_map(|deadline| deadline.checked_duration_since(now))
-            .filter(|delay| !delay.is_zero())
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(now)
+                    .max(Duration::from_millis(1))
+            })
             .min();
         if let Some(delay) = next {
             ctx.request_repaint_after(delay);
@@ -750,4 +756,44 @@ fn popup_position_for_monitor(size: egui::Vec2) -> egui::Pos2 {
         placement::POPUP_DEFAULT,
     );
     egui::pos2(px as f32, py as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fix_x5_elapsed_deadline_requests_a_prompt_follow_up() {
+        let (cmds, _) = mpsc::channel();
+        let (_, events) = mpsc::channel();
+        let mut app = PopupApp::new(AppParts {
+            profile: PathBuf::from("deadline-rig"),
+            cmds,
+            events,
+            tray: Box::new(Vec::new),
+            hold: None,
+            open: false,
+            status_period: Duration::from_secs(3600),
+            trace: None,
+            allow_foreground: Box::new(|| {}),
+        });
+        app.paused = true;
+        app.pause_deadline = Some(app.start);
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput::default();
+        for _ in 0..3 {
+            let _ = ctx.run_logic(&raw, |_| {});
+        }
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        ctx.set_request_repaint_callback(move |info| {
+            captured.lock().expect("requests").push(info.delay);
+        });
+        let _ = ctx.run_logic(&raw, |ctx| app.schedule_wake(ctx));
+        assert_eq!(
+            *requests.lock().expect("requests"),
+            vec![Duration::from_millis(1)],
+            "a deadline that elapsed after tick must still wake the runner"
+        );
+    }
 }
