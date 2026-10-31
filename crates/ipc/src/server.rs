@@ -124,6 +124,269 @@ impl EventBus {
         self.subs
             .retain(|_, sub| now.saturating_duration_since(sub.last_active) <= self.idle_limit);
     }
+
+    /// Drop a subscriber and its queued events.
+    pub fn unsubscribe(&mut self, id: u64) {
+        self.subs.remove(&id);
+    }
+
+    /// Number of subscribers listening on `topic`.
+    #[must_use]
+    pub fn subscriber_count(&self, topic: &str) -> usize {
+        self.subs
+            .values()
+            .filter(|sub| sub.topics.iter().any(|t| t == topic))
+            .count()
+    }
+}
+
+/// Subscription rule for one event topic.
+#[derive(Clone, Debug)]
+pub struct TopicRule {
+    /// Topic name (the event frame's `method`).
+    pub topic: String,
+    /// At most one subscriber at a time; later ones get `already_subscribed`.
+    pub exclusive: bool,
+}
+
+/// Daemon policy for one subscription: topic, the subscriber's OS process id
+/// (when known) and its `events.subscribe` params.
+pub type SubscribeGuard = std::sync::Arc<dyn Fn(&str, Option<u32>, &Value) -> bool + Send + Sync>;
+
+/// One live subscriber as the daemon sees it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubscriberInfo {
+    /// OS process id of the subscribed connection's peer, when known.
+    pub peer_pid: Option<u32>,
+    /// The `events.subscribe` params the subscriber sent.
+    pub params: Value,
+}
+
+/// How long an event published to nobody waits for its first subscriber.
+const HOLD_TTL: Duration = Duration::from_secs(10);
+
+/// Server-side fan-out of daemon events to `events.subscribe` connections.
+/// Clones share the same subscribers.
+#[derive(Clone)]
+pub struct EventHub {
+    inner: std::sync::Arc<std::sync::Mutex<HubInner>>,
+}
+
+struct HubInner {
+    bus: EventBus,
+    rules: Vec<TopicRule>,
+    guard: Option<SubscribeGuard>,
+    subs: HashMap<u64, HubSub>,
+    held: HashMap<String, (Envelope, Instant)>,
+    hold_ttl: Duration,
+    next_event: u64,
+}
+
+struct HubSub {
+    topics: Vec<String>,
+    wake: std::sync::Arc<tokio::sync::Notify>,
+    info: SubscriberInfo,
+}
+
+impl EventHub {
+    /// Hub serving only the topics in `rules`.
+    #[must_use]
+    pub fn new(rules: Vec<TopicRule>) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(HubInner {
+                // Subscribers live as long as their connection; no idle eviction.
+                bus: EventBus::new(Duration::MAX),
+                rules,
+                guard: None,
+                subs: HashMap::new(),
+                held: HashMap::new(),
+                hold_ttl: HOLD_TTL,
+                next_event: 0,
+            })),
+        }
+    }
+
+    /// Check every subscription with `guard` before it is accepted.
+    #[must_use]
+    pub fn with_guard(self, guard: SubscribeGuard) -> Self {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.guard = Some(guard);
+        }
+        self
+    }
+
+    /// Override how long a held event waits for a subscriber.
+    #[must_use]
+    pub fn with_hold_ttl(self, ttl: Duration) -> Self {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.hold_ttl = ttl;
+        }
+        self
+    }
+
+    /// Publish `params` on `topic`; returns how many subscribers got it.
+    #[must_use]
+    pub fn publish(&self, topic: &str, params: Value) -> usize {
+        self.send(topic, params, false)
+    }
+
+    /// Like [`EventHub::publish`], but with nobody subscribed the event is
+    /// held and handed to the next subscriber of `topic` (returns 0 then).
+    #[must_use]
+    pub fn publish_or_hold(&self, topic: &str, params: Value) -> usize {
+        self.send(topic, params, true)
+    }
+
+    /// Live subscribers of `topic`.
+    #[must_use]
+    pub fn subscribers(&self, topic: &str) -> Vec<SubscriberInfo> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        inner
+            .subs
+            .values()
+            .filter(|sub| sub.topics.iter().any(|t| t == topic))
+            .map(|sub| sub.info.clone())
+            .collect()
+    }
+
+    fn send(&self, topic: &str, params: Value, hold: bool) -> usize {
+        let Ok(mut inner) = self.inner.lock() else {
+            return 0;
+        };
+        let env = inner.event(topic, params);
+        let count = inner.bus.subscriber_count(topic);
+        if count == 0 {
+            if hold {
+                inner.held.insert(topic.to_string(), (env, Instant::now()));
+            }
+            return 0;
+        }
+        inner.bus.publish(env);
+        for sub in inner.subs.values() {
+            if sub.topics.iter().any(|t| t == topic) {
+                sub.wake.notify_one();
+            }
+        }
+        count
+    }
+
+    /// Register a subscriber; the guard runs outside the hub lock.
+    fn subscribe(
+        &self,
+        topics: Vec<String>,
+        peer_pid: Option<u32>,
+        params: Value,
+    ) -> Result<(u64, std::sync::Arc<tokio::sync::Notify>), IpcError> {
+        if topics.is_empty() {
+            return Err(IpcError::new(
+                "invalid_params",
+                "events.subscribe needs topics".to_string(),
+            ));
+        }
+        let guard = {
+            let inner = self.lock_inner()?;
+            for topic in &topics {
+                inner.rule(topic)?;
+            }
+            inner.guard.clone()
+        };
+        if let Some(guard) = guard {
+            if !topics.iter().all(|topic| guard(topic, peer_pid, &params)) {
+                return Err(IpcError::new("denied", "subscription refused".to_string()));
+            }
+        }
+        let mut inner = self.lock_inner()?;
+        for topic in &topics {
+            if inner.rule(topic)?.exclusive && inner.bus.subscriber_count(topic) > 0 {
+                return Err(IpcError::new(
+                    "already_subscribed",
+                    format!("{topic} already has a subscriber"),
+                ));
+            }
+        }
+        let id = inner.bus.subscribe(topics.clone());
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let now = Instant::now();
+        let ttl = inner.hold_ttl;
+        for topic in &topics {
+            if let Some((env, at)) = inner.held.remove(topic) {
+                if now.saturating_duration_since(at) <= ttl {
+                    inner.bus.publish(env);
+                }
+            }
+        }
+        inner.subs.insert(
+            id,
+            HubSub {
+                topics,
+                wake: std::sync::Arc::clone(&wake),
+                info: SubscriberInfo { peer_pid, params },
+            },
+        );
+        wake.notify_one();
+        Ok((id, wake))
+    }
+
+    fn unsubscribe(&self, id: u64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.bus.unsubscribe(id);
+            inner.subs.remove(&id);
+        }
+    }
+
+    fn drain(&self, id: u64) -> Vec<Envelope> {
+        self.inner
+            .lock()
+            .map(|mut inner| inner.bus.pending(id))
+            .unwrap_or_default()
+    }
+
+    fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, HubInner>, IpcError> {
+        self.inner
+            .lock()
+            .map_err(|_| IpcError::new("internal", "event hub lock poisoned".to_string()))
+    }
+}
+
+impl HubInner {
+    fn rule(&self, topic: &str) -> Result<&TopicRule, IpcError> {
+        self.rules
+            .iter()
+            .find(|rule| rule.topic == topic)
+            .ok_or_else(|| IpcError::new("unknown_topic", format!("no events for {topic}")))
+    }
+
+    fn event(&mut self, topic: &str, params: Value) -> Envelope {
+        self.next_event = self.next_event.wrapping_add(1);
+        Envelope {
+            v: IPC_VERSION.to_string(),
+            id: format!("e{}", self.next_event),
+            kind: FrameKind::Event,
+            method: Some(topic.to_string()),
+            params: Some(params),
+            result: None,
+            error: None,
+            seq: None,
+        }
+    }
+}
+
+/// Resolves a connected named pipe's client process id from its raw handle
+/// (Windows; supplied by the daemon, which owns the Win32 bindings).
+pub type PipePeerPid = std::sync::Arc<dyn Fn(usize) -> Option<u32> + Send + Sync>;
+
+/// Optional server features.
+#[derive(Clone, Default)]
+pub struct ServeOptions {
+    /// Connection lifecycle callback.
+    pub lifecycle: Option<LifecycleCb>,
+    /// Event fan-out for `events.subscribe`; without it the method reaches
+    /// the handler like any other.
+    pub hub: Option<EventHub>,
+    /// Windows: client process id of a connected pipe.
+    pub pipe_peer_pid: Option<PipePeerPid>,
 }
 
 /// Overflow marker: an event frame with method `resync-required`.
@@ -172,10 +435,30 @@ impl Server {
         handler: Handler,
         lifecycle: Option<LifecycleCb>,
     ) -> Result<Self, IpcError> {
+        let options = ServeOptions {
+            lifecycle,
+            ..ServeOptions::default()
+        };
+        Self::bind_with(sock, token, handler, options).await
+    }
+
+    /// Bind `sock` like [`Server::bind`] with optional server features.
+    ///
+    /// # Errors
+    ///
+    /// Returns `bind_failed` when the socket cannot be bound.
+    #[cfg(unix)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    pub async fn bind_with(
+        sock: &Path,
+        token: String,
+        handler: Handler,
+        options: ServeOptions,
+    ) -> Result<Self, IpcError> {
         let _ = std::fs::remove_file(sock);
         let listener = tokio::net::UnixListener::bind(sock)
             .map_err(|e| IpcError::new("bind_failed", e.to_string()))?;
-        let task = tokio::spawn(accept_loop(listener, token, handler, lifecycle));
+        let task = tokio::spawn(accept_loop(listener, token, handler, options));
         Ok(Self { _task: task })
     }
 
@@ -204,13 +487,33 @@ impl Server {
         handler: Handler,
         lifecycle: Option<LifecycleCb>,
     ) -> Result<Self, IpcError> {
+        let options = ServeOptions {
+            lifecycle,
+            ..ServeOptions::default()
+        };
+        Self::bind_pipe_with(pipe_name, token, handler, options)
+    }
+
+    /// Bind `pipe_name` like [`Server::bind_pipe`] with optional server
+    /// features.
+    ///
+    /// # Errors
+    ///
+    /// Returns `bind_failed` when the pipe name is taken or cannot be bound.
+    #[cfg(windows)]
+    pub fn bind_pipe_with(
+        pipe_name: &str,
+        token: String,
+        handler: Handler,
+        options: ServeOptions,
+    ) -> Result<Self, IpcError> {
         let first = make_pipe_instance(pipe_name, true)?;
         let task = tokio::spawn(windows_accept_loop(
             pipe_name.to_string(),
             token,
             handler,
             first,
-            lifecycle,
+            options,
         ));
         Ok(Self { _task: task })
     }
@@ -245,6 +548,24 @@ impl Server {
             "ipc server needs a Unix socket".to_string(),
         ))
     }
+
+    /// Options-binding stub on platforms without sockets or named pipes.
+    ///
+    /// # Errors
+    ///
+    /// Always fails with `unavailable`.
+    #[cfg(not(any(unix, windows)))]
+    pub async fn bind_with(
+        _sock: &Path,
+        _token: String,
+        _handler: Handler,
+        _options: ServeOptions,
+    ) -> Result<Self, IpcError> {
+        Err(IpcError::new(
+            "unavailable",
+            "ipc server needs a Unix socket".to_string(),
+        ))
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -257,17 +578,23 @@ async fn accept_loop(
     listener: tokio::net::UnixListener,
     token: String,
     handler: Handler,
-    lifecycle: Option<LifecycleCb>,
+    options: ServeOptions,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
+        let peer_pid = stream
+            .peer_cred()
+            .ok()
+            .and_then(|cred| cred.pid())
+            .and_then(|pid| u32::try_from(pid).ok());
         tokio::spawn(serve_conn(
             stream,
             token.clone(),
             handler.clone(),
-            lifecycle.clone(),
+            options.clone(),
+            peer_pid,
         ));
     }
 }
@@ -291,8 +618,9 @@ async fn windows_accept_loop(
     token: String,
     handler: Handler,
     mut listener: tokio::net::windows::named_pipe::NamedPipeServer,
-    lifecycle: Option<LifecycleCb>,
+    options: ServeOptions,
 ) {
+    use std::os::windows::io::AsRawHandle as _;
     loop {
         if listener.connect().await.is_err() {
             let _ = listener.disconnect();
@@ -301,11 +629,16 @@ async fn windows_accept_loop(
         match make_pipe_instance(&pipe_name, false) {
             Ok(next) => {
                 let connected = std::mem::replace(&mut listener, next);
+                let peer_pid = options
+                    .pipe_peer_pid
+                    .as_ref()
+                    .and_then(|resolve| resolve(connected.as_raw_handle() as usize));
                 tokio::spawn(serve_conn(
                     connected,
                     token.clone(),
                     handler.clone(),
-                    lifecycle.clone(),
+                    options.clone(),
+                    peer_pid,
                 ));
             }
             Err(_) => {
@@ -316,10 +649,16 @@ async fn windows_accept_loop(
 }
 
 #[cfg(any(unix, windows))]
-async fn serve_conn<S>(stream: S, token: String, handler: Handler, lifecycle: Option<LifecycleCb>)
-where
+async fn serve_conn<S>(
+    stream: S,
+    token: String,
+    handler: Handler,
+    options: ServeOptions,
+    peer_pid: Option<u32>,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let lifecycle = options.lifecycle;
     let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(read_half);
     let writer: SharedWriter<S> = Arc::new(tokio::sync::Mutex::new(write_half));
@@ -345,11 +684,28 @@ where
             client: client.clone(),
         });
     }
-    serve_requests(&mut reader, &writer, &token, handler, client.clone()).await;
+    let hub = options.hub;
+    let mut subscription = None;
+    serve_requests(
+        &mut reader,
+        &writer,
+        &token,
+        handler,
+        hub.as_ref().map(|hub| (hub, peer_pid, &mut subscription)),
+    )
+    .await;
+    if let (Some(hub), Some((id, task))) = (&hub, subscription) {
+        task.abort();
+        hub.unsubscribe(id);
+    }
     if let Some(cb) = &lifecycle {
         cb(LifecycleEvent::Disconnected { client });
     }
 }
+
+/// A connection's live subscription: hub id + its event writer task.
+#[cfg(any(unix, windows))]
+type Subscription = (u64, tokio::task::JoinHandle<()>);
 
 #[cfg(any(unix, windows))]
 async fn serve_requests<S, R>(
@@ -357,7 +713,7 @@ async fn serve_requests<S, R>(
     writer: &SharedWriter<S>,
     token: &str,
     handler: Handler,
-    _client: String,
+    mut events: Option<(&EventHub, Option<u32>, &mut Option<Subscription>)>,
 ) where
     S: tokio::io::AsyncWrite + Unpin + Send + 'static,
     R: tokio::io::AsyncRead + Unpin,
@@ -375,14 +731,82 @@ async fn serve_requests<S, R>(
                     set.insert(env.id);
                 }
             }
-            FrameKind::Req => {
-                if env.method.as_deref() == Some("hello") {
-                    answer_hello(writer, &env, token).await;
-                } else {
-                    dispatch((*writer).clone(), cancelled.clone(), handler.clone(), env);
+            FrameKind::Req => match (env.method.as_deref(), events.as_mut()) {
+                (Some("hello"), _) => answer_hello(writer, &env, token).await,
+                (Some("events.subscribe"), Some((hub, peer_pid, slot))) => {
+                    subscribe(writer, hub, &env, *peer_pid, slot).await;
                 }
-            }
+                _ => dispatch((*writer).clone(), cancelled.clone(), handler.clone(), env),
+            },
             FrameKind::Res | FrameKind::Event => {}
+        }
+    }
+}
+
+/// Answer `events.subscribe` and start the connection's event writer. The
+/// answer is written before the writer starts, so it precedes every event.
+#[cfg(any(unix, windows))]
+async fn subscribe<S>(
+    writer: &SharedWriter<S>,
+    hub: &EventHub,
+    req: &Envelope,
+    peer_pid: Option<u32>,
+    slot: &mut Option<Subscription>,
+) where
+    S: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    if slot.is_some() {
+        let error = IpcError::new(
+            "already_subscribed",
+            "this connection is already subscribed".to_string(),
+        );
+        send_res(writer, &req.id, None, Some(error)).await;
+        return;
+    }
+    let params = req.params.clone().unwrap_or(Value::Null);
+    let topics: Vec<String> = params
+        .get("topics")
+        .and_then(Value::as_array)
+        .map(|topics| {
+            topics
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    match hub.subscribe(topics, peer_pid, params) {
+        Ok((id, wake)) => {
+            let ok = serde_json::json!({"ok": true});
+            send_res(writer, &req.id, Some(ok), None).await;
+            let task = tokio::spawn(write_events(Arc::clone(writer), hub.clone(), id, wake));
+            *slot = Some((id, task));
+        }
+        Err(error) => send_res(writer, &req.id, None, Some(error)).await,
+    }
+}
+
+/// Write a subscriber's queued events whenever the hub wakes it.
+#[cfg(any(unix, windows))]
+async fn write_events<S>(
+    writer: SharedWriter<S>,
+    hub: EventHub,
+    id: u64,
+    wake: Arc<tokio::sync::Notify>,
+) where
+    S: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncWriteExt as _;
+    loop {
+        wake.notified().await;
+        for env in hub.drain(id) {
+            let Ok(bytes) = encode_line(&env) else {
+                continue;
+            };
+            let mut guard = writer.lock().await;
+            if guard.write_all(&bytes).await.is_err() {
+                return;
+            }
         }
     }
 }

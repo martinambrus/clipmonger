@@ -40,6 +40,12 @@ struct ClientLink {
 #[cfg(not(any(unix, windows)))]
 struct NoLink;
 
+/// Blocking reader of the events pushed to a subscribed connection.
+pub struct EventStream {
+    #[cfg(any(unix, windows))]
+    reader: BufReader<Stream>,
+}
+
 #[cfg(any(unix, windows))]
 fn write_line(reader: &mut BufReader<Stream>, bytes: &[u8]) -> Result<(), IpcError> {
     let stream = reader.get_mut();
@@ -232,5 +238,86 @@ impl Client {
             "unavailable",
             "ipc client needs a Unix socket".to_string(),
         ))
+    }
+
+    /// Turn this connection into an event stream for `topics`. `extra`
+    /// (a JSON object) travels with the subscription, e.g. the popup window.
+    ///
+    /// # Errors
+    ///
+    /// Returns the server's refusal (`unknown_topic`, `already_subscribed`,
+    /// `denied`) or an I/O failure.
+    #[cfg(any(unix, windows))]
+    pub fn subscribe(self, topics: &[&str], extra: Value) -> Result<EventStream, IpcError> {
+        let mut link = self
+            .link
+            .into_inner()
+            .map_err(|_| IpcError::new("io_failed", "client lock poisoned".to_string()))?;
+        let mut params = match extra {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        params.insert("topics".to_string(), Value::from(topics.to_vec()));
+        let seq = link.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = format!("c{seq}");
+        let req = Envelope {
+            v: IPC_VERSION.to_string(),
+            id: id.clone(),
+            kind: FrameKind::Req,
+            method: Some("events.subscribe".to_string()),
+            params: Some(Value::Object(params)),
+            result: None,
+            error: None,
+            seq: None,
+        };
+        let bytes = encode_line(&req)?;
+        write_line(&mut link.reader, &bytes)?;
+        loop {
+            let frame = read_frame(&mut link.reader)?;
+            if frame.kind != FrameKind::Res || frame.id != id {
+                continue;
+            }
+            if let Some(error) = frame.error {
+                return Err(error);
+            }
+            return Ok(EventStream {
+                reader: link.reader,
+            });
+        }
+    }
+
+    /// Subscribe stub on platforms without Unix sockets or named pipes.
+    ///
+    /// # Errors
+    ///
+    /// Always fails with `unavailable`.
+    #[cfg(not(any(unix, windows)))]
+    pub fn subscribe(self, _topics: &[&str], _extra: Value) -> Result<EventStream, IpcError> {
+        let _ = &self.link;
+        Err(IpcError::new(
+            "unavailable",
+            "ipc client needs a Unix socket".to_string(),
+        ))
+    }
+}
+
+impl EventStream {
+    /// Block until the next pushed event; returns its topic and params.
+    ///
+    /// # Errors
+    ///
+    /// Returns `connection_closed` when the daemon goes away, or a decode or
+    /// I/O failure.
+    #[cfg(any(unix, windows))]
+    pub fn next_event(&mut self) -> Result<(String, Value), IpcError> {
+        loop {
+            let frame = read_frame(&mut self.reader)?;
+            if frame.kind == FrameKind::Event {
+                return Ok((
+                    frame.method.unwrap_or_default(),
+                    frame.params.unwrap_or(Value::Null),
+                ));
+            }
+        }
     }
 }

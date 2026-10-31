@@ -216,6 +216,38 @@ pub struct EventsSubscribeParams {
 pub struct EventsSubscribeResult {
     pub ok: bool,
 }
+/// Event topic the daemon pushes to the UI to show its popup.
+pub const SHOW_POPUP_TOPIC: &str = "ui.show_popup";
+/// Payload of the daemon→UI `ui.show_popup` event.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShowPopupEvent {
+    /// `hotkey` for a key press, `request` for `popup.open`.
+    pub source: String,
+    /// The press came while the popup was in front: hide it instead.
+    #[serde(default)]
+    pub toggle: bool,
+    /// Paste target captured at the press (Windows HWND, X11 window id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<u64>,
+    /// Single-use gesture token minted for the press.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gesture: Option<u64>,
+    /// X11 server time of the press, for focus requests (reserved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x11_time: Option<u32>,
+    /// Wayland xdg-activation token for the press (reserved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_token: Option<String>,
+}
+/// Empty params for `popup.open` (no gesture, no target).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PopupOpenParams {}
+/// Output for `popup.open`: whether a running UI got the request (otherwise
+/// it waits for the UI the daemon starts).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PopupOpenResult {
+    pub delivered: bool,
+}
 /// Capture relay for `capture.report`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureReportParams {
