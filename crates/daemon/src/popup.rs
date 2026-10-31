@@ -78,7 +78,7 @@ impl DaemonState {
         };
         let ui = hub.subscribers(SHOW_POPUP_TOPIC).into_iter().next();
         let (target, toggle) = match source {
-            PopupSource::Press => press_target(ui.as_ref().and_then(|ui| ui.peer_pid)),
+            PopupSource::Press => press_target(ui.as_ref()),
             PopupSource::Request => (None, false),
         };
         let gesture = (source == PopupSource::Press).then(|| self.mint_gesture_token(target));
@@ -189,19 +189,52 @@ impl PopupChord {
 /// Paste target of a press, and whether the press should hide the popup
 /// instead (the UI's popup is the window in front).
 #[cfg(all(windows, feature = "backend-windows"))]
-fn press_target(ui_pid: Option<u32>) -> (Option<u64>, bool) {
-    let Some(hwnd) = clipmonger_backend_windows::foreground_window_id() else {
+fn press_target(ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
+    let foreground = clipmonger_backend_windows::foreground_window_id();
+    press_decision(
+        foreground,
+        foreground.and_then(clipmonger_backend_windows::hwnd_owner_pid),
+        ui.and_then(|ui| ui.peer_pid),
+        ui.and_then(registered_popup_hwnd),
+    )
+}
+
+/// The press decision without the Win32 calls. The popup is in front only
+/// when the foreground window is the popup window the UI registered, so any
+/// other window of the UI (Settings) is an ordinary paste target. A UI that
+/// registered no popup window is told apart by its process.
+#[cfg(any(test, all(windows, feature = "backend-windows")))]
+fn press_decision(
+    foreground: Option<i64>,
+    foreground_pid: Option<u32>,
+    ui_pid: Option<u32>,
+    popup_hwnd: Option<u64>,
+) -> (Option<u64>, bool) {
+    let Some(foreground) = foreground else {
         return (None, false);
     };
-    if ui_pid.is_some() && clipmonger_backend_windows::hwnd_owner_pid(hwnd) == ui_pid {
-        return (None, true);
+    let popup_in_front = match popup_hwnd {
+        Some(popup) => foreground.cast_unsigned() == popup,
+        None => ui_pid.is_some() && foreground_pid == ui_pid,
+    };
+    if popup_in_front {
+        (None, true)
+    } else {
+        (Some(foreground.cast_unsigned()), false)
     }
-    (Some(hwnd.cast_unsigned()), false)
+}
+
+/// The popup window the UI registered when it subscribed.
+#[cfg(all(windows, feature = "backend-windows"))]
+fn registered_popup_hwnd(ui: &SubscriberInfo) -> Option<u64> {
+    ui.params
+        .get("popup_hwnd")
+        .and_then(serde_json::Value::as_u64)
 }
 
 /// Paste target of a press: the active X11 window (the UI decides toggling).
 #[cfg(all(unix, feature = "backend-x11"))]
-fn press_target(_ui_pid: Option<u32>) -> (Option<u64>, bool) {
+fn press_target(_ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
     use clipmonger_platform::types::PlatformHandle;
     if std::env::var_os("DISPLAY").is_none() {
         return (None, false);
@@ -220,7 +253,7 @@ fn press_target(_ui_pid: Option<u32>) -> (Option<u64>, bool) {
     all(windows, feature = "backend-windows"),
     all(unix, feature = "backend-x11")
 )))]
-fn press_target(_ui_pid: Option<u32>) -> (Option<u64>, bool) {
+fn press_target(_ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
     (None, false)
 }
 
@@ -233,11 +266,7 @@ fn activate_popup(ui: Option<&SubscriberInfo>) {
     let Some(ui) = ui else {
         return;
     };
-    let hwnd = ui
-        .params
-        .get("popup_hwnd")
-        .and_then(serde_json::Value::as_u64);
-    if let (Some(hwnd), Some(pid)) = (hwnd, ui.peer_pid) {
+    if let (Some(hwnd), Some(pid)) = (registered_popup_hwnd(ui), ui.peer_pid) {
         let _ = clipmonger_backend_windows::show_owned_window(hwnd.cast_signed(), pid);
     }
 }
@@ -472,5 +501,78 @@ mod chord_tests {
             "a released chord is picked up on retry"
         );
         assert_eq!(keys.held[&HotkeyId(1)], "ctrl+alt+x");
+    }
+}
+
+#[cfg(test)]
+mod press_tests {
+    use super::press_decision;
+
+    const UI_PID: u32 = 100;
+    const OTHER_PID: u32 = 200;
+    const POPUP: u64 = 0x1234;
+    const SETTINGS: u64 = 0x5678;
+    const OTHER: u64 = 0x9abc;
+
+    fn fg(hwnd: u64) -> i64 {
+        hwnd.cast_signed()
+    }
+
+    #[test]
+    fn registered_popup_in_front_toggles() {
+        assert_eq!(
+            press_decision(Some(fg(POPUP)), Some(UI_PID), Some(UI_PID), Some(POPUP)),
+            (None, true)
+        );
+    }
+
+    #[test]
+    fn another_ui_window_in_front_is_a_normal_press_with_that_target() {
+        assert_eq!(
+            press_decision(Some(fg(SETTINGS)), Some(UI_PID), Some(UI_PID), Some(POPUP)),
+            (Some(SETTINGS), false)
+        );
+    }
+
+    #[test]
+    fn foreign_window_in_front_is_a_normal_press_with_that_target() {
+        assert_eq!(
+            press_decision(Some(fg(OTHER)), Some(OTHER_PID), Some(UI_PID), Some(POPUP)),
+            (Some(OTHER), false)
+        );
+    }
+
+    #[test]
+    fn without_a_registered_popup_the_ui_process_decides() {
+        assert_eq!(
+            press_decision(Some(fg(SETTINGS)), Some(UI_PID), Some(UI_PID), None),
+            (None, true)
+        );
+        assert_eq!(
+            press_decision(Some(fg(OTHER)), Some(OTHER_PID), Some(UI_PID), None),
+            (Some(OTHER), false)
+        );
+        assert_eq!(
+            press_decision(Some(fg(OTHER)), None, Some(UI_PID), None),
+            (Some(OTHER), false),
+            "an unknown owner is not the UI"
+        );
+        assert_eq!(
+            press_decision(Some(fg(OTHER)), None, None, None),
+            (Some(OTHER), false),
+            "no UI subscribed: nothing to toggle"
+        );
+    }
+
+    #[test]
+    fn no_foreground_window_is_a_press_without_target() {
+        assert_eq!(
+            press_decision(None, None, Some(UI_PID), Some(POPUP)),
+            (None, false)
+        );
+        assert_eq!(
+            press_decision(None, None, Some(UI_PID), None),
+            (None, false)
+        );
     }
 }

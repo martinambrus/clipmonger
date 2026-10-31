@@ -627,3 +627,83 @@ fn t411_swap_restores_formats() {
         let _ = t.write(&[("text/plain".to_string(), orig)]);
     }
 }
+
+/// ADR-004 popup show: `show_owned_window` restores a minimized window of
+/// this process (still visible, or hidden like a popup dismissed with Esc),
+/// shows it and brings it to the front. Own windows only.
+#[test]
+fn t_show_owned_window_restores_minimized() {
+    use clipmonger_backend_windows::show_owned_window;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, GetForegroundWindow, IsIconic, IsWindowVisible, ShowWindow,
+        SW_HIDE, SW_SHOWMINNOACTIVE, WS_OVERLAPPEDWINDOW,
+    };
+    const T: &str = "t_show_owned_window_restores_minimized";
+
+    /// Destroys the window on drop, also when an assertion fails.
+    struct OwnWindow(HWND);
+    impl Drop for OwnWindow {
+        fn drop(&mut self) {
+            // Safety: the window was created by this thread and is destroyed once.
+            unsafe {
+                DestroyWindow(self.0);
+            }
+        }
+    }
+
+    // Safety: plain window-manager calls on a window this test creates.
+    unsafe {
+        if GetForegroundWindow().is_null() {
+            println!("SKIP {T}: session has no foreground window");
+            return;
+        }
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let hwnd = CreateWindowExW(
+            0,
+            class.as_ptr(),
+            std::ptr::null(),
+            WS_OVERLAPPEDWINDOW,
+            100,
+            100,
+            200,
+            100,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        assert!(!hwnd.is_null(), "{T}: cannot create the test window");
+        let _window = OwnWindow(hwnd);
+        // The launcher's startup info may override the first ShowWindow of a
+        // process; spend that call on the hidden window.
+        ShowWindow(hwnd, SW_HIDE);
+        for hidden in [false, true] {
+            ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+            if hidden {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+            assert!(IsIconic(hwnd) != 0, "{T}: setup: not minimized");
+            assert_eq!(
+                IsWindowVisible(hwnd) != 0,
+                !hidden,
+                "{T}: setup: visibility"
+            );
+
+            assert!(
+                show_owned_window(hwnd as i64, std::process::id()),
+                "{T}: hidden={hidden}: not in front afterwards"
+            );
+            assert!(
+                IsWindowVisible(hwnd) != 0,
+                "{T}: hidden={hidden}: not visible"
+            );
+            assert!(IsIconic(hwnd) == 0, "{T}: hidden={hidden}: still minimized");
+            assert_eq!(
+                GetForegroundWindow(),
+                hwnd,
+                "{T}: hidden={hidden}: not the foreground window"
+            );
+        }
+    }
+}
