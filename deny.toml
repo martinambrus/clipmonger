@@ -14,6 +14,9 @@ ignore = [
     { id = "RUSTSEC-2026-0368", reason = "zip extract() symlink target; extract() not used, symlinks rejected, see above" },
     { id = "RUSTSEC-2026-0369", reason = "zip extract() permissions via symlink; extract() not used, see above" },
     { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained (transitive build dep); no vulnerability, triage at next dep bump" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained; transitive via ksni 0.3.7 (Linux tray) and ashpd 0.13.13 (Wayland portal) on zbus 5; merged into zbus 6.0.0; no ksni or ashpd release on zbus 6 as of 2026-10-31; Linux-only; revisit when they move to zbus 6" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained; transitive via ksni 0.3.7 (Linux tray) and ashpd 0.13.13 (Wayland portal) on zbus 5; merged into zbus 6.0.0; no ksni or ashpd release on zbus 6 as of 2026-10-31; Linux-only; revisit when they move to zbus 6" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained; transitive via ksni 0.3.7 (Linux tray) and ashpd 0.13.13 (Wayland portal) on zbus 5; merged into zbus 6.0.0; no ksni or ashpd release on zbus 6 as of 2026-10-31; Linux-only; revisit when they move to zbus 6" },
 ]
 
 [licenses]
