@@ -2165,8 +2165,7 @@ impl DaemonState {
             let restore = self
                 .config
                 .lock()
-                .map(|cfg| cfg.popup.restore_clipboard)
-                .unwrap_or(true);
+                .map_or(true, |cfg| cfg.popup.restore_clipboard);
             let paste = clipmonger_backend_windows::WinPaste::new(
                 usize::try_from(unicode_limit).unwrap_or(65536),
             )
@@ -2311,8 +2310,7 @@ impl DaemonState {
         let restore = self
             .config
             .lock()
-            .map(|cfg| cfg.popup.restore_clipboard)
-            .unwrap_or(true);
+            .map_or(true, |cfg| cfg.popup.restore_clipboard);
         if delivery == clipmonger_core::PasteDelivery::ClipboardRestore {
             let swap = clipmonger_backend_windows::paste::ClipboardSwap::begin(payloads, restore)
                 .map_err(|e| IpcError::new("backend", format!("paste.execute: {e}")))?;

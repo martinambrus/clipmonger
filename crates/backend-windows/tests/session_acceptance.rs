@@ -60,8 +60,7 @@ macro_rules! guard {
 fn unique_marker(test: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     format!("clipmonger-winback-{test}-{}-{}", std::process::id(), nanos)
 }
 
@@ -280,7 +279,7 @@ fn t411_guarded_restore() {
 }
 
 /// T-408 integrity: own-process capture must never report High integrity
-/// (which would refuse paste per seg-04 S4). Strategy must be UnicodeInject.
+/// (which would refuse paste per seg-04 S4). Strategy must be `UnicodeInject`.
 #[test]
 fn t408_integrity_medium() {
     const T: &str = "t408_integrity_medium";
@@ -375,7 +374,7 @@ fn t405_monitor_capture() {
 }
 
 /// Backend caps smoke: `caps()` must report the healthy Windows matrix
-/// (Full monitor/transfer/hotkey, UnicodeInject paste, autostart on,
+/// (Full monitor/transfer/hotkey, `UnicodeInject` paste, autostart on,
 /// no primary selection).
 #[test]
 fn t_caps_backend() {

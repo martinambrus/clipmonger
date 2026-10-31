@@ -248,13 +248,14 @@ fn elevate_schtasks(params: &str) -> Result<(), String> {
     let file = to_wide("schtasks.exe");
     let pars = to_wide(params);
     let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
-    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.cbSize = u32::try_from(std::mem::size_of::<SHELLEXECUTEINFOW>())
+        .expect("SHELLEXECUTEINFOW size fits in u32");
     info.fMask = SEE_MASK_NOCLOSEPROCESS;
     info.lpVerb = verb.as_ptr();
     info.lpFile = file.as_ptr();
     info.lpParameters = pars.as_ptr();
     info.nShow = SW_HIDE;
-    let ok = unsafe { ShellExecuteExW(&mut info) };
+    let ok = unsafe { ShellExecuteExW(&raw mut info) };
     if ok == 0 {
         return Err(format!(
             "ShellExecuteEx(runas) refused: {}",
