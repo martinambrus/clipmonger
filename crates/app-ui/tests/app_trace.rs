@@ -1270,3 +1270,83 @@ fn rule_app_session_trace_in_order() {
         ]
     );
 }
+
+/// Reach a painted widget through keyboard navigation, without activating it.
+fn focus_widget(rig: &mut Rig, text: &str) {
+    let centre = rig.show().centre_of(text);
+    for _ in 0..20 {
+        rig.key(egui::Key::Tab);
+        rig.show();
+        let focused = rig.ctx.memory(egui::Memory::focused);
+        if focused
+            .and_then(|id| rig.ctx.read_response(id))
+            .is_some_and(|response| response.rect.contains(centre))
+        {
+            return;
+        }
+        rig.input(egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: Some(egui::Key::Tab),
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        rig.show();
+    }
+    panic!("keyboard navigation never focused {text:?}");
+}
+
+#[test]
+fn fix_x1_settings_activation_does_not_pick_a_clip() {
+    for key in [egui::Key::Enter, egui::Key::Space] {
+        let mut rig = Rig::new(false);
+        rig.push(hotkey(Some(7), Some(9)));
+        rig.push(history(&[clip(1, "alpha")]));
+        rig.tick();
+        focus_widget(
+            &mut rig,
+            clipmonger_app_ui::strings::text("config.open_config"),
+        );
+        let _ = rig.cmds();
+        rig.key(key);
+        rig.show();
+        assert!(rig.app.desired().settings_open, "{key:?} opens Settings");
+        assert!(rig.is_open(), "{key:?} must leave the popup open");
+        rig.tick();
+        thread::sleep(Duration::from_millis(170));
+        rig.tick();
+        assert!(rig.cmds().iter().all(|cmd| !matches!(
+            cmd,
+            UiCmd::PasteClipTo(..) | UiCmd::PasteClip(_) | UiCmd::ExecPermanent(_)
+        )));
+        assert_eq!(rig.foreground.load(Ordering::SeqCst), 0);
+        assert_eq!(rig.trace(), vec![open_line("hotkey", true, true)]);
+    }
+}
+
+#[test]
+fn fix_x1_group_activation_does_not_pick_a_clip() {
+    for key in [egui::Key::Enter, egui::Key::Space] {
+        let mut rig = Rig::new(false);
+        rig.push(hotkey(Some(7), Some(9)));
+        rig.push(history(&[clip(1, "alpha")]));
+        show_permanents(&mut rig);
+        rig.app.config().lock().expect("settings").perm_source = None;
+        focus_widget(&mut rig, "Work");
+        let _ = rig.cmds();
+        rig.key(key);
+        rig.show();
+        assert_eq!(
+            rig.app.config().lock().expect("settings").perm_source,
+            Some(0),
+            "{key:?} selects the group"
+        );
+        assert!(rig.is_open(), "{key:?} must leave the popup open");
+        rig.tick();
+        thread::sleep(Duration::from_millis(170));
+        rig.tick();
+        assert_eq!(rig.cmds(), vec![], "no paste or exec after {key:?}");
+        assert_eq!(rig.foreground.load(Ordering::SeqCst), 0);
+        assert_eq!(rig.trace(), vec![open_line("hotkey", true, true)]);
+    }
+}

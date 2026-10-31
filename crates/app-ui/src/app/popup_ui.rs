@@ -44,6 +44,7 @@ impl PopupApp {
         }) {
             self.feed(Event::Key);
         }
+        let widget_focused = !search_focused && ctx.memory(egui::Memory::focused).is_some();
         let pressed: Vec<(String, bool, bool)> = ctx.input(|input| {
             let mut out = Vec::new();
             let ctrl = input.modifiers.ctrl;
@@ -72,6 +73,10 @@ impl PopupApp {
                 (egui::Key::Num9, "9"),
             ];
             for (key, name) in pairs {
+                // egui activates the focused widget without consuming its key.
+                if widget_focused && matches!(key, egui::Key::Enter | egui::Key::Space) {
+                    continue;
+                }
                 if input.key_pressed(key) {
                     out.push((name.to_string(), ctrl, alt));
                 }
