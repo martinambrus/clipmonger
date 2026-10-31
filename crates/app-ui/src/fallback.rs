@@ -337,6 +337,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_SHOWWINDOW => {
+            if wparam.0 == 0 {
+                // Hidden (focus loss, Esc, paste, toggle, tray): the target and
+                // gesture belong to one open. A request only raises the popup
+                // the daemon already showed, so it must find none left over.
+                G_TARGET_HWND = None;
+                G_GESTURE = None;
+            }
             if wparam.0 != 0 {
                 if let Some(ptr) = G_STATE {
                     let s = &mut *ptr;
@@ -997,6 +1004,8 @@ fn do_paste(state: &mut PopupState) {
     // closed meanwhile, so the daemon refuses visibly instead of pasting
     // into whatever window is in front.
     let target = unsafe { G_TARGET_HWND }.filter(|t| *t != hwnd_main);
+    // Taken before the hide below, which forgets the target and gesture.
+    let gesture = unsafe { G_GESTURE };
     let picked_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
@@ -1019,7 +1028,6 @@ fn do_paste(state: &mut PopupState) {
         eprintln!("  hide ok={}", ok.as_bool());
     }
     // Spent by this paste; the next one needs a new press.
-    let gesture = unsafe { G_GESTURE };
     unsafe {
         G_GESTURE = None;
     }

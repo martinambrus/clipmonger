@@ -54,6 +54,11 @@ reserved for the release that passes all seg-11 §5 gates.
 - GNOME extension: until the daemon's config arrived it registered the old
   default shortcut `Ctrl+Alt+V`, and its settings schema still defaulted to
   it; it now uses `Ctrl+Alt+H` like the daemon.
+- Windows popup: a popup opened by `clipmonger-cli show-popup` or by
+  starting Clipmonger again pasted into the window of an earlier hotkey
+  press instead of the window in front, because it kept that press's
+  target after hiding. It now forgets the target and the admin-paste
+  gesture whenever it hides.
 - Windows admin-window pastes were delayed by up to 30 s, silently
   dropped after ~7.5 min idle, or ran late into whatever window had
   focus: the helper heartbeat stalled on synchronous pipe I/O and jobs
