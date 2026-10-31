@@ -36,6 +36,12 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+# egui bundles these fonts, including Ubuntu-Light as the primary UI font.
+# Their license texts are retained in licenses/fonts/ for release shipping.
+[[licenses.exceptions]]
+name = "epaint_default_fonts"
+allow = ["OFL-1.1", "Ubuntu-font-1.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "warn"
