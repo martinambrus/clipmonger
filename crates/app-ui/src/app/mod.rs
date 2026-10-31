@@ -827,7 +827,9 @@ mod tests {
                 trace: None,
                 allow_foreground: Box::new(|| {}),
             });
-            app.start = Instant::now() - Duration::from_secs(1);
+            app.start = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("tray clock origin");
             let pressed = app.start + Duration::from_millis(10);
             if focus_first {
                 app.feed_at(Event::FocusLost, 10);

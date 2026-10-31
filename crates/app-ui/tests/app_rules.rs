@@ -3429,7 +3429,10 @@ fn fix_fc3_closing_settings_clears_old_messages_before_reopening() {
             rig.push(event);
             rig.tick();
             let old = rig.app.config().lock().expect("settings").error.clone();
-            assert!(!old.is_empty());
+            assert!(
+                !old.is_empty(),
+                "the Settings reply sets a message before close"
+            );
             rig.close_request(WindowKind::Settings);
             rig.pass(WindowKind::Settings, visible);
             assert!(!rig.desired().settings_open);
@@ -3437,6 +3440,68 @@ fn fix_fc3_closing_settings_clears_old_messages_before_reopening() {
             rig.tray(&[TrayAction::OpenConfig]);
             rig.tick();
             assert!(!rig.show_settings().painted(&old));
+        }
+    }
+}
+
+#[test]
+fn fix_n3_long_history_keeps_error_and_settings_painted_inside_window() {
+    fn text_bounds(
+        shape: &egui::Shape,
+        clip: egui::Rect,
+        out: &mut Vec<(String, egui::Rect, egui::Rect)>,
+    ) {
+        match shape {
+            egui::Shape::Text(text) => out.push((
+                text.galley.text().to_string(),
+                egui::Rect::from_min_size(text.pos, text.galley.size()),
+                clip,
+            )),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    text_bounds(shape, clip, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut rig = Rig::opened();
+    let clips: Vec<_> = (1..=60)
+        .map(|n| clip(n, &format!("History row {n}")))
+        .collect();
+    rig.push(history(&clips));
+    rig.push(UiEvent::PasteFailed(
+        "paste failed with a long history".to_string(),
+    ));
+    rig.tick();
+    let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 360.0));
+    for _ in 0..2 {
+        let mut output = rig.popup.ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(window),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                rig.app.logic(ui.ctx(), WindowKind::Popup);
+                rig.app.ui(ui, WindowKind::Popup);
+            },
+        );
+        output.textures_delta.clear();
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            text_bounds(&clipped.shape, clipped.clip_rect, &mut texts);
+        }
+        for expected in [
+            "paste failed with a long history",
+            strings::text("config.open_config"),
+            rig.app.vm().status_line().as_str(),
+        ] {
+            assert!(
+                texts.iter().any(|(text, rect, clip)| {
+                    text == expected && window.contains_rect(*rect) && clip.contains_rect(*rect)
+                }),
+                "{expected:?} must be painted inside the window and its clip: {texts:?}"
+            );
         }
     }
 }

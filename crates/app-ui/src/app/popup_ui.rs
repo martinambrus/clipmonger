@@ -94,6 +94,18 @@ impl PopupApp {
         }
     }
 
+    /// Paint the footer and report whether Settings was activated.
+    fn render_footer(&self, ui: &mut egui::Ui) -> bool {
+        if !self.vm.banner().is_empty() {
+            ui.label(self.vm.banner());
+        }
+        ui.label(self.vm.status_line());
+        if let Some(error) = self.shell.error() {
+            ui.label(error);
+        }
+        ui.button(strings::text("config.open_config")).clicked()
+    }
+
     /// Render the popup window contents.
     #[allow(clippy::too_many_lines)]
     pub(super) fn render(&mut self, ui: &mut egui::Ui) {
@@ -106,6 +118,22 @@ impl PopupApp {
         let mut search_focused = false;
         let mut open_settings = false;
         egui::CentralPanel::default().show(ui, |ui| {
+            // Measure without interaction so the footer reserves its actual
+            // height on the first pass, while keeping keyboard order below.
+            let full_rect = ui.max_rect();
+            let footer_height = {
+                let mut measure = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("popup_footer_measure")
+                        .sizing_pass()
+                        .invisible(),
+                );
+                self.render_footer(&mut measure);
+                measure.min_size().y
+            };
+            ui.set_max_height(
+                (full_rect.height() - footer_height - ui.spacing().item_spacing.y).max(0.0),
+            );
             let field = ui.add(
                 egui::TextEdit::singleline(&mut query)
                     .hint_text(strings::text("popup.search_hint")),
@@ -209,16 +237,14 @@ impl PopupApp {
                     }
                 });
             }
-            if !self.vm.banner().is_empty() {
-                ui.label(self.vm.banner());
-            }
-            ui.label(self.vm.status_line());
-            if let Some(error) = self.shell.error() {
-                ui.label(error);
-            }
-            if ui.button(strings::text("config.open_config")).clicked() {
-                open_settings = true;
-            }
+            let mut footer = ui.new_child(egui::UiBuilder::new().id_salt("popup_footer").max_rect(
+                egui::Rect::from_min_max(
+                    egui::pos2(full_rect.left(), full_rect.bottom() - footer_height),
+                    full_rect.max,
+                ),
+            ));
+            open_settings = self.render_footer(&mut footer);
+            ui.expand_to_include_rect(footer.min_rect());
         });
         if open_settings {
             self.open_settings(None);

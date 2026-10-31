@@ -1513,7 +1513,10 @@ fn fix_n1_unrelated_error_does_not_steal_a_pending_permanent_failure() {
         if settings {
             let config = rig.app.config().lock().expect("settings");
             assert_eq!(config.error, "earlier command failed");
-            assert!(config.pending_apply.is_empty());
+            assert!(
+                config.pending_apply.is_empty(),
+                "the Apply error completes pending keys"
+            );
         }
         rig.push(permanent_backend_failure("exec failed"));
         rig.tick();
