@@ -9,14 +9,19 @@ pub const CLOUD_OPT_OUT: &str = "CanUploadToCloudClipboard";
 /// Skip capture when the source offers this format.
 pub const VIEWER_IGNORE: &str = "Clipboard Viewer Ignore";
 
-/// Decode a small privacy marker: serialized DWORD or legacy text.
+/// Decode a privacy marker of at most 64 bytes. A little-endian DWORD
+/// zero or one with optional zero padding is returned in decimal; all
+/// other payloads use the legacy text decoding and trimming.
 #[must_use]
 pub fn decode_marker(bytes: &[u8]) -> Option<String> {
     if bytes.len() > 64 {
         return None;
     }
-    if let Ok(dword) = <[u8; 4]>::try_from(bytes) {
-        return Some(u32::from_le_bytes(dword).to_string());
+    if bytes.len() >= 4 && bytes[4..].iter().all(|&byte| byte == 0) {
+        let dword = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if matches!(dword, 0 | 1) {
+            return Some(dword.to_string());
+        }
     }
     let text = String::from_utf8_lossy(bytes).into_owned();
     Some(text.trim_matches('\0').trim().to_string())
@@ -93,13 +98,42 @@ mod tests {
     }
 
     #[test]
-    fn marker_dword_is_little_endian_decimal() {
+    fn marker_one_decodes_and_other_dwords_do_not_skip() {
         assert_eq!(decode_marker(&1_u32.to_le_bytes()).as_deref(), Some("1"));
-        assert_eq!(decode_marker(&[0, 1, 0, 0]).as_deref(), Some("256"));
-        assert_eq!(
-            decode_marker(&u32::MAX.to_le_bytes()),
-            Some(u32::MAX.to_string())
-        );
+        for name in [HISTORY_OPT_OUT, CLOUD_OPT_OUT] {
+            for bytes in [
+                [0, 1, 0, 0],
+                [0, 0, 0, 1],
+                [2, 0, 0, 0],
+                u32::MAX.to_le_bytes(),
+            ] {
+                assert!(!marker_skips(name, &bytes));
+            }
+        }
+    }
+
+    #[test]
+    fn marker_four_byte_text_zero_skips() {
+        for name in [HISTORY_OPT_OUT, CLOUD_OPT_OUT] {
+            assert!(marker_skips(name, b"0\0\0\0"));
+        }
+    }
+
+    #[test]
+    fn marker_padded_dword_zero_skips() {
+        for name in [HISTORY_OPT_OUT, CLOUD_OPT_OUT] {
+            assert!(marker_skips(name, &[0; 8]));
+            assert!(marker_skips(name, &[0; 16]));
+        }
+    }
+
+    #[test]
+    fn marker_padded_dword_one_decodes_and_does_not_skip() {
+        let bytes = [1, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(decode_marker(&bytes).as_deref(), Some("1"));
+        for name in [HISTORY_OPT_OUT, CLOUD_OPT_OUT] {
+            assert!(!marker_skips(name, &bytes));
+        }
     }
 
     #[test]
