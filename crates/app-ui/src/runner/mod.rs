@@ -236,13 +236,20 @@ struct Slot {
     host: Option<Host>,
 }
 
+/// Construct either window's egui context before it receives input.
+fn new_context() -> Context {
+    let ctx = Context::default();
+    ctx.options_mut(|options| options.zoom_with_keyboard = false);
+    ctx
+}
+
 impl Slot {
     fn new(
         kind: WindowKind,
         proxy: &EventLoopProxy<UserEvent>,
         fonts: &Arc<egui_system_font_provider::SystemFontProvider>,
     ) -> Self {
-        let ctx = Context::default();
+        let ctx = new_context();
         ctx.add_font_provider(fonts.clone());
         let proxy = proxy.clone();
         ctx.set_request_repaint_callback(move |info| {
@@ -702,5 +709,21 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
     /// Run tick on wait.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.tick(event_loop);
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    #[test]
+    fn fix_x6_both_window_contexts_disable_keyboard_zoom_at_creation() {
+        for kind in [WindowKind::Popup, WindowKind::Settings] {
+            let ctx = new_context();
+            assert!(
+                !ctx.options(|options| options.zoom_with_keyboard),
+                "{kind:?}: keyboard zoom must be off before the first pass"
+            );
+        }
     }
 }
