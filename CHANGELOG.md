@@ -47,6 +47,10 @@ reserved for the release that passes all seg-11 §5 gates.
   validation and was never applied; list values in both settings windows
   were shown as JSON but read back as comma-separated text. Both windows
   now show and read the same text form for every row kind.
+- A refused admin-window paste from a popup not opened by the hotkey (no
+  gesture) marked paste Degraded ("elevation refused") until the daemon
+  restarted. It is now refused and audited only; a cancelled UAC prompt
+  still degrades paste (seg-04 §5).
 - Windows admin-window pastes were delayed by up to 30 s, silently
   dropped after ~7.5 min idle, or ran late into whatever window had
   focus: the helper heartbeat stalled on synchronous pipe I/O and jobs

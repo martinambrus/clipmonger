@@ -1411,6 +1411,13 @@ impl DaemonState {
         if let Ok(mut flag) = self.elevation_refused.lock() {
             *flag = true;
         }
+        self.audit_elevation_refused(reason);
+    }
+
+    /// Audit one refused elevated paste without touching caps: a missing
+    /// gesture refuses that paste only (caps degrade on a UAC refusal,
+    /// seg-04 §5).
+    fn audit_elevation_refused(&self, reason: &str) {
         let profile = self
             .profile_dir
             .lock()
@@ -2201,7 +2208,7 @@ impl DaemonState {
                 let token_ok =
                     token.is_some_and(|t| self.consume_gesture_token(t, now_ms(), target_id));
                 if !token_ok {
-                    self.note_elevation_refused("missing or invalid gesture token");
+                    self.audit_elevation_refused("missing or invalid gesture token");
                     return Err(IpcError::new(
                         "denied",
                         "paste.execute: elevation refused (gesture required)".to_string(),
@@ -2852,5 +2859,29 @@ mod tests {
         let mut texts = history_texts(&state);
         texts.sort();
         assert_eq!(texts, vec!["second".to_string(), "third".to_string()]);
+    }
+
+    #[test]
+    fn missing_gesture_is_audited_without_degrading_paste() {
+        let (dir, state) = fresh_state("gesture-refusal");
+        state.set_profile_dir(&dir);
+        let paste_level = |state: &DaemonState| {
+            state.caps_snapshot()["paste"]["level"]
+                .as_str()
+                .map(str::to_string)
+        };
+        state.audit_elevation_refused("missing or invalid gesture token");
+        assert!(!state.elevation_refused());
+        assert_eq!(paste_level(&state).as_deref(), Some("unavailable"));
+        let audit = std::fs::read_to_string(dir.join("audit.log")).expect("audit.log");
+        assert!(
+            audit.contains("\"action\":\"elevation_refused\"")
+                && audit.contains("missing or invalid gesture token"),
+            "refusal must still be audited, got: {audit}"
+        );
+        // A refused UAC prompt still latches caps paste Degraded.
+        state.note_elevation_refused("elevation refused: UAC cancelled");
+        assert!(state.elevation_refused());
+        assert_eq!(paste_level(&state).as_deref(), Some("degraded"));
     }
 }
