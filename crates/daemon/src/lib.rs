@@ -16,6 +16,8 @@ use clipmonger_ipc::proto::IpcError;
 use clipmonger_platform::types::{BackendCaps, Level, PasteStrategy};
 use serde_json::Value;
 
+pub mod capture;
+
 /// Protocol tag written to the rendezvous file.
 pub const PROTOCOL: &str = "ipc/v1";
 /// Daemon crate version reported by `status`.
