@@ -9,7 +9,6 @@ use image::codecs::png::{PngDecoder, PngEncoder};
 use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder as _, RgbaImage};
 
 /// Decode guards (seg-03 §8): bigger images are refused before decoding.
-const MAX_SIDE: u32 = 8192;
 const MAX_PIXELS: u64 = 64_000_000;
 
 /// Largest clipboard bitmap worth reading: the guard's pixel limit at
@@ -81,7 +80,7 @@ pub fn png_to_dib(png: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn check_size((width, height): (u32, u32)) -> Result<(), String> {
-    if width > MAX_SIDE || height > MAX_SIDE || u64::from(width) * u64::from(height) > MAX_PIXELS {
+    if u64::from(width) * u64::from(height) > MAX_PIXELS {
         return Err(format!("image {width}x{height} is over the decode limit"));
     }
     Ok(())
@@ -222,13 +221,11 @@ mod tests {
     #[test]
     fn decode_guard_refuses_before_reading_pixels() {
         // Headers alone: the guard must fire before any pixel read.
-        let err = dib_to_png(&header_only(9000, 1)).unwrap_err();
+        let err = dib_to_png(&header_only(5213, 12277)).unwrap_err();
         assert!(err.contains("decode limit"), "{err}");
         let err = dib_to_png(&header_only(8000, 8001)).unwrap_err();
         assert!(err.contains("decode limit"), "{err}");
-        let wide = encode_png(&RgbaImage::new(9000, 1)).unwrap();
-        let err = png_to_dib(&wide).unwrap_err();
-        assert!(err.contains("decode limit"), "{err}");
+        assert!(check_size((11520, 2160)).is_ok());
         assert!(check_size((8192, 7812)).is_ok());
     }
 
