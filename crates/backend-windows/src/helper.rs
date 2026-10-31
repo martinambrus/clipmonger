@@ -442,6 +442,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persistent_pipe_name_matches_fnv1a64_vectors() {
+        for (profile, expected) in [
+            ("", r"\\.\pipe\clipmonger-persist-cbf29ce484222325"),
+            ("a", r"\\.\pipe\clipmonger-persist-af63dc4c8601ec8c"),
+            ("foobar", r"\\.\pipe\clipmonger-persist-85944171f73967e8"),
+        ] {
+            assert_eq!(
+                persistent_pipe_name(std::path::Path::new(profile)),
+                expected,
+                "profile: {profile:?}"
+            );
+        }
+    }
+
+    #[test]
     fn paste_chord_job_roundtrips_with_empty_payload() {
         let job = Job {
             job_id: 7,
