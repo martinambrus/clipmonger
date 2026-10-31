@@ -51,6 +51,9 @@ reserved for the release that passes all seg-11 §5 gates.
   gesture) marked paste Degraded ("elevation refused") until the daemon
   restarted. It is now refused and audited only; a cancelled UAC prompt
   still degrades paste (seg-04 §5).
+- GNOME extension: until the daemon's config arrived it registered the old
+  default shortcut `Ctrl+Alt+V`, and its settings schema still defaulted to
+  it; it now uses `Ctrl+Alt+H` like the daemon.
 - Windows admin-window pastes were delayed by up to 30 s, silently
   dropped after ~7.5 min idle, or ran late into whatever window had
   focus: the helper heartbeat stalled on synchronous pipe I/O and jobs

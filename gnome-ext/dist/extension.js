@@ -6,7 +6,7 @@ import { CaptureRelay } from './capture.js';
 import { PollDiff } from './polddiff.js';
 import { Hotkeys } from './hotkeys.js';
 import { PasteAssist } from './paste.js';
-import { mergeConfig } from './config.js';
+import { DEFAULT_POPUP_HOTKEY, mergeConfig } from './config.js';
 export default class ClipmongerExtension extends Extension {
     ipc = null;
     capture = null;
@@ -30,7 +30,7 @@ export default class ClipmongerExtension extends Extension {
             hotkeys.registerPopup(cfg.popup.hotkey);
         };
         // Pre-config fallback so the popup chord exists before the first resync.
-        this.hotkeys.registerPopup('ctrl+alt+v');
+        this.hotkeys.registerPopup(DEFAULT_POPUP_HOTKEY);
         this.ipc.start();
         this.capture.start();
     }

@@ -39,11 +39,11 @@ test('config merge: defaults on empty, partial overrides keep other defaults', (
   const def = mergeConfig({});
   assert.equal(def.monitor.max_bytes, DEFAULT_MAX_BYTES);
   assert.equal(def.monitor.poll_ms, 500);
-  assert.equal(def.popup.hotkey, 'ctrl+alt+v');
+  assert.equal(def.popup.hotkey, 'ctrl+alt+h');
   const merged = mergeConfig({ config: { monitor: { max_bytes: 42 }, privacy: { denylist: ['a'] } } });
   assert.equal(merged.monitor.max_bytes, 42);
   assert.deepEqual(merged.privacy.denylist, ['a']);
-  assert.equal(merged.popup.hotkey, 'ctrl+alt+v');
+  assert.equal(merged.popup.hotkey, 'ctrl+alt+h');
   assert.equal(mergeConfig(null).monitor.poll_ms, 500);
   assert.equal(mergeConfig({ monitor: { max_bytes: -5 } }).monitor.max_bytes, DEFAULT_MAX_BYTES);
 });

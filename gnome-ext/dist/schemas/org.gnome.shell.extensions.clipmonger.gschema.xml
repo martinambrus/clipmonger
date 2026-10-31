@@ -2,7 +2,7 @@
 <schemalist>
   <schema id="org.gnome.shell.extensions.clipmonger" path="/org/gnome/shell/extensions/clipmonger/">
     <key name="popup" type="as">
-      <default>['&lt;Control&gt;&lt;Alt&gt;v']</default>
+      <default>['&lt;Control&gt;&lt;Alt&gt;h']</default>
       <summary>Popup keybinding</summary>
     </key>
     <key name="profile-dir" type="s">

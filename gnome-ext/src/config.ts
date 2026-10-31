@@ -2,6 +2,7 @@
 export const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_POLL_MS = 500;
 export const DEFAULT_FORMATS = ['text/plain;charset=utf-8', 'text/plain', 'text/html', 'text/rtf', 'image/png', 'text/uri-list'];
+export const DEFAULT_POPUP_HOTKEY = 'ctrl+alt+h';
 
 export interface ExtConfig {
   monitor: { formats: string[]; max_bytes: number; ignores: string[]; poll_ms: number };
@@ -11,7 +12,7 @@ export interface ExtConfig {
 export function defaultConfig(): ExtConfig {
   return {
     monitor: { formats: [...DEFAULT_FORMATS], max_bytes: DEFAULT_MAX_BYTES, ignores: [], poll_ms: DEFAULT_POLL_MS },
-    popup: { hotkey: 'ctrl+alt+v' },
+    popup: { hotkey: DEFAULT_POPUP_HOTKEY },
     privacy: { denylist: [] },
   };
 }
