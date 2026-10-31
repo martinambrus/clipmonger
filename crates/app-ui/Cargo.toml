@@ -13,6 +13,10 @@ name = "clipmonger"
 path = "src/main.rs"
 required-features = ["gui"]
 
+[[example]]
+name = "runner_smoke"
+required-features = ["gui"]
+
 [dependencies]
 clipmonger-core = { path = "../core" }
 clipmonger-platform = { path = "../platform" }
@@ -21,7 +25,13 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 uuid = { version = "1.28", features = ["v7", "serde"] }
 eframe = { version = "0.37", optional = true, default-features = false, features = ["glow", "x11", "wayland", "default_fonts", "system_fonts"] }
-egui = { version = "0.37", optional = true }
+egui = { version = "0.37", optional = true, features = ["default_fonts"] }
+winit = { version = "0.30", optional = true, default-features = false, features = ["x11", "wayland", "rwh_06"] }
+egui-winit = { version = "0.37", optional = true, default-features = false, features = ["x11", "wayland", "clipboard"] }
+softbuffer = { version = "0.4.8", optional = true, default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+hdrshot-egui-backend = { version = "=0.2.0", optional = true }
+egui_system_font_provider = { version = "0.37", optional = true }
+bytemuck = { version = "1.25", optional = true }
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 tray-icon = "0.26"
@@ -30,15 +40,12 @@ tray-icon = "0.26"
 ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
 
 [target.'cfg(windows)'.dependencies]
-softbuffer = { version = "0.4.6", optional = true }
 tiny-skia = { version = "0.12", optional = true }
-winit = { version = "0.30", optional = true }
-egui-winit = { version = "0.37", optional = true }
 windows = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_SystemServices", "Win32_UI_Controls", "Win32_System_Threading", "Win32_UI_Shell"] }
 
 [features]
 default = ["gui"]
-gui = ["dep:eframe", "dep:egui"]
+gui = ["dep:eframe", "dep:egui", "dep:winit", "dep:egui-winit", "dep:softbuffer", "dep:hdrshot-egui-backend", "dep:egui_system_font_provider", "dep:bytemuck"]
 software = ["dep:softbuffer", "dep:tiny-skia", "dep:winit", "dep:egui-winit", "dep:windows", "gui"]
 
 [dev-dependencies]

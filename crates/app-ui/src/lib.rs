@@ -10,6 +10,8 @@ pub mod permanents;
 pub mod placement;
 pub mod popup;
 pub mod push;
+#[cfg(feature = "gui")]
+pub mod runner;
 pub mod search;
 pub mod strings;
 pub mod target_session;
