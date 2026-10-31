@@ -230,6 +230,36 @@ mod tests {
     }
 
     #[test]
+    fn png_decode_guard_refuses_before_reading_pixels() {
+        // CRC-valid IHDR (5213x12277 RGBA8), IDAT with a zlib header,
+        // and IEND. Pixel data is deliberately incomplete.
+        let png = hex(
+            "89504e470d0a1a0a0000000d494844520000145d00002ff5080600000015e4077c0000000249444154789c62a4912b0000000049454e44ae426082",
+        );
+        let err = png_to_dib(&png).unwrap_err();
+        assert!(err.contains("decode limit"), "{err}");
+    }
+
+    #[test]
+    fn decode_guard_accepts_exact_pixel_limit() {
+        assert!(check_size((8000, 8000)).is_ok());
+    }
+
+    #[test]
+    fn wide_png_to_dib_to_png_keeps_pixels() {
+        let image = RgbaImage::from_fn(9000, 1, |x, _| {
+            image::Rgba([u8::try_from(x % 256).unwrap(), 120, 200, 255])
+        });
+        let png = encode_png(&image).unwrap();
+        let dib = png_to_dib(&png).unwrap();
+        assert_eq!(i32::from_le_bytes(dib[4..8].try_into().unwrap()), 9000);
+        assert_eq!(i32::from_le_bytes(dib[8..12].try_into().unwrap()), 1);
+        let back = dib_to_png(&dib).unwrap();
+        let decoded = image::load_from_memory(&back).unwrap().to_rgba8();
+        assert_eq!(decoded, image);
+    }
+
+    #[test]
     fn garbage_is_an_error() {
         assert!(dib_to_png(b"not a bitmap").is_err());
         assert!(png_to_dib(b"not a png").is_err());
