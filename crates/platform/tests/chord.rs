@@ -42,7 +42,7 @@ fn named_and_function_keys() {
 fn default_popup_hotkey_parses() {
     assert_eq!(
         parse(DEFAULT_POPUP_HOTKEY).unwrap().to_string(),
-        "ctrl+alt+v"
+        "ctrl+alt+h"
     );
 }
 
