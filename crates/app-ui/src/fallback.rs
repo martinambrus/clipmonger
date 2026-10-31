@@ -832,7 +832,7 @@ fn drain_events(state: &mut PopupState) {
             }
             ipc_bridge::UiEvent::History(b) => {
                 let prev_id = state.vm.clip_at(state.vm.selected).map(|c| c.id);
-                if state.vm.apply_history(&b) {
+                if state.vm.apply_history(&b) == popup::HistoryApply::Changed {
                     let c = state.vm.clips().first().cloned();
                     state.vm.set_current(c);
                     if let Some(pid) = prev_id {

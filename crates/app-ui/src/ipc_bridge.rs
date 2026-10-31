@@ -95,6 +95,11 @@ pub enum UiEvent {
     PasteFailed(String),
     /// Daemon acknowledged stop.
     Stopped,
+    /// The stop request failed; carries the message.
+    StopFailed(String),
+    /// A status or history call failed because the daemon link is down
+    /// (not running, connection lost); carries the message.
+    Offline(String),
     /// Anything else, carrying the guard message.
     Error(String),
     /// Config document reply body.
@@ -246,6 +251,9 @@ pub fn params_for(cmd: &UiCmd) -> Value {
     }
 }
 
+/// Error codes of an absent or lost daemon link.
+const TRANSPORT_CODES: [&str; 3] = ["unavailable", "io_failed", "connection_closed"];
+
 /// Turn one transport outcome into shell events.
 #[allow(clippy::match_same_arms)]
 #[allow(clippy::too_many_lines)]
@@ -365,9 +373,13 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
             | UiCmd::PermGroupDelete(_),
             Err(error),
         ) => UiEvent::Error(error.message),
-        (UiCmd::Status | UiCmd::ListHistory | UiCmd::Stop, Err(error)) => {
-            UiEvent::Error(error.message)
+        (UiCmd::Stop, Err(error)) => UiEvent::StopFailed(error.message),
+        (UiCmd::Status | UiCmd::ListHistory, Err(error))
+            if TRANSPORT_CODES.contains(&error.code.as_str()) =>
+        {
+            UiEvent::Offline(error.message)
         }
+        (UiCmd::Status | UiCmd::ListHistory, Err(error)) => UiEvent::Error(error.message),
         (UiCmd::PasteClip(_) | UiCmd::ExecPermanent(_), Err(error))
             if error.code == "unavailable" || error.code == "denied" =>
         {

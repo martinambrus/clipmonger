@@ -391,17 +391,22 @@ impl ShellApp {
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                 }
-                ipc_bridge::UiEvent::History(body) => {
-                    if self.vm.apply_history(&body) {
+                ipc_bridge::UiEvent::History(body) => match self.vm.apply_history(&body) {
+                    popup::HistoryApply::Changed => {
                         let current = self.vm.clips().first().cloned();
                         self.vm.set_current(current);
                         self.inputs.attached = true;
                         self.vm.set_offline(false);
-                    } else {
+                    }
+                    popup::HistoryApply::Unchanged => {
+                        self.inputs.attached = true;
+                        self.vm.set_offline(false);
+                    }
+                    popup::HistoryApply::Malformed => {
                         self.vm.set_offline(true);
                         self.error = strings::text("app.error").to_string();
                     }
-                }
+                },
                 ipc_bridge::UiEvent::Deleted(id) => self.vm.remove_clip(id),
                 ipc_bridge::UiEvent::Pinned(id, pinned) => self.vm.apply_pin(id, pinned),
                 ipc_bridge::UiEvent::PasteDone(_) => {
@@ -538,7 +543,9 @@ impl ShellApp {
                         config.error = message;
                     }
                 }
-                ipc_bridge::UiEvent::Error(message) => {
+                ipc_bridge::UiEvent::Error(message)
+                | ipc_bridge::UiEvent::Offline(message)
+                | ipc_bridge::UiEvent::StopFailed(message) => {
                     self.error.clone_from(&message);
                     if let Ok(mut config) = self.config.lock() {
                         if !config.pending_apply.is_empty() {
@@ -1415,6 +1422,7 @@ fn main() -> ExitCode {
     let online = mode == lifecycle::StartMode::Attached;
     let (cmds, push_events, events) = ipc_bridge::Bridge::spawn_shared(transport);
     let _ = cmds.send(ipc_bridge::UiCmd::Status);
+    let _ = cmds.send(ipc_bridge::UiCmd::ConfigGet);
     let _ = cmds.send(ipc_bridge::UiCmd::ListHistory);
     let _ = cmds.send(ipc_bridge::UiCmd::ListPermanents);
     let _ = cmds.send(ipc_bridge::UiCmd::PermGroups);

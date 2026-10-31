@@ -69,6 +69,24 @@ pub fn forwards_key_when_editing(name: &str) -> bool {
     )
 }
 
+/// What applying a history-list reply did to the popup state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryApply {
+    /// The reply holds a different list, which replaced the shown one.
+    Changed,
+    /// The reply holds the list that is shown already (an empty one included).
+    Unchanged,
+    /// The reply is not a history list; the state is untouched.
+    Malformed,
+}
+
+/// The clips of a history-list reply body, `None` when the body is malformed.
+#[must_use]
+pub fn parse_history(body: &Value) -> Option<Vec<Clip>> {
+    let clips = body.get("clips")?;
+    serde_json::from_value::<Vec<Clip>>(clips.clone()).ok()
+}
+
 /// Number of rows a page key moves the selection.
 const PAGE_ROWS: isize = 10;
 
@@ -189,12 +207,9 @@ impl PopupVm {
     }
 
     /// Replace the list from a history-list reply body.
-    pub fn apply_history(&mut self, body: &Value) -> bool {
-        let Some(clips) = body.get("clips") else {
-            return false;
-        };
-        let Ok(list) = serde_json::from_value::<Vec<Clip>>(clips.clone()) else {
-            return false;
+    pub fn apply_history(&mut self, body: &Value) -> HistoryApply {
+        let Some(list) = parse_history(body) else {
+            return HistoryApply::Malformed;
         };
         if self.clips.len() == list.len()
             && self
@@ -203,14 +218,14 @@ impl PopupVm {
                 .zip(list.iter())
                 .all(|(a, b)| a.id == b.id && a.preview == b.preview && a.pinned == b.pinned)
         {
-            return false;
+            return HistoryApply::Unchanged;
         }
         let prev_len = self.clips.len();
         self.clips = list;
         if self.clips.len() != prev_len {
             self.clamp_selection();
         }
-        true
+        HistoryApply::Changed
     }
 
     /// Clip at a visible row, if any.
