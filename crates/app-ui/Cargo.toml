@@ -1,10 +1,10 @@
 [package]
-publish.workspace = true
 name = "clipmonger-app-ui"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT"
+publish.workspace = true
 
 [lib]
 name = "clipmonger_app_ui"
