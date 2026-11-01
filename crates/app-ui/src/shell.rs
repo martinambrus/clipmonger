@@ -55,7 +55,7 @@ pub struct Desired {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// A bridge event as it arrives (replies and daemon pushes). Handled:
-    /// `ShowPopup`, `PasteFailed`, `Error`, `Offline`,
+    /// `ShowPopup`, `PasteFailed`, `ExecFailed`, `Error`, `Offline`,
     /// `StopFailed`, `Status`, `History`, `Config`, `Stopped` and
     /// `AnotherInstance`; every other variant changes nothing (a `PasteDone`
     /// reply never shows or hides the popup).
@@ -273,19 +273,29 @@ impl Shell {
         Vec::new()
     }
 
+    /// Show a paste failure, opening the popup without context when closed.
+    fn on_paste_failed(&mut self, message: String) -> Vec<Effect> {
+        let effects = if self.want.popup_open {
+            Vec::new()
+        } else {
+            self.open_popup(Context::default())
+        };
+        self.error = Some(message);
+        effects
+    }
+
     /// Apply one bridge event; events without a rule change nothing.
     fn on_bridge(&mut self, event: UiEvent) -> Vec<Effect> {
         match event {
             UiEvent::ShowPopup(push) => self.on_push(&push),
-            UiEvent::PasteFailed(message) => {
-                if self.want.popup_open {
-                    self.error = Some(message);
-                    Vec::new()
+            UiEvent::PasteFailed(message) => self.on_paste_failed(message),
+            UiEvent::ExecFailed(_, error) => {
+                let message = if error.code == "unavailable" || error.code == "denied" {
+                    strings::text("popup.paste_blocked").to_string()
                 } else {
-                    let effects = self.open_popup(Context::default());
-                    self.error = Some(message);
-                    effects
-                }
+                    error.message
+                };
+                self.on_paste_failed(message)
             }
             UiEvent::Error(message) => {
                 self.error = Some(message);
@@ -450,6 +460,9 @@ impl Shell {
     /// - `Bridge(PasteFailed(msg))`: closed: open with an empty context, the
     ///   open sequence, then the error line is `msg`; open: the error line is
     ///   `msg`, nothing else.
+    /// - `Bridge(ExecFailed(_, error))`: the same as `PasteFailed`, with the
+    ///   text `popup.paste_blocked` for unavailable or denied failures and
+    ///   the daemon message for other errors.
     /// - `Bridge(Error(msg))`: the error line is `msg`.
     /// - `Bridge(Status(_))`: not offline. `Bridge(Offline(_))`: offline, error
     ///   line unchanged.

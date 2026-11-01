@@ -451,6 +451,13 @@ fn paste_failed(text: &str) -> Event {
     Event::Bridge(UiEvent::PasteFailed(text.to_string()))
 }
 
+fn exec_failed(code: &str, message: &str) -> Event {
+    Event::Bridge(UiEvent::ExecFailed(
+        id(77),
+        IpcError::new(code, message.to_string()),
+    ))
+}
+
 fn paste_done(n: u128) -> Event {
     Event::Bridge(UiEvent::PasteDone(id(n)))
 }
@@ -1402,6 +1409,39 @@ fn r10_paste_failed_reopens_the_popup_with_an_error() {
             )
             .ev(200, Event::Dismiss, hide(), &[open(false)])
             .ev(300, Event::Key, nothing(), &[no_err()]),
+    ]);
+}
+
+#[test]
+fn r10_exec_failed_reopens_the_popup_with_an_error() {
+    let blocked = text("popup.paste_blocked");
+    run(vec![
+        Case::new("closed: unavailable uses the blocked text", false).ev(
+            100,
+            exec_failed("unavailable", "no paste"),
+            open_seq(),
+            &[open(true), no_ctx(), err(blocked)],
+        ),
+        Case::new("closed: denied uses the blocked text", false).ev(
+            100,
+            exec_failed("denied", "access refused"),
+            open_seq(),
+            &[open(true), no_ctx(), err(blocked)],
+        ),
+        Case::new("closed: backend uses the daemon message", false).ev(
+            100,
+            exec_failed("backend", "boom"),
+            open_seq(),
+            &[open(true), no_ctx(), err("boom")],
+        ),
+        Case::new("open: only the error line changes", false)
+            .ev(100, hotkey(7, 9), open_seq(), &[open(true), ctx(7, 9)])
+            .ev(
+                200,
+                exec_failed("unavailable", "no paste"),
+                nothing(),
+                &[ctx(7, 9), err(blocked)],
+            ),
     ]);
 }
 

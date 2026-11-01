@@ -235,6 +235,13 @@ fn rule_open_source_words() {
             Event::Bridge(UiEvent::PasteFailed("gone".to_string())),
             "paste_failed",
         ),
+        (
+            Event::Bridge(UiEvent::ExecFailed(
+                Uuid::from_u128(77),
+                clipmonger_ipc::proto::IpcError::new("backend", "boom".to_string()),
+            )),
+            "paste_failed",
+        ),
     ];
     let others = [
         Event::Dismiss,
@@ -997,8 +1004,8 @@ fn rule_app_permanent_pick_writes_hide_then_paste_without_a_target() {
     );
 }
 
-// PopupApp: an error line that is new or changed, or set again by PasteFailed or
-// Error, is written as Error; anything else is not
+// PopupApp: an error line that is new or changed, or set again by PasteFailed,
+// ExecFailed or Error, is written as Error; anything else is not
 #[test]
 fn rule_app_error_lines() {
     let mut rig = Rig::new(true);
@@ -1016,6 +1023,16 @@ fn rule_app_error_lines() {
         rig.tick();
         expected.push(error_line());
         assert_eq!(rig.trace(), expected, "PasteFailed");
+    }
+    // ExecFailed while open: changed, then set again with the same text
+    for _ in 0..2 {
+        rig.push(UiEvent::ExecFailed(
+            Uuid::from_u128(77),
+            clipmonger_ipc::proto::IpcError::new("backend", "boom".to_string()),
+        ));
+        rig.tick();
+        expected.push(error_line());
+        assert_eq!(rig.trace(), expected, "ExecFailed");
     }
     // events that leave the error line alone write nothing
     for event in [
