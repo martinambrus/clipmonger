@@ -1261,7 +1261,7 @@ pub struct DaemonState {
     /// Clip store for history methods. Interior mutability so
     /// `backup.restore` can reopen the store on the restored profile
     /// while other arms hold only read guards.
-    store: RwLock<Store>,
+    store: RwLock<Option<Store>>,
     /// Capability aggregator for status/caps methods.
     caps: CapsAggregator,
     /// Monitor pause flag toggled by `monitor.set`.
@@ -1283,6 +1283,8 @@ pub struct DaemonState {
     portal_bind_pending: Mutex<bool>,
     /// Loaded config served by `config.get`/`config.set`.
     config: Mutex<clipmonger_core::Config>,
+    /// Serialize profile operations (backup.create, backup.restore, config.set)
+    profile_op: Mutex<()>,
     /// In-flight `blob.put` assemblies keyed by `(clip, mime)`.
     blob_buf: Mutex<HashMap<(String, String), BlobAsm>>,
     /// Latest `hotkey.conflict` note surfaced in caps notes.
@@ -1305,7 +1307,7 @@ impl DaemonState {
     #[must_use]
     pub fn with_config(store: Store, config: clipmonger_core::Config) -> Self {
         Self {
-            store: RwLock::new(store),
+            store: RwLock::new(Some(store)),
             caps: CapsAggregator::new(),
             monitoring_paused: Mutex::new(false),
             paste_limits: Mutex::new((65536, 1000)),
@@ -1316,6 +1318,7 @@ impl DaemonState {
             helper: Mutex::new(HelperSupervisor::new()),
             portal_bind_pending: Mutex::new(false),
             config: Mutex::new(config),
+            profile_op: Mutex::new(()),
             blob_buf: Mutex::new(HashMap::new()),
             hotkey_conflict_note: Mutex::new(None),
             popup: Mutex::new(popup::PopupTrigger::default()),
@@ -1552,6 +1555,15 @@ impl DaemonState {
         sensitive: bool,
         payloads: &[(String, Vec<u8>)],
     ) -> bool {
+        let _gate = self.profile_op.lock().ok();
+        let limits = self.config.lock().map(|cfg| retention_limits(&cfg)).ok();
+        let Ok(store_opt) = self.store.read() else {
+            return false;
+        };
+        let Some(store) = store_opt.as_ref() else {
+            return false;
+        };
+        drop(_gate);
         #[cfg(all(unix, feature = "backend-wayland"))]
         {
             if !sensitive && !payloads.is_empty() {
@@ -1568,13 +1580,8 @@ impl DaemonState {
             }
         }
         let seed = u64::try_from(now_ms().max(0)).unwrap_or_default();
-        // Config before store: never hold both locks.
-        let limits = self.config.lock().map(|cfg| retention_limits(&cfg)).ok();
-        let Ok(store) = self.store.read() else {
-            return false;
-        };
         let stored = matches!(
-            store_payloads(&store, origin, sensitive, payloads, seed),
+            store_payloads(store, origin, sensitive, payloads, seed),
             (StoreDecision::Stored, _)
         );
         if let (true, Some(limits)) = (stored, limits) {
@@ -1589,9 +1596,10 @@ impl DaemonState {
 
     /// Find a stored clip id by its string form without naming the id type.
     fn find_clip(&self, id: &str) -> Option<clipmonger_core::model::Clip> {
-        // Bounded scan window: `u64::MAX` overflows the SQL `LIMIT` cast
-        // and silently yields no rows (every get/paste misses).
-        let Ok(store) = self.store.read() else {
+        let Ok(store_opt) = self.store.read() else {
+            return None;
+        };
+        let Some(store) = store_opt.as_ref() else {
             return None;
         };
         let clips = store.list_history(10_000, 0, true).unwrap_or_default();
@@ -1604,10 +1612,38 @@ impl DaemonState {
     }
 
     /// Read guard on the clip store for `&self` arms.
-    fn store_read(&self) -> Result<std::sync::RwLockReadGuard<'_, Store>, IpcError> {
+    fn store_read(&self) -> Result<std::sync::RwLockReadGuard<'_, Option<Store>>, IpcError> {
         self.store
             .read()
             .map_err(|_| IpcError::new("internal", "store lock poisoned".to_string()))
+    }
+
+    fn store_read_some(&self) -> Result<std::sync::RwLockReadGuard<'_, Option<Store>>, IpcError> {
+        let guard = self
+            .store
+            .read()
+            .map_err(|_| IpcError::new("internal", "store lock poisoned".to_string()))?;
+        if guard.is_none() {
+            return Err(IpcError::new(
+                "unavailable",
+                "store unavailable".to_string(),
+            ));
+        }
+        Ok(guard)
+    }
+
+    fn with_store<F, T>(&self, f: F) -> Result<T, IpcError>
+    where
+        F: FnOnce(&Store) -> Result<T, IpcError>,
+    {
+        let guard = self.store_read()?;
+        let Some(store) = guard.as_ref() else {
+            return Err(IpcError::new(
+                "unavailable",
+                "store unavailable".to_string(),
+            ));
+        };
+        f(store)
     }
 
     /// Requested clip id from `params`, looked up in the store.
@@ -1632,12 +1668,19 @@ impl DaemonState {
                     .unwrap_or(false);
                 let clips = self
                     .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .list_history(limit, offset, include_removed)
                     .map_err(|e| IpcError::new("backend", e.to_string()))?;
                 Ok(serde_json::json!({"clips": clips}))
             }
             "history.get" => match self.requested_clip(params) {
-                Some(found) => match self.store_read()?.get_clip(found.id) {
+                Some(found) => match self
+                    .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
+                    .get_clip(found.id)
+                {
                     Ok(Some((clip, _))) => Ok(serde_json::json!({"clip": clip})),
                     Ok(None) => Ok(serde_json::json!({"clip": null})),
                     Err(e) => Err(IpcError::new("backend", e.to_string())),
@@ -1647,6 +1690,8 @@ impl DaemonState {
             "history.delete" => match self.requested_clip(params) {
                 Some(found) => self
                     .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .soft_delete(found.id)
                     .map_err(|e| IpcError::new("backend", e.to_string()))
                     .map(|()| serde_json::json!({"deleted": true})),
@@ -1658,10 +1703,21 @@ impl DaemonState {
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
                 match self.requested_clip(params) {
-                    Some(found) => match self.store_read()?.get_clip(found.id) {
+                    Some(found) => match self
+                        .store_read()?
+                        .as_ref()
+                        .ok_or_else(|| {
+                            IpcError::new("unavailable", "store unavailable".to_string())
+                        })?
+                        .get_clip(found.id)
+                    {
                         Ok(Some((mut clip, payloads))) => {
                             clip.pinned = pinned;
                             self.store_read()?
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    IpcError::new("unavailable", "store unavailable".to_string())
+                                })?
                                 .insert_clip(&clip, &payloads)
                                 .map_err(|e| IpcError::new("backend", e.to_string()))
                                 .map(|_| serde_json::json!({"pinned": pinned}))
@@ -1673,7 +1729,11 @@ impl DaemonState {
                 }
             }
             "history.purge_removed" => {
-                let purged = self.store_read()?.purge_removed();
+                let purged = self
+                    .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
+                    .purge_removed();
                 Ok(serde_json::json!({"purged": purged}))
             }
             other => Err(IpcError::new(
@@ -1868,6 +1928,10 @@ impl DaemonState {
     /// Dispatch `config.set`: apply one dotted key and persist
     /// `<profile>/config.toml`.
     fn handle_config_set(&self, params: &Value) -> Result<Value, IpcError> {
+        let _op = self
+            .profile_op
+            .lock()
+            .map_err(|_| IpcError::new("internal", "profile op poisoned".to_string()))?;
         let profile = self
             .profile_dir
             .lock()
@@ -1912,13 +1976,20 @@ impl DaemonState {
 
     /// Dispatch `backup.create`: snapshot the live store into a ZIP at `dest`.
     fn handle_backup_create(&self, params: &Value) -> Result<Value, IpcError> {
+        let _op = self
+            .profile_op
+            .lock()
+            .map_err(|_| IpcError::new("internal", "profile op poisoned".to_string()))?;
         let dest = params
             .get("dest")
             .and_then(Value::as_str)
             .ok_or_else(|| IpcError::new("backend", "backup.create: dest required".to_string()))?;
-        self.store_read()?
-            .backup_zip(Path::new(dest))
-            .map_err(|e| IpcError::new(e.code(), e.to_string()))?;
+        self.with_store(|store| {
+            store
+                .backup_zip(Path::new(dest))
+                .map_err(|e| IpcError::new(e.code(), e.to_string()))?;
+            Ok(())
+        })?;
         Ok(serde_json::json!({"path": dest}))
     }
 
@@ -1940,18 +2011,64 @@ impl DaemonState {
                 "backup.restore: no profile dir configured".to_string(),
             ));
         }
-        Store::restore_zip(Path::new(src), &profile)
+        let _op = self
+            .profile_op
+            .lock()
+            .map_err(|_| IpcError::new("internal", "profile op poisoned".to_string()))?;
+        // Prepare before closing Store
+        let prepared = Store::prepare_restore(Path::new(src), &profile)
             .map_err(|e| IpcError::new(e.code(), e.to_string()))?;
-        let reopened = Store::open(&profile).map_err(|e| IpcError::new(e.code(), e.to_string()))?;
-        match self.store.write() {
-            Ok(mut slot) => {
-                *slot = reopened;
+        // Close old connection under exclusive store guard
+        let old_store = {
+            let mut write = self
+                .store
+                .write()
+                .map_err(|_| IpcError::new("internal", "store lock poisoned".to_string()))?;
+            let Some(old) = write.take() else {
+                return Err(IpcError::new(
+                    "unavailable",
+                    "store unavailable".to_string(),
+                ));
+            };
+            if let Err(e) = old.checkpoint() {
+                *write = Some(old);
+                return Err(IpcError::new(e.code(), e.to_string()));
             }
-            Err(_) => {
-                return Err(IpcError::new("internal", "store lock poisoned".to_string()));
+            // checkpoint succeeded, drop old (close)
+            drop(old);
+            write
+        };
+        // Install with old store closed, write guard held
+        let install_result = {
+            // we still hold write guard via old_store variable (which is the guard)
+            prepared.install_and_open(&profile)
+        };
+        match install_result {
+            Ok(()) => {
+                let reopened =
+                    Store::open(&profile).map_err(|e| IpcError::new(e.code(), e.to_string()))?;
+                let mut write = old_store;
+                *write = Some(reopened);
+                Ok(serde_json::json!({"ok": true}))
+            }
+            Err(e) => {
+                let code = e.code();
+                let is_catastrophic = e.to_string().contains("recovery at");
+                if !is_catastrophic {
+                    if let Ok(old_reopened) = Store::open(&profile) {
+                        let mut write = old_store;
+                        *write = Some(old_reopened);
+                    } else {
+                        let mut write = old_store;
+                        *write = None;
+                    }
+                } else {
+                    let mut write = old_store;
+                    *write = None;
+                }
+                return Err(IpcError::new(code, e.to_string()));
             }
         }
-        Ok(serde_json::json!({"ok": true}))
     }
 
     /// Dispatch `logs.tail`: the last `lines` of `<profile>/audit.log`,
@@ -1993,6 +2110,8 @@ impl DaemonState {
                 let group = params.get("group").and_then(Value::as_str);
                 let permanents = self
                     .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .list_permanents(group)
                     .map_err(perm_err)?;
                 Ok(serde_json::json!({"permanents": permanents}))
@@ -2000,6 +2119,8 @@ impl DaemonState {
             "permanent.create" => {
                 let created = self
                     .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .create_permanent(
                         params.get("group").and_then(Value::as_str).unwrap_or(""),
                         params.get("name").and_then(Value::as_str).unwrap_or(""),
@@ -2021,6 +2142,8 @@ impl DaemonState {
                         .map_err(|e| IpcError::new("backend", format!("permanent.update: {e}")))?;
                 let updated = self
                     .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .update_permanent(&clip)
                     .map_err(perm_err)?;
                 Ok(serde_json::json!({"updated": updated}))
@@ -2033,11 +2156,21 @@ impl DaemonState {
                     .ok_or_else(|| {
                         IpcError::new("backend", "permanent.delete: id required".to_string())
                     })?;
-                let deleted = self.store_read()?.delete_permanent(id).map_err(perm_err)?;
+                let deleted = self
+                    .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
+                    .delete_permanent(id)
+                    .map_err(perm_err)?;
                 Ok(serde_json::json!({"deleted": deleted}))
             }
             "permanent.groups" => {
-                let groups = self.store_read()?.list_perm_groups().map_err(perm_err)?;
+                let groups = self
+                    .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
+                    .list_perm_groups()
+                    .map_err(perm_err)?;
                 let list: Vec<Value> = groups
                     .iter()
                     .map(|g| {
@@ -2049,6 +2182,8 @@ impl DaemonState {
             "permanent.group_create" => {
                 let created = self
                     .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .create_perm_group(params.get("name").and_then(Value::as_str).unwrap_or(""))
                     .map_err(perm_err)?;
                 Ok(serde_json::json!({"created": created}))
@@ -2056,6 +2191,8 @@ impl DaemonState {
             "permanent.group_delete" => {
                 let deleted = self
                     .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .delete_perm_group(params.get("name").and_then(Value::as_str).unwrap_or(""))
                     .map_err(perm_err)?;
                 Ok(serde_json::json!({"deleted": deleted}))
@@ -2083,6 +2220,8 @@ impl DaemonState {
         };
         let perm = self
             .store_read()?
+            .as_ref()
+            .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
             .get_permanent(id)
             .map_err(perm_err)?
             .ok_or_else(|| {
@@ -2120,6 +2259,8 @@ impl DaemonState {
             })?;
             let payloads = self
                 .store_read()?
+                .as_ref()
+                .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                 .get_clip(found.id)
                 .map_err(|e| IpcError::new("backend", e.to_string()))?
                 .map(|(_, payloads)| payloads)
@@ -2215,11 +2356,10 @@ impl DaemonState {
                 }
                 let res = self.paste_via_helper(&target, payloads, deadline_ms);
                 if res.is_ok() {
-                    let _ = self
-                        .store
-                        .read()
-                        .ok()
-                        .and_then(|s| s.bump_clip(clip.0, now_ms()).ok());
+                    let _ = self.store.read().ok().and_then(|s| {
+                        s.as_ref()
+                            .and_then(|st| st.bump_clip(clip.0, now_ms()).ok())
+                    });
                 }
                 return res;
             }
@@ -2233,11 +2373,10 @@ impl DaemonState {
                         IpcError::new("backend", format!("paste.execute: {e}"))
                     }
                 })?;
-            let _ = self
-                .store
-                .read()
-                .ok()
-                .and_then(|s| s.bump_clip(clip.0, now_ms()).ok());
+            let _ = self.store.read().ok().and_then(|s| {
+                s.as_ref()
+                    .and_then(|st| st.bump_clip(clip.0, now_ms()).ok())
+            });
             Ok(serde_json::json!({"pasted": true}))
         }
         #[cfg(all(unix, feature = "backend-wayland"))]
