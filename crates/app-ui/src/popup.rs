@@ -182,6 +182,17 @@ impl PopupVm {
         Ok(())
     }
 
+    /// Test exact native shortcut ownership before egui's clipboard translation.
+    pub(crate) fn has_binding(&self, event: &keymap::KeyEvent) -> bool {
+        self.keymap.has_binding(event)
+    }
+
+    /// Resolve a key event to its action via the current keymap.
+    #[must_use]
+    pub fn action_for(&self, event: &keymap::KeyEvent) -> Option<keymap::Action> {
+        self.keymap.action_for(event)
+    }
+
     /// Mark monitoring paused or running for the status line.
     pub fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
@@ -265,7 +276,7 @@ impl PopupVm {
     }
 
     /// Clamp the selection into the visible rows.
-    fn clamp_selection(&mut self) {
+    pub(crate) fn clamp_selection(&mut self) {
         let len = self.visible().len();
         if len == 0 {
             self.selected = 0;
@@ -300,6 +311,11 @@ impl PopupVm {
         let Some(action) = self.keymap.action_for(&event) else {
             return VmEffect::None;
         };
+        self.on_action(action)
+    }
+
+    /// Apply an already resolved action to the history list.
+    pub fn on_action(&mut self, action: keymap::Action) -> VmEffect {
         match action {
             keymap::Action::NavigateUp => {
                 self.move_selection(-1);

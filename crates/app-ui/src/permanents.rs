@@ -140,6 +140,51 @@ impl PermanentsVm {
             .map(|clip| clip.id)
     }
 
+    /// Id of the selected visible permanent for a query, if any.
+    #[must_use]
+    pub fn selected_id(&self, query: &str) -> Option<Uuid> {
+        self.visible(query)
+            .get(self.selected)
+            .and_then(|index| self.permanents.get(*index))
+            .map(|clip| clip.id)
+    }
+
+    /// Clamp selection for a query.
+    pub fn clamp_for(&mut self, query: &str) {
+        let len = self.visible(query).len();
+        if len == 0 {
+            self.selected = 0;
+        } else if self.selected >= len {
+            self.selected = len.saturating_sub(1);
+        }
+    }
+
+    /// Move selection by delta for a query.
+    pub fn move_selection(&mut self, delta: isize, query: &str) {
+        let len = self.visible(query).len();
+        if len == 0 {
+            self.selected = 0;
+            return;
+        }
+        let last = len.saturating_sub(1);
+        self.selected = self
+            .selected
+            .min(last)
+            .saturating_add_signed(delta)
+            .min(last);
+    }
+
+    /// Move to first row for a query.
+    pub fn home(&mut self, _query: &str) {
+        self.selected = 0;
+    }
+
+    /// Move to last row for a query.
+    pub fn end(&mut self, query: &str) {
+        let len = self.visible(query).len();
+        self.selected = len.saturating_sub(1);
+    }
+
     /// Start a draft for a new clip in the active group.
     pub fn begin_new(&mut self) {
         let group = self

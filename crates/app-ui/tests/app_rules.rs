@@ -89,6 +89,7 @@ struct Pass {
     /// Every text the pass painted (empty for a hidden pass).
     texts: Vec<String>,
     fills: Vec<egui::Color32>,
+    bounds: Vec<(String, egui::Rect, egui::Rect)>,
 }
 
 impl Pass {
@@ -349,7 +350,9 @@ impl Rig {
             textures_delta.clear();
             let mut texts = Vec::new();
             let mut fills = Vec::new();
+            let mut bounds = Vec::new();
             for clipped in &shapes {
+                settings_text_bounds(&clipped.shape, clipped.clip_rect, &mut bounds);
                 collect_text(&clipped.shape, &mut texts);
                 collect_fills(&clipped.shape, &mut fills);
             }
@@ -360,6 +363,7 @@ impl Rig {
                     .unwrap_or_default(),
                 texts,
                 fills,
+                bounds,
             }
         } else {
             let mut output = win.ctx.run_logic(&raw, |ctx| app.logic(ctx, kind));
@@ -370,6 +374,7 @@ impl Rig {
                     .unwrap_or_default(),
                 texts: Vec::new(),
                 fills: Vec::new(),
+                bounds: Vec::new(),
             }
         }
     }
@@ -4198,4 +4203,393 @@ fn rule_raise_tray_show_while_open_preserves_and_activates() {
         rig.app.take_popup_activation(),
         "tray show must request activation"
     );
+}
+
+fn active_list_rig(permanent: bool, count: u128) -> Rig {
+    let mut rig = Rig::opened();
+    rig.push(history(
+        &(1..=count)
+            .map(|n| clip(n, &format!("History row {n}")))
+            .collect::<Vec<_>>(),
+    ));
+    rig.push(UiEvent::Permanents(json!({"permanents": (1..=count).map(|n| permanent_json(1000+n, "Work", &format!("Permanent row {n}"))).collect::<Vec<_>>()})));
+    rig.push(UiEvent::PermGroups(
+        json!({"groups": [{"name":"Work", "system":false,"count":count}]}),
+    ));
+    rig.tick();
+    rig.app.config().lock().expect("config").perm_source = permanent.then_some(0);
+    rig.show();
+    rig.show();
+    let _ = rig.cmds();
+    rig
+}
+
+fn popup_widget(rig: &mut Rig, label: &str) -> egui::Response {
+    let pass = rig.show();
+    let (_, text, clip) = pass
+        .bounds
+        .iter()
+        .rev()
+        .find(|(text, _, _)| text == label)
+        .unwrap_or_else(|| panic!("missing {label:?}: {:?}", pass.texts));
+    let text = *text;
+    let clip = *clip;
+    assert!(
+        clip.contains_rect(text),
+        "{label:?} text {text:?} outside scroll clip {clip:?}"
+    );
+    assert!(rig.popup.ctx.viewport_rect().contains_rect(text));
+    rig.input(egui::Event::PointerMoved(text.center()));
+    rig.show();
+    let hovered = rig
+        .popup
+        .ctx
+        .interaction_snapshot(|s| s.hovered.iter().copied().collect::<Vec<_>>());
+    let responses: Vec<_> = hovered
+        .into_iter()
+        .filter_map(|id| rig.popup.ctx.read_response(id))
+        .collect();
+    let response = responses
+        .iter()
+        .find(|r| r.sense.senses_click() && r.rect.contains(text.center()))
+        .unwrap_or_else(|| panic!("actual row widget {label} text={text:?} hovered={responses:?}"))
+        .clone();
+    assert!(response.enabled());
+    assert!(
+        clip.contains_rect(response.rect),
+        "widget {:?} outside {clip:?}",
+        response.rect
+    );
+    assert!(rig.popup.ctx.viewport_rect().contains_rect(response.rect));
+    println!("{label}: widget={:?} clip={clip:?}", response.rect);
+    response
+}
+
+fn click_popup_widget(rig: &mut Rig, label: &str) {
+    let response = popup_widget(rig, label);
+    for pressed in [true, false] {
+        rig.input(egui::Event::PointerButton {
+            pos: response.rect.center(),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        rig.show();
+    }
+    assert_eq!(
+        rig.popup.ctx.interaction_snapshot(|s| s.clicked),
+        Some(response.id)
+    );
+}
+
+fn finish_popup_pick(rig: &mut Rig) {
+    assert!(!rig.is_open(), "pick must close popup before execution");
+    rig.tick();
+    thread::sleep(Duration::from_millis(170));
+    rig.tick();
+}
+
+#[test]
+fn active_list_permanent_navigation_and_history_actions_are_isolated() {
+    let mut rig = active_list_rig(true, 3);
+    rig.app.vm_mut().selected = 1;
+    for key in [egui::Key::ArrowDown, egui::Key::End] {
+        rig.key(key);
+        rig.show();
+    }
+    assert_eq!(rig.app.config().lock().expect("config").perm_vm.selected, 2);
+    for (key, modifiers) in [
+        (egui::Key::Delete, egui::Modifiers::NONE),
+        (egui::Key::P, egui::Modifiers::CTRL),
+        (egui::Key::E, egui::Modifiers::CTRL),
+    ] {
+        rig.input(key_event(key, true, modifiers));
+        rig.show();
+    }
+    assert_eq!(rig.app.vm().selected, 1);
+    assert_eq!(rig.app.vm().clips().len(), 3);
+    assert_eq!(rig.cmds(), vec![]);
+    // Move the pointer off the list so focused-row activation cannot consume Enter.
+    rig.popup.ctx.memory_mut(|m| {
+        if let Some(id) = m.focused() {
+            m.surrender_focus(id);
+        }
+    });
+    rig.key(egui::Key::Enter);
+    rig.show();
+    finish_popup_pick(&mut rig);
+    assert_eq!(rig.cmds(), vec![UiCmd::ExecPermanent(id(1003))]);
+}
+
+fn filtered_permanent_pick(mouse: bool) {
+    let mut rig = active_list_rig(true, 2);
+    rig.app.vm_mut().query = "row 2".into();
+    rig.app.vm_mut().selected = 1;
+    rig.show();
+    rig.show();
+    if mouse {
+        click_popup_widget(&mut rig, "Permanent row 2");
+    } else {
+        rig.key(egui::Key::Enter);
+        rig.show();
+    }
+    finish_popup_pick(&mut rig);
+    assert_eq!(rig.cmds(), vec![UiCmd::ExecPermanent(id(1002))]);
+    assert_eq!(rig.app.vm().selected, 1);
+}
+
+#[test]
+fn active_list_filtered_keyboard_activation() {
+    filtered_permanent_pick(false);
+}
+
+#[test]
+fn active_list_filtered_mouse_activation() {
+    filtered_permanent_pick(true);
+}
+
+#[test]
+fn active_list_empty_activation() {
+    let mut rig = active_list_rig(true, 2);
+    rig.app.vm_mut().query = "no matches".into();
+    rig.key(egui::Key::Enter);
+    rig.show();
+    assert_eq!(rig.cmds(), vec![]);
+}
+
+#[test]
+fn active_list_configured_chords_use_each_event_modifiers() {
+    let mut rig = active_list_rig(true, 4);
+    rig.push(config_reply(&json!({"popup":{"keys":{"navigate_down":"ctrl+j", "end":"shift+end", "home":"F21", "page_down":"F22", "page_up":"F23", "paste":"F24"}}})));
+    rig.tick();
+    let _ = rig.cmds();
+    for (key, modifiers, selected) in [
+        (egui::Key::J, egui::Modifiers::CTRL, 1),
+        (egui::Key::End, egui::Modifiers::SHIFT, 3),
+        (egui::Key::F21, egui::Modifiers::NONE, 0),
+        (egui::Key::F22, egui::Modifiers::NONE, 3),
+        (egui::Key::F23, egui::Modifiers::NONE, 0),
+    ] {
+        rig.input(key_event(key, true, modifiers));
+        rig.input(key_event(key, false, egui::Modifiers::NONE));
+        rig.input(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        rig.show();
+        assert_eq!(
+            rig.app.config().lock().expect("config").perm_vm.selected,
+            selected,
+            "{key:?}"
+        );
+    }
+    rig.key(egui::Key::F24);
+    rig.show();
+    finish_popup_pick(&mut rig);
+    assert_eq!(rig.cmds(), vec![UiCmd::ExecPermanent(id(1001))]);
+}
+
+fn scroll_controls(permanent: bool) {
+    let mut rig = active_list_rig(permanent, 60);
+    let prefix = if permanent { "Permanent" } else { "History" };
+    for (key, row) in [
+        (egui::Key::End, 60),
+        (egui::Key::Home, 1),
+        (egui::Key::PageDown, 11),
+    ] {
+        rig.key(key);
+        rig.show();
+        rig.show();
+        println!(
+            "key={key:?} history selected={} permanent selected={}",
+            rig.app.vm().selected,
+            rig.app.config().lock().expect("config").perm_vm.selected
+        );
+        popup_widget(&mut rig, &format!("{prefix} row {row}"));
+    }
+    rig.key(egui::Key::End);
+    rig.show();
+    rig.show();
+    let selected = popup_widget(&mut rig, &format!("{prefix} row 60"));
+    // A real wheel event scrolls away from the selected row.
+    rig.input(egui::Event::PointerMoved(selected.rect.center()));
+    rig.input(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        source: egui::MouseWheelSource::Unknown,
+        phase: egui::TouchPhase::Move,
+        delta: egui::vec2(0.0, 450.0),
+        modifiers: egui::Modifiers::NONE,
+    });
+    rig.show();
+    for _ in 0..20 {
+        rig.show();
+    }
+    let pass = rig.show();
+    assert!(
+        !pass
+            .bounds
+            .iter()
+            .any(|(text, rect, clip)| text == &format!("{prefix} row 60")
+                && clip.intersects(*rect)),
+        "idle must not undo wheel scrolling"
+    );
+    rig.key(egui::Key::End);
+    rig.show();
+    rig.show();
+    popup_widget(&mut rig, &format!("{prefix} row 60"));
+    rig.key(egui::Key::Enter);
+    rig.show();
+    finish_popup_pick(&mut rig);
+    let commands = rig.cmds();
+    if permanent {
+        assert_eq!(commands, vec![UiCmd::ExecPermanent(id(1060))]);
+    } else {
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd, UiCmd::PasteClipTo(picked, ..) if *picked == id(60))),
+            "{commands:?}"
+        );
+    }
+}
+
+#[test]
+fn active_list_history_scroll_reveals_and_preserves_wheel() {
+    scroll_controls(false);
+}
+
+#[test]
+fn active_list_permanent_scroll_reveals_and_preserves_wheel() {
+    scroll_controls(true);
+}
+
+#[test]
+fn active_list_settings_reply_preserves_unfiltered_selection() {
+    let mut rig = active_list_rig(true, 3);
+    rig.app.vm_mut().query = "no popup matches".into();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    rig.app.config().lock().expect("config").perm_vm.selected = 2;
+    rig.push(UiEvent::Permanents(json!({"permanents": (1..=3).map(|n| permanent_json(1000+n,"Work", &format!("Permanent row {n}"))).collect::<Vec<_>>()})));
+    rig.push(UiEvent::PermGroups(
+        json!({"groups":[{"name":"Work","system":false,"count":3}]}),
+    ));
+    rig.tick_settings();
+    assert_eq!(
+        rig.app
+            .config()
+            .lock()
+            .expect("config")
+            .perm_vm
+            .activate_selected(),
+        Some(id(1003))
+    );
+    rig.show();
+    assert_eq!(
+        rig.app
+            .config()
+            .lock()
+            .expect("config")
+            .perm_vm
+            .activate_selected(),
+        Some(id(1003)),
+        "passive popup repaint must preserve the Settings selection"
+    );
+}
+
+#[test]
+fn active_list_search_editing_and_focused_widget_activation_stay_separate() {
+    let mut rig = active_list_rig(true, 3);
+    rig.app.vm_mut().selected = 2;
+    rig.app.config().lock().expect("config").perm_vm.selected = 2;
+    rig.input(egui::Event::Text("row 2".into()));
+    rig.show();
+    rig.show();
+    assert_eq!(rig.app.vm().query, "row 2");
+    assert_eq!(
+        rig.app.vm().selected,
+        2,
+        "searching permanents leaves hidden history alone"
+    );
+    assert_eq!(rig.app.config().lock().expect("config").perm_vm.selected, 0);
+    rig.key(egui::Key::Delete);
+    rig.show();
+    assert!(
+        rig.cmds().is_empty(),
+        "editing Delete must not remove hidden history"
+    );
+    let button = popup_widget(&mut rig, strings::text("config.open_config"));
+    button.request_focus();
+    rig.key(egui::Key::Enter);
+    rig.show();
+    assert!(rig.desired().settings_open);
+    assert!(rig.is_open(), "focused button must not additionally paste");
+    assert!(!rig
+        .cmds()
+        .iter()
+        .any(|c| matches!(c, UiCmd::ExecPermanent(_) | UiCmd::PasteClipTo(..))));
+}
+
+#[test]
+fn active_list_source_switch_and_replaced_pending_rows_settle() {
+    let mut rig = active_list_rig(false, 60);
+    rig.key(egui::Key::End);
+    rig.show();
+    // Replace the row that has an outstanding reveal before it can paint.
+    rig.push(history(&[clip(99, "Replacement")]));
+    rig.show();
+    rig.show();
+    popup_widget(&mut rig, "Replacement");
+    rig.input(key_event(egui::Key::Num1, true, egui::Modifiers::ALT));
+    rig.show();
+    rig.show();
+    popup_widget(&mut rig, "Permanent row 1");
+    rig.key(egui::Key::End);
+    rig.show();
+    // Same-sized permanent replacement changes ID, then an empty result clears it.
+    rig.push(UiEvent::Permanents(json!({"permanents":(1..=60).map(|n| permanent_json(2000+n,"Work", &format!("Replacement permanent {n}"))).collect::<Vec<_>>()})));
+    rig.show();
+    rig.show();
+    popup_widget(&mut rig, "Replacement permanent 60");
+    rig.push(UiEvent::Permanents(json!({"permanents":[]})));
+    rig.input(egui::Event::PointerGone);
+    for _ in 0..20 {
+        rig.show();
+    }
+    let _ = rig.requests();
+    for _ in 0..3 {
+        rig.show();
+    }
+    assert!(
+        !rig.requests().iter().any(|r| r.delay == Duration::ZERO),
+        "stale pending row must not request perpetual repaint"
+    );
+    rig.key(egui::Key::Enter);
+    rig.show();
+    assert!(rig.is_open());
+    assert_eq!(rig.cmds(), vec![]);
+}
+
+#[test]
+fn active_list_return_to_history_clamps_only_when_displayed() {
+    let mut rig = active_list_rig(true, 3);
+    rig.app.vm_mut().selected = 2;
+    rig.input(egui::Event::Text("row 1".into()));
+    rig.show();
+    rig.show();
+    assert_eq!(rig.app.vm().selected, 2);
+    click_popup_widget(&mut rig, strings::text("perm.tab_history"));
+    rig.show();
+    assert_eq!(rig.app.vm().selected, 0);
+    popup_widget(&mut rig, "History row 1");
+    // A focused source tab retains its own Enter/Space behavior; release it to pick.
+    rig.popup.ctx.memory_mut(|m| {
+        if let Some(id) = m.focused() {
+            m.surrender_focus(id);
+        }
+    });
+    rig.key(egui::Key::Enter);
+    rig.show();
+    finish_popup_pick(&mut rig);
+    assert!(rig
+        .cmds()
+        .iter()
+        .any(|cmd| matches!(cmd, UiCmd::PasteClipTo(picked, ..) if *picked == id(1))));
 }

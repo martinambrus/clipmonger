@@ -58,6 +58,21 @@ pub trait App {
     /// The logical state the app wants, read after every tick.
     fn desired(&self) -> Desired;
 
+    /// Preserve physical Super in popup shortcut events; other apps keep egui defaults.
+    fn preserve_native_super(&self, _kind: WindowKind) -> bool {
+        false
+    }
+
+    /// Whether a configured list action overrides a native clipboard shortcut.
+    fn native_key_override(
+        &self,
+        _kind: WindowKind,
+        _key: egui::Key,
+        _modifiers: egui::Modifiers,
+    ) -> bool {
+        false
+    }
+
     /// One-shot activation request for the popup, drained by the runner.
     fn take_popup_activation(&mut self) -> bool {
         false
@@ -231,6 +246,94 @@ impl Host {
     }
 }
 
+/// Native modifier snapshots are applied only to events appended by one translation.
+#[derive(Default)]
+struct NativeInput {
+    modifiers: egui::Modifiers,
+}
+
+impl NativeInput {
+    fn observe(&mut self, event: &WindowEvent, is_mac: bool) {
+        match event {
+            WindowEvent::ModifiersChanged(mods) => {
+                let state = mods.state();
+                self.modifiers = egui::Modifiers {
+                    alt: state.alt_key(),
+                    ctrl: state.control_key(),
+                    shift: state.shift_key(),
+                    mac_cmd: state.super_key(),
+                    command: if is_mac {
+                        state.super_key()
+                    } else {
+                        state.control_key()
+                    },
+                };
+            }
+            WindowEvent::Focused(false) | WindowEvent::Destroyed => self.reset(),
+            _ => {}
+        }
+    }
+
+    fn clipboard_override<A: App>(
+        &self,
+        app: &A,
+        kind: WindowKind,
+        key: &winit::keyboard::Key,
+        pressed: bool,
+    ) -> Option<egui::Key> {
+        self.clipboard_key(key, pressed)
+            .filter(|key| app.native_key_override(kind, *key, self.modifiers))
+    }
+
+    fn clipboard_key(&self, key: &winit::keyboard::Key, pressed: bool) -> Option<egui::Key> {
+        if !pressed || !self.modifiers.command_only() {
+            return None;
+        }
+        match key.as_ref() {
+            winit::keyboard::Key::Character("c" | "C") => Some(egui::Key::C),
+            winit::keyboard::Key::Character("x" | "X") => Some(egui::Key::X),
+            winit::keyboard::Key::Character("v" | "V") => Some(egui::Key::V),
+            _ => None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.modifiers = egui::Modifiers::NONE;
+    }
+
+    fn finish(&self, input: &mut RawInput, start: usize, override_key: Option<egui::Key>) {
+        // egui-winit can append Text after Key for printable Super chords on non-Mac.
+        let mut appended = input.events.split_off(start);
+        let has_key = appended
+            .iter()
+            .any(|event| matches!(event, egui::Event::Key { .. }));
+        appended.retain_mut(|event| match event {
+            egui::Event::Key { modifiers, .. } | egui::Event::ModifiersChanged(modifiers) => {
+                *modifiers = self.modifiers;
+                true
+            }
+            egui::Event::Text(_)
+                if override_key.is_some() || (has_key && self.modifiers.mac_cmd) =>
+            {
+                false
+            }
+            _ => true,
+        });
+        if !has_key {
+            if let Some(key) = override_key {
+                appended.push(egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: self.modifiers,
+                });
+            }
+        }
+        input.events.extend(appended);
+    }
+}
+
 /// One egui context with its rasterizer, deadline and, while it exists, its OS window.
 struct Slot {
     kind: WindowKind,
@@ -239,6 +342,7 @@ struct Slot {
     pending_raw: RawInput,
     deadline: sched::Deadline,
     host: Option<Host>,
+    native_input: NativeInput,
 }
 
 /// Construct either window's egui context before it receives input.
@@ -271,6 +375,7 @@ impl Slot {
             pending_raw: RawInput::default(),
             deadline: sched::Deadline::new(),
             host: None,
+            native_input: NativeInput::default(),
         }
     }
 
@@ -416,6 +521,7 @@ impl<A: App> Runner<A> {
         if !self.per_show {
             let host = self.create_host(event_loop, WindowKind::Popup, false)?;
             popup_hwnd = window::hwnd(&host.window);
+            self.popup.native_input.reset();
             self.popup.host = Some(host);
         }
         let make_app = self.make_app.take().expect("make_app already taken");
@@ -614,9 +720,11 @@ impl<A: App> Runner<A> {
         if self.per_show {
             if open {
                 let host = self.create_host(event_loop, WindowKind::Popup, true)?;
+                self.popup.native_input.reset();
                 self.popup.host = Some(host);
             } else {
                 self.popup.host = None;
+                self.popup.native_input.reset();
             }
         } else if let Some(host) = self.popup.host.as_mut() {
             if open {
@@ -646,11 +754,13 @@ impl<A: App> Runner<A> {
             if needs_host {
                 let host = self.create_host(event_loop, WindowKind::Settings, true)?;
                 if let Some(slot) = self.settings.as_mut() {
+                    slot.native_input.reset();
                     slot.host = Some(host);
                 }
             }
         } else if let Some(slot) = self.settings.as_mut() {
             slot.host = None;
+            slot.native_input.reset();
             slot.deadline.clear();
         }
         Ok(())
@@ -717,12 +827,44 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
             None
         });
         if let Some(kind) = kind {
+            let preserve_super = self
+                .app
+                .as_ref()
+                .is_some_and(|app| app.preserve_native_super(kind));
+            let slot = match kind {
+                WindowKind::Popup => Some(&self.popup),
+                WindowKind::Settings => self.settings.as_ref(),
+            };
+            let override_key = slot.and_then(|slot| {
+                let WindowEvent::KeyboardInput {
+                    event,
+                    is_synthetic: false,
+                    ..
+                } = &event
+                else {
+                    return None;
+                };
+                slot.native_input.clipboard_override(
+                    self.app.as_ref()?,
+                    kind,
+                    &event.logical_key,
+                    event.state.is_pressed(),
+                )
+            });
             if let Some(slot) = self.slot_mut(kind) {
                 if let Some(host) = slot.host.as_mut() {
                     if close {
                         host.info.events.push(ViewportEvent::Close);
                     }
+                    let start = host.state.egui_input_mut().events.len();
+                    if preserve_super {
+                        slot.native_input.observe(&event, slot.ctx.os().is_mac());
+                    }
                     let response = host.state.on_window_event(&host.window, &event);
+                    if preserve_super {
+                        slot.native_input
+                            .finish(host.state.egui_input_mut(), start, override_key);
+                    }
                     if response.repaint || close {
                         slot.deadline.at(now);
                     }
@@ -750,6 +892,311 @@ mod zoom_tests {
                 !ctx.options(|options| options.zoom_with_keyboard),
                 "{kind:?}: keyboard zoom must be off before the first pass"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_input_tests {
+    use super::*;
+    use winit::keyboard::ModifiersState;
+
+    fn key(pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::J,
+            physical_key: Some(egui::Key::J),
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn native_input_patches_key_before_text_and_preserves_batched_snapshots() {
+        for is_mac in [false, true] {
+            let mut adapter = NativeInput::default();
+            let mut input = RawInput::default();
+            adapter.observe(
+                &WindowEvent::ModifiersChanged(ModifiersState::SUPER.into()),
+                is_mac,
+            );
+            input.events.extend([
+                key(true, egui::Modifiers::NONE),
+                egui::Event::Text("j".into()),
+            ]);
+            adapter.finish(&mut input, 0, None);
+            adapter.observe(
+                &WindowEvent::ModifiersChanged(ModifiersState::empty().into()),
+                is_mac,
+            );
+            let start = input.events.len();
+            input.events.push(key(false, egui::Modifiers::NONE));
+            adapter.finish(&mut input, start, None);
+            assert_eq!(input.events.len(), 2, "shortcut text must not reach search");
+            assert!(
+                matches!(input.events[0], egui::Event::Key { pressed:true, modifiers, .. } if modifiers.mac_cmd && modifiers.command == is_mac && !modifiers.ctrl)
+            );
+            assert!(
+                matches!(input.events[1], egui::Event::Key { pressed:false, modifiers, .. } if modifiers == egui::Modifiers::NONE)
+            );
+        }
+    }
+
+    fn shortcut_app() -> (crate::app::PopupApp, Context) {
+        use crate::app::{AppParts, PopupApp};
+        use crate::ipc_bridge::{UiCmd, UiEvent};
+        use serde_json::json;
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel::<UiCmd>();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut app = PopupApp::new(AppParts {
+            profile: std::path::PathBuf::from("native-input-fixture"),
+            cmds: cmd_tx,
+            events: event_rx,
+            tray: Box::new(Vec::new),
+            hold: None,
+            open: true,
+            status_period: Duration::from_secs(3600),
+            trace: None,
+            allow_foreground: Box::new(|| {}),
+        });
+        event_tx
+            .send(UiEvent::Config(
+                json!({"config":{"popup":{"keys":{"navigate_down":"super+j", "end":"ctrl+c", "home":"ctrl+x", "page_down":"ctrl+v"}}}}),
+            ))
+            .expect("config");
+        app.vm_mut().set_clips((1..=3).map(|n| serde_json::from_value(json!({
+            "id":uuid::Uuid::from_u128(n), "created_ms":1, "source_os":"linux", "preview":"row", "pinned":false,
+            "rev":{"wall_ms":1,"dev":"fixture"}
+        })).expect("clip")).collect());
+        let ctx = new_context();
+        frame(&mut app, &ctx, RawInput::default());
+        (app, ctx)
+    }
+
+    fn frame(app: &mut crate::app::PopupApp, ctx: &Context, input: RawInput) {
+        let mut output = ctx.run_ui(input, |ui| {
+            app.logic(ui.ctx(), WindowKind::Popup);
+            app.ui(ui, WindowKind::Popup);
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn native_input_super_batch_dispatches_once_without_search_text() {
+        let (mut app, ctx) = shortcut_app();
+        let mut adapter = NativeInput::default();
+        adapter.observe(
+            &WindowEvent::ModifiersChanged(ModifiersState::SUPER.into()),
+            false,
+        );
+        let mut input = RawInput {
+            events: vec![
+                key(true, egui::Modifiers::NONE),
+                egui::Event::Text("j".into()),
+            ],
+            ..RawInput::default()
+        };
+        adapter.finish(&mut input, 0, None);
+        adapter.observe(
+            &WindowEvent::ModifiersChanged(ModifiersState::empty().into()),
+            false,
+        );
+        let start = input.events.len();
+        input.events.extend([
+            key(false, egui::Modifiers::NONE),
+            egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+        ]);
+        adapter.finish(&mut input, start, None);
+        frame(&mut app, &ctx, input);
+        assert_eq!(
+            app.vm().selected,
+            1,
+            "one native shortcut must dispatch exactly once"
+        );
+        assert!(
+            app.vm().query.is_empty(),
+            "shortcut must not fall back to search text"
+        );
+    }
+
+    #[test]
+    fn native_input_clipboard_overrides_preserve_text_editing() {
+        let (mut app, ctx) = shortcut_app();
+        let mut adapter = NativeInput::default();
+        adapter.observe(
+            &WindowEvent::ModifiersChanged(ModifiersState::CONTROL.into()),
+            false,
+        );
+        // Clipboard translation remains text editing when the search field owns focus.
+        let native_v = winit::keyboard::Key::Character("v".into());
+        assert!(ctx.text_edit_focused());
+        assert_eq!(
+            adapter.clipboard_override(&app, WindowKind::Popup, &native_v, true),
+            Some(egui::Key::V)
+        );
+        let mut paste = RawInput {
+            events: vec![egui::Event::Paste("needle".into())],
+            ..RawInput::default()
+        };
+        adapter.finish(&mut paste, 0, Some(egui::Key::V));
+        frame(&mut app, &ctx, paste);
+        assert_eq!(app.vm().query, "needle");
+        app.vm_mut().query.clear();
+        ctx.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+        });
+        frame(&mut app, &ctx, RawInput::default());
+        assert!(!ctx.text_edit_focused());
+        for (name, translated, selected) in [
+            ("c", egui::Event::Copy, 2),
+            ("x", egui::Event::Cut, 0),
+            ("v", egui::Event::Paste("must not enter search".into()), 2),
+        ] {
+            let native = winit::keyboard::Key::Character(name.into());
+            let override_key = adapter.clipboard_override(&app, WindowKind::Popup, &native, true);
+            assert!(
+                override_key.is_some(),
+                "configured {name} must survive native clipboard translation"
+            );
+            let mut input = RawInput {
+                events: vec![translated],
+                ..RawInput::default()
+            };
+            adapter.finish(&mut input, 0, override_key);
+            assert_eq!(
+                input.events.len(),
+                2,
+                "preserve clipboard input until actual frame focus is known"
+            );
+            frame(&mut app, &ctx, input);
+            assert_eq!(app.vm().selected, selected);
+            assert_eq!(app.vm().query, "");
+        }
+    }
+
+    #[test]
+    fn native_input_clipboard_focus_changes_in_same_batch() {
+        let (mut app, ctx) = shortcut_app();
+        let search_id = ctx
+            .memory(egui::Memory::focused)
+            .expect("search owns focus");
+        let search = ctx
+            .read_response(search_id)
+            .expect("actual search widget")
+            .rect;
+        ctx.memory_mut(|memory| memory.surrender_focus(search_id));
+        frame(&mut app, &ctx, RawInput::default());
+        assert!(!ctx.text_edit_focused());
+        let mut adapter = NativeInput::default();
+        adapter.observe(
+            &WindowEvent::ModifiersChanged(ModifiersState::CONTROL.into()),
+            false,
+        );
+        let click = |pos| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        let native_v = winit::keyboard::Key::Character("v".into());
+        let override_key = adapter.clipboard_override(&app, WindowKind::Popup, &native_v, true);
+        let mut input = RawInput {
+            events: click(search.center()),
+            ..RawInput::default()
+        };
+        let start = input.events.len();
+        input.events.push(egui::Event::Paste("needle".into()));
+        adapter.finish(&mut input, start, override_key);
+        frame(&mut app, &ctx, input);
+        assert!(
+            ctx.text_edit_focused(),
+            "actual search click at {search:?} must focus text editor"
+        );
+        assert_eq!(
+            app.vm().query,
+            "needle",
+            "same-batch search click must retain native paste"
+        );
+        assert_eq!(
+            app.vm().selected,
+            0,
+            "paste into search must not also navigate the list"
+        );
+        app.vm_mut().query.clear();
+        frame(&mut app, &ctx, RawInput::default());
+        assert!(ctx.text_edit_focused());
+        let mut rows = ctx
+            .interactive_rects_last_pass()
+            .into_iter()
+            .filter(|rect| rect.top() > search.bottom() && rect.height() <= 25.0)
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        let row = rows.get(1).expect("actual second history row");
+        let native_c = winit::keyboard::Key::Character("c".into());
+        let override_key = adapter.clipboard_override(&app, WindowKind::Popup, &native_c, true);
+        let mut input = RawInput {
+            events: click(row.center()),
+            ..RawInput::default()
+        };
+        let start = input.events.len();
+        input.events.push(egui::Event::Copy);
+        adapter.finish(&mut input, start, override_key);
+        frame(&mut app, &ctx, input);
+        assert!(!ctx.text_edit_focused());
+        assert_eq!(
+            app.vm().selected,
+            2,
+            "same-batch list click must honor configured copy chord"
+        );
+        assert_eq!(app.vm().query, "");
+    }
+
+    #[test]
+    fn native_input_ctrl_focus_and_host_reset_do_not_invent_super() {
+        for is_mac in [false, true] {
+            let mut adapter = NativeInput::default();
+            adapter.observe(
+                &WindowEvent::ModifiersChanged(ModifiersState::CONTROL.into()),
+                is_mac,
+            );
+            let mut input = RawInput {
+                events: vec![key(true, egui::Modifiers::NONE)],
+                ..RawInput::default()
+            };
+            adapter.finish(&mut input, 0, None);
+            assert!(
+                matches!(input.events[0], egui::Event::Key { modifiers, .. } if modifiers.ctrl && !modifiers.mac_cmd && modifiers.command != is_mac)
+            );
+            for event in [WindowEvent::Focused(false), WindowEvent::Destroyed] {
+                adapter.observe(
+                    &WindowEvent::ModifiersChanged(
+                        (ModifiersState::SUPER | ModifiersState::ALT | ModifiersState::SHIFT)
+                            .into(),
+                    ),
+                    is_mac,
+                );
+                adapter.observe(&event, is_mac);
+                assert_eq!(adapter.modifiers, egui::Modifiers::NONE);
+            }
+            adapter.observe(
+                &WindowEvent::ModifiersChanged(ModifiersState::SUPER.into()),
+                is_mac,
+            );
+            adapter.reset();
+            assert_eq!(adapter.modifiers, egui::Modifiers::NONE);
         }
     }
 }

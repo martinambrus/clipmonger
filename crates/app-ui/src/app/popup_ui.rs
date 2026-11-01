@@ -34,64 +34,212 @@ impl PopupApp {
         }
     }
 
+    pub(super) fn egui_key_to_chord_name(key: egui::Key) -> Option<String> {
+        let name = match key {
+            egui::Key::ArrowUp => "ArrowUp",
+            egui::Key::ArrowDown => "ArrowDown",
+            egui::Key::ArrowLeft => "ArrowLeft",
+            egui::Key::ArrowRight => "ArrowRight",
+            egui::Key::Home => "Home",
+            egui::Key::End => "End",
+            egui::Key::PageUp => "PageUp",
+            egui::Key::PageDown => "PageDown",
+            egui::Key::Enter => "Enter",
+            egui::Key::Escape => "Escape",
+            egui::Key::Delete => "Delete",
+            egui::Key::Backspace => "Backspace",
+            egui::Key::Tab => "Tab",
+            egui::Key::Space => "Space",
+            egui::Key::A => "a",
+            egui::Key::B => "b",
+            egui::Key::C => "c",
+            egui::Key::D => "d",
+            egui::Key::E => "e",
+            egui::Key::F => "f",
+            egui::Key::G => "g",
+            egui::Key::H => "h",
+            egui::Key::I => "i",
+            egui::Key::J => "j",
+            egui::Key::K => "k",
+            egui::Key::L => "l",
+            egui::Key::M => "m",
+            egui::Key::N => "n",
+            egui::Key::O => "o",
+            egui::Key::P => "p",
+            egui::Key::Q => "q",
+            egui::Key::R => "r",
+            egui::Key::S => "s",
+            egui::Key::T => "t",
+            egui::Key::U => "u",
+            egui::Key::V => "v",
+            egui::Key::W => "w",
+            egui::Key::X => "x",
+            egui::Key::Y => "y",
+            egui::Key::Z => "z",
+            egui::Key::Num0 => "0",
+            egui::Key::Num1 => "1",
+            egui::Key::Num2 => "2",
+            egui::Key::Num3 => "3",
+            egui::Key::Num4 => "4",
+            egui::Key::Num5 => "5",
+            egui::Key::Num6 => "6",
+            egui::Key::Num7 => "7",
+            egui::Key::Num8 => "8",
+            egui::Key::Num9 => "9",
+            egui::Key::F1 => "F1",
+            egui::Key::F2 => "F2",
+            egui::Key::F3 => "F3",
+            egui::Key::F4 => "F4",
+            egui::Key::F5 => "F5",
+            egui::Key::F6 => "F6",
+            egui::Key::F7 => "F7",
+            egui::Key::F8 => "F8",
+            egui::Key::F9 => "F9",
+            egui::Key::F10 => "F10",
+            egui::Key::F11 => "F11",
+            egui::Key::F12 => "F12",
+            egui::Key::F13 => "F13",
+            egui::Key::F14 => "F14",
+            egui::Key::F15 => "F15",
+            egui::Key::F16 => "F16",
+            egui::Key::F17 => "F17",
+            egui::Key::F18 => "F18",
+            egui::Key::F19 => "F19",
+            egui::Key::F20 => "F20",
+            egui::Key::F21 => "F21",
+            egui::Key::F22 => "F22",
+            egui::Key::F23 => "F23",
+            egui::Key::F24 => "F24",
+            _ => return None,
+        };
+        Some(name.to_string())
+    }
+
     /// Forward special keys to the view-model; typing stays in the field.
-    fn handle_keys(&mut self, ctx: &egui::Context, search_focused: bool) {
-        if ctx.input(|input| {
-            input
-                .events
-                .iter()
-                .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
-        }) {
+    fn handle_keys(&mut self, ctx: &egui::Context, search_focused: bool, events: &[egui::Event]) {
+        if events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
+        {
             self.feed(Event::Key);
         }
-        let widget_focused = !search_focused && ctx.memory(egui::Memory::focused).is_some();
-        let pressed: Vec<(String, bool, bool)> = ctx.input(|input| {
+        let widget_focused = !search_focused && ctx.memory(|m| m.focused().is_some());
+        let pressed: Vec<(String, bool, bool, bool, bool)> = {
             let mut out = Vec::new();
-            let ctrl = input.modifiers.ctrl;
-            let alt = input.modifiers.alt;
-            let pairs = [
-                (egui::Key::Enter, "Enter"),
-                (egui::Key::Escape, "Escape"),
-                (egui::Key::Delete, "Delete"),
-                (egui::Key::Home, "Home"),
-                (egui::Key::End, "End"),
-                (egui::Key::PageUp, "PageUp"),
-                (egui::Key::PageDown, "PageDown"),
-                (egui::Key::ArrowUp, "ArrowUp"),
-                (egui::Key::ArrowDown, "ArrowDown"),
-                (egui::Key::F5, "F5"),
-                (egui::Key::P, "p"),
-                (egui::Key::E, "e"),
-                (egui::Key::Num1, "1"),
-                (egui::Key::Num2, "2"),
-                (egui::Key::Num3, "3"),
-                (egui::Key::Num4, "4"),
-                (egui::Key::Num5, "5"),
-                (egui::Key::Num6, "6"),
-                (egui::Key::Num7, "7"),
-                (egui::Key::Num8, "8"),
-                (egui::Key::Num9, "9"),
-            ];
-            for (key, name) in pairs {
-                // egui activates the focused widget without consuming its key.
-                if widget_focused && key == egui::Key::Enter {
-                    continue;
-                }
-                if input.key_pressed(key) {
-                    out.push((name.to_string(), ctrl, alt));
+            for event in events {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = event
+                {
+                    if ctx.text_edit_focused()
+                        && modifiers.command_only()
+                        && matches!(key, egui::Key::C | egui::Key::X | egui::Key::V)
+                    {
+                        continue;
+                    }
+                    if widget_focused && (*key == egui::Key::Enter || *key == egui::Key::Space) {
+                        continue;
+                    }
+                    let Some(name) = Self::egui_key_to_chord_name(*key) else {
+                        continue;
+                    };
+                    let ctrl = modifiers.ctrl;
+                    let alt = modifiers.alt;
+                    let shift = modifiers.shift;
+                    let super_key = modifiers.mac_cmd;
+                    out.push((name, ctrl, alt, shift, super_key));
                 }
             }
             out
-        });
-        for (name, ctrl, alt) in pressed {
-            let editing = search_focused && !ctrl && !alt;
-            if editing && !popup::forwards_key_when_editing(&name) {
+        };
+        for (name, ctrl, alt, shift, super_key) in pressed {
+            let editing = search_focused && !ctrl && !alt && !super_key;
+            if editing && !popup::forwards_key_when_editing(&name) && !name.starts_with('F') {
                 continue;
             }
-            let event = keymap::KeyEvent::new(name, ctrl, alt, false);
-            let effect = self.vm.on_key(event);
+            let event = keymap::KeyEvent {
+                key: name.clone(),
+                ctrl,
+                alt,
+                shift,
+                super_key,
+            };
+            let permanent = self.config.lock().is_ok_and(|c| c.perm_source.is_some());
+            if name == "Backspace" && !ctrl && !alt && !super_key {
+                self.vm.query.pop();
+                self.reconcile_query(permanent);
+                self.request_reveal(ctx);
+                continue;
+            }
+            let Some(action) = self.vm.action_for(&event) else {
+                continue;
+            };
+            let navigation = matches!(
+                action,
+                keymap::Action::NavigateUp
+                    | keymap::Action::NavigateDown
+                    | keymap::Action::PageUp
+                    | keymap::Action::PageDown
+                    | keymap::Action::Home
+                    | keymap::Action::End
+            );
+            let query_changed = matches!(action, keymap::Action::TypeChar(_));
+            let effect = if permanent {
+                self.permanent_action(action)
+            } else {
+                self.vm.clamp_selection();
+                self.vm.on_action(action)
+            };
             self.apply_effect(effect);
+            if query_changed {
+                self.reconcile_query(permanent);
+            }
+            if navigation || query_changed || matches!(action, keymap::Action::GroupTab(_)) {
+                self.request_reveal(ctx);
+            }
         }
+    }
+
+    fn reconcile_query(&mut self, permanent: bool) {
+        if permanent {
+            if let Ok(mut config) = self.config.lock() {
+                config.perm_vm.selected = 0;
+            }
+        } else {
+            self.vm.selected = 0;
+        }
+    }
+
+    fn permanent_action(&mut self, action: keymap::Action) -> popup::VmEffect {
+        use keymap::Action;
+        let Ok(mut config) = self.config.lock() else {
+            return popup::VmEffect::None;
+        };
+        let vm = &mut config.perm_vm;
+        let query = &self.vm.query;
+        vm.clamp_for(query);
+        match action {
+            Action::NavigateUp => vm.move_selection(-1, query),
+            Action::NavigateDown => vm.move_selection(1, query),
+            Action::PageUp => vm.move_selection(-10, query),
+            Action::PageDown => vm.move_selection(10, query),
+            Action::Home => vm.home(query),
+            Action::End => vm.end(query),
+            Action::Paste | Action::PasteInto => {
+                return vm
+                    .selected_id(query)
+                    .map_or(popup::VmEffect::None, popup::VmEffect::ExecPermanent)
+            }
+            Action::Dismiss => return popup::VmEffect::Dismiss,
+            Action::Refresh => return popup::VmEffect::Refresh,
+            Action::GroupTab(n) => return popup::VmEffect::GroupTab(n),
+            Action::TypeChar(c) => self.vm.query.push(c),
+            Action::Remove | Action::Pin | Action::Edit | Action::None => {}
+        }
+        popup::VmEffect::None
     }
 
     /// Paint the footer and report whether Settings was activated.
@@ -109,6 +257,7 @@ impl PopupApp {
     /// Render the popup window contents.
     #[allow(clippy::too_many_lines)]
     pub(super) fn render(&mut self, ui: &mut egui::Ui) {
+        let events = ui.input(|input| input.events.clone());
         let mut query = self.vm.query.clone();
         let mut clicked_row: Option<usize> = Option::None;
         let mut clicked_perm_row: Option<usize> = Option::None;
@@ -117,9 +266,30 @@ impl PopupApp {
         let mut delete_row: Option<usize> = Option::None;
         let mut search_focused = false;
         let mut open_settings = false;
+        if let Ok(mut config) = self.config.lock() {
+            if config.perm_source.is_some() {
+                if !self.shell.desired().settings_open {
+                    if query != self.last_query {
+                        config.perm_vm.selected = 0;
+                    }
+                    config.perm_vm.clamp_for(&query);
+                }
+                config.perm_source = (!config.perm_vm.group_names().is_empty())
+                    .then_some(config.perm_vm.active_group);
+            } else {
+                self.vm.clamp_selection();
+            }
+        }
+        let current = self.compute_reveal_key();
+        if current != self.last_reveal || query != self.last_query || self.pending_reveal.is_some()
+        {
+            self.pending_reveal = current.clone();
+        }
+        self.last_reveal = current;
+        self.last_query.clone_from(&query);
+        let pending = self.pending_reveal.take();
+
         egui::CentralPanel::default().show(ui, |ui| {
-            // Measure without interaction so the footer reserves its actual
-            // height on the first pass, while keeping keyboard order below.
             let full_rect = ui.max_rect();
             let footer_height = {
                 let mut measure = ui.new_child(
@@ -134,8 +304,20 @@ impl PopupApp {
             ui.set_max_height(
                 (full_rect.height() - footer_height - ui.spacing().item_spacing.y).max(0.0),
             );
+            // Resolve pointer focus before TextEdit consumes a batched clipboard event.
+            let search_id = ui.make_persistent_id("popup_search");
+            if let Some(response) = ui.ctx().read_response(search_id) {
+                if response.clicked() {
+                    response.request_focus();
+                } else if ui.input(|input| input.pointer.any_pressed())
+                    && !response.contains_pointer()
+                {
+                    response.surrender_focus();
+                }
+            }
             let field = ui.add(
                 egui::TextEdit::singleline(&mut query)
+                    .id(search_id)
                     .hint_text(strings::text("popup.search_hint")),
             );
             if std::mem::take(&mut self.focus_search) {
@@ -172,22 +354,19 @@ impl PopupApp {
                 });
             }
             if perm_source.is_some() && !group_names.is_empty() {
-                let rows: Vec<(usize, String, bool)> = self
+                let rows: Vec<(usize, String, bool, uuid::Uuid)> = self
                     .config
                     .lock()
                     .map(|config| {
-                        config
-                            .perm_vm
-                            .visible(&query)
+                        let visible = config.perm_vm.visible(&query);
+                        visible
                             .iter()
                             .enumerate()
-                            .map(|(row, &index)| {
-                                let name = config
-                                    .perm_vm
-                                    .permanents
-                                    .get(index)
-                                    .map_or_else(String::new, |clip| clip.name.clone());
-                                (row, name, config.perm_vm.selected == row)
+                            .filter_map(|(row, &index)| {
+                                let clip = config.perm_vm.permanents.get(index)?;
+                                let name = clip.name.clone();
+                                let selected = config.perm_vm.selected == row;
+                                Some((row, name, selected, clip.id))
                             })
                             .collect()
                     })
@@ -195,47 +374,80 @@ impl PopupApp {
                 if rows.is_empty() {
                     ui.label(strings::text("popup.empty"));
                 }
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (row, name, selected) in &rows {
-                        if ui.selectable_label(*selected, name).clicked() {
-                            clicked_perm_row = Some(*row);
+                egui::ScrollArea::vertical()
+                    .animated(false)
+                    .id_salt((
+                        "popup_permanents",
+                        group_names.get(perm_source.unwrap_or(0)),
+                    ))
+                    .show(ui, |ui| {
+                        for (row, name, selected, id) in &rows {
+                            let response = ui.selectable_label(*selected, name);
+                            if *selected
+                                && pending.as_ref().is_some_and(
+                                    |(source, selected, selected_id)| {
+                                        source.as_ref() == group_names.get(perm_source.unwrap_or(0))
+                                            && *selected == *row
+                                            && selected_id == id
+                                    },
+                                )
+                            {
+                                response.scroll_to_me(None);
+                            }
+                            if response.clicked() {
+                                clicked_perm_row = Some(*row);
+                            }
                         }
-                    }
-                });
+                    });
             } else {
                 let count = self.vm.visible().len();
                 if count == 0 {
                     ui.label(strings::text("popup.empty"));
                 }
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for row in 0..count {
-                        let Some(clip) = self.vm.clip_at(row) else {
-                            continue;
-                        };
-                        let clip_id = clip.id;
-                        let pinned = clip.pinned;
-                        let response = ui.selectable_label(self.vm.selected == row, &clip.preview);
-                        if response.clicked() {
-                            clicked_row = Some(row);
-                        }
-                        response.context_menu(|ui| {
-                            let pin_label = if pinned {
-                                strings::text("popup.unpin")
-                            } else {
-                                strings::text("popup.pin")
+                egui::ScrollArea::vertical()
+                    .animated(false)
+                    .id_salt("popup_history")
+                    .show(ui, |ui| {
+                        for row in 0..count {
+                            let Some(clip) = self.vm.clip_at(row) else {
+                                continue;
                             };
-                            if ui.button(pin_label).clicked() {
-                                pin_row = Some(row);
-                                ui.close();
+                            let clip_id = clip.id;
+                            let pinned = clip.pinned;
+                            let selected = self.vm.selected == row;
+                            let response = ui.selectable_label(selected, &clip.preview);
+                            if selected
+                                && pending.as_ref().is_some_and(
+                                    |(source, selected, selected_id)| {
+                                        source.is_none()
+                                            && *selected == row
+                                            && *selected_id == clip_id
+                                    },
+                                )
+                            {
+                                response.scroll_to_me(None);
                             }
-                            if ui.button(strings::text("popup.delete")).clicked() {
-                                delete_row = Some(row);
-                                ui.close();
+                            if response.clicked() {
+                                clicked_row = Some(row);
                             }
-                            let _ = clip_id;
-                        });
-                    }
-                });
+                            response.context_menu(|ui| {
+                                let pin_label = if pinned {
+                                    strings::text("popup.unpin")
+                                } else {
+                                    strings::text("popup.pin")
+                                };
+                                if ui.button(pin_label).clicked() {
+                                    pin_row = Some(row);
+                                    ui.close();
+                                }
+                                if ui.button(strings::text("popup.delete")).clicked() {
+                                    delete_row = Some(row);
+                                    ui.close();
+                                }
+                                let _ = clip_id;
+                            });
+                        }
+                    });
             }
             let mut footer = ui.new_child(egui::UiBuilder::new().id_salt("popup_footer").max_rect(
                 egui::Rect::from_min_max(
@@ -250,8 +462,10 @@ impl PopupApp {
             self.open_settings(None);
         }
         if query != self.vm.query {
-            self.vm.query = query;
-            self.vm.selected = 0;
+            self.vm.query.clone_from(&query);
+            let permanent = self.config.lock().is_ok_and(|c| c.perm_source.is_some());
+            self.reconcile_query(permanent);
+            self.request_reveal(ui.ctx());
         }
         if let Some(tab) = perm_tab_click {
             match tab {
@@ -259,19 +473,24 @@ impl PopupApp {
                     if let Ok(mut config) = self.config.lock() {
                         config.perm_source = None;
                     }
+                    self.request_reveal(ui.ctx());
                 }
                 Some(index) => {
                     if let Ok(mut config) = self.config.lock() {
                         config.perm_vm.select_group(index);
                         config.perm_source = Some(config.perm_vm.active_group);
+                        let q = self.vm.query.clone();
+                        config.perm_vm.clamp_for(&q);
                     }
+                    self.request_reveal(ui.ctx());
                 }
             }
         }
         if let Some(row) = clicked_perm_row {
+            let q = self.vm.query.clone();
             let activate = self.config.lock().map_or(None, |mut config| {
                 if row == config.perm_vm.selected {
-                    config.perm_vm.activate_selected()
+                    config.perm_vm.selected_id(&q)
                 } else {
                     config.perm_vm.selected = row;
                     None
@@ -279,6 +498,8 @@ impl PopupApp {
             });
             if let Some(id) = activate {
                 self.apply_effect(popup::VmEffect::ExecPermanent(id));
+            } else {
+                self.request_reveal(ui.ctx());
             }
         }
         if let Some(row) = pin_row {
@@ -296,17 +517,19 @@ impl PopupApp {
         }
         if let Some(row) = clicked_row {
             if row == self.vm.selected {
-                let effect = self.vm.on_key(keymap::KeyEvent::new(
-                    "Enter".to_string(),
-                    false,
-                    false,
-                    false,
-                ));
+                let effect = self.vm.on_key(keymap::KeyEvent {
+                    key: "Enter".to_string(),
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                    super_key: false,
+                });
                 self.apply_effect(effect);
             } else {
                 self.vm.selected = row;
+                self.request_reveal(ui.ctx());
             }
         }
-        self.handle_keys(ui.ctx(), search_focused);
+        self.handle_keys(ui.ctx(), search_focused, &events);
     }
 }

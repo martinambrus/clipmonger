@@ -92,6 +92,9 @@ pub struct PopupApp {
     /// Theme last applied to the contexts: popup, settings (dark, font scale bits).
     theme_applied: [Option<(bool, u32)>; 2],
     pending_activation: bool,
+    pending_reveal: Option<(Option<String>, usize, uuid::Uuid)>,
+    last_reveal: Option<(Option<String>, usize, uuid::Uuid)>,
+    last_query: String,
 }
 
 impl PopupApp {
@@ -137,6 +140,9 @@ impl PopupApp {
             focus_search: open,
             theme_applied: [None, None],
             pending_activation: false,
+            pending_reveal: None,
+            last_reveal: None,
+            last_query: String::new(),
         };
         app.apply_effects(Shell::start());
         if open {
@@ -362,11 +368,25 @@ impl PopupApp {
             UiEvent::Permanents(body) => {
                 if let Ok(mut config) = self.config.lock() {
                     config.perm_vm.apply_list(&body);
+                    if config.perm_source.is_some()
+                        && self.shell.desired().popup_open
+                        && !self.shell.desired().settings_open
+                    {
+                        config.perm_vm.clamp_for(&self.vm.query);
+                        config.perm_source = Some(config.perm_vm.active_group);
+                    }
                 }
             }
             UiEvent::PermGroups(body) => {
                 if let Ok(mut config) = self.config.lock() {
                     config.perm_vm.apply_groups(&body);
+                    if config.perm_source.is_some()
+                        && self.shell.desired().popup_open
+                        && !self.shell.desired().settings_open
+                    {
+                        config.perm_vm.clamp_for(&self.vm.query);
+                        config.perm_source = Some(config.perm_vm.active_group);
+                    }
                 }
             }
             UiEvent::PermanentSaved => {
@@ -639,6 +659,37 @@ impl PopupApp {
     }
 }
 
+impl PopupApp {
+    fn compute_reveal_key(&self) -> Option<(Option<String>, usize, uuid::Uuid)> {
+        let config = self.config.lock().ok()?;
+        if config.perm_source.is_some() {
+            let group = config
+                .perm_vm
+                .group_names()
+                .get(config.perm_vm.active_group)?
+                .clone();
+            Some((
+                Some(group),
+                config.perm_vm.selected,
+                config.perm_vm.selected_id(&self.vm.query)?,
+            ))
+        } else {
+            Some((
+                None,
+                self.vm.selected,
+                self.vm.clip_at(self.vm.selected)?.id,
+            ))
+        }
+    }
+
+    fn request_reveal(&mut self, ctx: &egui::Context) {
+        self.pending_reveal = self.compute_reveal_key();
+        if self.pending_reveal.is_some() {
+            ctx.request_repaint();
+        }
+    }
+}
+
 impl runner::App for PopupApp {
     /// Popup, in this order:
     /// 1. `hide_unconfirmed` set: clear it and `feed(Event::Hidden)`;
@@ -745,6 +796,31 @@ impl runner::App for PopupApp {
             settings_open: want.settings_open,
             exit: want.exit,
         }
+    }
+
+    fn preserve_native_super(&self, kind: runner::WindowKind) -> bool {
+        kind == runner::WindowKind::Popup
+    }
+
+    fn native_key_override(
+        &self,
+        kind: runner::WindowKind,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) -> bool {
+        if kind != runner::WindowKind::Popup {
+            return false;
+        }
+        let Some(key) = Self::egui_key_to_chord_name(key) else {
+            return false;
+        };
+        self.vm.has_binding(&crate::keymap::KeyEvent {
+            key,
+            ctrl: modifiers.ctrl,
+            alt: modifiers.alt,
+            shift: modifiers.shift,
+            super_key: modifiers.mac_cmd,
+        })
     }
 
     fn take_popup_activation(&mut self) -> bool {
