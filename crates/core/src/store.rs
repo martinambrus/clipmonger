@@ -192,46 +192,46 @@ fn norm_hotkey(hotkey: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RestoreFault {
-    AfterOldDbMove,
-    AfterOldBlobsMove,
-    AfterNewDbInstall,
-    OnNewOpen,
-    OnRollback,
-    OnOldReopen,
+// These operation failures exist only in unit-test builds, never in the runtime API.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreFault {
+    OldMove(usize),
+    NewMove(usize),
+    NewOpen,
+    RollbackRemove,
+    RollbackRename,
+    OldOpen,
+    Close,
 }
-
+#[cfg(test)]
 thread_local! {
-    static TL_FAULT: std::cell::RefCell<Option<RestoreFault>> = std::cell::RefCell::new(None);
+    static RESTORE_FAULTS: std::cell::RefCell<Vec<RestoreFault>> = const { std::cell::RefCell::new(Vec::new()) };
 }
-
-#[doc(hidden)]
-pub fn set_restore_fault(fault: Option<RestoreFault>) {
-    TL_FAULT.with(|c| *c.borrow_mut() = fault);
-}
-
-fn take_restore_fault() -> Option<RestoreFault> {
-    TL_FAULT.with(|c| c.borrow().clone())
-}
-
-fn check_fault(point: RestoreFault) -> Result<(), CoreError> {
-    let current = TL_FAULT.with(|c| c.borrow().clone());
-    if let Some(f) = current {
-        if f == point {
-            set_restore_fault(None);
-            return Err(CoreError::Backend {
-                backend: "test-fault".to_string(),
-                kind: BackendKind::Internal,
-                message: format!("injected fault at {point:?}"),
-            });
+#[cfg(test)]
+fn check_restore_fault(point: RestoreFault) -> Result<(), CoreError> {
+    RESTORE_FAULTS.with(|faults| {
+        let mut faults = faults.borrow_mut();
+        if let Some(index) = faults.iter().position(|fault| *fault == point) {
+            faults.remove(index);
+            return Err(CoreError::Io(std::io::Error::other(format!(
+                "injected {point:?}"
+            ))));
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
-
-fn check_fault_rollback() -> Result<(), CoreError> {
-    check_fault(RestoreFault::OnRollback)
+macro_rules! restore_point {
+    ($point:expr) => {{
+        #[cfg(test)]
+        {
+            check_restore_fault($point)
+        }
+        #[cfg(not(test))]
+        {
+            Ok::<(), CoreError>(())
+        }
+    }};
 }
 
 /// SQLite-backed clip store.
@@ -304,12 +304,8 @@ fn mkdir(dir: &Path) -> Result<(), CoreError> {
 
 fn mkdir_if_missing(dir: &Path) -> Result<(), CoreError> {
     if dir.exists() {
-        let meta = fs::symlink_metadata(dir).map_err(CoreError::Io)?;
-        if meta.file_type().is_symlink() {
-            return Err(CoreError::Corrupt {
-                message: "profile is symlink where directory expected".to_string(),
-            });
-        }
+        // The selected anchor is trusted; pin its canonical target in preparation.
+        let meta = fs::metadata(dir).map_err(CoreError::Io)?;
         if !meta.is_dir() {
             return Err(CoreError::Corrupt {
                 message: "profile exists as file".to_string(),
@@ -348,16 +344,23 @@ fn create_stage_root(profile: &Path) -> Result<PathBuf, CoreError> {
             Ok(()) => {
                 let incoming = dir.join("incoming");
                 let old = dir.join("old");
-                fs::create_dir(&incoming).map_err(CoreError::Io)?;
-                fs::create_dir(&old).map_err(CoreError::Io)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    for p in [&incoming, &old] {
-                        let mut perms = fs::metadata(p).map_err(CoreError::Io)?.permissions();
-                        perms.set_mode(0o700);
-                        fs::set_permissions(p, perms).map_err(CoreError::Io)?;
+                let children = (|| -> Result<(), CoreError> {
+                    fs::create_dir(&incoming).map_err(CoreError::Io)?;
+                    fs::create_dir(&old).map_err(CoreError::Io)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        for p in [&incoming, &old] {
+                            let mut perms = fs::metadata(p).map_err(CoreError::Io)?.permissions();
+                            perms.set_mode(0o700);
+                            fs::set_permissions(p, perms).map_err(CoreError::Io)?;
+                        }
                     }
+                    Ok(())
+                })();
+                if let Err(error) = children {
+                    let _ = fs::remove_dir_all(&dir);
+                    return Err(error);
                 }
                 return Ok(dir);
             }
@@ -396,27 +399,81 @@ fn check_managed_not_symlink(path: &Path) -> Result<(), CoreError> {
     }
 }
 
-fn is_ancestor_managed(src: &Path, profile: &Path) -> bool {
-    let Ok(src_canon) = src.canonicalize() else {
-        return false;
-    };
-    let managed = [
-        profile.join(DB_NAME),
-        profile.join(format!("{DB_NAME}-wal")),
-        profile.join(format!("{DB_NAME}-shm")),
-        profile.join("blobs"),
-    ];
-    for m in &managed {
-        if let Ok(m_canon) = m.canonicalize() {
-            if src_canon == m_canon || src_canon.starts_with(&m_canon) {
-                return true;
-            }
-        }
-        if src == m {
+fn same_file(left: &Path, right: &Path) -> bool {
+    if let (Ok(left), Ok(right)) = (left.canonicalize(), right.canonicalize()) {
+        if left == right {
             return true;
         }
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) {
+            return left.dev() == right.dev() && left.ino() == right.ino();
+        }
+    }
     false
+}
+
+fn is_ancestor_managed(src: &Path, profile: &Path) -> Result<bool, CoreError> {
+    let source = src.canonicalize().map_err(CoreError::Io)?;
+    for name in [
+        DB_NAME,
+        "clipstore.sqlite3-wal",
+        "clipstore.sqlite3-shm",
+        "blobs",
+    ] {
+        let managed = profile.join(name);
+        if same_file(src, &managed) || source.starts_with(&managed) {
+            return Ok(true);
+        }
+        if name == "blobs" && fs::symlink_metadata(&managed).is_ok_and(|m| m.is_dir()) {
+            // Hard links cannot be resolved lexically. Inspect the managed blob leaves.
+            for entry in fs::read_dir(&managed).map_err(CoreError::Io)? {
+                if same_file(src, &entry.map_err(CoreError::Io)?.path()) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn check_restore_components(profile: &Path) -> Result<(), CoreError> {
+    #[cfg(unix)]
+    let anchor_device = {
+        use std::os::unix::fs::MetadataExt as _;
+        fs::metadata(profile).map_err(CoreError::Io)?.dev()
+    };
+    for name in [
+        DB_NAME,
+        "clipstore.sqlite3-wal",
+        "clipstore.sqlite3-shm",
+        "blobs",
+    ] {
+        let path = profile.join(name);
+        check_managed_not_symlink(&path)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(CoreError::Io(error)),
+        };
+        if (name == "blobs" && !metadata.is_dir()) || (name != "blobs" && !metadata.is_file()) {
+            return Err(CoreError::Unsupported {
+                message: format!("wrong managed component type: {}", path.display()),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if metadata.dev() != anchor_device {
+                return Err(CoreError::Unsupported {
+                    message: format!("managed component crosses filesystem: {}", path.display()),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_profile_container(profile: &Path) -> Result<(), CoreError> {
@@ -1135,22 +1192,61 @@ impl Store {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Flush committed WAL frames, refusing a busy checkpoint.
+    ///
+    /// # Errors
+    /// Returns a database error or Unavailable if another reader blocks truncation.
     pub fn checkpoint(&self) -> Result<(), CoreError> {
-        let conn = self.lock();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .map_err(|e| db_err(&e))?;
+        let busy: i64 = self
+            .lock()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .map_err(|error| db_err(&error))?;
+        if busy != 0 {
+            return Err(CoreError::Backend {
+                backend: "sqlite".to_string(),
+                kind: BackendKind::Unavailable,
+                message: "checkpoint is busy".to_string(),
+            });
+        }
         Ok(())
     }
 
-    pub fn close(self) -> Result<(), CoreError> {
-        {
-            let conn = self
-                .conn
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    /// Checkpoint and close the actual SQLite connection. Failure returns the
+    /// original Store so callers can keep serving it without moving any files.
+    ///
+    /// # Errors
+    /// Returns the original Store and the checkpoint or connection-close error.
+    #[allow(clippy::result_large_err)]
+    pub fn close(self) -> Result<(), (Self, CoreError)> {
+        if let Err(error) = self.checkpoint() {
+            return Err((self, error));
         }
-        Ok(())
+        #[cfg(test)]
+        if let Err(error) = check_restore_fault(RestoreFault::Close) {
+            return Err((self, error));
+        }
+        let Self {
+            blobs,
+            db_path,
+            conn,
+            fts,
+            read_only,
+        } = self;
+        let connection = conn
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        connection.close().map_err(|(connection, error)| {
+            (
+                Self {
+                    blobs,
+                    db_path,
+                    conn: Mutex::new(connection),
+                    fts,
+                    read_only,
+                },
+                db_err(&error),
+            )
+        })
     }
 
     /// Content key and hex digest for one external blob.
@@ -2133,9 +2229,16 @@ impl Store {
     /// [`CoreError::Corrupt`] when the embedded DB fails validation.
     pub fn restore_zip(src: &Path, profile: &Path) -> Result<(), CoreError> {
         let prepared = PreparedRestore::prepare(src, profile)?;
-        prepared.install_and_open(profile)
+        prepared
+            .install_and_open()
+            .map(drop)
+            .map_err(|failure| failure.error)
     }
 
+    /// Validate a destination-local restore while the live Store is still open.
+    ///
+    /// # Errors
+    /// Returns archive-validation, unsafe-component or I/O errors before replacement.
     pub fn prepare_restore(src: &Path, profile: &Path) -> Result<PreparedRestore, CoreError> {
         PreparedRestore::prepare(src, profile)
     }
@@ -2194,240 +2297,184 @@ impl Store {
     }
 }
 
+/// A validated archive bound to its canonical destination and private stage.
 pub struct PreparedRestore {
     stage_root: PathBuf,
     incoming: PathBuf,
     old_dir: PathBuf,
     profile: PathBuf,
+    cleanup: bool,
+}
+
+/// Failed installation, with a usable original Store after successful rollback.
+/// When recovery fails, `store` is absent and `recovery_dir` is retained.
+/// An initially absent database also has no original Store to return.
+#[derive(Debug)]
+pub struct RestoreFailure {
+    pub error: CoreError,
+    pub store: Option<Store>,
+    pub recovery_dir: Option<PathBuf>,
+}
+
+impl Drop for PreparedRestore {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = fs::remove_dir_all(&self.stage_root);
+        }
+    }
 }
 
 impl PreparedRestore {
-    pub fn prepare(src: &Path, profile: &Path) -> Result<Self, CoreError> {
+    fn prepare(src: &Path, profile: &Path) -> Result<Self, CoreError> {
         ensure_profile_container(profile)?;
-        if is_ancestor_managed(src, profile) {
+        let profile = profile.canonicalize().map_err(CoreError::Io)?;
+        check_restore_components(&profile)?;
+        if is_ancestor_managed(src, &profile)? {
             return Err(CoreError::Unsupported {
                 message: "restore source aliases managed component".to_string(),
             });
         }
-        let stage_root = create_stage_root(profile)?;
-        let incoming = stage_root.join("incoming");
-        let old_dir = stage_root.join("old");
-        let res: Result<(), CoreError> = (|| {
-            extract_zip(src, &incoming)?;
-            validate_profile(&incoming)?;
-            let blobs_in = incoming.join("blobs");
-            if !blobs_in.exists() {
-                mkdir(&blobs_in)?;
-            } else {
-                check_managed_not_symlink(&blobs_in)?;
-            }
-            check_managed_not_symlink(&profile.join(DB_NAME))?;
-            check_managed_not_symlink(&profile.join(format!("{DB_NAME}-wal")))?;
-            check_managed_not_symlink(&profile.join(format!("{DB_NAME}-shm")))?;
-            check_managed_not_symlink(&profile.join("blobs"))?;
-            Ok(())
-        })();
-        if let Err(e) = res {
-            let _ = fs::remove_dir_all(&stage_root);
-            return Err(e);
-        }
-        Ok(Self {
+        let stage_root = create_stage_root(&profile)?;
+        let prepared = Self {
+            incoming: stage_root.join("incoming"),
+            old_dir: stage_root.join("old"),
             stage_root,
-            incoming,
-            old_dir,
-            profile: profile.to_path_buf(),
-        })
+            profile,
+            cleanup: true,
+        };
+        extract_zip(src, &prepared.incoming)?;
+        validate_profile(&prepared.incoming)?;
+        let blobs = prepared.incoming.join("blobs");
+        if !blobs.exists() {
+            mkdir(&blobs)?;
+        }
+        check_restore_components(&prepared.incoming)?;
+        Ok(prepared)
     }
 
+    #[must_use]
     pub fn stage_root(&self) -> &Path {
         &self.stage_root
     }
+    #[must_use]
     pub fn incoming(&self) -> &Path {
         &self.incoming
     }
 
-    pub fn install_and_open(self, profile: &Path) -> Result<(), CoreError> {
-        let Self {
-            stage_root,
-            incoming,
-            old_dir,
-            profile: _,
-        } = self;
-        struct Guard {
-            path: PathBuf,
-        }
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.path);
-            }
-        }
-        let stage_guard = Guard {
-            path: stage_root.clone(),
-        };
-        let cur_db = profile.join(DB_NAME);
-        let cur_wal = profile.join(format!("{DB_NAME}-wal"));
-        let cur_shm = profile.join(format!("{DB_NAME}-shm"));
-        let cur_blobs = profile.join("blobs");
-        let new_db = incoming.join(DB_NAME);
-        let new_blobs = incoming.join("blobs");
+    /// Install with every external Store handle closed. The returned connection
+    /// is the validated serving connection; recovery is retained until it opens.
+    ///
+    /// # Errors
+    /// Returns the primary error and the reopened original Store after rollback.
+    /// Failed rollback or reopen returns no Store and retains the recovery path.
+    #[allow(clippy::result_large_err)]
+    pub fn install_and_open(mut self) -> Result<Store, RestoreFailure> {
+        let had_database = self.profile.join(DB_NAME).is_file();
         let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut installed: Vec<PathBuf> = Vec::new();
-        let move_file = |src: &Path,
-                         dst: &Path,
-                         moved: &mut Vec<(PathBuf, PathBuf)>|
-         -> Result<bool, CoreError> {
-            if !src.exists() {
-                return Ok(false);
+        let install = (|| {
+            check_restore_components(&self.profile)?;
+            for (index, name) in [
+                DB_NAME,
+                "clipstore.sqlite3-wal",
+                "clipstore.sqlite3-shm",
+                "blobs",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let original = self.profile.join(name);
+                match fs::symlink_metadata(&original) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(CoreError::Io(error)),
+                }
+                restore_point!(RestoreFault::OldMove(index))?;
+                let backup = self.old_dir.join(name);
+                fs::rename(&original, &backup).map_err(CoreError::Io)?;
+                moved.push((backup, original));
+                let _ = index;
             }
-            check_managed_not_symlink(src)?;
-            fs::rename(src, dst).map_err(CoreError::Io)?;
-            moved.push((dst.to_path_buf(), src.to_path_buf()));
-            Ok(true)
-        };
-        let move_dir = |src: &Path,
-                        dst: &Path,
-                        moved: &mut Vec<(PathBuf, PathBuf)>|
-         -> Result<bool, CoreError> {
-            if !src.exists() {
-                return Ok(false);
+            for (index, name) in ["blobs", DB_NAME].iter().enumerate() {
+                restore_point!(RestoreFault::NewMove(index))?;
+                let target = self.profile.join(name);
+                fs::rename(self.incoming.join(name), &target).map_err(CoreError::Io)?;
+                installed.push(target);
+                let _ = index;
             }
-            check_managed_not_symlink(src)?;
-            fs::rename(src, dst).map_err(CoreError::Io)?;
-            moved.push((dst.to_path_buf(), src.to_path_buf()));
-            Ok(true)
-        };
-        let old_db_backup = old_dir.join(DB_NAME);
-        if cur_db.exists() {
-            move_file(&cur_db, &old_db_backup, &mut moved)?;
-            if let Err(e) = check_fault(RestoreFault::AfterOldDbMove) {
-                let _ = Self::rollback_moves(&mut moved, &mut installed, profile);
-                return Err(e);
+            // Opening SQLite can create sidecars even when opening later fails.
+            installed.push(self.profile.join("clipstore.sqlite3-wal"));
+            installed.push(self.profile.join("clipstore.sqlite3-shm"));
+            restore_point!(RestoreFault::NewOpen)?;
+            Store::open(&self.profile)
+        })();
+        match install {
+            Ok(store) => {
+                fsync_dir(&self.profile);
+                // Cleanup errors leave an owned recovery directory; never roll back
+                // after a serving connection has been published to the caller.
+                Ok(store)
             }
-        }
-        let old_wal_backup = old_dir.join(format!("{DB_NAME}-wal"));
-        if cur_wal.exists() {
-            if let Err(e) = move_file(&cur_wal, &old_wal_backup, &mut moved) {
-                let _ = Self::rollback_moves(&mut moved, &mut installed, profile);
-                return Err(e);
-            }
-        }
-        let old_shm_backup = old_dir.join(format!("{DB_NAME}-shm"));
-        if cur_shm.exists() {
-            if let Err(e) = move_file(&cur_shm, &old_shm_backup, &mut moved) {
-                let _ = Self::rollback_moves(&mut moved, &mut installed, profile);
-                return Err(e);
-            }
-        }
-        let old_blobs_backup = old_dir.join("blobs");
-        if cur_blobs.exists() {
-            if let Err(e) = move_dir(&cur_blobs, &old_blobs_backup, &mut moved) {
-                let _ = Self::rollback_moves(&mut moved, &mut installed, profile);
-                return Err(e);
-            }
-            if let Err(e) = check_fault(RestoreFault::AfterOldBlobsMove) {
-                let _ = Self::rollback_moves(&mut moved, &mut installed, profile);
-                return Err(e);
-            }
-        }
-        if !new_blobs.exists() {
-            mkdir(&cur_blobs)?;
-            installed.push(cur_blobs.clone());
-        } else {
-            if let Err(e) = fs::rename(&new_blobs, &cur_blobs).map_err(CoreError::Io) {
-                let _ = Self::rollback_moves(&mut moved, &mut installed, profile);
-                return Err(e);
-            }
-            installed.push(cur_blobs.clone());
-        }
-        if let Err(e) = fs::rename(&new_db, &cur_db).map_err(CoreError::Io) {
-            let _ = Self::rollback_moves(&mut moved, &mut installed, profile);
-            return Err(e);
-        }
-        installed.push(cur_db.clone());
-        if let Err(e) = check_fault(RestoreFault::AfterNewDbInstall) {
-            let _ = Self::rollback_moves(&mut moved, &mut installed, profile);
-            return Err(e);
-        }
-        if let Some(f) = take_restore_fault() {
-            if f == RestoreFault::OnNewOpen {
-                set_restore_fault(None);
-                let open_err = CoreError::Corrupt {
-                    message: "injected new open failure".to_string(),
-                };
-                match Self::rollback_and_reopen(moved, installed, profile) {
-                    Ok(()) => return Err(open_err),
-                    Err(rb_err) => {
-                        std::mem::forget(stage_guard);
-                        return Err(CoreError::Backend { backend: "restore".to_string(), kind: BackendKind::Internal, message: format!("primary open failed: {open_err}; rollback failed: {rb_err}; recovery at {}", stage_root.display()) });
+            Err(primary) => {
+                if !had_database && moved.is_empty() && installed.is_empty() {
+                    return Err(RestoreFailure {
+                        error: primary,
+                        store: None,
+                        recovery_dir: None,
+                    });
+                }
+                let rollback = Self::rollback_moves(&mut moved, &mut installed).and_then(|()| {
+                    if !had_database {
+                        return Ok(None);
+                    }
+                    restore_point!(RestoreFault::OldOpen)?;
+                    Store::open(&self.profile).map(Some)
+                });
+                match rollback {
+                    Ok(store) => Err(RestoreFailure {
+                        error: primary,
+                        store,
+                        recovery_dir: None,
+                    }),
+                    Err(recovery) => {
+                        self.cleanup = false;
+                        Err(RestoreFailure {
+                            error: CoreError::Backend { backend: "restore".to_string(), kind: BackendKind::Unavailable,
+                                message: format!("restore failed: {primary}; recovery failed: {recovery}; recovery at {} (original components may also be in {})", self.stage_root.display(), self.profile.display()) },
+                            store: None, recovery_dir: Some(self.stage_root.clone()),
+                        })
                     }
                 }
-            } else {
-                set_restore_fault(Some(f));
             }
-        }
-        match Store::open(profile) {
-            Ok(new_store) => {
-                drop(new_store);
-                let _ = fs::remove_dir_all(&old_dir);
-                std::mem::forget(stage_guard);
-                let _ = fs::remove_dir_all(&stage_root);
-                fsync_dir(profile);
-                Ok(())
-            }
-            Err(open_err) => match Self::rollback_and_reopen(moved, installed, profile) {
-                Ok(()) => Err(open_err),
-                Err(rb_err) => {
-                    std::mem::forget(stage_guard);
-                    Err(CoreError::Backend { backend: "restore".to_string(), kind: BackendKind::Internal, message: format!("primary open failed: {open_err}; rollback failed: {rb_err}; recovery at {}", stage_root.display()) })
-                }
-            },
         }
     }
 
     fn rollback_moves(
         moved: &mut Vec<(PathBuf, PathBuf)>,
         installed: &mut Vec<PathBuf>,
-        profile: &Path,
     ) -> Result<(), CoreError> {
-        if let Err(e) = check_fault_rollback() {
-            return Err(e);
+        while let Some(path) = installed.last() {
+            restore_point!(RestoreFault::RollbackRemove)?;
+            match fs::symlink_metadata(path) {
+                Ok(metadata) => {
+                    if metadata.is_dir() {
+                        fs::remove_dir_all(path)
+                    } else {
+                        fs::remove_file(path)
+                    }
+                    .map_err(CoreError::Io)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(CoreError::Io(error)),
+            }
+            installed.pop();
         }
-        for p in installed.drain(..).rev() {
-            let _ = fs::remove_file(&p);
-            let _ = fs::remove_dir_all(&p);
+        while let Some((backup, original)) = moved.last() {
+            restore_point!(RestoreFault::RollbackRename)?;
+            fs::rename(backup, original).map_err(CoreError::Io)?;
+            moved.pop();
         }
-        for (backup, original) in moved.drain(..).rev() {
-            let _ = fs::rename(&backup, &original);
-        }
-        let _ = profile;
         Ok(())
-    }
-
-    fn rollback_and_reopen(
-        mut moved: Vec<(PathBuf, PathBuf)>,
-        mut installed: Vec<PathBuf>,
-        profile: &Path,
-    ) -> Result<(), CoreError> {
-        Self::rollback_moves(&mut moved, &mut installed, profile)?;
-        if let Some(f) = take_restore_fault() {
-            if f == RestoreFault::OnOldReopen {
-                set_restore_fault(None);
-                return Err(CoreError::Backend {
-                    backend: "restore".to_string(),
-                    kind: BackendKind::Internal,
-                    message: "injected old reopen failure".to_string(),
-                });
-            } else {
-                set_restore_fault(Some(f));
-            }
-        }
-        match Store::open(profile) {
-            Ok(s) => {
-                drop(s);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
     }
 }
 
@@ -2837,26 +2884,6 @@ fn validate_profile(tmp: &Path) -> Result<(), CoreError> {
         }
     }
     Ok(())
-}
-
-/// Atomically swap a validated profile in, keeping rollback copies on failure.
-fn swap_profile(tmp: &Path, profile: &Path) -> Result<(), CoreError> {
-    ensure_profile_container(profile)?;
-    let stage_root = create_stage_root(profile)?;
-    let incoming = stage_root.join("incoming");
-    let old_dir = stage_root.join("old");
-    for entry in fs::read_dir(tmp).map_err(CoreError::Io)? {
-        let e = entry.map_err(CoreError::Io)?;
-        let dest = incoming.join(e.file_name());
-        fs::rename(e.path(), dest).map_err(CoreError::Io)?;
-    }
-    let pr = PreparedRestore {
-        stage_root,
-        incoming,
-        old_dir,
-        profile: profile.to_path_buf(),
-    };
-    pr.install_and_open(profile)
 }
 
 #[cfg(test)]
@@ -3402,3 +3429,7 @@ mod tests {
         assert_eq!(history_ids(&store).len(), writers * per_writer);
     }
 }
+
+#[cfg(test)]
+#[path = "restore_tests.rs"]
+mod restore_tests;

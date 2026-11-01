@@ -274,33 +274,12 @@ fn check_hostile_manifest_key(hostile_key: &str) {
         sentinel_before,
         "sentinel must survive"
     );
-    // Destination may be empty container but must not contain managed components or hostile file
+    // An invalid archive may create an empty container, never data or staging leftovers.
     if dest.exists() {
         assert!(
-            !dest.join("clipstore.sqlite3").exists(),
-            "managed DB must not be created on bad ZIP"
+            std::fs::read_dir(&dest).unwrap().next().is_none(),
+            "bad ZIP must leave only an empty destination container"
         );
-        assert!(
-            !dest.join("blobs").join("evil").exists(),
-            "hostile file must not be created"
-        );
-        assert!(
-            !dest.join("blobs").exists()
-                || std::fs::read_dir(dest.join("blobs"))
-                    .map(|mut i| i.next().is_none())
-                    .unwrap_or(true),
-            "no blobs on bad ZIP"
-        );
-        // allow empty container, but must not have staged data
-        let entries: Vec<_> = std::fs::read_dir(&dest).unwrap().collect();
-        for e in &entries {
-            let e = e.as_ref().unwrap();
-            let name = e.file_name().to_string_lossy().to_string();
-            assert!(
-                name.starts_with(".restore-") || entries.len() <= 1,
-                "only staging dir allowed, got {name}"
-            );
-        }
     }
 }
 
