@@ -655,6 +655,7 @@ name = "clipmonger-core"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "getrandom 0.4.3",
  "rusqlite",
  "serde",
  "serde_json",

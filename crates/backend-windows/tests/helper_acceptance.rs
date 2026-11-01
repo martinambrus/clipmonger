@@ -160,7 +160,7 @@ fn t403_result_echo_job_id() {
 fn t413_unit_token_consume_once() {
     const T: &str = "t413_unit_token_consume_once";
     let mut tokens = GestureTokens::new();
-    let tok = tokens.mint(1_000);
+    let tok = tokens.mint(1_000).expect("mint");
     assert!(
         tokens.consume(tok, 1_001),
         "{T}: first consume must succeed"
@@ -176,14 +176,14 @@ fn t413_unit_token_consume_once() {
 fn t413_unit_token_expired_unknown() {
     const T: &str = "t413_unit_token_expired_unknown";
     let mut tokens = GestureTokens::new();
-    let tok = tokens.mint(0);
+    let tok = tokens.mint(0).expect("mint");
     assert!(
         tokens.consume(tok, 30_000),
         "{T}: consume at exactly TTL must still succeed"
     );
 
     let mut tokens = GestureTokens::new();
-    let tok = tokens.mint(0);
+    let tok = tokens.mint(0).expect("mint");
     assert!(
         !tokens.consume(tok, 30_001),
         "{T}: consume past TTL (30_000 ms) must be false"
