@@ -368,6 +368,26 @@ fn size_only_prefers_primary_monitor_scale_and_unknown_monitor_preserves_native_
         state.normalized_for_restore([960.0, 680.0], &[monitor(), primary], Some(primary), false);
     close(restore.logical_size[0], 1271.0);
     close(restore.logical_size[1], 697.5);
+    let mut positioned = GeometryState::new(None);
+    positioned.handle(
+        Lifecycle::Changed,
+        Some(&Native {
+            size: PhysicalSize::new(12000, 12000),
+            position: [i32::MAX, i32::MIN],
+            ..Native::normal()
+        }),
+        true,
+        |message| panic!("{message}"),
+    );
+    let nearest = positioned.normalized_for_restore(
+        [960.0, 680.0],
+        &[monitor(), primary],
+        Some(monitor()),
+        true,
+    );
+    close(nearest.logical_size[0], 1271.0);
+    close(nearest.logical_size[1], 697.5);
+    assert_eq!(nearest.physical_position, Some([2510, 0]));
     let unknown = state.normalized_for_restore([960.0, 680.0], &[], None, false);
     close(unknown.logical_size[0], 8000.0);
     assert!(unknown.physical_position.is_none());

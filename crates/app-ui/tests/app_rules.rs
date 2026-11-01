@@ -3076,7 +3076,15 @@ fn desktop(cursor: Option<(i32, i32)>) -> placement::DesktopContext {
         h: 1080,
     };
     placement::DesktopContext {
-        monitors: vec![monitor],
+        monitors: vec![
+            monitor,
+            placement::Rect {
+                x: 0,
+                y: 100,
+                w: 2560,
+                h: 1440,
+            },
+        ],
         cursor,
         current_monitor: Some(monitor),
         primary_monitor: None,
@@ -3138,7 +3146,7 @@ fn rule_placement_reopens_with_fresh_cursor_but_already_open_raise_does_not_jump
         &mut rig.app,
         || panic!("closed Config queried desktop")
     ));
-    for cursor in [(-1700, 100), (-1400, 200)] {
+    for cursor in [(-1700, 100), (300, 400)] {
         rig.tray(&[TrayAction::OpenPopup]);
         assert_none(&rig.tick().positions(), "placement commands");
         deliver(&mut rig, desktop(Some(cursor)));
