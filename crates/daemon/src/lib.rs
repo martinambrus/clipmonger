@@ -671,7 +671,7 @@ impl CapsAggregator {
             return Self::merged_snapshot(&backends, extension_up);
         }
         let mut notes = vec![Value::from(SKELETON_NOTE)];
-        if !extension_up {
+        if !extension_up && cfg!(target_os = "linux") {
             notes.push(Value::from(
                 "gnome extension disconnected: paste unavailable",
             ));
@@ -696,7 +696,7 @@ impl CapsAggregator {
             .iter()
             .map(|note| Value::from(note.as_str()))
             .collect();
-        if !extension_up {
+        if !extension_up && cfg!(target_os = "linux") {
             notes.push(Value::from(
                 "gnome extension disconnected: paste unavailable",
             ));
@@ -2796,10 +2796,17 @@ mod tests {
                     .iter()
                     .any(|note| note.as_str().unwrap_or_default().contains("gnome"))
             });
-        assert!(
-            gnome_noted,
-            "flipped snapshot must note the gnome entry, got: {flipped}"
-        );
+        if cfg!(target_os = "linux") {
+            assert!(
+                gnome_noted,
+                "flipped snapshot must note the gnome entry, got: {flipped}"
+            );
+        } else {
+            assert!(
+                !gnome_noted,
+                "non-Linux snapshot must not note gnome, got: {flipped}"
+            );
+        }
         assert_eq!(
             flipped
                 .get("monitor")
