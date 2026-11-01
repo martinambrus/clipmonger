@@ -55,7 +55,7 @@ pub struct Desired {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// A bridge event as it arrives (replies and daemon pushes). Handled:
-    /// `ShowPopup`, `PasteFailed`, `PasteUnavailable`, `Error`, `Offline`,
+    /// `ShowPopup`, `PasteFailed`, `Error`, `Offline`,
     /// `StopFailed`, `Status`, `History`, `Config`, `Stopped` and
     /// `AnotherInstance`; every other variant changes nothing (a `PasteDone`
     /// reply never shows or hides the popup).
@@ -291,10 +291,6 @@ impl Shell {
                 self.error = Some(message);
                 Vec::new()
             }
-            UiEvent::PasteUnavailable => {
-                self.error = Some(strings::text("popup.paste_blocked").to_string());
-                Vec::new()
-            }
             UiEvent::Offline(_) => {
                 self.offline = true;
                 Vec::new()
@@ -454,8 +450,7 @@ impl Shell {
     /// - `Bridge(PasteFailed(msg))`: closed: open with an empty context, the
     ///   open sequence, then the error line is `msg`; open: the error line is
     ///   `msg`, nothing else.
-    /// - `Bridge(Error(msg))`: the error line is `msg`. `Bridge(PasteUnavailable)`:
-    ///   the error line is the text `popup.paste_blocked`.
+    /// - `Bridge(Error(msg))`: the error line is `msg`.
     /// - `Bridge(Status(_))`: not offline. `Bridge(Offline(_))`: offline, error
     ///   line unchanged.
     /// - `Bridge(History(body))`: a well-formed reply (see

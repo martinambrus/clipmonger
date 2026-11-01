@@ -195,8 +195,8 @@ impl PopupApp {
     ///    `Open { source: trace::open_source(&event), target, gesture }` (the
     ///    flags of the new context); open to closed is
     ///    `Hide { reason: trace::hide_reason(&event) }`; an error line that is
-    ///    new or changed, or that an event of the kind `PasteFailed`, `Error` or
-    ///    `PasteUnavailable` set again, is `Error` while the popup is open;
+    ///    new or changed, or that an event of the kind `PasteFailed` or `Error`
+    ///    set again, is `Error` while the popup is open;
     /// 2. `apply_effects`;
     /// 3. closed to open: sends `ListPermanents` and `PermGroups` (the shell
     ///    sends only `ListHistory`) and clears `seen_focus`; open to closed:
@@ -211,7 +211,7 @@ impl PopupApp {
         let old_error = self.shell.error().map(str::to_owned);
         let error_kind = matches!(
             &event,
-            Event::Bridge(UiEvent::PasteFailed(_) | UiEvent::Error(_) | UiEvent::PasteUnavailable)
+            Event::Bridge(UiEvent::PasteFailed(_) | UiEvent::Error(_))
         );
         let source = trace::open_source(&event);
         let reason = trace::hide_reason(&event);
@@ -319,7 +319,7 @@ impl PopupApp {
     /// - `ExecFailed`: becomes `PasteFailed` so the shell reopens even when
     ///   Settings is open; unavailable or denied uses `popup.paste_blocked`,
     ///   other failures use the daemon message. No in-flight state is needed.
-    /// - `ShowPopup`, `PasteFailed`, `PasteUnavailable`, `Offline`,
+    /// - `ShowPopup`, `PasteFailed`, `Offline`,
     ///   `StopFailed`, `Stopped`, `AnotherInstance`: the shell hears them.
     #[allow(clippy::too_many_lines)]
     fn on_bridge(&mut self, event: UiEvent) {
@@ -466,7 +466,6 @@ impl PopupApp {
             }
             event @ (UiEvent::ShowPopup(_)
             | UiEvent::PasteFailed(_)
-            | UiEvent::PasteUnavailable
             | UiEvent::Offline(_)
             | UiEvent::StopFailed(_)
             | UiEvent::Stopped
