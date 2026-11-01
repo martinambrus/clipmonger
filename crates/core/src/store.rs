@@ -195,8 +195,6 @@ fn norm_hotkey(hotkey: Option<&str>) -> Option<String> {
 /// SQLite-backed clip store.
 #[derive(Debug)]
 pub struct Store {
-    /// Path to `clipstore.sqlite3`.
-    db_path: PathBuf,
     /// Path to `blobs/`.
     blobs: PathBuf,
     /// Connection guarded for shared `&self` use across threads.
@@ -907,7 +905,6 @@ impl Store {
         validate_db_keys(&conn)?;
         let fts = probe_fts(&conn);
         Ok(Self {
-            db_path,
             blobs,
             conn: Mutex::new(conn),
             fts,
@@ -957,7 +954,6 @@ impl Store {
         blobs_root_ok(blobs)?;
         let fts = probe_fts(&conn);
         Ok(Self {
-            db_path: db_path.to_path_buf(),
             blobs: blobs.to_path_buf(),
             conn: Mutex::new(conn),
             fts,
@@ -1848,44 +1844,60 @@ impl Store {
         let tmp = create_private_dir("cm-backup")?;
         let _guard = TmpGuard { path: tmp.clone() };
         let tmp_db = tmp.join("clipstore.sqlite3");
-        {
-            let src = open_conn(&self.db_path, true)?;
-            let mut out_db = Connection::open(&tmp_db).map_err(|e| db_err(&e))?;
-            let backup =
-                rusqlite::backup::Backup::new(&src, &mut out_db).map_err(|e| db_err(&e))?;
-            backup.step(-1).map_err(|e| db_err(&e))?;
-        }
-        let conn = self.lock();
-        validate_db_keys(&conn)?;
-        let clips: i64 = conn
-            .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
-            .map_err(|e| db_err(&e))?;
-        let referenced = referenced_keys(&conn)?;
-        let mut blob_metadata = Vec::with_capacity(referenced.len());
-        for key in &referenced {
-            let sha: String = conn
-                .query_row(
-                    "SELECT sha256 FROM clip_blobs WHERE blob_key=?1",
-                    params![key],
-                    |r| r.get(0),
-                )
-                .map_err(|e| db_err(&e))?;
-            blob_metadata.push((key.clone(), sha));
-        }
-        drop(conn);
-        let db_bytes = fs::read(&tmp_db).map_err(CoreError::Io)?;
-        let db_sha = hex_of(&Sha256::digest(&db_bytes));
         let tmp_blobs = tmp.join("blobs");
-        mkdir(&tmp_blobs)?;
-        let mut blob_entries = Vec::new();
-        for (key, sha) in &blob_metadata {
-            let bytes = safe_blob_read(&self.blobs, key, sha)?;
-            fs::write(tmp_blobs.join(key), &bytes).map_err(CoreError::Io)?;
-            blob_entries.push(format!(
-                "{{key={key:?},bytes={},sha256={sha:?}}}",
-                bytes.len()
-            ));
-        }
+        let (clips, referenced, blob_entries, db_bytes) = {
+            let conn = self.lock();
+            {
+                let mut out_db = Connection::open(&tmp_db).map_err(|e| db_err(&e))?;
+                let backup =
+                    rusqlite::backup::Backup::new(&conn, &mut out_db).map_err(|e| db_err(&e))?;
+                if !matches!(
+                    backup.step(-1).map_err(|e| db_err(&e))?,
+                    rusqlite::backup::StepResult::Done
+                ) {
+                    return Err(CoreError::Backend {
+                        backend: "sqlite".to_string(),
+                        kind: BackendKind::Internal,
+                        message: "backup snapshot did not complete".to_string(),
+                    });
+                }
+            }
+            let snap_conn = Connection::open(&tmp_db).map_err(|e| db_err(&e))?;
+            snap_conn
+                .busy_timeout(Duration::from_secs(5))
+                .map_err(|e| db_err(&e))?;
+            validate_db_keys(&snap_conn)?;
+            let clips: i64 = snap_conn
+                .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
+                .map_err(|e| db_err(&e))?;
+            let referenced = referenced_keys(&snap_conn)?;
+            let mut blob_metadata = Vec::with_capacity(referenced.len());
+            for key in &referenced {
+                let (sha, bytes): (String, i64) = snap_conn
+                    .query_row(
+                        "SELECT sha256, bytes FROM clip_blobs WHERE blob_key=?1",
+                        params![key],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .map_err(|e| db_err(&e))?;
+                validate_blob_metadata(key, &sha, bytes)?;
+                blob_metadata.push((key.clone(), sha));
+            }
+            let db_bytes = fs::read(&tmp_db).map_err(CoreError::Io)?;
+            mkdir(&tmp_blobs)?;
+            let mut blob_entries = Vec::new();
+            for (key, sha) in &blob_metadata {
+                let bytes = safe_blob_read(&self.blobs, key, sha)?;
+                fs::write(tmp_blobs.join(key), &bytes).map_err(CoreError::Io)?;
+                blob_entries.push(format!(
+                    "{{key={key:?},bytes={},sha256={sha:?}}}",
+                    bytes.len()
+                ));
+            }
+            drop(snap_conn);
+            (clips, referenced, blob_entries, db_bytes)
+        };
+        let db_sha = hex_of(&Sha256::digest(&db_bytes));
         let manifest = format!(
             "schema_version = 1\ncreated_ms = {}\nclips = {clips}\ndb_sha256 = {db_sha:?}\n\
             db_bytes = {}\nblobs = [{}]\n",
@@ -1912,9 +1924,6 @@ impl Store {
         zip.write_all(&db_bytes).map_err(CoreError::Io)?;
         for key in &referenced {
             let path = tmp_blobs.join(key);
-            if !path.is_file() {
-                continue;
-            }
             zip.start_file(format!("blobs/{key}"), opts)
                 .map_err(|e| zip_err(&e))?;
             zip.write_all(fs::read(&path).map_err(CoreError::Io)?.as_slice())
@@ -2096,7 +2105,7 @@ fn sweep_blobs(conn: &Connection, blobs: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// Keys referenced by live external payload rows.
+/// Keys referenced by all external payload rows, including removed clips.
 fn referenced_keys(conn: &Connection) -> Result<HashSet<String>, CoreError> {
     let mut stmt = conn
         .prepare(
@@ -2280,6 +2289,7 @@ fn validated_manifest_blobs(man: &toml::Value) -> Result<Vec<(String, u64, Strin
         .as_array()
         .ok_or_else(|| bad("restore manifest blobs not an array"))?;
     let mut out = Vec::with_capacity(blobs.len());
+    let mut keys = HashSet::with_capacity(blobs.len());
     for blob in blobs {
         let key = blob
             .get("key")
@@ -2287,6 +2297,9 @@ fn validated_manifest_blobs(man: &toml::Value) -> Result<Vec<(String, u64, Strin
             .ok_or_else(|| bad("restore manifest blob key missing or not a string"))?;
         let (prefix, size) =
             parse_blob_key(key).ok_or_else(|| bad("restore manifest invalid blob key"))?;
+        if !keys.insert(key) {
+            return Err(bad("restore manifest duplicate blob key"));
+        }
         if size > RESTORE_MAX_ENTRY {
             return Err(bad("restore blob exceeds size cap"));
         }
@@ -2347,6 +2360,15 @@ fn validate_profile(tmp: &Path) -> Result<(), CoreError> {
         return Err(bad("restore archive missing clipstore.sqlite3"));
     }
     let bytes = fs::read(&db).map_err(CoreError::Io)?;
+    if let Some(value) = man.get("db_bytes") {
+        let expected = value
+            .as_integer()
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(|| bad("restore manifest db_bytes not a nonnegative integer"))?;
+        if u64::try_from(bytes.len()).ok() != Some(expected) {
+            return Err(bad("restore database db_bytes mismatch"));
+        }
+    }
     if let Some(sha) = man.get("db_sha256").and_then(toml::Value::as_str) {
         if hex_of(&Sha256::digest(&bytes)) != sha {
             return Err(bad("restore database checksum mismatch"));
@@ -2366,35 +2388,25 @@ fn validate_profile(tmp: &Path) -> Result<(), CoreError> {
     }
     validate_db_keys(&probe)?;
     let manifest_blobs = validated_manifest_blobs(&man)?;
-    if !manifest_blobs.is_empty() {
-        blobs_root_ok(&tmp.join("blobs"))?;
+    let referenced = referenced_keys(&probe)?;
+    let manifest_keys: HashSet<_> = manifest_blobs
+        .iter()
+        .map(|(key, _, _)| key.clone())
+        .collect();
+    if manifest_keys != referenced {
+        return Err(bad("restore manifest blob reference set mismatch"));
     }
-    for (key, size, sha) in &manifest_blobs {
-        let blobs_root = tmp.join("blobs");
-        blobs_root_ok(&blobs_root)?;
-        let path = safe_blob_path(&blobs_root, key)
-            .map_err(|_| bad("restore manifest invalid blob key"))?;
-        let meta =
-            fs::symlink_metadata(&path).map_err(|_| bad("restore archive missing blob file"))?;
-        if meta.len() != *size {
-            return Err(bad("restore blob size mismatch"));
-        }
-        if *size > RESTORE_MAX_ENTRY {
-            return Err(bad("restore blob exceeds size cap"));
-        }
-        let file = fs::File::open(&path).map_err(|_| bad("restore archive missing blob file"))?;
-        let mut buf = Vec::new();
-        let n = file
-            .take(RESTORE_MAX_ENTRY + 1)
-            .read_to_end(&mut buf)
-            .map_err(CoreError::Io)?;
-        if n as u64 > RESTORE_MAX_ENTRY {
-            return Err(bad("restore blob exceeds size cap"));
-        }
-        if u64::try_from(n).ok() != Some(*size) {
-            return Err(bad("restore blob size mismatch"));
-        }
-        if !sha.is_empty() && hex_of(&Sha256::digest(&buf)) != *sha {
+    let blobs_root = tmp.join("blobs");
+    for (key, _, manifest_sha) in &manifest_blobs {
+        let db_sha: String = probe
+            .query_row(
+                "SELECT sha256 FROM clip_blobs WHERE blob_key=?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .map_err(|e| db_err(&e))?;
+        let bytes = safe_blob_read(&blobs_root, key, &db_sha)?;
+        if !manifest_sha.is_empty() && hex_of(&Sha256::digest(&bytes)) != *manifest_sha {
             return Err(bad("restore blob checksum mismatch"));
         }
     }
