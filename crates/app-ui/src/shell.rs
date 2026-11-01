@@ -76,6 +76,11 @@ pub enum Event {
         /// Unix milliseconds of the pick.
         picked_ms: i64,
     },
+    /// The user picked a permanent clip.
+    PickPermanent {
+        /// The picked permanent.
+        id: Uuid,
+    },
     /// The host confirms the popup window is hidden now.
     Hidden,
     /// Any key press in the popup.
@@ -139,6 +144,7 @@ pub struct Shell {
     focus_hide_at: Option<Millis>,
     hidden_at: Option<Millis>,
     pending_paste: Option<PendingPaste>,
+    pending_exec: Option<Uuid>,
     quit_at: Option<Millis>,
 }
 
@@ -160,6 +166,7 @@ impl Shell {
             focus_hide_at: None,
             hidden_at: None,
             pending_paste: None,
+            pending_exec: None,
             quit_at: None,
         }
     }
@@ -186,6 +193,7 @@ impl Shell {
         self.focus_hide_at = None;
         self.hidden_at = None;
         self.pending_paste = None;
+        self.pending_exec = None;
         vec![
             Effect::ClearSearch,
             Effect::Send(UiCmd::ListHistory),
@@ -372,6 +380,18 @@ impl Shell {
         effects
     }
 
+    /// Hide the popup and execute the picked permanent once the popup is
+    /// confirmed hidden (see [`Shell::tick`]).
+    fn on_pick_permanent(&mut self, id: Uuid) -> Vec<Effect> {
+        if !self.want.popup_open {
+            return Vec::new();
+        }
+        let mut effects = vec![Effect::AllowForeground];
+        effects.extend(self.hide(None));
+        self.pending_exec = Some(id);
+        effects
+    }
+
     /// Store the first confirmation that the closed popup is hidden.
     fn on_hidden(&mut self, now: Millis) -> Vec<Effect> {
         if !self.want.popup_open && self.hidden_at.is_none() {
@@ -462,6 +482,11 @@ impl Shell {
     ///   then with a target `Send(PasteClipTo(id, target, picked_ms, gesture))`;
     ///   without a target nothing more now: the paste waits as pending and
     ///   [`Shell::tick`] sends `PasteClipTo(id, None, picked_ms, gesture)`.
+    /// - `PickPermanent { id }`: only while open. The effects `AllowForeground`,
+    ///   `Hide` (a hide as above), nothing more now, whatever the context holds:
+    ///   the exec waits as pending and [`Shell::tick`] sends `ExecPermanent(id)`
+    ///   (it has no target, the daemon pastes into the foreground window). Any
+    ///   open drops it, like a pending paste.
     /// - `Hidden`: only while closed; stores `now` as the confirmed-hidden time
     ///   unless one is stored already (the first confirmation counts).
     /// - `Key`: clears the error line.
@@ -478,6 +503,7 @@ impl Shell {
             Event::CloseRequest => self.on_close_request(),
             Event::TrayToggle => self.on_tray_toggle(now),
             Event::Pick { id, picked_ms } => self.on_pick(id, picked_ms),
+            Event::PickPermanent { id } => self.on_pick_permanent(id),
             Event::Hidden => self.on_hidden(now),
             Event::Key => self.on_key(),
             Event::Refresh => Self::on_refresh(),
@@ -491,8 +517,10 @@ impl Shell {
     /// reading [`Shell::desired`]. A pending paste is released as
     /// `Send(PasteClipTo(id, None, picked_ms, gesture))` once the popup is
     /// closed, a confirmed-hidden time is stored and
-    /// `now >= hidden_at + PASTE_DELAY_MS`. Exit is set once a Quit is stored
-    /// and `now >= quit + QUIT_TIMEOUT_MS`; it stays set.
+    /// `now >= hidden_at + PASTE_DELAY_MS`; a pending permanent exec is
+    /// released as `Send(ExecPermanent(id))` under the same condition. Exit is
+    /// set once a Quit is stored and `now >= quit + QUIT_TIMEOUT_MS`; it stays
+    /// set.
     #[must_use]
     pub fn tick(&mut self, now: Millis) -> Vec<Effect> {
         let mut effects = Vec::new();
@@ -509,6 +537,14 @@ impl Shell {
                 }
             }
         }
+        if let Some(id) = self.pending_exec {
+            if let Some(hidden_at) = self.hidden_at {
+                if !self.want.popup_open && now >= hidden_at.saturating_add(PASTE_DELAY_MS) {
+                    self.pending_exec = None;
+                    effects.push(Effect::Send(UiCmd::ExecPermanent(id)));
+                }
+            }
+        }
         if let Some(quit_at) = self.quit_at {
             if !self.want.exit && now >= quit_at.saturating_add(QUIT_TIMEOUT_MS) {
                 self.want.exit = true;
@@ -519,8 +555,8 @@ impl Shell {
 
     /// The earliest time at which [`Shell::tick`] has something to do: the
     /// quit deadline while a Quit is stored and exit is not set, and the paste
-    /// deadline while a pending paste has a confirmed-hidden time; the smaller
-    /// of the two, `None` when there is neither.
+    /// deadline while a pending paste or exec has a confirmed-hidden time; the
+    /// smaller of the two, `None` when there is neither.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Millis> {
         let mut deadlines = Vec::new();
@@ -529,7 +565,7 @@ impl Shell {
                 deadlines.push(quit_at.saturating_add(QUIT_TIMEOUT_MS));
             }
         }
-        if self.pending_paste.is_some() {
+        if self.pending_paste.is_some() || self.pending_exec.is_some() {
             if let Some(hidden_at) = self.hidden_at {
                 deadlines.push(hidden_at.saturating_add(PASTE_DELAY_MS));
             }

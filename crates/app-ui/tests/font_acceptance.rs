@@ -1,6 +1,6 @@
-//! Font regression: eframe is built with `default-features = false`, which
-//! once dropped `default_fonts`/`system_fonts` and rendered every label as
-//! tofu squares on a real display (observed Ubuntu 24.04, 2026-10-27).
+//! Font regression: building the UI without egui's `default_fonts` feature
+//! once rendered every label as tofu squares on a real display (observed
+//! Ubuntu 24.04, 2026-10-27).
 
 #[test]
 fn default_font_definitions_carry_real_fonts() {

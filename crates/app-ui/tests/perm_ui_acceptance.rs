@@ -272,7 +272,7 @@ fn u3_confirmed_delete_discipline() {
     assert!(vm.permanents.iter().all(|c| c.id != id));
 }
 
-// U4 exec result mapping (copies PasteClip arms).
+// U4 exec replies retain failure identity and map success to PasteDone.
 #[test]
 fn u4_exec_result_mapping() {
     let id = Uuid::parse_str(ID_B).unwrap();
@@ -280,15 +280,17 @@ fn u4_exec_result_mapping() {
         let (tx, rx, _s) = spawn_canned(Err(IpcError::new(code, "no paste".to_string())));
         tx.send(UiCmd::ExecPermanent(id)).expect("send exec");
         assert!(
-            matches!(recv(&rx), UiEvent::PasteUnavailable),
-            "code {code} must map to PasteUnavailable"
+            matches!(recv(&rx), UiEvent::ExecFailed(got, error)
+                if got == id && error == IpcError::new(code, "no paste".to_string())),
+            "code {code} must map to ExecFailed"
         );
     }
     let (tx, rx, _s) = spawn_canned(Err(IpcError::new("backend", "boom".to_string())));
     tx.send(UiCmd::ExecPermanent(id)).expect("send exec");
     assert!(
-        matches!(recv(&rx), UiEvent::Error(_)),
-        "backend error must map to Error"
+        matches!(recv(&rx), UiEvent::ExecFailed(got, error)
+            if got == id && error == IpcError::new("backend", "boom".to_string())),
+        "backend error must map to ExecFailed"
     );
     let (tx, rx, seen) = spawn_canned(Ok(json!({ "ok": true })));
     tx.send(UiCmd::ExecPermanent(id)).expect("send exec");
