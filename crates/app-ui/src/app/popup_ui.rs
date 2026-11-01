@@ -286,7 +286,6 @@ impl PopupApp {
             self.pending_reveal = current.clone();
         }
         self.last_reveal = current;
-        self.last_query.clone_from(&query);
         let pending = self.pending_reveal.take();
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -531,5 +530,6 @@ impl PopupApp {
             }
         }
         self.handle_keys(ui.ctx(), search_focused, &events);
+        self.last_query.clone_from(&self.vm.query);
     }
 }

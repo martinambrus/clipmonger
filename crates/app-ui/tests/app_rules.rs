@@ -4593,3 +4593,43 @@ fn active_list_return_to_history_clamps_only_when_displayed() {
         .iter()
         .any(|cmd| matches!(cmd, UiCmd::PasteClipTo(picked, ..) if *picked == id(1))));
 }
+
+fn query_edit_then_navigation_pick(permanent: bool) {
+    let mut rig = active_list_rig(permanent, 3);
+    if permanent {
+        rig.app.vm_mut().selected = 2;
+    }
+    rig.input(egui::Event::Text("row".into()));
+    rig.key(egui::Key::ArrowDown);
+    rig.show();
+    assert_eq!(rig.app.vm().query, "row");
+    if permanent {
+        assert_eq!(rig.app.config().lock().expect("config").perm_vm.selected, 1);
+        assert_eq!(rig.app.vm().selected, 2);
+    } else {
+        assert_eq!(rig.app.vm().selected, 1);
+    }
+    // Enter is in the following frame, after the query was already reconciled.
+    rig.key(egui::Key::Enter);
+    rig.show();
+    finish_popup_pick(&mut rig);
+    let commands = rig.cmds();
+    if permanent {
+        assert_eq!(commands, vec![UiCmd::ExecPermanent(id(1002))]);
+    } else {
+        assert!(
+            matches!(commands.as_slice(), [UiCmd::PasteClipTo(picked,..)] if *picked == id(2)),
+            "{commands:?}"
+        );
+    }
+}
+
+#[test]
+fn active_list_query_edit_then_history_navigation_keeps_the_picked_row() {
+    query_edit_then_navigation_pick(false);
+}
+
+#[test]
+fn active_list_query_edit_then_permanent_navigation_keeps_the_picked_row() {
+    query_edit_then_navigation_pick(true);
+}
