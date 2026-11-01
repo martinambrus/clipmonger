@@ -2623,22 +2623,6 @@ fn rule_paste_failed_while_open_sets_the_error_only() {
     );
 }
 
-// rule 12: PasteUnavailable shows the paste-blocked text
-#[test]
-fn rule_paste_unavailable_shows_the_blocked_text() {
-    let mut rig = Rig::opened();
-    rig.push(UiEvent::PasteUnavailable);
-    rig.tick();
-    assert_eq!(
-        rig.error().as_deref(),
-        Some(strings::text("popup.paste_blocked"))
-    );
-    assert_eq!(
-        rig.trace(),
-        vec![open_line("start", false, false), error_line()]
-    );
-}
-
 // ---------------------------------------------------------------------------
 // 13. Timers
 // ---------------------------------------------------------------------------

@@ -21,15 +21,6 @@ use clipmonger_ipc::framing;
 use clipmonger_ipc::proto::IpcError;
 use serde_json::Value;
 
-#[cfg(all(windows, feature = "software"))]
-use clipmonger_app_ui::app::ConfigWindowState;
-#[cfg(all(windows, feature = "software"))]
-use clipmonger_app_ui::{config_model, popup};
-#[cfg(all(windows, feature = "software"))]
-mod fallback;
-#[cfg(all(windows, feature = "software"))]
-mod fallback_config;
-
 /// Daemon spawn wait: tries times interval.
 const SPAWN_TRIES: u32 = 50;
 /// Interval between spawn-wait tries.

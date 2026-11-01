@@ -966,13 +966,6 @@ fn ipc_bridge_builders_send_clip_not_id() {
     assert_eq!(method, "history.pin");
     assert_eq!(params, json!({ "clip": id.to_string(), "pinned": true }));
 
-    let (method, params) = (
-        ipc_bridge::method_for(&ipc_bridge::UiCmd::PasteClip(id)),
-        ipc_bridge::params_for(&ipc_bridge::UiCmd::PasteClip(id)),
-    );
-    assert_eq!(method, "paste.execute");
-    assert_eq!(params, json!({ "clip": id.to_string() }));
-
     let targeted = ipc_bridge::UiCmd::PasteClipTo(id, Some(0x0003_0838), 1_000, Some(77));
     let (method, params) = (
         ipc_bridge::method_for(&targeted),
@@ -1026,7 +1019,8 @@ fn ipc_bridge_wire_params_recorded_by_fake_transport() {
     let id = clip_id(2);
     tx.send(UiCmd::DeleteClip(id)).expect("send delete");
     tx.send(UiCmd::PinClip(id, true)).expect("send pin");
-    tx.send(UiCmd::PasteClip(id)).expect("send paste");
+    tx.send(UiCmd::PasteClipTo(id, None, 0, None))
+        .expect("send paste");
     let events: Vec<UiEvent> = (0..3)
         .map(|_| {
             rx.recv_timeout(Duration::from_secs(2))
@@ -1050,7 +1044,7 @@ fn ipc_bridge_wire_params_recorded_by_fake_transport() {
             ),
             (
                 "paste.execute".to_string(),
-                json!({ "clip": id.to_string() })
+                json!({ "clip": id.to_string(), "picked_ms": 0 })
             ),
         ],
         "wire params must use the daemon clip shape for all three commands"

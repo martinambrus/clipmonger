@@ -57,7 +57,7 @@ pub fn line(event: &TraceEvent, t_ms: u64) -> String {
 
 /// Why an event opened the popup: `hotkey` for a daemon push with source
 /// `hotkey`, `request` for any other push source, `tray` for `TrayToggle`,
-/// `paste_failed` for a failed paste, `other` for anything else.
+/// `paste_failed` for a failed paste or permanent execution, `other` otherwise.
 #[must_use]
 pub fn open_source(event: &Event) -> &'static str {
     match event {
@@ -69,7 +69,7 @@ pub fn open_source(event: &Event) -> &'static str {
             }
         }
         Event::TrayToggle => "tray",
-        Event::Bridge(UiEvent::PasteFailed(_)) => "paste_failed",
+        Event::Bridge(UiEvent::PasteFailed(_) | UiEvent::ExecFailed(..)) => "paste_failed",
         _ => "other",
     }
 }

@@ -235,6 +235,13 @@ fn rule_open_source_words() {
             Event::Bridge(UiEvent::PasteFailed("gone".to_string())),
             "paste_failed",
         ),
+        (
+            Event::Bridge(UiEvent::ExecFailed(
+                Uuid::from_u128(77),
+                clipmonger_ipc::proto::IpcError::new("backend", "boom".to_string()),
+            )),
+            "paste_failed",
+        ),
     ];
     let others = [
         Event::Dismiss,
@@ -254,7 +261,6 @@ fn rule_open_source_words() {
         Event::SettingsClose,
         Event::Quit,
         Event::Bridge(UiEvent::Error("x".to_string())),
-        Event::Bridge(UiEvent::PasteUnavailable),
         Event::Bridge(UiEvent::Offline("x".to_string())),
         Event::Bridge(UiEvent::Status(json!({}))),
         Event::Bridge(UiEvent::History(json!({}))),
@@ -998,8 +1004,8 @@ fn rule_app_permanent_pick_writes_hide_then_paste_without_a_target() {
     );
 }
 
-// PopupApp: an error line that is new or changed, or set again by PasteFailed, Error or
-// PasteUnavailable, is written as Error; anything else is not
+// PopupApp: an error line that is new or changed, or set again by PasteFailed,
+// ExecFailed or Error, is written as Error; anything else is not
 #[test]
 fn rule_app_error_lines() {
     let mut rig = Rig::new(true);
@@ -1018,12 +1024,15 @@ fn rule_app_error_lines() {
         expected.push(error_line());
         assert_eq!(rig.trace(), expected, "PasteFailed");
     }
-    // PasteUnavailable: changed, then set again
+    // ExecFailed while open: changed, then set again with the same text
     for _ in 0..2 {
-        rig.push(UiEvent::PasteUnavailable);
+        rig.push(UiEvent::ExecFailed(
+            Uuid::from_u128(77),
+            clipmonger_ipc::proto::IpcError::new("backend", "boom".to_string()),
+        ));
         rig.tick();
         expected.push(error_line());
-        assert_eq!(rig.trace(), expected, "PasteUnavailable");
+        assert_eq!(rig.trace(), expected, "ExecFailed");
     }
     // events that leave the error line alone write nothing
     for event in [
@@ -1315,10 +1324,10 @@ fn fix_x1_settings_activation_does_not_pick_a_clip() {
         rig.tick();
         thread::sleep(Duration::from_millis(170));
         rig.tick();
-        assert!(rig.cmds().iter().all(|cmd| !matches!(
-            cmd,
-            UiCmd::PasteClipTo(..) | UiCmd::PasteClip(_) | UiCmd::ExecPermanent(_)
-        )));
+        assert!(rig
+            .cmds()
+            .iter()
+            .all(|cmd| !matches!(cmd, UiCmd::PasteClipTo(..) | UiCmd::ExecPermanent(_))));
         assert_eq!(rig.foreground.load(Ordering::SeqCst), 0);
         assert_eq!(rig.trace(), vec![open_line("hotkey", true, true)]);
     }
@@ -1452,25 +1461,21 @@ fn fix_x3_permanent_error_reopens_even_with_settings_open() {
 
 #[test]
 fn fix_x3_closed_errors_without_an_exec_are_not_traced_or_reopened() {
-    for failure in [
-        UiEvent::Error("background".to_string()),
-        UiEvent::PasteUnavailable,
-    ] {
-        let mut rig = Rig::new(false);
-        rig.push(failure);
-        rig.tick();
-        assert!(!rig.is_open());
-        assert!(rig.app.shell().error().is_some());
-        assert_eq!(
-            rig.trace(),
-            Vec::<Value>::new(),
-            "a hidden error is not shown"
-        );
-        rig.push(request());
-        rig.tick();
-        assert!(rig.app.shell().error().is_none());
-        assert_eq!(rig.trace(), vec![open_line("request", false, false)]);
-    }
+    let failure = UiEvent::Error("background".to_string());
+    let mut rig = Rig::new(false);
+    rig.push(failure);
+    rig.tick();
+    assert!(!rig.is_open());
+    assert!(rig.app.shell().error().is_some());
+    assert_eq!(
+        rig.trace(),
+        Vec::<Value>::new(),
+        "a hidden error is not shown"
+    );
+    rig.push(request());
+    rig.tick();
+    assert!(rig.app.shell().error().is_none());
+    assert_eq!(rig.trace(), vec![open_line("request", false, false)]);
 }
 
 /// Get the actual bridge reply to a failed permanent execution.
