@@ -314,7 +314,7 @@ struct Runner<A: App> {
     popup: Slot,
     settings: Option<Slot>,
     last: Desired,
-    pending_activation: bool,
+    pending_activation: window::Activation,
     error: Option<RunError>,
 }
 
@@ -337,7 +337,7 @@ impl<A: App> Runner<A> {
             popup,
             settings: None,
             last: Desired::default(),
-            pending_activation: false,
+            pending_activation: window::Activation::new(),
             error: None,
         }
     }
@@ -572,11 +572,6 @@ impl<A: App> Runner<A> {
             event_loop.exit();
             return;
         }
-        let edge = !previous.popup_open && desired.popup_open;
-        let mut pending = self.pending_activation || request || edge;
-        if !desired.popup_open {
-            pending = false;
-        }
         let now = Instant::now();
         if desired.popup_open != previous.popup_open {
             if let Err(e) = self.set_popup_open(event_loop, desired.popup_open) {
@@ -594,17 +589,24 @@ impl<A: App> Runner<A> {
                 slot.deadline.at(now);
             }
         }
-        if pending {
-            if let Some(host) = self.popup.host.as_ref() {
-                match window::try_activate(&*host.window, self.per_show) {
-                    window::ActivationStatus::Done => pending = false,
-                    window::ActivationStatus::Pending => {}
-                }
-            } else if !self.per_show {
-                pending = false;
-            }
+        let policy = window::native_policy(self.per_show);
+        if let Some(host) = self.popup.host.as_ref() {
+            self.pending_activation.reconcile(
+                request,
+                previous.popup_open,
+                desired.popup_open,
+                Some(&*host.window),
+                policy,
+            );
+        } else {
+            self.pending_activation.reconcile(
+                request,
+                previous.popup_open,
+                desired.popup_open,
+                None::<&winit::window::Window>,
+                policy,
+            );
         }
-        self.pending_activation = pending;
     }
 
     /// Show or hide the popup window.

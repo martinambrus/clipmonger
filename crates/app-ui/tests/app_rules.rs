@@ -3581,12 +3581,12 @@ fn rule_raise_hide_clears_pending() {
     let mut rig = Rig::opened();
     rig.push(hotkey(5, 6));
     rig.tick();
-    assert!(rig.app.take_popup_activation());
+    // hide must clear pending without intervening drain
     rig.push(toggle());
     rig.tick();
     assert!(!rig.is_open());
     assert!(!rig.app.take_popup_activation(), "hide must clear pending");
-    // also request then immediate hide in same tick
+    // true same-drain raise+hide in one tick
     let mut rig2 = Rig::closed();
     rig2.push(hotkey(1, 2));
     rig2.tick();
@@ -3599,11 +3599,13 @@ fn rule_raise_hide_clears_pending() {
     rig2.focus(Some(false));
     rig2.tick();
     rig2.push(hotkey(3, 4));
-    rig2.tick();
-    assert!(rig2.app.take_popup_activation());
     rig2.push(toggle());
     rig2.tick();
-    assert!(!rig2.app.take_popup_activation());
+    assert!(!rig2.is_open(), "hide must close");
+    assert!(
+        !rig2.app.take_popup_activation(),
+        "same-tick hide must clear pending"
+    );
 }
 
 // raise-design: batch coalescing - several Raises before drain coalesce to one
@@ -3642,6 +3644,9 @@ fn rule_raise_tray_show_while_open_preserves_and_activates() {
     rig.push(hotkey(10, 11));
     rig.tick();
     let _ = rig.cmds();
+    // drain hotkey latch so tray's own request is verified
+    assert!(rig.app.take_popup_activation());
+    let _ = rig.app.take_popup_activation();
     rig.push(config_reply(
         &json!({"popup": {"dismiss_on_focus_loss": false}}),
     ));
@@ -3653,10 +3658,17 @@ fn rule_raise_tray_show_while_open_preserves_and_activates() {
     rig.app.vm_mut().query = "search".to_string();
     rig.app.vm_mut().selected = 1;
     let ctx = rig.context();
+    let before_trace = rig.trace();
     rig.tray(&[TrayAction::OpenPopup]);
     rig.tick();
     assert!(rig.is_open());
-    assert_eq!(rig.context(), ctx);
+    assert_eq!(rig.context(), ctx, "tray show preserves context");
     assert_eq!(rig.app.vm().query, "search");
-    assert!(rig.app.take_popup_activation());
+    assert_eq!(rig.app.vm().selected, 1);
+    assert_eq!(rig.trace(), before_trace, "no open trace");
+    assert_eq!(rig.cmds(), vec![], "no refresh");
+    assert!(
+        rig.app.take_popup_activation(),
+        "tray show must request activation"
+    );
 }

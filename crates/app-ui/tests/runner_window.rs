@@ -105,57 +105,52 @@ struct ActivateFake {
     minimized: Cell<Option<bool>>,
     focused: Cell<bool>,
     focus_calls: Cell<usize>,
+    visible_calls: Cell<usize>,
     per_show: bool,
 }
 
 impl ActivateFake {
-    fn visible_unfocused() -> Self {
+    fn visible_unfocused(policy: clipmonger_app_ui::runner::window::ActivationPolicy) -> Self {
         Self {
             visible: Cell::new(Some(true)),
             minimized: Cell::new(Some(false)),
             focused: Cell::new(false),
             focus_calls: Cell::new(0),
-            per_show: false,
+            visible_calls: Cell::new(0),
+            per_show: policy == clipmonger_app_ui::runner::window::ActivationPolicy::Unsupported,
         }
     }
 
-    fn not_visible() -> Self {
+    fn not_visible(policy: clipmonger_app_ui::runner::window::ActivationPolicy) -> Self {
         Self {
             visible: Cell::new(Some(false)),
             minimized: Cell::new(Some(false)),
             focused: Cell::new(false),
             focus_calls: Cell::new(0),
-            per_show: false,
+            visible_calls: Cell::new(0),
+            per_show: policy == clipmonger_app_ui::runner::window::ActivationPolicy::Unsupported,
         }
     }
 
-    fn minimized() -> Self {
+    fn minimized(_policy: clipmonger_app_ui::runner::window::ActivationPolicy) -> Self {
         Self {
             visible: Cell::new(Some(true)),
             minimized: Cell::new(Some(true)),
             focused: Cell::new(false),
             focus_calls: Cell::new(0),
+            visible_calls: Cell::new(0),
             per_show: false,
         }
     }
 
-    fn focused() -> Self {
+    fn focused(_policy: clipmonger_app_ui::runner::window::ActivationPolicy) -> Self {
         Self {
             visible: Cell::new(Some(true)),
             minimized: Cell::new(Some(false)),
             focused: Cell::new(true),
             focus_calls: Cell::new(0),
+            visible_calls: Cell::new(0),
             per_show: false,
-        }
-    }
-
-    fn per_show() -> Self {
-        Self {
-            visible: Cell::new(Some(true)),
-            minimized: Cell::new(Some(false)),
-            focused: Cell::new(false),
-            focus_calls: Cell::new(0),
-            per_show: true,
         }
     }
 }
@@ -165,7 +160,9 @@ impl OsWindow for ActivateFake {
         self.visible.get()
     }
 
-    fn set_visible(&self, _visible: bool) {}
+    fn set_visible(&self, _visible: bool) {
+        self.visible_calls.set(self.visible_calls.get() + 1);
+    }
 
     fn is_minimized(&self) -> Option<bool> {
         self.minimized.get()
@@ -813,120 +810,294 @@ fn allows_refuses_what_changes_window_flags_or_focus() {
     assert!(allows(&C::InnerSize(Vec2::new(3.0, 4.0))));
 }
 
-// raise-design: try_activate tests the production helper called by Runner
+// D1: shared explicit production policy exercised via fake, native policy selected via cfg
 #[test]
-fn raise_try_activate_focuses_visible_unfocused() {
-    use clipmonger_app_ui::runner::window::{try_activate, ActivationStatus};
-    let fake = ActivateFake::visible_unfocused();
-    let status = try_activate(&fake, false);
-    assert_eq!(status, ActivationStatus::Done);
-    assert_eq!(fake.focus_calls.get(), 1, "visible unfocused must focus");
+fn activation_policy_native_selection() {
+    use clipmonger_app_ui::runner::window::{native_policy, ActivationPolicy};
+    assert_eq!(
+        native_policy(true),
+        ActivationPolicy::Unsupported,
+        "per_show always unsupported"
+    );
+    #[cfg(target_os = "windows")]
+    {
+        assert_eq!(native_policy(false), ActivationPolicy::Unsupported);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        assert_eq!(native_policy(false), ActivationPolicy::Supported);
+    }
 }
 
 #[test]
-fn raise_try_activate_retains_while_not_visible() {
-    use clipmonger_app_ui::runner::window::{try_activate, ActivationStatus};
-    let fake = ActivateFake::not_visible();
-    let status = try_activate(&fake, false);
-    assert_eq!(
-        status,
-        ActivationStatus::Pending,
-        "YesWait-like not visible retains"
-    );
-    assert_eq!(fake.focus_calls.get(), 0);
-    // simulate visibility notification then retry with no logic due - same helper after update
-    fake.visible.set(Some(true));
-    let status = try_activate(&fake, false);
+fn activation_try_activate_with_policy_supported_focuses() {
+    use clipmonger_app_ui::runner::window::{
+        try_activate_with_policy, ActivationPolicy, ActivationStatus,
+    };
+    let fake = ActivateFake::visible_unfocused(ActivationPolicy::Supported);
+    let status = try_activate_with_policy(&fake, ActivationPolicy::Supported);
     assert_eq!(status, ActivationStatus::Done);
+    assert_eq!(fake.focus_calls.get(), 1);
+    assert_eq!(fake.visible_calls.get(), 0, "no visibility manipulation");
+}
+
+#[test]
+fn activation_try_activate_with_policy_unsupported_discards() {
+    use clipmonger_app_ui::runner::window::{
+        try_activate_with_policy, ActivationPolicy, ActivationStatus,
+    };
+    let fake = ActivateFake::visible_unfocused(ActivationPolicy::Unsupported);
+    let status = try_activate_with_policy(&fake, ActivationPolicy::Unsupported);
+    assert_eq!(status, ActivationStatus::Done);
+    assert_eq!(fake.focus_calls.get(), 0);
+    assert_eq!(fake.visible_calls.get(), 0);
+}
+
+#[test]
+fn activation_try_activate_with_policy_retains_not_visible() {
+    use clipmonger_app_ui::runner::window::{
+        try_activate_with_policy, ActivationPolicy, ActivationStatus,
+    };
+    let fake = ActivateFake::not_visible(ActivationPolicy::Supported);
+    let status = try_activate_with_policy(&fake, ActivationPolicy::Supported);
+    assert_eq!(status, ActivationStatus::Pending);
+    assert_eq!(fake.focus_calls.get(), 0);
+    assert_eq!(fake.visible_calls.get(), 0);
+    fake.visible.set(Some(true));
+    let status = try_activate_with_policy(&fake, ActivationPolicy::Supported);
+    assert_eq!(status, ActivationStatus::Done);
+    assert_eq!(fake.focus_calls.get(), 1);
+    assert_eq!(fake.visible_calls.get(), 0);
+}
+
+#[test]
+fn activation_try_activate_focused_consumes_without_call() {
+    use clipmonger_app_ui::runner::window::{
+        try_activate_with_policy, ActivationPolicy, ActivationStatus,
+    };
+    let fake = ActivateFake::focused(ActivationPolicy::Supported);
+    let status = try_activate_with_policy(&fake, ActivationPolicy::Supported);
+    assert_eq!(status, ActivationStatus::Done);
+    assert_eq!(fake.focus_calls.get(), 0);
+    assert_eq!(fake.visible_calls.get(), 0);
+}
+
+#[test]
+fn activation_try_activate_minimized_discards() {
+    use clipmonger_app_ui::runner::window::{
+        try_activate_with_policy, ActivationPolicy, ActivationStatus,
+    };
+    let fake = ActivateFake::minimized(ActivationPolicy::Supported);
+    let status = try_activate_with_policy(&fake, ActivationPolicy::Supported);
+    assert_eq!(status, ActivationStatus::Done);
+    assert_eq!(fake.focus_calls.get(), 0);
+    assert_eq!(fake.visible_calls.get(), 0);
+}
+
+// D2: stateful helper actually called by Runner, with fake recording show/hide/flag/focus
+#[test]
+fn activation_helper_notready_then_ready_no_app_pass() {
+    use clipmonger_app_ui::runner::window::{Activation, ActivationPolicy};
+    let fake = ActivateFake::not_visible(ActivationPolicy::Supported);
+    let mut helper = Activation::new();
+    // first-show: closed->open edge, host not ready (is_visible false)
+    helper.reconcile(false, false, true, Some(&fake), ActivationPolicy::Supported);
+    assert!(helper.is_pending(), "pending retained while not visible");
+    assert_eq!(fake.focus_calls.get(), 0);
+    assert_eq!(fake.visible_calls.get(), 0);
+    // visibility notification makes ready, next reconcile with no app pass
+    fake.visible.set(Some(true));
+    helper.reconcile(false, true, true, Some(&fake), ActivationPolicy::Supported);
+    assert!(!helper.is_pending());
+    assert_eq!(fake.focus_calls.get(), 1);
+    assert_eq!(fake.visible_calls.get(), 0);
+}
+
+#[test]
+fn activation_helper_startopen() {
+    use clipmonger_app_ui::runner::window::{Activation, ActivationPolicy};
+    let fake = ActivateFake::visible_unfocused(ActivationPolicy::Supported);
+    let mut helper = Activation::new();
+    // startopen: previous false, desired true, edge triggers even without request
+    helper.reconcile(false, false, true, Some(&fake), ActivationPolicy::Supported);
+    assert!(!helper.is_pending());
+    assert_eq!(fake.focus_calls.get(), 1);
+    assert_eq!(fake.visible_calls.get(), 0);
+}
+
+#[test]
+fn activation_helper_alreadyopen_raise_no_visibility() {
+    use clipmonger_app_ui::runner::window::{Activation, ActivationPolicy};
+    let fake = ActivateFake::visible_unfocused(ActivationPolicy::Supported);
+    let mut helper = Activation::new();
+    helper.reconcile(true, true, true, Some(&fake), ActivationPolicy::Supported);
+    assert!(!helper.is_pending());
+    assert_eq!(fake.focus_calls.get(), 1);
+    assert_eq!(
+        fake.visible_calls.get(),
+        0,
+        "raise on already-open must not touch visibility"
+    );
+}
+
+#[test]
+fn activation_helper_idle_after_delivery_no_repeat() {
+    use clipmonger_app_ui::runner::window::{Activation, ActivationPolicy};
+    let fake = ActivateFake::visible_unfocused(ActivationPolicy::Supported);
+    let mut helper = Activation::new();
+    helper.reconcile(true, true, true, Some(&fake), ActivationPolicy::Supported);
+    assert_eq!(fake.focus_calls.get(), 1);
+    // focus lost again but idle should not refocus
+    fake.focused.set(false);
+    fake.visible.set(Some(true));
+    helper.reconcile(false, true, true, Some(&fake), ActivationPolicy::Supported);
     assert_eq!(
         fake.focus_calls.get(),
         1,
-        "ready then focuses even without new logic"
+        "idle after delivery must not refocus even if focus lost again"
     );
-    // next idle ticks do nothing - but helper is one-shot, caller would clear pending
-    // we verify helper itself is idempotent via focused check
+    assert!(!helper.is_pending());
+    assert_eq!(fake.visible_calls.get(), 0);
 }
 
 #[test]
-fn raise_try_activate_no_visibility_calls() {
-    use clipmonger_app_ui::runner::window::{try_activate, ActivationStatus};
-    let fake = ActivateFake::visible_unfocused();
-    // fake's set_visible not tracked here, but we verify try_activate never calls it
-    // by using a separate fake that would record visibility calls - here we just ensure no panic and no extra logic
-    let status = try_activate(&fake, false);
-    assert_eq!(status, ActivationStatus::Done);
-    assert_eq!(fake.focus_calls.get(), 1);
-    // already focused consumes without extra call
-    let focused = ActivateFake::focused();
-    let status = try_activate(&focused, false);
-    assert_eq!(status, ActivationStatus::Done);
-    assert_eq!(
-        focused.focus_calls.get(),
-        0,
-        "focused host consumed without call"
+fn activation_helper_pending_then_hide_cancels() {
+    use clipmonger_app_ui::runner::window::{Activation, ActivationPolicy};
+    let fake = ActivateFake::visible_unfocused(ActivationPolicy::Supported);
+    let mut helper = Activation::new();
+    // pending while not ready
+    let not_ready = ActivateFake::not_visible(ActivationPolicy::Supported);
+    helper.reconcile(
+        true,
+        false,
+        true,
+        Some(&not_ready),
+        ActivationPolicy::Supported,
     );
+    assert!(helper.is_pending());
+    assert_eq!(not_ready.focus_calls.get(), 0);
+    // hide cancels without focus
+    helper.reconcile(false, true, false, Some(&fake), ActivationPolicy::Supported);
+    assert!(!helper.is_pending());
+    assert_eq!(fake.focus_calls.get(), 0);
+    assert_eq!(fake.visible_calls.get(), 0);
 }
 
 #[test]
-fn raise_try_activate_minimized_discards() {
-    use clipmonger_app_ui::runner::window::{try_activate, ActivationStatus};
-    let fake = ActivateFake::minimized();
-    let status = try_activate(&fake, false);
-    assert_eq!(status, ActivationStatus::Done);
-    assert_eq!(
-        fake.focus_calls.get(),
-        0,
-        "minimized discards without focus"
-    );
+fn activation_helper_request_hide_batch_cancels() {
+    use clipmonger_app_ui::runner::window::{Activation, ActivationPolicy};
+    let fake = ActivateFake::visible_unfocused(ActivationPolicy::Supported);
+    let mut helper = Activation::new();
+    // request and hide in same reconcile (OR then cancel)
+    helper.reconcile(true, true, false, Some(&fake), ActivationPolicy::Supported);
+    assert!(!helper.is_pending());
+    assert_eq!(fake.focus_calls.get(), 0);
+    assert_eq!(fake.visible_calls.get(), 0);
 }
 
 #[test]
-fn raise_try_activate_wayland_per_show_discards() {
-    use clipmonger_app_ui::runner::window::{try_activate, ActivationStatus};
-    let fake = ActivateFake::per_show();
-    let status = try_activate(&fake, true);
-    assert_eq!(status, ActivationStatus::Done);
+fn activation_helper_coalescing() {
+    use clipmonger_app_ui::runner::window::{Activation, ActivationPolicy};
+    let fake_not_ready = ActivateFake::not_visible(ActivationPolicy::Supported);
+    let mut helper = Activation::new();
+    helper.reconcile(
+        true,
+        false,
+        true,
+        Some(&fake_not_ready),
+        ActivationPolicy::Supported,
+    );
+    assert!(helper.is_pending());
+    // second request before delivery coalesces
+    helper.reconcile(
+        true,
+        true,
+        true,
+        Some(&fake_not_ready),
+        ActivationPolicy::Supported,
+    );
+    assert!(helper.is_pending());
+    assert_eq!(fake_not_ready.focus_calls.get(), 0);
+    // now ready, only one focus
+    let fake_ready = ActivateFake::visible_unfocused(ActivationPolicy::Supported);
+    // transfer pending to new fake by reusing helper pending true
+    helper.reconcile(
+        false,
+        true,
+        true,
+        Some(&fake_ready),
+        ActivationPolicy::Supported,
+    );
+    assert!(!helper.is_pending());
+    assert_eq!(fake_ready.focus_calls.get(), 1);
+    assert_eq!(fake_ready.visible_calls.get(), 0);
+}
+
+#[test]
+fn activation_helper_focused_host_consumes() {
+    use clipmonger_app_ui::runner::window::{Activation, ActivationPolicy};
+    let fake = ActivateFake::focused(ActivationPolicy::Supported);
+    let mut helper = Activation::new();
+    helper.reconcile(true, true, true, Some(&fake), ActivationPolicy::Supported);
+    assert!(!helper.is_pending());
+    assert_eq!(fake.focus_calls.get(), 0);
+    assert_eq!(fake.visible_calls.get(), 0);
+}
+
+#[test]
+fn activation_helper_unsupported_windows_no_focus_no_visibility() {
+    use clipmonger_app_ui::runner::window::{Activation, ActivationPolicy};
+    let fake = ActivateFake::visible_unfocused(ActivationPolicy::Unsupported);
+    let mut helper = Activation::new();
+    helper.reconcile(true, true, true, Some(&fake), ActivationPolicy::Unsupported);
+    assert!(!helper.is_pending());
+    assert_eq!(fake.focus_calls.get(), 0, "Windows policy must not focus");
+    assert_eq!(fake.visible_calls.get(), 0);
+    // also startopen under Windows policy yields no focus
+    let fake2 = ActivateFake::visible_unfocused(ActivationPolicy::Unsupported);
+    let mut helper2 = Activation::new();
+    helper2.reconcile(
+        false,
+        false,
+        true,
+        Some(&fake2),
+        ActivationPolicy::Unsupported,
+    );
+    assert!(!helper2.is_pending());
+    assert_eq!(fake2.focus_calls.get(), 0);
+    assert_eq!(fake2.visible_calls.get(), 0);
+}
+
+#[test]
+fn activation_helper_unsupported_wayland_no_focus_preserves_host() {
+    use clipmonger_app_ui::runner::window::{Activation, ActivationPolicy};
+    let fake = ActivateFake::visible_unfocused(ActivationPolicy::Unsupported);
+    let mut helper = Activation::new();
+    // already-open request on Wayland must not destroy/recreate host and must not focus
+    helper.reconcile(true, true, true, Some(&fake), ActivationPolicy::Unsupported);
+    assert!(!helper.is_pending());
     assert_eq!(
         fake.focus_calls.get(),
         0,
         "Wayland tokenless must not focus"
     );
-    // already-open Wayland must not destroy/recreate host - we test per_show stays true
-    assert!(fake.per_show);
-}
-
-#[test]
-fn raise_first_show_waits_until_ready_then_focuses() {
-    use clipmonger_app_ui::runner::window::{try_activate, ActivationStatus};
-    // simulate first-show: fake show changes readiness to false (YesWait)
-    let fake = ActivateFake::not_visible();
-    // first tick after show: pending true but not ready -> Pending retained
-    let status = try_activate(&fake, false);
-    assert_eq!(status, ActivationStatus::Pending);
-    assert_eq!(fake.focus_calls.get(), 0);
-    // visibility notification makes is_visible true, next tick with no app logic due still focuses
-    fake.visible.set(Some(true));
-    let status = try_activate(&fake, false);
-    assert_eq!(status, ActivationStatus::Done);
-    assert_eq!(fake.focus_calls.get(), 1);
-    // next idle ticks do nothing - caller cleared pending
-}
-
-#[test]
-fn raise_windows_policy_discards_without_focus() {
-    use clipmonger_app_ui::runner::window::{try_activate, ActivationStatus};
-    // On Windows, compile out focus_window - we test per_show false but on Windows cfg the helper discards
-    // This test runs on Linux, but we can verify the helper's per_show path and document that Windows cfg also discards
-    // For headless, we assert the Linux helper would focus, but Windows build must not
-    let fake = ActivateFake::visible_unfocused();
-    // In this Linux build, per_show false means focus
-    let status = try_activate(&fake, false);
-    assert_eq!(status, ActivationStatus::Done);
-    // The Windows behavior is verified via cfg in source: #[cfg(target_os = "windows")] returns Done without focus
-    // We capture that policy is explicit, not generic not-Wayland
-    assert_eq!(
-        fake.focus_calls.get(),
-        1,
-        "Linux focuses; Windows would discard via cfg"
+    assert_eq!(fake.visible_calls.get(), 0);
+    assert!(
+        fake.per_show,
+        "Wayland per_show host preserved, not recreated"
     );
+}
+
+#[test]
+fn activation_helper_no_visibility_calls_on_supported() {
+    use clipmonger_app_ui::runner::window::{Activation, ActivationPolicy};
+    let fake = ActivateFake::visible_unfocused(ActivationPolicy::Supported);
+    let mut helper = Activation::new();
+    helper.reconcile(true, true, true, Some(&fake), ActivationPolicy::Supported);
+    assert_eq!(
+        fake.visible_calls.get(),
+        0,
+        "activation must not call set_visible"
+    );
+    assert_eq!(fake.focus_calls.get(), 1);
 }
