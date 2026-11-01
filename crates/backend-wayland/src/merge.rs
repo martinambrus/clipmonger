@@ -10,7 +10,6 @@
 use std::collections::HashMap;
 
 use clipmonger_core::hash::content_hash;
-use clipmonger_platform::types::PayloadMap;
 
 /// Canonical dedupe key for one observation's payloads.
 pub struct MergeKey;
@@ -18,7 +17,7 @@ pub struct MergeKey;
 impl MergeKey {
     /// Core canonical hash (sorted MIME keys, native `x-os/*` excluded).
     #[must_use]
-    pub fn of(payloads: &PayloadMap) -> String {
+    pub fn of(payloads: &[(String, Vec<u8>)]) -> String {
         content_hash(payloads)
     }
 }
@@ -103,14 +102,14 @@ mod tests {
 
     #[test]
     fn t603_key_is_core_content_hash() {
-        let payloads: PayloadMap = vec![("text/plain".to_string(), b"hello".to_vec())];
+        let payloads: Vec<(String, Vec<u8>)> = vec![("text/plain".to_string(), b"hello".to_vec())];
         assert_eq!(MergeKey::of(&payloads), content_hash(&payloads));
         // MIME order does not change the key.
-        let reordered: PayloadMap = vec![
+        let reordered: Vec<(String, Vec<u8>)> = vec![
             ("text/html".to_string(), b"<b>hi</b>".to_vec()),
             ("text/plain".to_string(), b"hi".to_vec()),
         ];
-        let swapped: PayloadMap = vec![
+        let swapped: Vec<(String, Vec<u8>)> = vec![
             ("text/plain".to_string(), b"hi".to_vec()),
             ("text/html".to_string(), b"<b>hi</b>".to_vec()),
         ];

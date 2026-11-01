@@ -1589,7 +1589,7 @@ impl DaemonState {
         #[cfg(all(unix, feature = "backend-wayland"))]
         {
             if !sensitive && !payloads.is_empty() {
-                let key = clipmonger_backend_wayland::merge::MergeKey::of(&payloads.to_vec());
+                let key = clipmonger_backend_wayland::merge::MergeKey::of(payloads);
                 let mimes: Vec<String> = payloads.iter().map(|(mime, _)| mime.clone()).collect();
                 let at_ms = u64::try_from(now_ms().max(0)).unwrap_or_default();
                 let duplicate = self.merger.lock().is_ok_and(|mut merger| {
@@ -2411,7 +2411,7 @@ impl DaemonState {
             probe_current().protocol != clipmonger_backend_wayland::probe::Protocol::None;
         let paste = WlPaste::new(has_data);
         let outcome = paste
-            .paste_payloads(&payloads.to_vec())
+            .paste_payloads(payloads)
             .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
         let mut result = serde_json::json!({"pasted": true});
         if let Some(toast) = outcome.toast {
