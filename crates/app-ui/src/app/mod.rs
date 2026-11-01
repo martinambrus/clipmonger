@@ -91,6 +91,7 @@ pub struct PopupApp {
     focus_search: bool,
     /// Theme last applied to the contexts: popup, settings (dark, font scale bits).
     theme_applied: [Option<(bool, u32)>; 2],
+    preview_width: u32,
     pending_activation: bool,
     pending_reveal: Option<(Option<String>, usize, uuid::Uuid)>,
     last_reveal: Option<(Option<String>, usize, uuid::Uuid)>,
@@ -139,6 +140,7 @@ impl PopupApp {
             centered: false,
             focus_search: open,
             theme_applied: [None, None],
+            preview_width: 80,
             pending_activation: false,
             pending_reveal: None,
             last_reveal: None,
@@ -462,10 +464,15 @@ impl PopupApp {
             }
             UiEvent::Config(body) => {
                 let doc = config_model::ConfigDoc::from_snapshot(&body);
+                let width = doc
+                    .get("popup.preview_width")
+                    .and_then(Value::as_u64)
+                    .map_or(80, |n| u32::try_from(n).unwrap_or(80));
                 if let Ok(mut config) = self.config.lock() {
                     config.doc = Some(doc);
                     config.edits.clear();
                 }
+                self.preview_width = width;
                 self.feed(Event::Bridge(UiEvent::Config(body)));
             }
             UiEvent::Error(message) => {

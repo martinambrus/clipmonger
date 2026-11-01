@@ -326,7 +326,7 @@ impl PopupApp {
             if let Some(current) = self.vm.current() {
                 ui.label(strings::text("popup.current"));
                 ui.label(strings::text(popup::preview_kind(current)));
-                ui.label(&current.preview);
+                ui.label(popup::display_preview(&current.preview, self.preview_width));
             }
             let group_names = self
                 .config
@@ -414,7 +414,9 @@ impl PopupApp {
                             let clip_id = clip.id;
                             let pinned = clip.pinned;
                             let selected = self.vm.selected == row;
-                            let response = ui.selectable_label(selected, &clip.preview);
+                            let truncated =
+                                popup::display_preview(&clip.preview, self.preview_width);
+                            let response = ui.selectable_label(selected, &truncated);
                             if selected
                                 && pending.as_ref().is_some_and(
                                     |(source, selected, selected_id)| {
