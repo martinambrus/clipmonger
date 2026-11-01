@@ -448,3 +448,45 @@ impl ClipboardTransfer for WinTransfer {
         }
     }
 }
+
+#[cfg(test)]
+mod native_encoding_tests {
+    use super::encode_native;
+
+    #[test]
+    fn native_html_offsets_delimit_context_and_multibyte_fragment() {
+        for fragment in ["<p>héllo 🌍 日本語</p>", "<b>native</b>", ""] {
+            let bytes = encode_native("text/html", fragment.as_bytes()).unwrap();
+            let context_start = bytes
+                .windows(b"<html>".len())
+                .position(|part| part == b"<html>")
+                .unwrap();
+            let header = std::str::from_utf8(&bytes[..context_start]).unwrap();
+            let offset = |key: &str| -> usize {
+                let field = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix(key))
+                    .unwrap();
+                assert!(field.bytes().all(|byte| byte.is_ascii_digit()));
+                field.parse().unwrap()
+            };
+            let start_html = offset("StartHTML:");
+            let end_html = offset("EndHTML:");
+            let start_fragment = offset("StartFragment:");
+            let end_fragment = offset("EndFragment:");
+            assert_eq!(start_html, context_start);
+            assert_eq!(end_html, bytes.len());
+            assert_eq!(
+                &bytes[start_html..start_fragment],
+                b"<html>\r\n<body>\r\n<!--StartFragment-->"
+            );
+            assert_eq!(&bytes[start_fragment..end_fragment], fragment.as_bytes());
+            assert_eq!(
+                &bytes[end_fragment..end_html],
+                b"<!--EndFragment-->\r\n</body>\r\n</html>"
+            );
+            // The already-framed publication route must remain byte-for-byte raw.
+            assert_eq!(encode_native("text/html", &bytes).unwrap(), bytes);
+        }
+    }
+}
