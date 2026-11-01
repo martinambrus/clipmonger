@@ -86,6 +86,9 @@ pub trait App {
 
     /// Provide fresh desktop context snapshot.
     fn provide_desktop_context(&mut self, _ctx: crate::placement::DesktopContext) {}
+
+    /// A native geometry change can resolve a previously unavailable monitor.
+    fn desktop_geometry_changed(&mut self) {}
 }
 
 /// Window sizes and titles. Sizes are in points at zoom 1.
@@ -204,27 +207,31 @@ impl Host {
         ctx: &Context,
         builder: &ViewportBuilder,
         class: &str,
-        visibility: Visibility,
         restore: Option<&geometry::NormalizedRestore>,
     ) -> Result<Self, RunError> {
         let prepared = window::prepare_host(ctx, builder.clone(), class, restore);
-        let window = event_loop
-            .create_window(prepared.attributes)
-            .map_err(RunError::Window)?;
-        egui_winit::apply_viewport_builder_to_window(ctx, &window, &prepared.after_creation);
-        let window = Arc::new(window);
-        let state = egui_winit::State::new(
-            ctx.clone(),
-            ViewportId::ROOT,
-            &*window,
-            Some(window.scale_factor() as f32),
-            window.theme(),
-            None,
+        let window = Arc::new(
+            event_loop
+                .create_window(prepared.attributes.clone())
+                .map_err(RunError::Window)?,
         );
-        let presenter = render::Presenter::new(surface_context, Arc::clone(&window))
-            .map_err(RunError::Surface)?;
-        let mut info = ViewportInfo::default();
-        egui_winit::update_viewport_info(&mut info, ctx, &window, true);
+        let ((state, presenter, info), visibility) =
+            prepared.finish_setup(&*window, |builder| {
+                egui_winit::apply_viewport_builder_to_window(ctx, &window, builder);
+                let state = egui_winit::State::new(
+                    ctx.clone(),
+                    ViewportId::ROOT,
+                    &*window,
+                    Some(window.scale_factor() as f32),
+                    window.theme(),
+                    None,
+                );
+                let presenter = render::Presenter::new(surface_context, Arc::clone(&window))
+                    .map_err(RunError::Surface)?;
+                let mut info = ViewportInfo::default();
+                egui_winit::update_viewport_info(&mut info, ctx, &window, true);
+                Ok::<_, RunError>((state, presenter, info))
+            })?;
         Ok(Self {
             window,
             state,
@@ -518,11 +525,6 @@ impl<A: App> Runner<A> {
             WindowKind::Popup => window::POPUP_CLASS,
             WindowKind::Settings => window::SETTINGS_CLASS,
         };
-        let visibility = if visible {
-            Visibility::shown()
-        } else {
-            Visibility::hidden()
-        };
         let ctx = match kind {
             WindowKind::Popup => &self.popup.ctx,
             WindowKind::Settings => {
@@ -566,7 +568,6 @@ impl<A: App> Runner<A> {
             ctx,
             &builder,
             class,
-            visibility,
             restore.as_ref(),
         )
     }
@@ -840,7 +841,7 @@ impl<A: App> Runner<A> {
         Ok(())
     }
 
-    fn settings_geometry_event(&mut self, kind: WindowKind, event: &WindowEvent) {
+    fn window_geometry_event(&mut self, kind: WindowKind, event: &WindowEvent) {
         if kind == WindowKind::Settings
             && matches!(
                 event,
@@ -851,6 +852,9 @@ impl<A: App> Runner<A> {
             )
         {
             self.settings_geometry(geometry::Lifecycle::Changed);
+        }
+        if let Some(app) = self.app.as_mut() {
+            notify_desktop_geometry(app, DesktopGeometrySignal::Window(kind, event));
         }
     }
 
@@ -906,6 +910,35 @@ pub fn deliver_desktop_context(
     true
 }
 
+/// Native signals that may make missing monitor geometry available.
+#[derive(Clone, Copy)]
+pub enum DesktopGeometrySignal<'a> {
+    Resumed,
+    Window(WindowKind, &'a WindowEvent),
+}
+
+/// Wake only unresolved placement; ordinary frames, Config and Raise do not retry.
+pub fn notify_desktop_geometry(app: &mut impl App, signal: DesktopGeometrySignal<'_>) -> bool {
+    let relevant = match signal {
+        DesktopGeometrySignal::Resumed => true,
+        DesktopGeometrySignal::Window(kind, event) => {
+            kind == WindowKind::Popup
+                && matches!(
+                    event,
+                    WindowEvent::Moved(_)
+                        | WindowEvent::Resized(_)
+                        | WindowEvent::ScaleFactorChanged { .. }
+                )
+        }
+    };
+    if relevant {
+        app.desktop_geometry_changed();
+        app.wants_desktop_context()
+    } else {
+        false
+    }
+}
+
 fn monitor_rect(monitor: &winit::monitor::MonitorHandle) -> crate::placement::Rect {
     let position = monitor.position();
     let size = monitor.size();
@@ -957,7 +990,11 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
 
     /// Handle resumed event.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.app.is_some() {
+        if let Some(app) = self.app.as_mut() {
+            if notify_desktop_geometry(app, DesktopGeometrySignal::Resumed) {
+                self.popup.deadline.at(Instant::now());
+                self.set_flow(event_loop);
+            }
             return;
         }
         if let Err(e) = self.start(event_loop) {
@@ -1014,7 +1051,7 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
             None
         });
         if let Some(kind) = kind {
-            self.settings_geometry_event(kind, &event);
+            self.window_geometry_event(kind, &event);
             let preserve_super = self
                 .app
                 .as_ref()

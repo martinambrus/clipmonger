@@ -87,6 +87,7 @@ pub struct PopupApp {
     seen_focus: bool,
     /// Placement pending for next desktop context.
     placement_pending: bool,
+    placement_waiting_for_geometry: bool,
     placement: placement::Placement,
     pending_physical_pos: Option<(i32, i32)>,
     /// Put the keyboard focus into the search box at the next render.
@@ -140,6 +141,7 @@ impl PopupApp {
             hide_unconfirmed: false,
             seen_focus: false,
             placement_pending: open,
+            placement_waiting_for_geometry: false,
             placement: placement::Placement::Center,
             pending_physical_pos: None,
             focus_search: open,
@@ -238,9 +240,11 @@ impl PopupApp {
             });
             // Pending placement for closed-to-open transition; not for raise while open.
             self.placement_pending = true;
+            self.placement_waiting_for_geometry = false;
         } else if was_open && !is_open {
             self.pending_physical_pos = None;
             self.placement_pending = false;
+            self.placement_waiting_for_geometry = false;
             self.record(&TraceEvent::Hide { reason });
         }
         let error_shown = is_open
@@ -492,6 +496,7 @@ impl PopupApp {
                 self.preview_width = width;
                 if placement_changed {
                     self.placement = new_placement;
+                    self.placement_waiting_for_geometry = false;
                     // Reposition once for an effective mode change while open.
                     if self.shell.desired().popup_open {
                         self.placement_pending = true;
@@ -854,8 +859,24 @@ impl runner::App for PopupApp {
         if !self.wants_desktop_context() {
             return;
         }
-        self.pending_physical_pos = crate::placement::place_with_context(self.placement, &ctx);
         self.placement_pending = false;
+        self.placement_waiting_for_geometry = ctx.supports_global_position
+            && !ctx
+                .monitors
+                .iter()
+                .any(|monitor| monitor.w > 0 && monitor.h > 0);
+        self.pending_physical_pos = if self.placement_waiting_for_geometry {
+            None
+        } else {
+            crate::placement::place_with_context(self.placement, &ctx)
+        };
+    }
+
+    fn desktop_geometry_changed(&mut self) {
+        if self.shell.desired().popup_open && self.placement_waiting_for_geometry {
+            self.placement_pending = true;
+            self.placement_waiting_for_geometry = false;
+        }
     }
 }
 

@@ -3213,6 +3213,99 @@ fn rule_placement_unknown_platform_fallback_and_wayland_emit_no_synthetic_positi
     assert_none(&rig.tick_settings().positions(), "placement commands");
 }
 
+fn placement_is_idle(rig: &mut Rig) {
+    assert_none(&rig.tick().positions(), "idle placement");
+    assert!(!clipmonger_app_ui::runner::deliver_desktop_context(
+        &mut rig.app,
+        || panic!("idle pass queried desktop")
+    ));
+}
+
+#[test]
+fn rule_placement_recovers_missing_monitors_on_native_geometry_signal_without_polling() {
+    use clipmonger_app_ui::runner::{notify_desktop_geometry, DesktopGeometrySignal};
+    use winit::{
+        dpi::{PhysicalPosition, PhysicalSize},
+        event::WindowEvent,
+    };
+    for signal in 0..3 {
+        let mut rig = Rig::opened();
+        rig.push(config_reply(&json!({"popup": {"placement": "cursor"}})));
+        rig.tick();
+        let mut missing = desktop(Some((-1700, 100)));
+        missing.monitors.clear();
+        missing.current_monitor = None;
+        if signal == 1 {
+            missing.monitors.push(placement::Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            });
+        }
+        deliver(&mut rig, missing);
+        for _ in 0..3 {
+            placement_is_idle(&mut rig);
+        }
+        rig.push(config_reply(&json!({"popup": {"placement": "cursor"}})));
+        placement_is_idle(&mut rig);
+        rig.push(request());
+        placement_is_idle(&mut rig);
+        assert!(!notify_desktop_geometry(
+            &mut rig.app,
+            DesktopGeometrySignal::Window(WindowKind::Popup, &WindowEvent::RedrawRequested)
+        ));
+        assert!(!notify_desktop_geometry(
+            &mut rig.app,
+            DesktopGeometrySignal::Window(
+                WindowKind::Settings,
+                &WindowEvent::Resized(PhysicalSize::new(960, 680))
+            )
+        ));
+        placement_is_idle(&mut rig);
+        let moved = WindowEvent::Moved(PhysicalPosition::new(-1800, 0));
+        let resized = WindowEvent::Resized(PhysicalSize::new(720, 540));
+        let useful = match signal {
+            0 => DesktopGeometrySignal::Window(WindowKind::Popup, &moved),
+            1 => DesktopGeometrySignal::Window(WindowKind::Popup, &resized),
+            _ => DesktopGeometrySignal::Resumed,
+        };
+        assert!(notify_desktop_geometry(&mut rig.app, useful));
+        assert!(rig.app.desired().popup_open, "recover within the same open");
+        deliver(&mut rig, desktop(Some((300, 400))));
+        assert_eq!(rig.tick().positions(), vec![egui::pos2(300.0, 400.0)]);
+        assert!(!notify_desktop_geometry(
+            &mut rig.app,
+            DesktopGeometrySignal::Resumed
+        ));
+        placement_is_idle(&mut rig);
+    }
+}
+
+#[test]
+fn rule_placement_wayland_has_no_retry_after_geometry_or_resume() {
+    use clipmonger_app_ui::runner::{notify_desktop_geometry, DesktopGeometrySignal};
+    let mut rig = Rig::opened();
+    let mut unsupported = desktop(None);
+    unsupported.supports_global_position = false;
+    unsupported.monitors.clear();
+    deliver(&mut rig, unsupported);
+    for _ in 0..3 {
+        assert!(!notify_desktop_geometry(
+            &mut rig.app,
+            DesktopGeometrySignal::Resumed
+        ));
+        assert!(!notify_desktop_geometry(
+            &mut rig.app,
+            DesktopGeometrySignal::Window(
+                WindowKind::Popup,
+                &winit::event::WindowEvent::Moved(winit::dpi::PhysicalPosition::new(0, 0))
+            )
+        ));
+        placement_is_idle(&mut rig);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 16. The offline banner mirrors the shell
 // ---------------------------------------------------------------------------

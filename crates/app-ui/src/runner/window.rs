@@ -71,6 +71,30 @@ pub fn attributes(ctx: &Context, builder: ViewportBuilder, class: &str) -> Windo
 pub struct PreparedHost {
     pub attributes: WindowAttributes,
     pub after_creation: ViewportBuilder,
+    show_after_setup: bool,
+}
+
+impl PreparedHost {
+    /// Complete the actual host setup before explicitly showing a restored window.
+    ///
+    /// # Errors
+    /// Returns the setup error without showing the window.
+    pub fn finish_setup<W: OsWindow, T, E>(
+        &self,
+        window: &W,
+        configure: impl FnOnce(&ViewportBuilder) -> Result<T, E>,
+    ) -> Result<(T, Visibility), E> {
+        let configured = configure(&self.after_creation)?;
+        let mut visibility = if self.attributes.visible {
+            Visibility::shown()
+        } else {
+            Visibility::hidden()
+        };
+        if self.show_after_setup {
+            visibility.show(window);
+        }
+        Ok((configured, visibility))
+    }
 }
 
 #[must_use]
@@ -81,6 +105,7 @@ pub fn prepare_host(
     restore: Option<&super::geometry::NormalizedRestore>,
 ) -> PreparedHost {
     let mut attrs = attributes(ctx, builder.clone(), class);
+    let show_after_setup = restore.is_some() && attrs.visible;
     if let Some(restore) = restore {
         attrs.inner_size = Some(
             winit::dpi::LogicalSize::new(restore.logical_size[0], restore.logical_size[1]).into(),
@@ -92,10 +117,15 @@ pub fn prepare_host(
         // Geometry has already been expressed in native units above.
         builder.inner_size = None;
         builder.position = None;
+        // Pinned winit on Windows applies visibility before size and position.
+        // Keep construction and post-creation setup hidden, then show explicitly.
+        attrs.visible = false;
+        builder.visible = Some(false);
     }
     PreparedHost {
         attributes: attrs,
         after_creation: builder,
+        show_after_setup,
     }
 }
 
