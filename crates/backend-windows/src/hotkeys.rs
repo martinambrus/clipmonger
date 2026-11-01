@@ -298,23 +298,20 @@ impl HotkeyManager for WinHotkeys {
                 // pumps messages (the manager's HWND lives on the thread
                 // that constructed it); without the pump no fire arrives.
                 pump_thread_messages();
-                match global_hotkey::GlobalHotKeyEvent::receiver().try_recv() {
-                    Ok(event) => {
-                        if event.state == global_hotkey::HotKeyState::Pressed {
-                            if let Some(id) = self.by_ghk.get(&event.id) {
-                                if !fired.contains(id) {
-                                    fired.push(*id);
-                                }
+                if let Ok(event) = global_hotkey::GlobalHotKeyEvent::receiver().try_recv() {
+                    if event.state == global_hotkey::HotKeyState::Pressed {
+                        if let Some(id) = self.by_ghk.get(&event.id) {
+                            if !fired.contains(id) {
+                                fired.push(*id);
                             }
                         }
                     }
-                    Err(_) => {
-                        if !fired.is_empty() {
-                            // Report the press now, not at the deadline.
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(5));
+                } else {
+                    if !fired.is_empty() {
+                        // Report the press now, not at the deadline.
+                        break;
                     }
+                    std::thread::sleep(Duration::from_millis(5));
                 }
             }
             Ok(fired)

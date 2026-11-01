@@ -289,7 +289,7 @@ impl ClipboardSwap {
                 None
             };
             let pre_state = transfer.unchanged_indicator();
-            transfer.write(&payloads.to_vec())?;
+            transfer.write(payloads)?;
             let post_state = transfer.unchanged_indicator();
             let temp_text = payloads
                 .iter()
