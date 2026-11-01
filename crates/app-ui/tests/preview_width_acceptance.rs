@@ -85,7 +85,7 @@ fn collect_text(shape: &egui::Shape, out: &mut Vec<String>) {
         egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
         egui::Shape::Vec(v) => {
             for s in v {
-                collect_text(s, out)
+                collect_text(s, out);
             }
         }
         _ => {}
@@ -96,7 +96,7 @@ fn collect_fills(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
         egui::Shape::Rect(r) => out.push(r.fill),
         egui::Shape::Vec(v) => {
             for s in v {
-                collect_fills(s, out)
+                collect_fills(s, out);
             }
         }
         _ => {}
@@ -111,7 +111,7 @@ fn settings_text_bounds(
         egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.galley.rect, clip)),
         egui::Shape::Vec(v) => {
             for s in v {
-                settings_text_bounds(s, clip, out)
+                settings_text_bounds(s, clip, out);
             }
         }
         _ => {}
@@ -192,7 +192,7 @@ impl Rig {
         {
             let r = Arc::clone(&requests);
             popup.ctx.set_request_repaint_callback(move |info| {
-                r.lock().expect("req").push(Request { delay: info.delay })
+                r.lock().expect("req").push(Request { delay: info.delay });
             });
         }
         Self {
