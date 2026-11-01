@@ -1,40 +1,40 @@
-#![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::restriction)]
+//! Private clipboard swap orchestration. Native calls cannot be preempted by
+//! the snapshot deadline; completed reads are rejected after the deadline.
 use clipmonger_platform::types::{Error, Result};
-use std::borrow::Cow;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChordAction {
+pub(crate) enum ChordAction {
     PressCtrl,
     ClickV,
     ReleaseCtrl,
 }
 
-pub trait ChordDriver {
+pub(crate) trait ChordDriver {
     fn init(&mut self) -> std::result::Result<(), String>;
     fn perform(&mut self, action: ChordAction) -> std::result::Result<(), String>;
 }
 
-pub fn run_chord<D: ChordDriver>(driver: &mut D) -> std::result::Result<(), String> {
-    driver.init().map_err(|e| e)?;
-    driver.perform(ChordAction::PressCtrl).map_err(|e| e)?;
+pub(crate) fn run_chord<D: ChordDriver>(driver: &mut D) -> std::result::Result<(), String> {
+    driver.init()?;
+    driver.perform(ChordAction::PressCtrl)?;
     let v_res = driver.perform(ChordAction::ClickV);
     let r_res = driver.perform(ChordAction::ReleaseCtrl);
     match (v_res, r_res) {
-        (Ok(_), Ok(_)) => Ok(()),
+        (Ok(()), Ok(())) => Ok(()),
         (Err(v), _) => Err(v),
-        (Ok(_), Err(r)) => Err(r),
+        (Ok(()), Err(r)) => Err(r),
     }
 }
 
 #[cfg(windows)]
-pub struct EnigoChordDriver {
+pub(crate) struct EnigoChordDriver {
     enigo: Option<enigo::Enigo>,
 }
 
 #[cfg(windows)]
 impl EnigoChordDriver {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { enigo: None }
     }
 }
@@ -48,7 +48,7 @@ impl ChordDriver for EnigoChordDriver {
     }
     fn perform(&mut self, action: ChordAction) -> std::result::Result<(), String> {
         use enigo::Keyboard;
-        let enigo = self.enigo.as_mut().unwrap();
+        let enigo = self.enigo.as_mut().ok_or("chord driver not initialized")?;
         match action {
             ChordAction::PressCtrl => enigo
                 .key(enigo::Key::Control, enigo::Direction::Press)
@@ -64,171 +64,148 @@ impl ChordDriver for EnigoChordDriver {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SnapshotKind {
+pub(crate) enum SnapshotKind {
     Available(Vec<(u32, Vec<u8>)>),
     VerifiedEmpty,
-    None,
+    Disabled,
 }
 
 #[derive(Debug)]
-pub struct BeginSuccess {
-    pub saved: SnapshotKind,
-    pub seq: Option<String>,
-    pub temp_text: Option<Vec<u8>>,
-    pub temp_has_text: bool,
+pub(crate) struct BeginSuccess {
+    pub(crate) saved: SnapshotKind,
+    pub(crate) seq: Option<String>,
+    pub(crate) temp_text: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
-pub struct BeginError {
-    pub primary: Error,
-    pub rollback: Option<Error>,
-    pub close: Option<Error>,
+pub(crate) struct BeginError {
+    pub(crate) primary: Error,
+    pub(crate) rollback: Option<Error>,
+    pub(crate) close: Option<Error>,
 }
 
-pub fn prepare_ops<'a>(
-    payloads: &'a [(String, Vec<u8>)],
-) -> Result<Vec<(u32, &'a str, Cow<'a, [u8]>)>> {
+impl BeginError {
+    // Only bounded status flags cross the diagnostic boundary, never content
+    // or platform error strings supplied by clipboard owners.
+    pub(crate) fn into_primary(self) -> Error {
+        if self.rollback.is_some() || self.close.is_some() {
+            eprintln!(
+                "clipboard publication cleanup: rollback_failed={} close_failed={}",
+                self.rollback.is_some(),
+                self.close.is_some()
+            );
+        }
+        self.primary
+    }
+}
+
+type NativeOps = Vec<(u32, Vec<u8>)>;
+
+fn prepare_ops(payloads: &[(String, Vec<u8>)]) -> Result<NativeOps> {
+    use crate::transfer::imp;
     if payloads.is_empty() {
         return Err(Error::Unsupported(
-            "clipboard restore needs stored payload bytes".to_string(),
+            "clipboard restore needs stored payload bytes".into(),
         ));
     }
-    let mut ops: Vec<(u32, &str, Cow<'a, [u8]>)> = Vec::with_capacity(payloads.len() + 2);
+    let mut ops = Vec::with_capacity(payloads.len() + 2);
     for (mime, bytes) in payloads {
-        let id = crate::transfer::imp::id_for_mime(mime)?;
-        if mime == "text/plain" || mime == "text/plain;charset=utf-8" {
-            std::str::from_utf8(bytes)
-                .map_err(|e| Error::Internal(format!("text payload is not UTF-8: {e}")))?;
-        } else if mime == "text/html" {
-            if crate::html::parse_cf_html(bytes).is_ok() {
-            } else {
-                std::str::from_utf8(bytes)
-                    .map_err(|e| Error::Internal(format!("html payload is not UTF-8: {e}")))?;
-            }
-        } else if mime == "text/uri-list" {
-            let text = std::str::from_utf8(bytes)
-                .map_err(|e| Error::Internal(format!("uri-list payload is not UTF-8: {e}")))?;
-            let paths = crate::uri::uri_list_to_paths(text);
-            if paths.is_empty() {
-                return Err(Error::Unsupported(
-                    "text/uri-list names no Windows file".to_string(),
-                ));
-            }
-        }
-        ops.push((id, mime.as_str(), Cow::Borrowed(bytes.as_slice())));
+        let id = imp::id_for_mime(mime)?;
+        ops.push((id, crate::transfer::encode_native(mime, bytes)?));
         if mime == "image/png" {
             if let Ok(dib) = crate::dib::png_to_dib(bytes) {
-                ops.push((crate::transfer::imp::CF_DIB, mime.as_str(), Cow::Owned(dib)));
+                ops.push((imp::CF_DIB, dib));
             }
         }
-        if mime == "text/uri-list" {
-            if !payloads
-                .iter()
-                .any(|(m, _)| m == crate::transfer::imp::DROP_EFFECT_MIME)
-            {
-                ops.push((
-                    crate::transfer::imp::register(crate::transfer::imp::DROP_EFFECT_FORMAT)?,
-                    crate::transfer::imp::DROP_EFFECT_MIME,
-                    Cow::Owned(crate::transfer::imp::DROPEFFECT_COPY.to_le_bytes().to_vec()),
-                ));
-            }
+        if mime == "text/uri-list" && !payloads.iter().any(|(m, _)| m == imp::DROP_EFFECT_MIME) {
+            ops.push((
+                imp::register(imp::DROP_EFFECT_FORMAT)?,
+                imp::DROPEFFECT_COPY.to_le_bytes().to_vec(),
+            ));
         }
     }
     Ok(ops)
 }
 
-pub trait ClipBackend {
+pub(crate) trait ClipBackend {
     fn open(&mut self) -> Result<()>;
     fn close(&mut self) -> Result<()>;
     fn empty(&mut self) -> Result<()>;
+    // Both publication and restoration receive native bytes, never MIME bytes.
     fn set(&mut self, id: u32, bytes: &[u8]) -> Result<()>;
-    fn get(&mut self, id: u32) -> Result<Vec<u8>>;
+    fn get(&mut self, id: u32, cap: u64) -> Result<Vec<u8>>;
+    fn text_available(&mut self) -> Result<bool>;
     fn enum_formats(&mut self) -> Result<Vec<u32>>;
     fn seq(&self) -> Option<String>;
     fn size(&self, id: u32) -> Option<u64>;
 }
 
 #[cfg(windows)]
-pub struct WinBackend {
-    owner: Option<crate::sys::ClipboardWindow>,
+pub(crate) struct WinBackend {
+    owner: crate::sys::ClipboardWindow,
 }
 
 #[cfg(windows)]
 impl WinBackend {
-    pub fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let owner = crate::sys::ClipboardWindow::new().ok_or_else(|| {
             Error::Unavailable(format!(
                 "clipboard open: no owner window: {}",
                 crate::sys::last_error()
             ))
         })?;
-        Ok(Self { owner: Some(owner) })
+        Ok(Self { owner })
     }
 }
 
 #[cfg(windows)]
 impl ClipBackend for WinBackend {
     fn open(&mut self) -> Result<()> {
-        let owner = self.owner.as_ref().unwrap();
-        let mut attempts = 5;
-        loop {
-            match clipboard_win::raw::open_for(owner.hwnd()) {
-                Ok(()) => break,
-                Err(e) => {
-                    attempts -= 1;
-                    if attempts == 0 {
-                        return Err(Error::Timeout(format!(
-                            "clipboard open timed out opening (shared lock): {e}"
-                        )));
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
+        for attempt in 0..5 {
+            match clipboard_win::raw::open_for(self.owner.hwnd()) {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt == 4 => {
+                    return Err(Error::Timeout(format!("clipboard open timed out: {e}")))
                 }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
         }
-        Ok(())
+        unreachable!("bounded open retry")
     }
     fn close(&mut self) -> Result<()> {
-        clipboard_win::raw::close()
-            .map_err(|e| Error::Io(format!("clipboard close failed: {e}")))?;
-        Ok(())
+        clipboard_win::raw::close().map_err(|e| crate::transfer::imp::clip_error("close", e))
     }
     fn empty(&mut self) -> Result<()> {
-        clipboard_win::raw::empty()
-            .map_err(|e| Error::Io(format!("clipboard empty failed: {e}")))?;
-        Ok(())
+        clipboard_win::raw::empty().map_err(|e| crate::transfer::imp::clip_error("empty", e))
     }
     fn set(&mut self, id: u32, bytes: &[u8]) -> Result<()> {
-        if id == crate::transfer::imp::CF_UNICODETEXT {
-            let text = std::str::from_utf8(bytes)
-                .map_err(|e| Error::Internal(format!("text not utf8: {e}")))?;
-            clipboard_win::raw::set_string_with(text, clipboard_win::options::NoClear)
-                .map_err(|e| Error::Io(format!("clipboard set failed: {e}")))?;
-            Ok(())
-        } else {
-            clipboard_win::raw::set_without_clear(id, bytes)
-                .map_err(|e| Error::Io(format!("clipboard set failed: {e}")))?;
-            Ok(())
-        }
+        clipboard_win::raw::set_without_clear(id, bytes)
+            .map_err(|e| crate::transfer::imp::clip_error("set", e))
     }
-    fn get(&mut self, id: u32) -> Result<Vec<u8>> {
-        if id == crate::transfer::imp::CF_UNICODETEXT {
-            let mut out = Vec::new();
-            clipboard_win::raw::get_string(&mut out)
-                .map_err(|e| Error::Io(format!("clipboard get failed: {e}")))?;
-            Ok(out)
-        } else {
-            let mut out = Vec::new();
-            clipboard_win::raw::get_vec(id, &mut out)
-                .map_err(|e| Error::Io(format!("clipboard get failed: {e}")))?;
-            Ok(out)
+    fn get(&mut self, id: u32, cap: u64) -> Result<Vec<u8>> {
+        let size = clipboard_win::raw::size(id)
+            .ok_or_else(|| Error::Io("clipboard allocation size unavailable".into()))?
+            .get();
+        check_size(size as u64, cap)?;
+        let mut bytes = vec![0; size];
+        let copied = clipboard_win::raw::get(id, &mut bytes)
+            .map_err(|e| crate::transfer::imp::clip_error("get", e))?;
+        if copied != size
+            || clipboard_win::raw::size(id).map(std::num::NonZeroUsize::get) != Some(size)
+        {
+            return Err(Error::Io("clipboard allocation changed during read".into()));
         }
+        Ok(bytes)
+    }
+    fn text_available(&mut self) -> Result<bool> {
+        // IsClipboardFormatAvailable is a typed availability query: FALSE
+        // means absent; GetClipboardData errors never stand in for absence.
+        Ok(clipboard_win::raw::is_format_avail(
+            crate::transfer::imp::CF_UNICODETEXT,
+        ))
     }
     fn enum_formats(&mut self) -> Result<Vec<u32>> {
-        let mut ids = Vec::new();
-        for id in clipboard_win::raw::EnumFormats::new() {
-            ids.push(id);
-        }
-        Ok(ids)
+        crate::sys::clipboard_formats_checked()
     }
     fn seq(&self) -> Option<String> {
         clipboard_win::raw::seq_num().map(|n| n.get().to_string())
@@ -238,56 +215,69 @@ impl ClipBackend for WinBackend {
     }
 }
 
-pub fn snapshot_opened<B: ClipBackend>(
+fn check_size(size: u64, cap: u64) -> Result<()> {
+    if size > cap {
+        return Err(Error::TooLarge("clipboard data exceeds cap".into()));
+    }
+    Ok(())
+}
+
+fn snapshot_opened<B: ClipBackend>(
     backend: &mut B,
     ids: &[u32],
     max_bytes: u64,
     budget: Duration,
-    started: std::time::Instant,
-) -> std::result::Result<SnapshotKind, Error> {
+) -> Result<SnapshotKind> {
+    let started = Instant::now();
     let formats = backend.enum_formats()?;
-    let mut relevant: Vec<u32> = Vec::new();
-    for id in formats {
-        if ids.contains(&id) {
-            relevant.push(id);
-        }
-    }
-    if relevant.is_empty() {
-        return Ok(SnapshotKind::VerifiedEmpty);
-    }
+    let empty = formats.is_empty();
     let mut saved = Vec::new();
-    for id in relevant {
+    for id in formats {
+        if !ids.contains(&id) {
+            continue;
+        }
+        let size = backend
+            .size(id)
+            .ok_or_else(|| Error::Io("clipboard snapshot size unavailable".into()))?;
+        check_size(size, max_bytes)?;
         if started.elapsed() > budget {
-            return Err(Error::TooLarge(
-                "clipboard snapshot over budget".to_string(),
-            ));
+            return Err(Error::TooLarge("clipboard snapshot over budget".into()));
         }
-        if let Some(sz) = backend.size(id) {
-            if sz > max_bytes {
-                return Err(Error::TooLarge(
-                    "clipboard snapshot over budget".to_string(),
-                ));
-            }
-        }
-        let bytes = backend
-            .get(id)
-            .map_err(|e| Error::Io(format!("snapshot read failed for format {id}: {e}")))?;
-        if bytes.len() as u64 > max_bytes {
-            return Err(Error::TooLarge(
-                "clipboard snapshot over budget".to_string(),
-            ));
+        let bytes = backend.get(id, max_bytes)?;
+        check_size(bytes.len() as u64, max_bytes)?;
+        if started.elapsed() > budget {
+            return Err(Error::TooLarge("clipboard snapshot over budget".into()));
         }
         saved.push((id, bytes));
     }
-    if saved.is_empty() {
-        return Err(Error::Io(
-            "snapshot read produced no bytes despite formats".to_string(),
-        ));
+    if started.elapsed() > budget {
+        return Err(Error::TooLarge("clipboard snapshot over budget".into()));
     }
-    Ok(SnapshotKind::Available(saved))
+    if empty {
+        Ok(SnapshotKind::VerifiedEmpty)
+    } else if saved.is_empty() {
+        Err(Error::Unsupported(
+            "clipboard has no recoverable formats".into(),
+        ))
+    } else {
+        Ok(SnapshotKind::Available(saved))
+    }
 }
 
-pub fn begin_transaction<B: ClipBackend>(
+fn restore_opened<B: ClipBackend>(backend: &mut B, saved: &SnapshotKind) -> Result<()> {
+    if matches!(saved, SnapshotKind::Disabled) {
+        return Ok(());
+    }
+    backend.empty()?;
+    if let SnapshotKind::Available(formats) = saved {
+        for (id, bytes) in formats {
+            backend.set(*id, bytes)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn begin_transaction<B: ClipBackend>(
     backend: &mut B,
     payloads: &[(String, Vec<u8>)],
     restore: bool,
@@ -295,955 +285,800 @@ pub fn begin_transaction<B: ClipBackend>(
     max_bytes: u64,
     budget: Duration,
 ) -> std::result::Result<BeginSuccess, BeginError> {
-    let ops = match prepare_ops(payloads) {
-        Ok(o) => o,
-        Err(e) => {
-            return Err(BeginError {
-                primary: e,
-                rollback: None,
-                close: None,
-            })
-        }
+    let before_open_error = |primary| BeginError {
+        primary,
+        rollback: None,
+        close: None,
     };
+    let ops = prepare_ops(payloads).map_err(before_open_error)?;
     let temp_text = payloads
         .iter()
-        .find(|(m, _)| m == "text/plain")
-        .map(|(_, b)| b.clone());
-    let temp_has_text = temp_text.is_some();
-    if let Err(e) = backend.open() {
-        return Err(BeginError {
-            primary: e,
-            rollback: None,
-            close: None,
-        });
-    }
-    let started = std::time::Instant::now();
-    let snapshot_kind = if restore {
-        match snapshot_opened(backend, snapshot_ids, max_bytes, budget, started) {
-            Ok(k) => k,
-            Err(_e) => SnapshotKind::None,
+        .rev()
+        .find(|(mime, _)| mime == "text/plain" || mime == "text/plain;charset=utf-8")
+        .map(|(_, bytes)| bytes.clone());
+    backend.open().map_err(before_open_error)?;
+    let saved = if restore {
+        match snapshot_opened(backend, snapshot_ids, max_bytes, budget) {
+            Ok(saved) => saved,
+            Err(primary) => {
+                return Err(BeginError {
+                    primary,
+                    rollback: None,
+                    close: backend.close().err(),
+                })
+            }
         }
     } else {
-        SnapshotKind::None
+        SnapshotKind::Disabled
     };
-    // If snapshot_opened returned error, we treat as None but remember we had failure? For rollback we need to know it was unavailable, so we keep None.
-    // However we lost the error; we should capture it as rollback unavailable distinction.
-    // For now, treat snapshot error as None meaning no rollback.
-    let publish_result: Result<()> = (|| {
+    let publish = (|| {
         backend.empty()?;
-        for (id, _mime, bytes) in &ops {
+        for (id, bytes) in &ops {
             backend.set(*id, bytes)?;
         }
         Ok(())
     })();
-
-    if let Err(primary) = publish_result {
-        let mut rollback_err = None;
-        if restore {
-            match &snapshot_kind {
-                SnapshotKind::Available(saved) => {
-                    let rb: Result<()> = (|| {
-                        backend.empty()?;
-                        for (id, b) in saved {
-                            backend.set(*id, b)?;
-                        }
-                        Ok(())
-                    })();
-                    if let Err(e) = rb {
-                        rollback_err = Some(e);
-                    }
-                }
-                SnapshotKind::VerifiedEmpty => {
-                    let rb = backend.empty();
-                    if let Err(e) = rb {
-                        rollback_err = Some(e);
-                    }
-                }
-                SnapshotKind::None => {}
-            }
-        }
-        let close_err = backend.close().err();
+    if let Err(primary) = publish {
+        let rollback = if restore {
+            restore_opened(backend, &saved).err()
+        } else {
+            None
+        };
         return Err(BeginError {
             primary,
-            rollback: rollback_err,
-            close: close_err,
+            rollback,
+            close: backend.close().err(),
         });
     }
-
-    let seq = backend.seq().filter(|s| s != "0");
+    // This in-open observation is deliberately never promoted to a later
+    // value: a legitimate close-side change can conservatively refuse finish.
+    let seq = backend
+        .seq()
+        .filter(|s| s.parse::<u32>().is_ok_and(|n| n != 0));
     if seq.is_none() {
-        let close_err = backend.close().err();
+        let primary = Error::Io("clipboard sequence unavailable after publish".into());
+        let rollback = if restore {
+            restore_opened(backend, &saved).err()
+        } else {
+            None
+        };
         return Err(BeginError {
-            primary: Error::Io("clipboard sequence unavailable after publish".to_string()),
-            rollback: None,
-            close: close_err,
+            primary,
+            rollback,
+            close: backend.close().err(),
         });
     }
-    let seq_val = seq.clone().unwrap();
-    if seq_val.parse::<u32>().map(|v| v == 0).unwrap_or(true) {
-        let close_err = backend.close().err();
-        return Err(BeginError {
-            primary: Error::Io("clipboard sequence zero after publish".to_string()),
-            rollback: None,
-            close: close_err,
-        });
-    }
-    match backend.close() {
-        Ok(_) => Ok(BeginSuccess {
-            saved: snapshot_kind,
-            seq,
-            temp_text,
-            temp_has_text,
-        }),
-        Err(e) => Err(BeginError {
-            primary: e,
-            rollback: None,
-            close: None,
-        }),
-    }
+    backend.close().map_err(before_open_error)?;
+    Ok(BeginSuccess {
+        saved,
+        seq,
+        temp_text,
+    })
 }
 
-pub fn finish_transaction<B: ClipBackend>(
+fn decode_text(bytes: &[u8]) -> Result<String> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(Error::Io("clipboard text has an odd byte count".into()));
+    }
+    let units = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .take_while(|unit| *unit != 0)
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).map_err(|_| Error::Io("clipboard text is not valid UTF-16".into()))
+}
+
+pub(crate) fn finish_transaction<B: ClipBackend>(
     backend: &mut B,
     saved: &SnapshotKind,
-    expected_seq: &Option<String>,
-    temp_text: &Option<Vec<u8>>,
-    temp_has_text: bool,
+    expected_seq: Option<&str>,
+    temp_text: Option<&[u8]>,
     restore: bool,
-) -> std::result::Result<bool, String> {
-    if !restore {
-        return Ok(false);
+) -> bool {
+    const GUARD_CAP: u64 = 4 * 1024 * 1024;
+    if !restore || matches!(saved, SnapshotKind::Disabled) {
+        return false;
     }
-    let expected = match expected_seq {
-        Some(s) if s != "0" => s.clone(),
-        _ => return Ok(false),
+    let Some(expected) = expected_seq.filter(|s| s.parse::<u32>().is_ok_and(|n| n != 0)) else {
+        return false;
     };
-    if expected.parse::<u32>().map(|v| v == 0).unwrap_or(true) {
-        return Ok(false);
-    }
     if backend.open().is_err() {
-        return Ok(false);
+        return false;
     }
-    let current = backend.seq();
-    let current_str = match current {
-        Some(c) => c,
-        None => {
-            let _ = backend.close();
+    let result: Result<bool> = (|| {
+        if backend.seq().as_deref() != Some(expected) {
             return Ok(false);
         }
-    };
-    if current_str == "0" || current_str != expected {
-        let _ = backend.close();
-        return Ok(false);
-    }
-    let content_ok = if temp_has_text {
-        match &temp_text {
-            Some(expected_bytes) => {
-                let read_res = backend.get(crate::transfer::imp::CF_UNICODETEXT);
-                // Try unicode first; fallback to reading via backend get
-                match read_res {
-                    Ok(cur) => &cur == expected_bytes,
-                    Err(_) => false,
-                }
+        let available = backend.text_available()?;
+        let content_ok = match temp_text {
+            Some(text) if available => {
+                decode_text(&backend.get(crate::transfer::imp::CF_UNICODETEXT, GUARD_CAP)?)?
+                    .as_bytes()
+                    == text
             }
-            None => false,
+            None => !available,
+            Some(_) => false,
+        };
+        if !content_ok || backend.seq().as_deref() != Some(expected) {
+            return Ok(false);
         }
-    } else {
-        match backend.get(crate::transfer::imp::CF_UNICODETEXT) {
-            Ok(_) => false,
-            Err(e) => {
-                let msg = e.to_string().to_ascii_lowercase();
-                msg.contains("unavailable") || msg.contains("not available")
-            }
-        }
-    };
-    if !content_ok {
-        let _ = backend.close();
-        return Ok(false);
-    }
-    let current2 = backend.seq();
-    if current2.as_deref() != Some(expected.as_str()) {
-        let _ = backend.close();
-        return Ok(false);
-    }
-    let restore_res: Result<()> = (|| {
-        backend.empty()?;
-        match saved {
-            SnapshotKind::Available(v) => {
-                for (id, b) in v {
-                    backend.set(*id, b)?;
-                }
-            }
-            SnapshotKind::VerifiedEmpty => {
-                // already empty
-            }
-            SnapshotKind::None => {}
-        }
-        Ok(())
+        restore_opened(backend, saved)?;
+        Ok(true)
     })();
-    let close_res = backend.close();
-    if restore_res.is_err() || close_res.is_err() {
-        return Ok(false);
-    }
-    Ok(true)
+    let close = backend.close();
+    result.unwrap_or(false) && close.is_ok()
 }
 
 #[cfg(test)]
-pub mod fake {
+mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::transfer::imp::{self, CF_UNICODETEXT};
+    use std::cell::Cell;
 
-    #[derive(Debug, Clone)]
-    pub struct FakeBackend {
-        pub store: HashMap<u32, Vec<u8>>,
-        pub seq: u32,
-        pub locked: bool,
-        pub events: Vec<String>,
-        pub fail_open: bool,
-        pub fail_empty: bool,
-        pub fail_set_at: Option<usize>,
-        pub fail_get: bool,
-        pub fail_close: bool,
-        pub fail_snapshot_read: bool,
-        pub set_counter: usize,
-        pub foreign_seq_bump: Option<u32>,
+    // Independent fault toggles belong only to this test adapter.
+    #[allow(clippy::struct_excessive_bools)]
+    #[derive(Default)]
+    struct Backend {
+        data: NativeOps,
+        events: Vec<&'static str>,
+        locked: bool,
+        sequence: Cell<Option<u32>>,
+        fail_open: bool,
+        fail_enum: bool,
+        fail_get: bool,
+        fail_availability: bool,
+        unknown_size: bool,
+        oversized_size: bool,
+        oversized_read: bool,
+        slow_read: bool,
+        fail_sets: Vec<usize>,
+        sets: usize,
+        fail_empty: bool,
+        fail_close: bool,
+        close_bump: bool,
+        read_bump: bool,
+        attempt_writer_on_read: bool,
+        writer_blocked: bool,
+        writer_succeeded: bool,
+        caps: Vec<u64>,
     }
 
-    impl FakeBackend {
-        pub fn new() -> Self {
+    impl Backend {
+        fn original() -> Self {
             Self {
-                store: HashMap::new(),
-                seq: 1,
-                locked: false,
-                events: Vec::new(),
-                fail_open: false,
-                fail_empty: false,
-                fail_set_at: None,
-                fail_get: false,
-                fail_close: false,
-                fail_snapshot_read: false,
-                set_counter: 0,
-                foreign_seq_bump: None,
+                data: vec![(CF_UNICODETEXT, native("old"))],
+                sequence: Cell::new(Some(1)),
+                ..Self::default()
             }
         }
-        pub fn with_content(mut self, pairs: Vec<(u32, Vec<u8>)>) -> Self {
-            for (id, b) in pairs {
-                self.store.insert(id, b);
-            }
-            self
-        }
-        pub fn foreign_write(&mut self, pairs: Vec<(u32, Vec<u8>)>) {
+        fn foreign(&mut self, append: bool) {
             if self.locked {
-                self.events.push("foreign_write_blocked_locked".to_string());
+                self.writer_blocked = true;
                 return;
             }
-            self.store.clear();
-            for (id, b) in pairs {
-                self.store.insert(id, b);
+            self.writer_succeeded = true;
+            self.events.push("foreign_write");
+            if append {
+                self.data.push((900, b"foreign append".to_vec()));
+            } else {
+                self.data = vec![(CF_UNICODETEXT, native("new"))];
             }
-            self.seq = self.seq.wrapping_add(1);
-            if self.seq == 0 {
-                self.seq = 1;
-            }
-            self.events.push(format!("foreign_write seq={}", self.seq));
+            self.sequence
+                .set(self.sequence.get().map(|s| if s == 0 { 0 } else { s + 1 }));
+        }
+        fn bump(&self) {
+            self.sequence
+                .set(self.sequence.get().map(|s| if s == 0 { 0 } else { s + 1 }));
         }
     }
-
-    impl ClipBackend for FakeBackend {
+    impl ClipBackend for Backend {
         fn open(&mut self) -> Result<()> {
-            self.events.push("open".to_string());
-            if self.fail_open {
-                return Err(Error::Timeout("fake open fail".to_string()));
-            }
-            if self.locked {
-                return Err(Error::Timeout("already locked".to_string()));
+            self.events.push("open");
+            if self.fail_open || self.locked {
+                return Err(Error::Io("open".into()));
             }
             self.locked = true;
             Ok(())
         }
         fn close(&mut self) -> Result<()> {
-            self.events.push("close".to_string());
-            if !self.locked {
-                return Err(Error::Io("not locked".to_string()));
+            self.events.push("close");
+            assert!(self.locked);
+            self.locked = false;
+            // A writer waiting during the guard gets its opportunity if the
+            // implementation releases before the destructive restore.
+            if self.attempt_writer_on_read && self.events.iter().rev().nth(1) == Some(&"get") {
+                self.foreign(true);
+            }
+            if self.close_bump {
+                self.bump();
             }
             if self.fail_close {
-                self.locked = false;
-                return Err(Error::Io("fake close fail".to_string()));
+                Err(Error::Io("close".into()))
+            } else {
+                Ok(())
             }
-            self.locked = false;
-            if let Some(bump) = self.foreign_seq_bump.take() {
-                self.seq = self.seq.wrapping_add(bump);
-                self.events
-                    .push(format!("seq_bump_on_close seq={}", self.seq));
-            }
-            Ok(())
         }
         fn empty(&mut self) -> Result<()> {
-            self.events.push("empty".to_string());
-            if !self.locked {
-                return Err(Error::Io("not locked empty".to_string()));
-            }
+            assert!(self.locked);
+            self.events.push("empty");
             if self.fail_empty {
-                return Err(Error::Io("fake empty fail".to_string()));
+                return Err(Error::Io("empty".into()));
             }
-            self.store.clear();
-            self.seq = self.seq.wrapping_add(1);
-            if self.seq == 0 {
-                self.seq = 1;
-            }
+            self.data.clear();
+            self.bump();
             Ok(())
         }
         fn set(&mut self, id: u32, bytes: &[u8]) -> Result<()> {
-            self.events
-                .push(format!("set id={} len={}", id, bytes.len()));
-            if !self.locked {
-                return Err(Error::Io("not locked set".to_string()));
+            assert!(self.locked);
+            self.events.push("set");
+            self.sets += 1;
+            if self.fail_sets.contains(&self.sets) {
+                return Err(Error::Io(format!("set {}", self.sets)));
             }
-            let idx = self.set_counter;
-            self.set_counter += 1;
-            if let Some(fail_at) = self.fail_set_at {
-                if idx == fail_at {
-                    return Err(Error::Io(format!("fake set fail at {}", idx)));
-                }
+            if let Some((_, value)) = self.data.iter_mut().find(|(key, _)| *key == id) {
+                *value = bytes.to_vec();
+            } else {
+                self.data.push((id, bytes.to_vec()));
             }
-            self.store.insert(id, bytes.to_vec());
-            self.seq = self.seq.wrapping_add(1);
-            if self.seq == 0 {
-                self.seq = 1;
-            }
+            self.bump();
             Ok(())
         }
-        fn get(&mut self, id: u32) -> Result<Vec<u8>> {
-            self.events.push(format!("get id={}", id));
-            if self.fail_get {
-                return Err(Error::Io("fake get fail".to_string()));
+        fn get(&mut self, id: u32, cap: u64) -> Result<Vec<u8>> {
+            assert!(self.locked);
+            self.events.push("get");
+            self.caps.push(cap);
+            if self.attempt_writer_on_read {
+                self.foreign(true);
             }
-            if let Some(b) = self.store.get(&id) {
-                Ok(b.clone())
+            if self.read_bump {
+                self.bump();
+            }
+            if self.fail_get {
+                return Err(Error::Io("read: localized platform failure".into()));
+            }
+            if self.slow_read {
+                std::thread::sleep(Duration::from_millis(3));
+            }
+            if self.oversized_read {
+                return Ok(vec![0; 65]);
+            }
+            let bytes = self
+                .data
+                .iter()
+                .find(|(key, _)| *key == id)
+                .ok_or_else(|| Error::Io("missing data despite read request".into()))?
+                .1
+                .clone();
+            check_size(bytes.len() as u64, cap)?;
+            Ok(bytes)
+        }
+        fn text_available(&mut self) -> Result<bool> {
+            self.events.push("available");
+            if self.fail_availability {
+                Err(Error::Io("availability".into()))
             } else {
-                Err(Error::Unavailable("not available".to_string()))
+                Ok(self.data.iter().any(|(id, _)| *id == CF_UNICODETEXT))
             }
         }
         fn enum_formats(&mut self) -> Result<Vec<u32>> {
-            self.events.push("enum".to_string());
-            if self.fail_snapshot_read {
-                return Err(Error::Io("fake enum fail".to_string()));
+            self.events.push("enum");
+            if self.fail_enum {
+                Err(Error::Io("enumeration".into()))
+            } else {
+                Ok(self.data.iter().map(|(id, _)| *id).collect())
             }
-            Ok(self.store.keys().cloned().collect())
         }
         fn seq(&self) -> Option<String> {
-            Some(self.seq.to_string())
+            self.sequence.get().map(|s| s.to_string())
         }
         fn size(&self, id: u32) -> Option<u64> {
-            self.store.get(&id).map(|v| v.len() as u64)
-        }
-    }
-
-    pub struct FakeChord {
-        pub events: Vec<String>,
-        pub fail_init: bool,
-        pub fail_press: bool,
-        pub fail_click: bool,
-        pub fail_release: bool,
-    }
-
-    impl FakeChord {
-        pub fn new() -> Self {
-            Self {
-                events: Vec::new(),
-                fail_init: false,
-                fail_press: false,
-                fail_click: false,
-                fail_release: false,
+            if self.unknown_size {
+                None
+            } else if self.oversized_size {
+                Some(u64::MAX)
+            } else {
+                self.data
+                    .iter()
+                    .find(|(key, _)| *key == id)
+                    .map(|(_, bytes)| bytes.len() as u64)
             }
         }
     }
+    fn native(text: &str) -> Vec<u8> {
+        crate::transfer::encode_native("text/plain", text.as_bytes()).unwrap()
+    }
+    fn payload() -> Vec<(String, Vec<u8>)> {
+        vec![("text/plain".into(), b"new".to_vec())]
+    }
+    fn begin(backend: &mut Backend) -> std::result::Result<BeginSuccess, BeginError> {
+        begin_transaction(
+            backend,
+            &payload(),
+            true,
+            &[CF_UNICODETEXT],
+            64,
+            Duration::from_secs(1),
+        )
+    }
+    fn finish(backend: &mut Backend, swap: &BeginSuccess) -> bool {
+        finish_transaction(
+            backend,
+            &swap.saved,
+            swap.seq.as_deref(),
+            swap.temp_text.as_deref(),
+            true,
+        )
+    }
 
-    impl ChordDriver for FakeChord {
+    struct Chord {
+        events: Vec<ChordAction>,
+        fail: Option<ChordAction>,
+        init_error: bool,
+        release_error: bool,
+    }
+    impl ChordDriver for Chord {
         fn init(&mut self) -> std::result::Result<(), String> {
-            self.events.push("init".to_string());
-            if self.fail_init {
-                return Err("init fail".to_string());
+            if self.init_error {
+                Err("init".into())
+            } else {
+                Ok(())
             }
-            Ok(())
         }
         fn perform(&mut self, action: ChordAction) -> std::result::Result<(), String> {
-            match action {
-                ChordAction::PressCtrl => {
-                    self.events.push("press".to_string());
-                    if self.fail_press {
-                        Err("press fail".to_string())
-                    } else {
-                        Ok(())
-                    }
-                }
-                ChordAction::ClickV => {
-                    self.events.push("click".to_string());
-                    if self.fail_click {
-                        Err("click fail".to_string())
-                    } else {
-                        Ok(())
-                    }
-                }
-                ChordAction::ReleaseCtrl => {
-                    self.events.push("release".to_string());
-                    if self.fail_release {
-                        Err("release fail".to_string())
-                    } else {
-                        Ok(())
-                    }
-                }
+            self.events.push(action.clone());
+            if self.fail.as_ref() == Some(&action)
+                || (self.release_error && action == ChordAction::ReleaseCtrl)
+            {
+                Err(format!("{action:?}"))
+            } else {
+                Ok(())
             }
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::fake::{FakeBackend, FakeChord};
-    use super::*;
-
-    const CF_UNICODE: u32 = 13;
-    const CF_DIB: u32 = 8;
-    const CF_HDROP: u32 = 15;
-    const HTML_ID: u32 = 100;
-    const PNG_ID: u32 = 101;
-    const DROP_ID: u32 = 102;
-
-    fn ids() -> Vec<u32> {
-        vec![CF_UNICODE, CF_DIB, CF_HDROP, HTML_ID, PNG_ID, DROP_ID]
-    }
-
     #[test]
-    fn c1_chord_success_order() {
-        let mut f = FakeChord::new();
-        assert!(run_chord(&mut f).is_ok());
-        assert_eq!(f.events, vec!["init", "press", "click", "release"]);
+    fn c1_chord_release_order_and_primary_error() {
+        for fail in [
+            None,
+            Some(ChordAction::PressCtrl),
+            Some(ChordAction::ClickV),
+            Some(ChordAction::ReleaseCtrl),
+        ] {
+            let mut chord = Chord {
+                events: vec![],
+                fail: fail.clone(),
+                init_error: false,
+                release_error: true,
+            };
+            let error = run_chord(&mut chord).unwrap_err();
+            if fail == Some(ChordAction::PressCtrl) {
+                assert_eq!(chord.events, [ChordAction::PressCtrl]);
+                assert_eq!(error, "PressCtrl");
+            } else {
+                assert_eq!(
+                    chord.events,
+                    [
+                        ChordAction::PressCtrl,
+                        ChordAction::ClickV,
+                        ChordAction::ReleaseCtrl
+                    ]
+                );
+                assert_eq!(
+                    error,
+                    if fail == Some(ChordAction::ClickV) {
+                        "ClickV"
+                    } else {
+                        "ReleaseCtrl"
+                    }
+                );
+            }
+        }
+        let mut chord = Chord {
+            events: vec![],
+            fail: None,
+            init_error: false,
+            release_error: false,
+        };
+        assert!(run_chord(&mut chord).is_ok());
+        chord.events.clear();
+        chord.init_error = true;
+        assert_eq!(run_chord(&mut chord).unwrap_err(), "init");
+        assert_eq!(chord.events, []);
     }
-
     #[test]
-    fn c1_press_fail_no_v_no_release() {
-        let mut f = FakeChord::new();
-        f.fail_press = true;
-        let r = run_chord(&mut f);
-        assert!(r.is_err());
-        assert_eq!(f.events, vec!["init", "press"]);
+    fn c3_first_and_later_publication_errors_restore_before_only_close() {
+        for failure in [1, 2] {
+            let mut backend = Backend::original();
+            let original = backend.data.clone();
+            backend.fail_sets = vec![failure];
+            let payloads = vec![
+                ("text/plain".into(), b"new".to_vec()),
+                ("x-os/extra".into(), vec![1]),
+            ];
+            let error = begin_transaction(
+                &mut backend,
+                &payloads,
+                true,
+                &[CF_UNICODETEXT],
+                64,
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+            assert_eq!(error.primary.to_string(), format!("io: set {failure}"));
+            assert!(error.rollback.is_none());
+            assert!(error.close.is_none());
+            assert_eq!(backend.data, original);
+            assert_eq!(backend.events.iter().filter(|e| **e == "open").count(), 1);
+            assert_eq!(backend.events.iter().filter(|e| **e == "close").count(), 1);
+            assert_eq!(backend.events.last(), Some(&"close"));
+        }
     }
-
     #[test]
-    fn c1_v_fail_still_release_and_v_wins() {
-        let mut f = FakeChord::new();
-        f.fail_click = true;
-        let r = run_chord(&mut f);
-        assert_eq!(r.unwrap_err(), "click fail");
-        assert_eq!(f.events, vec!["init", "press", "click", "release"]);
-        let mut f2 = FakeChord::new();
-        f2.fail_click = true;
-        f2.fail_release = true;
-        let r2 = run_chord(&mut f2);
-        assert_eq!(r2.unwrap_err(), "click fail");
-        assert_eq!(f2.events, vec!["init", "press", "click", "release"]);
+    fn c4_snapshot_uncertainty_never_empties() {
+        for fault in 0..8 {
+            let mut backend = Backend::original();
+            match fault {
+                0 => backend.fail_enum = true,
+                1 => backend.fail_get = true,
+                2 => backend.unknown_size = true,
+                3 => backend.oversized_size = true,
+                4 => backend.oversized_read = true,
+                5 => backend.slow_read = true,
+                6 => backend.data = vec![(999, vec![1])],
+                7 => backend.fail_open = true,
+                _ => unreachable!(),
+            }
+            let original = backend.data.clone();
+            let budget = if fault == 5 {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_secs(1)
+            };
+            assert!(begin_transaction(
+                &mut backend,
+                &payload(),
+                true,
+                &[CF_UNICODETEXT],
+                64,
+                budget
+            )
+            .is_err());
+            assert_eq!(backend.data, original);
+            assert!(!backend.events.contains(&"empty"));
+        }
     }
-
     #[test]
-    fn c1_release_only_fail_returned() {
-        let mut f = FakeChord::new();
-        f.fail_release = true;
-        let r = run_chord(&mut f);
-        assert_eq!(r.unwrap_err(), "release fail");
-        assert_eq!(f.events, vec!["init", "press", "click", "release"]);
-    }
-
-    #[test]
-    fn c1_init_fail_no_press() {
-        let mut f = FakeChord::new();
-        f.fail_init = true;
-        let r = run_chord(&mut f);
-        assert!(r.is_err());
-        assert_eq!(f.events, vec!["init"]);
-    }
-
-    fn payload_text(s: &str) -> Vec<(String, Vec<u8>)> {
-        vec![("text/plain".to_string(), s.as_bytes().to_vec())]
-    }
-
-    #[test]
-    fn c2_local_finalization_success_and_error_single_finish() {
-        // Mock a simple begin+chord+finish counting: we test via direct orchestrator
-        // For this, we test that clipboard_restore logic would call finish exactly once.
-        // We simulate via a flag: backend's close count etc.
-        // Here we test the underlying principle: run_chord success path preserves dwell distinction.
-        // Actual local finalization is tested via integration of begin+chord+finish with fake backend.
-        let mut backend = FakeBackend::new().with_content(vec![(CF_UNICODE, b"old".to_vec())]);
-        let ids = ids();
-        let payload = payload_text("new");
-        let res = begin_transaction(
+    fn c4_validation_and_disabled_restore_and_verified_empty() {
+        for payloads in [
+            vec![],
+            vec![("text/plain".into(), vec![255])],
+            vec![("text/html".into(), vec![255])],
+            vec![("text/uri-list".into(), b"https://example.com".to_vec())],
+        ] {
+            let mut backend = Backend::original();
+            assert!(
+                begin_transaction(&mut backend, &payloads, true, &[], 64, Duration::ZERO).is_err()
+            );
+            assert_eq!(backend.events, [] as [&str; 0]);
+        }
+        let mut backend = Backend::original();
+        backend.fail_enum = true;
+        backend.fail_sets = vec![1];
+        assert!(
+            begin_transaction(&mut backend, &payload(), false, &[], 0, Duration::ZERO).is_err()
+        );
+        assert!(!backend.events.contains(&"enum"));
+        assert_eq!(backend.events.iter().filter(|e| **e == "empty").count(), 1);
+        let mut backend = Backend::original();
+        backend.data.clear();
+        let swap = begin(&mut backend).unwrap();
+        assert_eq!(swap.saved, SnapshotKind::VerifiedEmpty);
+        assert!(finish(&mut backend, &swap));
+        assert_eq!(backend.data, []);
+        backend.events.clear();
+        assert!(!finish_transaction(
             &mut backend,
-            &payload,
-            true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
-        );
-        assert!(res.is_ok());
-        let succ = res.unwrap();
-        assert!(succ.seq.is_some());
-        // Simulate finish success: dwell should be configured only on success
-        // We test zero vs configured by checking that finish is called with correct dwell
-        // Here we just verify saved was captured
-        assert!(matches!(succ.saved, SnapshotKind::Available(_)));
+            &SnapshotKind::Disabled,
+            swap.seq.as_deref(),
+            swap.temp_text.as_deref(),
+            true
+        ));
+        assert_eq!(backend.events, [] as [&str; 0]);
     }
-
     #[test]
-    fn c3_begin_first_set_fail_rollback_before_close() {
-        let mut backend = FakeBackend::new().with_content(vec![
-            (CF_UNICODE, b"orig".to_vec()),
-            (PNG_ID, b"pngorig".to_vec()),
-        ]);
-        backend.fail_set_at = Some(0); // first set fails after empty
-        let ids = ids();
-        let payload = payload_text("new");
-        let res = begin_transaction(
-            &mut backend,
-            &payload,
-            true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
-        );
-        assert!(res.is_err());
-        let err = res.unwrap_err();
-        assert!(err.primary.to_string().contains("fake set fail"));
-        // Verify rollback happened before close: store should be restored to orig
-        assert_eq!(backend.store.get(&CF_UNICODE).unwrap(), b"orig");
-        // Events: open, enum, empty, set(fail), empty(rollback), set(restored), close
-        assert!(backend.events.contains(&"open".to_string()));
-        assert!(backend.events.contains(&"close".to_string()));
-        // Verify empty happened twice (original publish empty, then rollback empty)
-        let empty_count = backend.events.iter().filter(|e| *e == "empty").count();
-        assert_eq!(
-            empty_count, 2,
-            "rollback must happen before close, need second empty"
-        );
-        // No chord would have run; we only test transaction
-        assert!(backend.locked == false);
-        // Rollback status should be None (success)
-        assert!(err.rollback.is_none());
-    }
-
-    #[test]
-    fn c3_begin_later_set_fail_rollback_before_close() {
-        // Need payload with 2 formats so second set fails
-        let mut backend = FakeBackend::new().with_content(vec![(CF_UNICODE, b"orig".to_vec())]);
-        backend.fail_set_at = Some(1); // second set fails
-        let ids = ids();
-        let payload = vec![
-            ("text/plain".to_string(), b"new".to_vec()),
-            ("x-os/Custom".to_string(), b"custom".to_vec()),
-        ];
-        // Need to register Custom id for test: we use HTML_ID as standin for custom
-        // But prepare_ops will map x-os/Custom to register id; fake will treat any id as store key, so we need to account:
-        // Actually our fake's set will fail at index 1, which corresponds to second op (custom)
-        let res = begin_transaction(
-            &mut backend,
-            &payload,
-            true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
-        );
-        assert!(res.is_err());
-        assert_eq!(backend.store.get(&CF_UNICODE).unwrap(), b"orig");
-        let empty_count = backend.events.iter().filter(|e| *e == "empty").count();
-        assert_eq!(empty_count, 2);
-    }
-
-    #[test]
-    fn c4_validation_fail_no_empty() {
-        let mut backend = FakeBackend::new();
-        // Invalid UTF-8 for text/plain should fail before open
-        let payload = vec![("text/plain".to_string(), vec![0xff, 0xfe])];
-        let ids = ids();
-        let res = begin_transaction(
-            &mut backend,
-            &payload,
-            true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
-        );
-        assert!(res.is_err());
-        assert!(!backend.events.contains(&"empty".to_string()));
-        assert!(!backend.events.contains(&"open".to_string()));
-    }
-
-    #[test]
-    fn c4_open_fail_no_empty() {
-        let mut backend = FakeBackend::new();
-        backend.fail_open = true;
-        let payload = payload_text("hi");
-        let ids = ids();
-        let res = begin_transaction(
-            &mut backend,
-            &payload,
-            true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
-        );
-        assert!(res.is_err());
-        assert!(!backend.events.contains(&"empty".to_string()));
-    }
-
-    #[test]
-    fn c4_snapshot_unavailable_not_empty_mask() {
-        let mut backend = FakeBackend::new().with_content(vec![(CF_UNICODE, b"orig".to_vec())]);
-        backend.fail_snapshot_read = true;
-        // Snapshot failure should not be treated as verified empty; but publish still happens
-        // If publish succeeds, we still get swap but with None saved (unavailable)
-        let payload = payload_text("new");
-        let ids = ids();
-        let res = begin_transaction(
-            &mut backend,
-            &payload,
-            true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
-        );
-        assert!(res.is_ok());
-        assert!(matches!(res.unwrap().saved, SnapshotKind::None));
-    }
-
-    #[test]
-    fn c4_restore_false_no_snapshot_no_rollback() {
-        let mut backend = FakeBackend::new().with_content(vec![(CF_UNICODE, b"orig".to_vec())]);
-        backend.fail_set_at = Some(0);
-        let payload = payload_text("new");
-        let ids = ids();
-        let res = begin_transaction(
-            &mut backend,
-            &payload,
-            false,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
-        );
-        assert!(res.is_err());
-        // With restore false, rollback should not happen: store should be empty (partial) or cleared?
-        // It should not attempt second empty+restore
-        let empty_count = backend.events.iter().filter(|e| *e == "empty").count();
-        assert_eq!(empty_count, 1, "restore false must not rollback");
-        assert!(backend.store.is_empty());
-    }
-
-    #[test]
-    fn c4_close_fail_no_active_swap() {
-        let mut backend = FakeBackend::new();
+    fn c4_primary_rollback_close_fail_independently() {
+        for rollback_fail in [false, true] {
+            for close_fail in [false, true] {
+                let mut backend = Backend::original();
+                backend.fail_sets = if rollback_fail { vec![1, 2] } else { vec![1] };
+                backend.fail_close = close_fail;
+                let error = begin(&mut backend).unwrap_err();
+                assert_eq!(error.rollback.is_some(), rollback_fail);
+                assert_eq!(error.close.is_some(), close_fail);
+                assert_eq!(error.into_primary().to_string(), "io: set 1");
+                assert_eq!(backend.events.last(), Some(&"close"));
+            }
+        }
+        let mut backend = Backend::original();
         backend.fail_close = true;
-        let payload = payload_text("hi");
-        let ids = ids();
-        let res = begin_transaction(
-            &mut backend,
-            &payload,
-            true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
+        assert_eq!(
+            begin(&mut backend).unwrap_err().into_primary().to_string(),
+            "io: close"
         );
-        assert!(res.is_err());
-        assert!(res.unwrap_err().primary.to_string().contains("close"));
+        assert_eq!(backend.events.iter().filter(|e| **e == "empty").count(), 1);
+        let mut backend = Backend::original();
+        backend.fail_empty = true;
+        let error = begin(&mut backend).unwrap_err();
+        assert!(error.rollback.is_some());
     }
-
     #[test]
-    fn c5_foreign_before_open_is_saved_state() {
-        let mut backend = FakeBackend::new();
-        // Foreign write before open should be captured as saved
-        backend.foreign_write(vec![(CF_UNICODE, b"foreign".to_vec())]);
-        let payload = payload_text("new");
-        let ids = ids();
-        let res = begin_transaction(
-            &mut backend,
-            &payload,
-            true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
-        );
-        assert!(res.is_ok());
-        let succ = res.unwrap();
-        if let SnapshotKind::Available(ref saved) = succ.saved {
-            assert_eq!(saved[0].1, b"foreign");
-        } else {
-            panic!("should be available");
+    fn c4_missing_publish_receipt_rolls_back_without_fresh_adoption() {
+        for sequence in [None, Some(0)] {
+            let mut backend = Backend::original();
+            let original = backend.data.clone();
+            backend.sequence.set(sequence);
+            let error = begin(&mut backend).unwrap_err();
+            assert!(error.primary.to_string().contains("sequence unavailable"));
+            assert_eq!(backend.data, original);
+            assert_eq!(backend.events.last(), Some(&"close"));
         }
     }
-
     #[test]
-    fn c5_finish_rejects_foreign_change_during_dwell() {
-        // Simulate we began, then foreign write happened while unlocked (dwell), then finish should reject
-        let mut backend = FakeBackend::new().with_content(vec![(CF_UNICODE, b"old".to_vec())]);
-        let payload = payload_text("new");
-        let ids = ids();
-        let succ = begin_transaction(
-            &mut backend,
-            &payload,
-            true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
-        )
-        .unwrap();
-        // Do foreign write now (simulating during dwell, after close)
-        backend.foreign_write(vec![(CF_UNICODE, b"foreign".to_vec())]);
-        // Now finish should see seq mismatch and not restore
-        let did = finish_transaction(
-            &mut backend,
-            &succ.saved,
-            &succ.seq,
-            &succ.temp_text,
-            succ.temp_has_text,
-            true,
-        )
-        .unwrap();
-        assert!(!did, "foreign seq change must prevent restore");
-        assert_eq!(backend.store.get(&CF_UNICODE).unwrap(), b"foreign");
+    fn c5_same_text_republish_and_no_empty_append_win() {
+        for append in [false, true] {
+            let mut backend = Backend::original();
+            let swap = begin(&mut backend).unwrap();
+            backend.foreign(append);
+            let foreign = backend.data.clone();
+            backend.events.clear();
+            assert!(!finish(&mut backend, &swap));
+            assert_eq!(backend.data, foreign);
+            assert!(!backend.events.contains(&"empty"));
+        }
     }
-
     #[test]
-    fn c6_missing_seq_fails_closed() {
-        let mut backend = FakeBackend::new();
-        let payload = payload_text("new");
-        let ids = ids();
-        let succ = begin_transaction(
-            &mut backend,
-            &payload,
-            true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
-        )
-        .unwrap();
-        // Test missing seq: we create a swap with None seq
-        let did = finish_transaction(
-            &mut backend,
-            &succ.saved,
-            &None,
-            &succ.temp_text,
-            succ.temp_has_text,
-            true,
-        )
-        .unwrap();
-        assert!(!did);
+    fn c5_guard_writer_attempt_is_blocked_through_restore() {
+        let mut backend = Backend::original();
+        let original = backend.data.clone();
+        let swap = begin(&mut backend).unwrap();
+        backend.events.clear();
+        backend.attempt_writer_on_read = true;
+        assert!(finish(&mut backend, &swap));
+        assert!(backend.writer_blocked);
+        assert!(!backend.writer_succeeded);
+        assert_eq!(backend.data, original);
+        assert_eq!(
+            backend.events,
+            ["open", "available", "get", "empty", "set", "close"]
+        );
     }
-
     #[test]
-    fn c6_nontext_proved_absence_vs_readfailure() {
-        // Non-text payload: temp_has_text false, temp_text None
-        // Proved absence should allow restore if text not available, read failure should reject
-        let mut backend_ok = FakeBackend::new();
-        // For nontext, we need to have no CF_UNICODE in store after publish (which is true for nontext payload)
-        // Simulate begin with image/png (nontext)
-        let payload = vec![("image/png".to_string(), b"\x89PNG\r\n\x1a\nfake".to_vec())];
-        let ids = ids();
-        let succ = begin_transaction(
-            &mut backend_ok,
-            &payload,
-            true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
-        )
-        .unwrap();
-        assert!(!succ.temp_has_text);
-        // Now backend has no CF_UNICODE, get will return Unavailable -> should be considered proved absence
-        let did = finish_transaction(
-            &mut backend_ok,
-            &succ.saved,
-            &succ.seq,
-            &succ.temp_text,
-            succ.temp_has_text,
-            true,
-        )
-        .unwrap();
-        // For empty original, saved was VerifiedEmpty, and nontext absence should allow restore (which is empty)
-        assert!(did);
-
-        let mut backend_fail = FakeBackend::new();
-        backend_fail.fail_get = true;
-        // Need to have same succ but with fail_get backend for finish
-        // We need to copy seq/saved etc but use failing backend
-        let mut backend2 = FakeBackend::new();
-        backend2.store = backend_ok.store.clone();
-        backend2.seq = backend_ok.seq;
-        backend2.fail_get = true;
-        let did2 = finish_transaction(
-            &mut backend2,
-            &succ.saved,
-            &succ.seq,
-            &succ.temp_text,
-            succ.temp_has_text,
-            true,
-        )
-        .unwrap();
-        assert!(!did2, "read failure must not be treated as absence");
-    }
-
-    #[test]
-    fn c7_format_bytes_preserved() {
-        // Test that PNG/DIB/HDROP/HTML/text/optout bytes survive roundtrip via fake
-        let mut backend = FakeBackend::new().with_content(vec![
-            (CF_UNICODE, b"hello".to_vec()),
-            (CF_DIB, b"dibits".to_vec()),
-            (CF_HDROP, b"filelist".to_vec()),
-            (HTML_ID, b"<b>hi</b>".to_vec()),
-            (PNG_ID, b"pngbytes".to_vec()),
-            (DROP_ID, b"\x01\x00\x00\x00".to_vec()),
-        ]);
-        let ids = ids();
-        let payload = vec![("text/plain".to_string(), b"newtext".to_vec())];
-        let succ = begin_transaction(
-            &mut backend,
-            &payload,
-            true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
-        )
-        .unwrap();
-        // Verify saved contains all original bytes in order
-        if let SnapshotKind::Available(ref saved) = succ.saved {
-            assert_eq!(saved.len(), 6);
-            let mut has_hello = false;
-            let mut has_dibits = false;
-            for (_, b) in saved.iter() {
-                if b == b"hello" {
-                    has_hello = true;
-                }
-                if b == b"dibits" {
-                    has_dibits = true;
-                }
+    fn c6_sequence_content_and_read_uncertainty_refuse() {
+        for fault in 0..10 {
+            let mut backend = Backend::original();
+            let mut swap = begin(&mut backend).unwrap();
+            match fault {
+                0 => swap.seq = None,
+                1 => swap.seq = Some("0".into()),
+                2 => backend.sequence.set(None),
+                3 => backend.sequence.set(Some(0)),
+                4 => backend.close_bump = true,
+                5 => backend.read_bump = true,
+                6 => backend.data[0].1 = native("different"),
+                7 => backend.fail_get = true,
+                8 => backend.fail_availability = true,
+                9 => backend.data[0].1 = vec![0; 4 * 1024 * 1024 + 1],
+                _ => unreachable!(),
             }
-            assert!(has_hello, "hello must be in saved");
-            assert!(has_dibits, "dibits must be in saved");
-        } else {
-            panic!("should be available");
+            if fault == 4 {
+                backend.bump();
+            }
+            let current = backend.data.clone();
+            backend.events.clear();
+            assert!(!finish(&mut backend, &swap), "fault {fault}");
+            assert_eq!(backend.data, current);
+            assert!(!backend.events.contains(&"empty"));
+            assert!(backend.caps.iter().all(|cap| *cap <= 4 * 1024 * 1024));
         }
-        // Now simulate finish restoring
-        let did = finish_transaction(
-            &mut backend,
-            &succ.saved,
-            &succ.seq,
-            &succ.temp_text,
-            succ.temp_has_text,
-            true,
-        )
-        .unwrap();
-        assert!(did);
-        assert_eq!(backend.store.get(&CF_UNICODE).unwrap(), b"hello");
     }
-
     #[test]
-    fn c2_finish_dwell_zero_on_error() {
-        // This is a conceptual check: we ensure that our clipboard_restore would call finish with 0 on chord error.
-        // We test the helper directly: finish should be called with dwell 0 when chord fails.
-        // We can model by checking that after begin, if chord error, we still call finish with 0 and it doesn't restore?
-        // For this unit test, just verify that begin+error path doesn't skip finish
-        let mut backend = FakeBackend::new().with_content(vec![(CF_UNICODE, b"orig".to_vec())]);
-        let payload = payload_text("new");
-        let ids = ids();
-        let succ = begin_transaction(
-            &mut backend,
-            &payload,
-            true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
-        )
-        .unwrap();
-        // Simulate chord error: we still call finish with 0 dwell, should still attempt restore check
-        // To test, we do foreign check: if dwell is 0 but restore still enabled, finish logic is same.
-        // We test that finish with restore false does nothing
-        let did_no_restore = finish_transaction(
-            &mut backend,
-            &succ.saved,
-            &succ.seq,
-            &succ.temp_text,
-            succ.temp_has_text,
-            false,
-        )
-        .unwrap();
-        assert!(!did_no_restore);
+    fn c6_close_side_sequence_change_is_never_promoted() {
+        let mut backend = Backend::original();
+        backend.close_bump = true;
+        let swap = begin(&mut backend).unwrap();
+        assert_ne!(backend.seq(), swap.seq);
+        let current = backend.data.clone();
+        backend.events.clear();
+        assert!(!finish(&mut backend, &swap));
+        assert_eq!(backend.data, current);
+        assert!(!backend.events.contains(&"empty"));
     }
-
     #[test]
-    fn c4_rollback_failure_preserves_primary() {
-        let mut backend = FakeBackend::new().with_content(vec![(CF_UNICODE, b"orig".to_vec())]);
-        backend.fail_set_at = Some(0); // first set fails -> publish primary error
-                                       // To make rollback also fail, we need empty to fail on rollback? We have fail_empty flag but it will affect both empties.
-                                       // Instead we simulate rollback set failure by failing at set index 1 (which would be rollback's first set after second empty)
-                                       // But our fail_set_at counts from 0, so after first failure at 0, rollback would be at 1? Let's test:
-                                       // Actually set_counter increments on each set attempt, even failed ones. So first set fail at 0 increments to 1, then rollback empty (not counted), then rollback set at 1 should also fail if we set fail at 1 as well? We only allow one fail index.
-                                       // We need a more nuanced fake to fail rollback separately; for now we test that primary is preserved even if rollback would fail via empty fail.
-        backend.fail_empty = false;
-        let payload = payload_text("new");
-        let ids = ids();
-        let res = begin_transaction(
-            &mut backend,
-            &payload,
-            true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
-        );
-        assert!(res.is_err());
-        assert!(res
-            .unwrap_err()
-            .primary
-            .to_string()
-            .contains("fake set fail"));
+    fn c6_text_guard_decodes_native_utf16_and_refuses_malformed() {
+        for invalid in [false, true] {
+            let mut backend = Backend::original();
+            let swap = begin(&mut backend).unwrap();
+            if invalid {
+                backend.data[0].1 = vec![0, 0xd8, 0, 0];
+            } else {
+                backend.data[0].1.extend([0, 0, 0, 0]);
+            }
+            assert_eq!(finish(&mut backend, &swap), !invalid);
+        }
     }
-
     #[test]
-    fn c5_no_foreign_writer_in_new_unlock_gap() {
-        // Verify that after finish's open, no foreign write can happen in gap before restore
-        let mut backend = FakeBackend::new().with_content(vec![(CF_UNICODE, b"orig".to_vec())]);
-        let payload = payload_text("new");
-        let ids = ids();
-        let succ = begin_transaction(
+    fn c6_nontext_typed_absence_and_read_failure_are_distinct() {
+        for text_present in [false, true] {
+            for read_failure in [false, true] {
+                let mut backend = Backend::original();
+                let swap = begin_transaction(
+                    &mut backend,
+                    &[("x-os/extra".into(), vec![1])],
+                    true,
+                    &[CF_UNICODETEXT],
+                    64,
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+                if text_present {
+                    backend.data.push((CF_UNICODETEXT, native("foreign")));
+                }
+                backend.fail_get = read_failure;
+                backend.events.clear();
+                assert_eq!(finish(&mut backend, &swap), !text_present);
+                assert!(!backend.events.contains(&"get"));
+            }
+        }
+        let mut backend = Backend::original();
+        let swap = begin(&mut backend).unwrap();
+        backend.fail_get = true;
+        assert!(!finish(&mut backend, &swap));
+        assert!(backend.events.contains(&"get"));
+    }
+    #[test]
+    fn c7_publication_native_framing_control() {
+        let mut backend = Backend::original();
+        let payloads = vec![
+            ("text/html".into(), b"<b>native</b>".to_vec()),
+            ("text/uri-list".into(), b"file:///C:/A.txt\r\n".to_vec()),
+        ];
+        begin_transaction(
             &mut backend,
-            &payload,
+            &payloads,
             true,
-            &ids,
-            1024 * 1024,
-            Duration::from_millis(500),
+            &[CF_UNICODETEXT],
+            1024,
+            Duration::from_secs(1),
         )
         .unwrap();
-        // Record events: finish will do open, seq check, get, seq recheck, empty+restore, close
-        // Ensure there is no unlock between check and restore: our backend's locked flag should stay true throughout
-        // We can verify by checking that foreign_write while locked is blocked
-        // Simulate foreign attempt during locked phase: we try to call foreign_write while locked should be blocked
-        // But our test harness doesn't expose mid-transaction hook, so we just verify event order has no extra close/open in middle
-        let did = finish_transaction(
-            &mut backend,
-            &succ.saved,
-            &succ.seq,
-            &succ.temp_text,
-            succ.temp_has_text,
-            true,
-        )
-        .unwrap();
-        assert!(did);
-        // Check events: should have open ... empty ... close with no foreign_write_blocked
-        let open_idx = backend.events.iter().position(|e| e == "open").unwrap();
-        let close_idx = backend.events.iter().rposition(|e| e == "close").unwrap();
-        let seq_checks = backend.events[open_idx..close_idx]
+        let html = backend
+            .data
             .iter()
-            .filter(|e| e.starts_with("get"))
-            .count();
-        assert!(seq_checks > 0);
-        assert!(!backend
-            .events
-            .contains(&"foreign_write_blocked_locked".to_string()));
+            .find(|(id, _)| *id == imp::id_for_mime("text/html").unwrap())
+            .unwrap();
+        assert_eq!(
+            crate::html::parse_cf_html(&html.1).unwrap(),
+            "<b>native</b>"
+        );
+        let files = backend
+            .data
+            .iter()
+            .find(|(id, _)| *id == imp::CF_HDROP)
+            .unwrap();
+        assert_eq!(
+            &files.1[..20],
+            &[20_u32, 0, 0, 0, 1]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &files.1[20..],
+            "C:\\A.txt\0\0"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn c7_native_encoders_and_raw_snapshot_order_full_bytes() {
+        let files = b"file:///C:/A%20B.txt\r\nfile:///D:/music.txt\r\n";
+        let html = b"<b>hello</b>";
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let payloads = vec![
+            (
+                "text/plain;charset=utf-8".into(),
+                "hello 🌍".as_bytes().to_vec(),
+            ),
+            ("text/html".into(), html.to_vec()),
+            ("text/uri-list".into(), files.to_vec()),
+            ("image/png".into(), png.into_inner()),
+        ];
+        let ops = prepare_ops(&payloads).unwrap();
+        assert_eq!(
+            ops[0].1,
+            "hello 🌍"
+                .encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            crate::html::parse_cf_html(&ops[1].1).unwrap(),
+            "<b>hello</b>"
+        );
+        assert_eq!(
+            &ops[2].1[..20],
+            &[20_u32, 0, 0, 0, 1]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &ops[2].1[20..],
+            "C:\\A B.txt\0D:\\music.txt\0\0"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ops[3],
+            (
+                imp::register(imp::DROP_EFFECT_FORMAT).unwrap(),
+                1_u32.to_le_bytes().to_vec()
+            )
+        );
+        assert_eq!(ops[4].1, payloads[3].1);
+        assert_eq!(
+            ops[5],
+            (imp::CF_DIB, crate::dib::png_to_dib(&payloads[3].1).unwrap())
+        );
+        let explicit = vec![
+            ("text/uri-list".into(), files.to_vec()),
+            (imp::DROP_EFFECT_MIME.into(), 2_u32.to_le_bytes().to_vec()),
+        ];
+        assert_eq!(prepare_ops(&explicit).unwrap().len(), 2);
+        let framed = crate::html::build_cf_html("<p>raw</p>");
+        assert_eq!(
+            crate::transfer::encode_native("text/html", &framed).unwrap(),
+            framed
+        );
+        let mut original = vec![
+            (CF_UNICODETEXT, vec![65, 0, 0, 0, 99, 0]),
+            (imp::CF_DIB, vec![3, 0, 2]),
+            (imp::CF_HDROP, vec![4, 0, 5]),
+        ];
+        for name in [
+            "HTML Format",
+            "Rich Text Format",
+            "PNG",
+            imp::DROP_EFFECT_FORMAT,
+            crate::optout::EXCLUDE_FORMAT,
+            crate::optout::HISTORY_OPT_OUT,
+            crate::optout::CLOUD_OPT_OUT,
+            crate::optout::VIEWER_IGNORE,
+        ] {
+            original.push((imp::register(name).unwrap(), name.as_bytes().to_vec()));
+        }
+        let ids = crate::paste::restore_ids().unwrap();
+        let mut backend = Backend::original();
+        backend.data.clone_from(&original);
+        let swap = begin_transaction(
+            &mut backend,
+            &payloads,
+            true,
+            &ids,
+            1024,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(backend.data, ops);
+        assert_eq!(swap.saved, SnapshotKind::Available(original.clone()));
+        assert!(finish(&mut backend, &swap));
+        assert_eq!(backend.data, original);
     }
 }

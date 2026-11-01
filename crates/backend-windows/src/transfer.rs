@@ -1,12 +1,9 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::unnecessary_wraps,
-    clippy::pedantic
-)]
+#![allow(clippy::cast_possible_truncation, clippy::unnecessary_wraps)]
 //! Synchronous clipboard data transfer over direct Win32 clipboard APIs.
 //!
 //! Writes are one `OpenClipboard` / `EmptyClipboard` / `SetClipboardData*n` /
-//! `CloseClipboard` sequence (atomic). Opening retries 5x20 ms; exhaustion
+//! `CloseClipboard` sequence. This excludes concurrent writers but does not
+//! roll back partial errors. Opening retries 5x20 ms; exhaustion
 //! maps to `Error::Timeout` (the clipboard is a shared lock).
 
 use clipmonger_platform::traits::ClipboardTransfer;
@@ -22,7 +19,7 @@ impl WinTransfer {
         Self
     }
 
-    /// Multi-format atomic write of any payload slice.
+    /// Multi-format exclusive write of any payload slice; errors may leave partial data.
     ///
     /// The slice form also accepts array literals and `&Vec` (via deref);
     /// the [`ClipboardTransfer`] impl delegates here.
@@ -97,13 +94,9 @@ impl Default for WinTransfer {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), test))]
 pub(crate) mod imp {
     use super::{Error, Result};
-    #[allow(dead_code)]
-    pub(crate) const CF_TEXT: u32 = 1;
-    #[allow(dead_code)]
-    pub(crate) const CF_OEMTEXT: u32 = 7;
     pub(crate) const CF_DIB: u32 = 8;
     pub(crate) const CF_HDROP: u32 = 15;
     pub(crate) const CF_UNICODETEXT: u32 = 13;
@@ -312,52 +305,6 @@ pub(crate) mod imp {
         Ok(list)
     }
 
-    /// Raw bytes of the formats in `ids` that the clipboard holds, in
-    /// clipboard order, for [`restore`]. `None` when one is over
-    /// `max_bytes` or reading outlasts `budget` (owners render delayed
-    /// formats on demand, and the paste waits for this).
-    #[allow(dead_code)]
-    pub(crate) fn snapshot(
-        ids: &[u32],
-        max_bytes: u64,
-        budget: std::time::Duration,
-    ) -> Option<Vec<(u32, Vec<u8>)>> {
-        let started = std::time::Instant::now();
-        with_open("snapshot", || {
-            let mut saved = Vec::new();
-            for id in raw::EnumFormats::new() {
-                if !ids.contains(&id) {
-                    continue;
-                }
-                if started.elapsed() > budget
-                    || raw::size(id).is_some_and(|n| n.get() as u64 > max_bytes)
-                {
-                    return Err(Error::TooLarge(
-                        "clipboard snapshot over budget".to_string(),
-                    ));
-                }
-                let mut bytes = Vec::new();
-                if raw::get_vec(id, &mut bytes).is_ok() {
-                    saved.push((id, bytes));
-                }
-            }
-            Ok(saved)
-        })
-        .ok()
-    }
-
-    /// Put a [`snapshot`] back in one atomic write.
-    #[allow(dead_code)]
-    pub(crate) fn restore(saved: &[(u32, Vec<u8>)]) -> Result<()> {
-        with_open("restore", || {
-            raw::empty().map_err(|e| clip_error("empty", e))?;
-            for (id, bytes) in saved {
-                raw::set_without_clear(*id, bytes).map_err(|e| clip_error("restore", e))?;
-            }
-            Ok(())
-        })
-    }
-
     pub(crate) fn read_one(id: u32, mime: &str, max_bytes: u64) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         if mime == "text/html" {
@@ -379,29 +326,51 @@ pub(crate) mod imp {
     }
 
     pub(crate) fn write_one(id: u32, mime: &str, bytes: &[u8]) -> Result<()> {
-        use clipboard_win::{options::NoClear, raw};
-        if mime == "text/plain" || mime == "text/plain;charset=utf-8" {
-            let text = std::str::from_utf8(bytes)
-                .map_err(|e| Error::Internal(format!("text payload is not UTF-8: {e}")))?;
-            return raw::set_string_with(text, NoClear).map_err(|e| clip_error("write text", e));
+        let native = super::encode_native(mime, bytes)?;
+        raw::set_without_clear(id, &native).map_err(|e| clip_error("write", e))
+    }
+}
+
+/// Prepare bytes for the native format before destructive swap publication.
+/// Raw snapshots deliberately bypass this canonical MIME conversion.
+#[cfg(any(windows, test))]
+pub(crate) fn encode_native(mime: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    let utf8 = || {
+        std::str::from_utf8(bytes)
+            .map_err(|e| Error::Internal(format!("{mime} payload is not UTF-8: {e}")))
+    };
+    match mime {
+        "text/plain" | "text/plain;charset=utf-8" => Ok(utf8()?
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()),
+        "text/html" if crate::html::parse_cf_html(bytes).is_err() => {
+            Ok(crate::html::build_cf_html(utf8()?))
         }
-        if mime == "text/html" {
-            if crate::html::parse_cf_html(bytes).is_ok() {
-                return raw::set_without_clear(id, bytes).map_err(|e| clip_error("write html", e));
+        "text/uri-list" => {
+            let paths = crate::uri::uri_list_to_paths(utf8()?);
+            if paths.is_empty() {
+                return Err(Error::Unsupported(
+                    "text/uri-list names no Windows file".into(),
+                ));
             }
-            let fragment = std::str::from_utf8(bytes)
-                .map_err(|e| Error::Internal(format!("html payload is not UTF-8: {e}")))?;
-            return raw::set_html_with(id, fragment, NoClear)
-                .map_err(|e| clip_error("write html", e));
+            // DROPFILES: pFiles=20, POINT=(0,0), fNC=0, fWide=TRUE.
+            let mut out = [20_u32, 0, 0, 0, 1]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            for path in paths {
+                out.extend(
+                    path.encode_utf16()
+                        .chain(std::iter::once(0))
+                        .flat_map(u16::to_le_bytes),
+                );
+            }
+            out.extend([0, 0]);
+            Ok(out)
         }
-        if mime == "text/uri-list" {
-            let text = std::str::from_utf8(bytes)
-                .map_err(|e| Error::Internal(format!("uri-list payload is not UTF-8: {e}")))?;
-            let paths = crate::uri::uri_list_to_paths(text);
-            return raw::set_file_list_with(&paths, NoClear)
-                .map_err(|e| clip_error("write uri-list", e));
-        }
-        raw::set_without_clear(id, bytes).map_err(|e| clip_error("write", e))
+        _ => Ok(bytes.to_vec()),
     }
 }
 
