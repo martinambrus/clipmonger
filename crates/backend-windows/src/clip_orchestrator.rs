@@ -108,20 +108,39 @@ fn prepare_ops(payloads: &[(String, Vec<u8>)]) -> Result<NativeOps> {
             "clipboard restore needs stored payload bytes".into(),
         ));
     }
-    let mut ops = Vec::with_capacity(payloads.len() + 2);
+    let needs_text = payloads
+        .iter()
+        .any(|(mime, _)| mime == "text/plain" || mime == "text/plain;charset=utf-8");
+    let text_locale = if needs_text {
+        Some(crate::text_encoding::text_locale_and_pages()?)
+    } else {
+        None
+    };
+    let mut ops = Vec::with_capacity(payloads.len() * 4 + 2);
     for (mime, bytes) in payloads {
-        let id = imp::id_for_mime(mime)?;
-        ops.push((id, crate::transfer::encode_native(mime, bytes)?));
-        if mime == "image/png" {
-            if let Ok(dib) = crate::dib::png_to_dib(bytes) {
-                ops.push((imp::CF_DIB, dib));
+        if mime == "text/plain" || mime == "text/plain;charset=utf-8" {
+            let text = std::str::from_utf8(bytes)
+                .map_err(|e| Error::Internal(format!("{mime} payload is not UTF-8: {e}")))?;
+            let (lcid, ansi_cp, oem_cp) = text_locale.unwrap();
+            let companions = crate::text_encoding::encode_text_companions_with_locale(
+                text, lcid, ansi_cp, oem_cp,
+            )?;
+            ops.extend(companions);
+        } else {
+            let id = imp::id_for_mime(mime)?;
+            ops.push((id, crate::transfer::encode_native(mime, bytes)?));
+            if mime == "image/png" {
+                if let Ok(dib) = crate::dib::png_to_dib(bytes) {
+                    ops.push((imp::CF_DIB, dib));
+                }
             }
-        }
-        if mime == "text/uri-list" && !payloads.iter().any(|(m, _)| m == imp::DROP_EFFECT_MIME) {
-            ops.push((
-                imp::register(imp::DROP_EFFECT_FORMAT)?,
-                imp::DROPEFFECT_COPY.to_le_bytes().to_vec(),
-            ));
+            if mime == "text/uri-list" && !payloads.iter().any(|(m, _)| m == imp::DROP_EFFECT_MIME)
+            {
+                ops.push((
+                    imp::register(imp::DROP_EFFECT_FORMAT)?,
+                    imp::DROPEFFECT_COPY.to_le_bytes().to_vec(),
+                ));
+            }
         }
     }
     Ok(ops)
@@ -443,10 +462,13 @@ mod tests {
         writer_blocked: bool,
         writer_succeeded: bool,
         caps: Vec<u64>,
+        set_ids: Vec<u32>,
+        expected_at_close: Option<NativeOps>,
     }
 
     impl Backend {
         fn original() -> Self {
+            crate::text_encoding::testing::ensure_injected_api();
             Self {
                 data: vec![(CF_UNICODETEXT, native("old"))],
                 sequence: Cell::new(Some(1)),
@@ -485,6 +507,12 @@ mod tests {
         fn close(&mut self) -> Result<()> {
             self.events.push("close");
             assert!(self.locked);
+            if let Some(expected) = &self.expected_at_close {
+                assert_eq!(
+                    &self.data, expected,
+                    "original raw bytes must be restored before close"
+                );
+            }
             self.locked = false;
             // A writer waiting during the guard gets its opportunity if the
             // implementation releases before the destructive restore.
@@ -513,6 +541,7 @@ mod tests {
         fn set(&mut self, id: u32, bytes: &[u8]) -> Result<()> {
             assert!(self.locked);
             self.events.push("set");
+            self.set_ids.push(id);
             self.sets += 1;
             if self.fail_sets.contains(&self.sets) {
                 return Err(Error::Io(format!("set {}", self.sets)));
@@ -688,9 +717,16 @@ mod tests {
     }
     #[test]
     fn c3_first_and_later_publication_errors_restore_before_only_close() {
-        for failure in [1, 2] {
+        for failure in [1, 2, 3, 4, 5] {
             let mut backend = Backend::original();
+            backend.data = vec![
+                (13, vec![65, 0, 0, 0, 99, 0]),
+                (16, vec![0x09, 4, 0, 0]),
+                (1, vec![0xe9, 0, 99]),
+                (7, vec![0x82, 0, 88]),
+            ];
             let original = backend.data.clone();
+            backend.expected_at_close = Some(original.clone());
             backend.fail_sets = vec![failure];
             let payloads = vec![
                 ("text/plain".into(), b"new".to_vec()),
@@ -700,7 +736,7 @@ mod tests {
                 &mut backend,
                 &payloads,
                 true,
-                &[CF_UNICODETEXT],
+                &[13, 16, 1, 7],
                 64,
                 Duration::from_secs(1),
             )
@@ -709,6 +745,9 @@ mod tests {
             assert!(error.rollback.is_none());
             assert!(error.close.is_none());
             assert_eq!(backend.data, original);
+            let emitted = [13, 16, 1, 7, imp::id_for_mime("x-os/extra").unwrap()];
+            assert_eq!(&backend.set_ids[..failure], &emitted[..failure]);
+            assert_eq!(&backend.set_ids[failure..], &[13, 16, 1, 7]);
             assert_eq!(backend.events.iter().filter(|e| **e == "open").count(), 1);
             assert_eq!(backend.events.iter().filter(|e| **e == "close").count(), 1);
             assert_eq!(backend.events.last(), Some(&"close"));
@@ -981,14 +1020,19 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
-    #[test]
-    fn c7_native_encoders_and_raw_snapshot_order_full_bytes() {
-        let files = b"file:///C:/A%20B.txt\r\nfile:///D:/music.txt\r\n";
-        let html = b"<b>hello</b>";
+    fn one_pixel_png() -> Vec<u8> {
         let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::new_rgba8(1, 1)
             .write_to(&mut png, image::ImageFormat::Png)
             .unwrap();
+        png.into_inner()
+    }
+
+    #[test]
+    fn c7_native_encoders_and_raw_snapshot_order_full_bytes() {
+        crate::text_encoding::set_injected_locale(0x0409, 1252, 437);
+        let files = b"file:///C:/A%20B.txt\r\nfile:///D:/music.txt\r\n";
+        let html = b"<b>hello</b>";
         let payloads = vec![
             (
                 "text/plain;charset=utf-8".into(),
@@ -996,9 +1040,11 @@ mod tests {
             ),
             ("text/html".into(), html.to_vec()),
             ("text/uri-list".into(), files.to_vec()),
-            ("image/png".into(), png.into_inner()),
+            ("image/png".into(), one_pixel_png()),
         ];
         let ops = prepare_ops(&payloads).unwrap();
+        assert_eq!(ops.len(), 9);
+        assert_eq!(ops[0].0, crate::text_encoding::CF_UNICODETEXT);
         assert_eq!(
             ops[0].1,
             "hello 🌍"
@@ -1007,34 +1053,38 @@ mod tests {
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>()
         );
+        assert_eq!(ops[1].0, crate::text_encoding::CF_LOCALE);
+        assert_eq!(ops[1].1.len(), 4);
+        assert_eq!(ops[2].0, crate::text_encoding::CF_TEXT);
+        assert_eq!(ops[3].0, crate::text_encoding::CF_OEMTEXT);
         assert_eq!(
-            crate::html::parse_cf_html(&ops[1].1).unwrap(),
+            crate::html::parse_cf_html(&ops[4].1).unwrap(),
             "<b>hello</b>"
         );
         assert_eq!(
-            &ops[2].1[..20],
+            &ops[5].1[..20],
             &[20_u32, 0, 0, 0, 1]
                 .into_iter()
                 .flat_map(u32::to_le_bytes)
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            &ops[2].1[20..],
+            &ops[5].1[20..],
             "C:\\A B.txt\0D:\\music.txt\0\0"
                 .encode_utf16()
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            ops[3],
+            ops[6],
             (
                 imp::register(imp::DROP_EFFECT_FORMAT).unwrap(),
                 1_u32.to_le_bytes().to_vec()
             )
         );
-        assert_eq!(ops[4].1, payloads[3].1);
+        assert_eq!(ops[7].1, payloads[3].1);
         assert_eq!(
-            ops[5],
+            ops[8],
             (imp::CF_DIB, crate::dib::png_to_dib(&payloads[3].1).unwrap())
         );
         let explicit = vec![
@@ -1080,5 +1130,354 @@ mod tests {
         assert_eq!(swap.saved, SnapshotKind::Available(original.clone()));
         assert!(finish(&mut backend, &swap));
         assert_eq!(backend.data, original);
+    }
+
+    // Small acceptance set B: production-shared preparation controls.
+    // This suite uses the actual production prepare_ops and verifies emitted IDs/order/bytes
+    // via independent expected values, not by calling the same converter to generate expectations.
+    // Linux injected converter is explicitly NOT a native Windows API proof; real WideCharToMultiByte
+    // behavior requires future Windows Go execution.
+
+    #[test]
+    fn b_actual_emitted_operations_and_independent_bytes() {
+        crate::text_encoding::set_injected_locale(0x0409, 1252, 437);
+        for (text, unicode, ansi, oem) in [
+            ("", vec![0, 0], vec![0], vec![0]),
+            (
+                "café",
+                vec![99, 0, 97, 0, 102, 0, 0xe9, 0, 0, 0],
+                vec![99, 97, 102, 0xe9, 0],
+                vec![99, 97, 102, 0x82, 0],
+            ),
+        ] {
+            let actual = prepare_ops(&[("text/plain".into(), text.as_bytes().to_vec())]).unwrap();
+            assert_eq!(
+                actual,
+                vec![(13, unicode), (16, vec![9, 4, 0, 0]), (1, ansi), (7, oem)]
+            );
+        }
+        crate::text_encoding::clear_injected_locale();
+    }
+
+    #[test]
+    fn b_text_empty_produces_four_ops_with_nul_terminators() {
+        crate::text_encoding::clear_injected_locale();
+        crate::text_encoding::set_injected_locale(0x0409, 1252, 437);
+        let payloads = vec![("text/plain".into(), b"".to_vec())];
+        let ops = prepare_ops(&payloads).unwrap();
+        assert_eq!(ops.len(), 4);
+        assert_eq!(ops[0].0, crate::text_encoding::CF_UNICODETEXT);
+        assert_eq!(ops[1].0, crate::text_encoding::CF_LOCALE);
+        assert_eq!(ops[2].0, crate::text_encoding::CF_TEXT);
+        assert_eq!(ops[3].0, crate::text_encoding::CF_OEMTEXT);
+        // Unicode: UTF-16LE NUL only
+        assert_eq!(ops[0].1, vec![0, 0]);
+        // Locale: 0x0409 LE
+        assert_eq!(ops[1].1, 0x0409_u32.to_le_bytes().to_vec());
+        // ANSI/OEM empty: single NUL byte each
+        assert_eq!(ops[2].1, vec![0]);
+        assert_eq!(ops[3].1, vec![0]);
+        crate::text_encoding::clear_injected_locale();
+    }
+
+    #[test]
+    fn b_text_e_acute_distinguishes_ansi_437_vs_oem() {
+        crate::text_encoding::clear_injected_locale();
+        crate::text_encoding::set_injected_locale(0x040C, 1252, 437);
+        let payloads = vec![("text/plain".into(), "café".as_bytes().to_vec())];
+        let ops = prepare_ops(&payloads).unwrap();
+        assert_eq!(ops.len(), 4);
+        // Independent expected bytes (not derived from converter under test)
+        let unicode_expected: Vec<u8> = "café"
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(ops[0].1, unicode_expected);
+        assert_eq!(ops[1].1, 0x040C_u32.to_le_bytes().to_vec());
+        // 1252: é -> 0xE9, 437: é -> 0x82 (distinct)
+        assert_eq!(ops[2].1, vec![b'c', b'a', b'f', 0xE9, 0]);
+        assert_eq!(ops[3].1, vec![b'c', b'a', b'f', 0x82, 0]);
+        crate::text_encoding::clear_injected_locale();
+    }
+
+    #[test]
+    fn b_text_multibyte_page_932_encodes_japanese() {
+        crate::text_encoding::clear_injected_locale();
+        crate::text_encoding::set_injected_locale(0x0411, 932, 437);
+        let payloads = vec![("text/plain".into(), "あ".as_bytes().to_vec())];
+        let ops = prepare_ops(&payloads).unwrap();
+        assert_eq!(ops.len(), 4);
+        let unicode_expected: Vec<u8> = "あ"
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(ops[0].1, unicode_expected);
+        // 932 Shift-JIS: あ -> 0x82 0xA0
+        assert_eq!(ops[2].1, vec![0x82, 0xA0, 0]);
+        // OEM still 437, unrepresentable -> '?'
+        // Our fake uses '?' for unrepresentable in 437 for this char
+        assert_eq!(ops[3].1, vec![b'?', 0]);
+        crate::text_encoding::clear_injected_locale();
+    }
+
+    #[test]
+    fn b_text_supplementary_and_replacement_preserves_unicode() {
+        crate::text_encoding::clear_injected_locale();
+        crate::text_encoding::set_injected_locale(0x0409, 1252, 437);
+        let payloads = vec![("text/plain".into(), "a🌍b".as_bytes().to_vec())];
+        let ops = prepare_ops(&payloads).unwrap();
+        assert_eq!(ops.len(), 4);
+        let unicode_expected: Vec<u8> = "a🌍b"
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(ops[0].1, unicode_expected);
+        // Supplementary U+1F30D cannot be represented in 1252/437 -> '?' 0x3F, Unicode authoritative exact
+        assert_eq!(ops[2].1, vec![b'a', b'?', b'b', 0]);
+        assert_eq!(ops[3].1, vec![b'a', b'?', b'b', 0]);
+        crate::text_encoding::clear_injected_locale();
+    }
+
+    #[test]
+    fn b_text_invalid_utf8_and_embedded_nul_fail_before_open() {
+        for bad in [vec![0xFF, 0xFF], b"a\0b".to_vec()] {
+            crate::text_encoding::clear_injected_locale();
+            let mut backend = Backend::original();
+            let original = backend.data.clone();
+            let payloads = vec![("text/plain".into(), bad)];
+            let err = begin_transaction(
+                &mut backend,
+                &payloads,
+                true,
+                &[CF_UNICODETEXT],
+                64,
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+            assert!(
+                err.primary.to_string().contains("UTF-8")
+                    || err.primary.to_string().contains("NUL")
+                    || err.primary.to_string().contains("payload"),
+                "primary={}",
+                err.primary
+            );
+            assert_eq!(backend.data, original);
+            assert!(!backend.events.contains(&"open"));
+            assert!(!backend.events.contains(&"empty"));
+            crate::text_encoding::clear_injected_locale();
+        }
+    }
+
+    #[test]
+    fn b_text_failed_locale_conversion_sizing_fail_before_open() {
+        use crate::text_encoding::testing::{inject_fault, Fault};
+        let payloads = vec![("text/plain".into(), b"hi".to_vec())];
+        for (lcid, ansi, oem) in [
+            (0, 1252, 437),
+            (0x007f, 1252, 437),
+            (0x0400, 1252, 437),
+            (0x0800, 1252, 437),
+            (0x0c00, 1252, 437),
+            (0x1000, 1252, 437),
+            (0x1400, 1252, 437),
+            (0x0501, 1252, 437),
+            (0x09ff, 1252, 437),
+            (0x05fe, 1252, 437),
+            (0x105fe, 1252, 437),
+            (0x0100_0409, 1252, 437),
+            (0x0409, 0, 437),
+            (0x0409, 1200, 437),
+            (0x0409, 1252, 0),
+            (0x0409, 1252, 65000),
+        ] {
+            crate::text_encoding::set_injected_locale(lcid, ansi, oem);
+            let mut backend = Backend::original();
+            let original = backend.data.clone();
+            assert!(begin_transaction(
+                &mut backend,
+                &payloads,
+                true,
+                &[CF_UNICODETEXT],
+                64,
+                Duration::from_secs(1)
+            )
+            .is_err());
+            assert_eq!(backend.data, original);
+            assert_eq!(backend.events, [] as [&str; 0]);
+        }
+        for fault in [
+            Fault::LocaleReturn(0),
+            Fault::LocaleReturn(1),
+            Fault::LocaleReturn(3),
+            Fault::Size(1252, 0),
+            Fault::Size(437, 0),
+            Fault::Size(1252, -1),
+            Fault::Write(1252, 0),
+            Fault::Write(437, 0),
+            Fault::Write(1252, 2),
+            Fault::Write(1252, 4),
+            Fault::MissingNul(1252),
+            Fault::MissingNul(437),
+        ] {
+            crate::text_encoding::set_injected_locale(0x0409, 1252, 437);
+            inject_fault(fault);
+            let mut backend = Backend::original();
+            let original = backend.data.clone();
+            let error = begin_transaction(
+                &mut backend,
+                &payloads,
+                true,
+                &[CF_UNICODETEXT],
+                64,
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+            assert!(error.primary.to_string().contains("87"));
+            assert_eq!(backend.data, original);
+            assert_eq!(backend.events, [] as [&str; 0]);
+        }
+        // An installed-page/API error is refused rather than retried with
+        // weaker flags or used as a Unicode-only publication.
+        crate::text_encoding::set_injected_locale(0x0409, 12345, 437);
+        inject_fault(Fault::Size(12345, 0));
+        let mut backend = Backend::original();
+        assert!(begin_transaction(
+            &mut backend,
+            &payloads,
+            true,
+            &[CF_UNICODETEXT],
+            64,
+            Duration::from_secs(1)
+        )
+        .is_err());
+        assert_eq!(backend.events, [] as [&str; 0]);
+        crate::text_encoding::clear_injected_locale();
+    }
+
+    #[test]
+    fn b_text_concrete_lcid_and_actual_conversion_call_contract() {
+        use crate::text_encoding::testing::{calls, Call};
+        // sah-RU is a real concrete LCID; page availability is a separate check.
+        for (ansi, oem, flags) in [(1252, 437, 0x400), (65001, 54936, 8)] {
+            crate::text_encoding::set_injected_locale(0x0485, ansi, oem);
+            let ops = prepare_ops(&[("text/plain".into(), b"hi".to_vec())]).unwrap();
+            assert_eq!(ops[1], (16, vec![0x85, 4, 0, 0]));
+            assert_eq!(
+                calls(),
+                vec![
+                    Call::Lcid,
+                    Call::Ansi(0x0485),
+                    Call::Oem,
+                    Call::Convert {
+                        cp: ansi,
+                        flags,
+                        wide: vec![104, 105, 0],
+                        count: 3,
+                        output: 0
+                    },
+                    Call::Convert {
+                        cp: ansi,
+                        flags,
+                        wide: vec![104, 105, 0],
+                        count: 3,
+                        output: 3
+                    },
+                    Call::Convert {
+                        cp: oem,
+                        flags,
+                        wide: vec![104, 105, 0],
+                        count: 3,
+                        output: 0
+                    },
+                    Call::Convert {
+                        cp: oem,
+                        flags,
+                        wide: vec![104, 105, 0],
+                        count: 3,
+                        output: 3
+                    },
+                ]
+            );
+        }
+        crate::text_encoding::clear_injected_locale();
+    }
+
+    #[test]
+    fn b_injected_converter_is_software_evidence_on_both_platforms() {
+        // This test documents that Linux headless verification uses a fake injected
+        // converter and does NOT prove native Windows WideCharToMultiByte behavior.
+        // Real converter execution requires a Windows Go environment with actual Win32 APIs.
+        crate::text_encoding::clear_injected_locale();
+        crate::text_encoding::set_injected_locale(0x0409, 1252, 437);
+        let payloads = vec![("text/plain".into(), "é".as_bytes().to_vec())];
+        let ops = prepare_ops(&payloads).unwrap();
+        // Fake distinguishes 1252 vs 437, but on Windows the actual bytes must be verified natively.
+        assert_eq!(ops[2].1, vec![0xE9, 0]);
+        assert_eq!(ops[3].1, vec![0x82, 0]);
+        crate::text_encoding::clear_injected_locale();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn b_windows_converter_compiles_and_requires_go() {
+        // This test compiles now on Windows and verifies the actual Win32 path can be invoked.
+        // It requires a future Windows Go to execute and is not run on Linux.
+        crate::text_encoding::clear_injected_locale();
+        let payloads = vec![("text/plain".into(), "héllo 🌍".as_bytes().to_vec())];
+        let ops = prepare_ops(&payloads).unwrap();
+        assert_eq!(ops.len(), 4);
+        assert_eq!(ops[0].0, 13);
+        assert_eq!(ops[1].0, 16);
+        assert_eq!(ops[2].0, 1);
+        assert_eq!(ops[3].0, 7);
+        // Unicode must be exact with supplementary and NUL
+        let expected_unicode: Vec<u8> = "héllo 🌍"
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(ops[0].1, expected_unicode);
+    }
+
+    #[test]
+    fn b_text_locale_selected_once_per_batch() {
+        crate::text_encoding::clear_injected_locale();
+        crate::text_encoding::set_injected_locale(0x0409, 1252, 437);
+        let payloads = vec![
+            ("text/plain".into(), b"a".to_vec()),
+            ("text/plain;charset=utf-8".into(), b"b".to_vec()),
+        ];
+        let ops = prepare_ops(&payloads).unwrap();
+        // Two text payloads should each produce 4 ops, sharing the same LCID, total 8
+        assert_eq!(ops.len(), 8);
+        assert_eq!(ops[0].0, crate::text_encoding::CF_UNICODETEXT);
+        assert_eq!(ops[4].0, crate::text_encoding::CF_UNICODETEXT);
+        assert_eq!(ops[1].1, ops[5].1);
+        let calls = crate::text_encoding::testing::calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| **call == crate::text_encoding::testing::Call::Lcid)
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, crate::text_encoding::testing::Call::Ansi(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| **call == crate::text_encoding::testing::Call::Oem)
+                .count(),
+            1
+        );
+        crate::text_encoding::clear_injected_locale();
     }
 }

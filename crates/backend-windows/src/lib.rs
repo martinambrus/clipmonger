@@ -24,6 +24,8 @@ pub mod monitor;
 pub mod optout;
 pub mod paste;
 pub mod sys;
+#[cfg(any(windows, test))]
+mod text_encoding;
 pub mod transfer;
 pub mod uri;
 
