@@ -1461,22 +1461,21 @@ fn fix_x3_permanent_error_reopens_even_with_settings_open() {
 
 #[test]
 fn fix_x3_closed_errors_without_an_exec_are_not_traced_or_reopened() {
-    for failure in [UiEvent::Error("background".to_string())] {
-        let mut rig = Rig::new(false);
-        rig.push(failure);
-        rig.tick();
-        assert!(!rig.is_open());
-        assert!(rig.app.shell().error().is_some());
-        assert_eq!(
-            rig.trace(),
-            Vec::<Value>::new(),
-            "a hidden error is not shown"
-        );
-        rig.push(request());
-        rig.tick();
-        assert!(rig.app.shell().error().is_none());
-        assert_eq!(rig.trace(), vec![open_line("request", false, false)]);
-    }
+    let failure = UiEvent::Error("background".to_string());
+    let mut rig = Rig::new(false);
+    rig.push(failure);
+    rig.tick();
+    assert!(!rig.is_open());
+    assert!(rig.app.shell().error().is_some());
+    assert_eq!(
+        rig.trace(),
+        Vec::<Value>::new(),
+        "a hidden error is not shown"
+    );
+    rig.push(request());
+    rig.tick();
+    assert!(rig.app.shell().error().is_none());
+    assert_eq!(rig.trace(), vec![open_line("request", false, false)]);
 }
 
 /// Get the actual bridge reply to a failed permanent execution.
