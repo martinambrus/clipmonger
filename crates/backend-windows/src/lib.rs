@@ -6,7 +6,11 @@
 //! `hotkeys`, `paste`, `foreground`, `autostart`) compile everywhere but only
 //! operate on Windows; elsewhere they report `Error::Unavailable`.
 //!
-//! Unsafe policy (WIN-F1): `unsafe` appears only in `sys.rs`.
+//! Unsafe policy (WIN-F1): `unsafe` is isolated to the Windows FFI boundary,
+//! primarily in `sys.rs` (Win32 wrappers); minimal additional `unsafe` blocks
+//! live in `elevated_task.rs`, `helper.rs`, and `hotkeys.rs` for direct Win32
+//! calls. These direct Win32 calls are `cfg(windows)`-gated; other modules
+//! use safe Rust.
 
 pub mod autostart;
 pub mod autostart_logic;

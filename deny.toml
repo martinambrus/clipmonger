@@ -1,6 +1,9 @@
 # cargo-deny config (seg-11 §5 gate 6, R-F3): advisories + licenses +
 # bans + sources in one tool. First run is calibration (rel.md Q5).
 
+[graph]
+all-features = true
+
 [advisories]
 version = 2
 ignore = [
@@ -25,6 +28,7 @@ allow = [
     "MPL-2.0",
     "Unlicense",
 ]
+unused-allowed-license = "deny"
 confidence-threshold = 0.8
 
 # egui bundles these fonts, including Ubuntu-Light as the primary UI font.
@@ -36,7 +40,7 @@ allow = ["OFL-1.1", "Ubuntu-font-1.0"]
 
 [bans]
 multiple-versions = "warn"
-wildcards = "warn"
+wildcards = "deny"
 allow-wildcard-paths = true
 
 [sources]

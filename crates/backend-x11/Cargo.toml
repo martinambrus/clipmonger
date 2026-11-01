@@ -20,6 +20,5 @@ enigo = "0.6"
 x11rb = { version = "0.13", features = ["xtest"] }
 uuid = { workspace = true }
 
-[lints.clippy]
-all = "warn"
-pedantic = "warn"
+[lints]
+workspace = true

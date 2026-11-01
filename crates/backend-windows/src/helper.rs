@@ -341,6 +341,7 @@ pub struct PinnedTarget {
 
 #[cfg(windows)]
 impl Drop for PinnedTarget {
+    #[allow(unsafe_code)] // Direct Win32 FFI boundary.
     fn drop(&mut self) {
         // Safety: handle came from OpenProcess in `pin_helper_target`.
         unsafe {
@@ -365,6 +366,7 @@ impl Drop for PinnedTarget {
 /// gone or not high-integrity, it never became foreground, or it cannot be
 /// pinned.
 #[cfg(windows)]
+#[allow(unsafe_code)] // Direct Win32 FFI boundary.
 pub fn pin_helper_target(job: &Job) -> Result<PinnedTarget, String> {
     use std::time::{Duration, Instant};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
