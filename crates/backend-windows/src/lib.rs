@@ -11,6 +11,7 @@
 pub mod autostart;
 pub mod autostart_logic;
 pub mod caps;
+pub mod clip_orchestrator;
 pub mod dib;
 pub mod elevated_task;
 pub mod foreground;

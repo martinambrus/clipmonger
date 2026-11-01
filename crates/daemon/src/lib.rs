@@ -2326,9 +2326,7 @@ impl DaemonState {
             } else {
                 0
             };
-            if restore {
-                swap.finish(dwell, true);
-            }
+            swap.finish(dwell, restore);
             return outcome;
         }
         let text = payloads

@@ -1,3 +1,8 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::unnecessary_wraps,
+    clippy::pedantic
+)]
 //! Synchronous clipboard data transfer over direct Win32 clipboard APIs.
 //!
 //! Writes are one `OpenClipboard` / `EmptyClipboard` / `SetClipboardData*n` /
@@ -89,6 +94,52 @@ impl WinTransfer {
 impl Default for WinTransfer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) mod imp {
+    use super::{Error, Result};
+    #[allow(dead_code)]
+    pub(crate) const CF_TEXT: u32 = 1;
+    #[allow(dead_code)]
+    pub(crate) const CF_OEMTEXT: u32 = 7;
+    pub(crate) const CF_DIB: u32 = 8;
+    pub(crate) const CF_HDROP: u32 = 15;
+    pub(crate) const CF_UNICODETEXT: u32 = 13;
+    pub(crate) const PNG_FORMAT: &str = "PNG";
+    pub(crate) const DROP_EFFECT_FORMAT: &str = "Preferred DropEffect";
+    pub(crate) const DROP_EFFECT_MIME: &str = "x-os/Preferred DropEffect";
+    pub(crate) const DROPEFFECT_COPY: u32 = 1;
+    pub(crate) fn id_for_mime(mime: &str) -> Result<u32> {
+        match mime {
+            "text/plain" | "text/plain;charset=utf-8" => return Ok(CF_UNICODETEXT),
+            "text/uri-list" => return Ok(CF_HDROP),
+            "image/png" => return register(PNG_FORMAT),
+            _ => {}
+        }
+        if let Some(windows) = crate::formats::canonical_to_windows(mime) {
+            return register(windows);
+        }
+        if let Some(name) = mime.strip_prefix("x-os/") {
+            if name.is_empty() {
+                return Err(Error::Unsupported(format!("bad format name '{mime}'")));
+            }
+            return register(name);
+        }
+        Err(Error::Unsupported(format!("unsupported format '{mime}'")))
+    }
+    pub(crate) fn register(name: &str) -> Result<u32> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        name.hash(&mut h);
+        let id = (h.finish() as u32) | 0xC000;
+        if id == 0 {
+            Ok(0xC001)
+        } else {
+            Ok(id)
+        }
     }
 }
 
@@ -265,6 +316,7 @@ pub(crate) mod imp {
     /// clipboard order, for [`restore`]. `None` when one is over
     /// `max_bytes` or reading outlasts `budget` (owners render delayed
     /// formats on demand, and the paste waits for this).
+    #[allow(dead_code)]
     pub(crate) fn snapshot(
         ids: &[u32],
         max_bytes: u64,
@@ -295,6 +347,7 @@ pub(crate) mod imp {
     }
 
     /// Put a [`snapshot`] back in one atomic write.
+    #[allow(dead_code)]
     pub(crate) fn restore(saved: &[(u32, Vec<u8>)]) -> Result<()> {
         with_open("restore", || {
             raw::empty().map_err(|e| clip_error("empty", e))?;
