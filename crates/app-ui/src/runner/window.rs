@@ -117,6 +117,12 @@ pub trait OsWindow {
     fn is_visible(&self) -> Option<bool>;
     /// Winit's `Window::set_visible`.
     fn set_visible(&self, visible: bool);
+    /// Whether the window is minimized.
+    fn is_minimized(&self) -> Option<bool>;
+    /// Whether the window has the keyboard focus.
+    fn has_focus(&self) -> bool;
+    /// Bring the window to the front.
+    fn focus_window(&self);
 }
 
 impl OsWindow for Window {
@@ -126,6 +132,56 @@ impl OsWindow for Window {
 
     fn set_visible(&self, visible: bool) {
         Window::set_visible(self, visible);
+    }
+
+    fn is_minimized(&self) -> Option<bool> {
+        Window::is_minimized(self)
+    }
+
+    fn has_focus(&self) -> bool {
+        Window::has_focus(self)
+    }
+
+    fn focus_window(&self) {
+        Window::focus_window(self);
+    }
+}
+
+/// Result of an activation attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationStatus {
+    /// Activation was delivered or consumed (already focused/minimized/unsupported).
+    Done,
+    /// Host not ready yet, keep pending for next tick.
+    Pending,
+}
+
+/// Try to activate the popup window for X11/macOS.
+/// Returns `Done` when pending should be cleared, `Pending` when it should be retained.
+/// On Windows and Wayland (`per_show`), always returns `Done` without focusing.
+#[allow(clippy::needless_return)]
+pub fn try_activate<W: OsWindow>(window: &W, per_show: bool) -> ActivationStatus {
+    if per_show {
+        return ActivationStatus::Done;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = window;
+        return ActivationStatus::Done;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if window.is_visible() != Some(true) {
+            return ActivationStatus::Pending;
+        }
+        if window.is_minimized() == Some(true) {
+            return ActivationStatus::Done;
+        }
+        if window.has_focus() {
+            return ActivationStatus::Done;
+        }
+        window.focus_window();
+        ActivationStatus::Done
     }
 }
 

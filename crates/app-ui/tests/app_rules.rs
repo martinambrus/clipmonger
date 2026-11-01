@@ -955,7 +955,7 @@ fn rule_push_reopen_sends_the_commands_again() {
     }
 }
 
-// effects: Hide and Raise ask the window for nothing; the runner follows desired()
+// effects: Hide and Raise ask the window for nothing via viewport commands; the runner follows desired() and its activation hook
 #[test]
 fn rule_push_hide_and_raise_send_no_viewport_commands() {
     let mut rig = Rig::closed();
@@ -3504,4 +3504,159 @@ fn fix_n3_long_history_keeps_error_and_settings_painted_inside_window() {
             );
         }
     }
+}
+
+// raise-design: actual reported scenario - open hotkey, disable dismiss, another hotkey exactly one activation with new context
+#[test]
+fn rule_raise_hotkey_while_open_requests_activation_with_new_context() {
+    let mut rig = Rig::closed();
+    rig.push(hotkey(1, 2));
+    rig.tick();
+    assert!(rig.is_open());
+    let _ = rig.cmds();
+    rig.push(config_reply(
+        &json!({"popup": {"dismiss_on_focus_loss": false}}),
+    ));
+    rig.tick();
+    rig.focus(Some(true));
+    rig.tick();
+    rig.focus(Some(false));
+    rig.tick();
+    assert!(rig.is_open(), "dismiss disabled so still open");
+    rig.push(hotkey(3, 4));
+    rig.tick();
+    assert!(rig.is_open());
+    assert_eq!(
+        rig.context(),
+        PasteContext {
+            target: Some(3),
+            gesture: Some(4)
+        }
+    );
+    assert!(
+        rig.app.take_popup_activation(),
+        "second hotkey while open must request activation"
+    );
+    rig.tick();
+    assert!(!rig.app.take_popup_activation(), "idle must not re-request");
+}
+
+// raise-design: request while open preserves search/selection/context and no reopen
+#[test]
+fn rule_raise_request_while_open_preserves_state_and_no_reopen() {
+    let mut rig = Rig::closed();
+    rig.push(hotkey(1, 2));
+    rig.tick();
+    let _ = rig.cmds();
+    rig.push(config_reply(
+        &json!({"popup": {"dismiss_on_focus_loss": false}}),
+    ));
+    rig.tick();
+    rig.focus(Some(true));
+    rig.tick();
+    rig.focus(Some(false));
+    rig.tick();
+    rig.app.vm_mut().query = "hello".to_string();
+    rig.app.vm_mut().selected = 2;
+    let before_context = rig.context();
+    let before_trace = rig.trace();
+    rig.push(request());
+    rig.tick();
+    assert!(rig.is_open());
+    assert_eq!(
+        rig.context(),
+        before_context,
+        "request while open keeps context"
+    );
+    assert_eq!(rig.app.vm().query, "hello");
+    assert_eq!(rig.app.vm().selected, 2);
+    assert!(rig.app.take_popup_activation());
+    assert_eq!(rig.trace(), before_trace, "no open transition");
+    assert_eq!(rig.cmds(), vec![], "request while open sends no refresh");
+}
+
+// raise-design: hide clears pending activation
+#[test]
+fn rule_raise_hide_clears_pending() {
+    let mut rig = Rig::opened();
+    rig.push(hotkey(5, 6));
+    rig.tick();
+    assert!(rig.app.take_popup_activation());
+    rig.push(toggle());
+    rig.tick();
+    assert!(!rig.is_open());
+    assert!(!rig.app.take_popup_activation(), "hide must clear pending");
+    // also request then immediate hide in same tick
+    let mut rig2 = Rig::closed();
+    rig2.push(hotkey(1, 2));
+    rig2.tick();
+    rig2.push(config_reply(
+        &json!({"popup": {"dismiss_on_focus_loss": false}}),
+    ));
+    rig2.tick();
+    rig2.focus(Some(true));
+    rig2.tick();
+    rig2.focus(Some(false));
+    rig2.tick();
+    rig2.push(hotkey(3, 4));
+    rig2.tick();
+    assert!(rig2.app.take_popup_activation());
+    rig2.push(toggle());
+    rig2.tick();
+    assert!(!rig2.app.take_popup_activation());
+}
+
+// raise-design: batch coalescing - several Raises before drain coalesce to one
+#[test]
+fn rule_raise_batch_coalesces() {
+    let mut rig = Rig::closed();
+    rig.push(hotkey(1, 2));
+    rig.tick();
+    let _ = rig.cmds();
+    rig.push(config_reply(
+        &json!({"popup": {"dismiss_on_focus_loss": false}}),
+    ));
+    rig.tick();
+    rig.focus(Some(true));
+    rig.tick();
+    rig.focus(Some(false));
+    rig.tick();
+    rig.push(hotkey(3, 4));
+    rig.push(hotkey(5, 6));
+    rig.tick();
+    assert_eq!(
+        rig.context(),
+        PasteContext {
+            target: Some(5),
+            gesture: Some(6)
+        }
+    );
+    assert!(rig.app.take_popup_activation());
+    assert!(!rig.app.take_popup_activation(), "coalesced to one");
+}
+
+// raise-design: tray Show while open preserves and activates
+#[test]
+fn rule_raise_tray_show_while_open_preserves_and_activates() {
+    let mut rig = Rig::opened();
+    rig.push(hotkey(10, 11));
+    rig.tick();
+    let _ = rig.cmds();
+    rig.push(config_reply(
+        &json!({"popup": {"dismiss_on_focus_loss": false}}),
+    ));
+    rig.tick();
+    rig.focus(Some(true));
+    rig.tick();
+    rig.focus(Some(false));
+    rig.tick();
+    rig.app.vm_mut().query = "search".to_string();
+    rig.app.vm_mut().selected = 1;
+    let ctx = rig.context();
+    rig.tray(&[TrayAction::OpenPopup]);
+    rig.tick();
+    assert!(rig.is_open());
+    assert_eq!(rig.context(), ctx);
+    assert_eq!(rig.app.vm().query, "search");
+    assert!(rig.app.take_popup_activation());
 }

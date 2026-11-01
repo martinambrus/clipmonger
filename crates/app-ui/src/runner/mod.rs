@@ -57,6 +57,11 @@ pub trait App {
 
     /// The logical state the app wants, read after every tick.
     fn desired(&self) -> Desired;
+
+    /// One-shot activation request for the popup, drained by the runner.
+    fn take_popup_activation(&mut self) -> bool {
+        false
+    }
 }
 
 /// Window sizes and titles. Sizes are in points at zoom 1.
@@ -309,6 +314,7 @@ struct Runner<A: App> {
     popup: Slot,
     settings: Option<Slot>,
     last: Desired,
+    pending_activation: bool,
     error: Option<RunError>,
 }
 
@@ -331,6 +337,7 @@ impl<A: App> Runner<A> {
             popup,
             settings: None,
             last: Desired::default(),
+            pending_activation: false,
             error: None,
         }
     }
@@ -555,14 +562,20 @@ impl<A: App> Runner<A> {
 
     /// Reconcile desired state with OS windows.
     fn reconcile(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(app) = self.app.as_ref() else {
+        let Some(app) = self.app.as_mut() else {
             return;
         };
         let desired = app.desired();
+        let request = app.take_popup_activation();
         let previous = std::mem::replace(&mut self.last, desired);
         if desired.exit {
             event_loop.exit();
             return;
+        }
+        let edge = !previous.popup_open && desired.popup_open;
+        let mut pending = self.pending_activation || request || edge;
+        if !desired.popup_open {
+            pending = false;
         }
         let now = Instant::now();
         if desired.popup_open != previous.popup_open {
@@ -581,6 +594,17 @@ impl<A: App> Runner<A> {
                 slot.deadline.at(now);
             }
         }
+        if pending {
+            if let Some(host) = self.popup.host.as_ref() {
+                match window::try_activate(&*host.window, self.per_show) {
+                    window::ActivationStatus::Done => pending = false,
+                    window::ActivationStatus::Pending => {}
+                }
+            } else if !self.per_show {
+                pending = false;
+            }
+        }
+        self.pending_activation = pending;
     }
 
     /// Show or hide the popup window.

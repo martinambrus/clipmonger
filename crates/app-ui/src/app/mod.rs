@@ -91,6 +91,7 @@ pub struct PopupApp {
     focus_search: bool,
     /// Theme last applied to the contexts: popup, settings (dark, font scale bits).
     theme_applied: [Option<(bool, u32)>; 2],
+    pending_activation: bool,
 }
 
 impl PopupApp {
@@ -135,6 +136,7 @@ impl PopupApp {
             centered: false,
             focus_search: open,
             theme_applied: [None, None],
+            pending_activation: false,
         };
         app.apply_effects(Shell::start());
         if open {
@@ -157,6 +159,10 @@ impl PopupApp {
     #[must_use]
     pub fn vm(&self) -> &popup::PopupVm {
         &self.vm
+    }
+
+    pub fn vm_mut(&mut self) -> &mut popup::PopupVm {
+        &mut self.vm
     }
 
     /// The Settings state shared by both windows.
@@ -243,8 +249,9 @@ impl PopupApp {
     /// Apply shell effects in order: `Send` goes to the bridge (and is traced
     /// as `Paste { target }` when it is a `PasteClipTo`, with `target` true when
     /// it names a window, or an `ExecPermanent`, with `target` false);
-    /// `AllowForeground` calls the `allow_foreground` hook; `Hide` and `Raise`
-    /// do nothing; `ClearSearch` empties the search text and selects row 0;
+    /// `AllowForeground` calls the `allow_foreground` hook; `Hide` clears a
+    /// pending activation and `Raise` sets it; `ClearSearch` empties the search
+    /// text and selects row 0;
     /// `SelectNewest` selects row 0; `FocusSearch` sets `focus_search`;
     /// `ApplyTheme` stores `dark` and, when present, the font scale in the
     /// Settings state; `ApplyKeys` applies the key overrides to the view-model
@@ -266,7 +273,8 @@ impl PopupApp {
                     self.send(cmd);
                 }
                 Effect::AllowForeground => (self.allow_foreground)(),
-                Effect::Hide | Effect::Raise => {}
+                Effect::Hide => self.pending_activation = false,
+                Effect::Raise => self.pending_activation = true,
                 Effect::ClearSearch => {
                     self.vm.query.clear();
                     self.vm.selected = 0;
@@ -738,6 +746,10 @@ impl runner::App for PopupApp {
             settings_open: want.settings_open,
             exit: want.exit,
         }
+    }
+
+    fn take_popup_activation(&mut self) -> bool {
+        std::mem::take(&mut self.pending_activation)
     }
 }
 
