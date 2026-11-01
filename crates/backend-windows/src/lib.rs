@@ -21,7 +21,6 @@ pub mod html;
 pub mod monitor;
 pub mod optout;
 pub mod paste;
-#[cfg(windows)]
 pub mod sys;
 pub mod transfer;
 pub mod uri;

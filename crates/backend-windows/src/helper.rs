@@ -328,13 +328,8 @@ pub fn quote_arg(value: &str) -> String {
 
 #[must_use]
 pub fn persistent_pipe_name(profile: &std::path::Path) -> String {
-    let s = profile.to_string_lossy();
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    format!(r"\\.\pipe\clipmonger-persist-{h:016x}")
+    let hash = clipmonger_core::hash::fnv1a64(profile.to_string_lossy().as_bytes());
+    format!(r"\\.\pipe\clipmonger-persist-{hash:016x}")
 }
 
 #[cfg(not(windows))]
@@ -447,6 +442,7 @@ mod tests {
             ("", r"\\.\pipe\clipmonger-persist-cbf29ce484222325"),
             ("a", r"\\.\pipe\clipmonger-persist-af63dc4c8601ec8c"),
             ("foobar", r"\\.\pipe\clipmonger-persist-85944171f73967e8"),
+            ("fo", r"\\.\pipe\clipmonger-persist-08985907b541d342"),
         ] {
             assert_eq!(
                 persistent_pipe_name(std::path::Path::new(profile)),
@@ -454,6 +450,21 @@ mod tests {
                 "profile: {profile:?}"
             );
         }
+    }
+
+    #[test]
+    fn persistent_pipe_name_proves_zero_padding_for_leading_zero_vector() {
+        let pipe = persistent_pipe_name(std::path::Path::new("fo"));
+        assert_eq!(pipe, r"\\.\pipe\clipmonger-persist-08985907b541d342");
+        assert!(
+            pipe.contains("08985907b541d342"),
+            "must preserve leading zero padding"
+        );
+        assert_eq!(
+            clipmonger_core::hash::fnv1a64(b"fo"),
+            0x0898_5907_b541_d342,
+            "core helper must agree on fo vector"
+        );
     }
 
     #[test]

@@ -815,12 +815,7 @@ fn new_id(index: u64) -> String {
 /// The store computes its own canonical dedupe hash from payloads; this only
 /// fills the row metadata.
 fn fnv_hex(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("{hash:016x}")
+    format!("{:016x}", clipmonger_core::hash::fnv1a64(bytes))
 }
 
 /// Decode standard padded base64; `None` on any malformed input.
@@ -2894,5 +2889,37 @@ mod tests {
         state.note_elevation_refused("elevation refused: UAC cancelled");
         assert!(state.elevation_refused());
         assert_eq!(paste_level(&state).as_deref(), Some("degraded"));
+    }
+
+    #[test]
+    fn fnv_hex_vectors_include_leading_zero_padding() {
+        assert_eq!(super::fnv_hex(b""), "cbf29ce484222325");
+        assert_eq!(super::fnv_hex(b"a"), "af63dc4c8601ec8c");
+        assert_eq!(super::fnv_hex(b"foobar"), "85944171f73967e8");
+        assert_eq!(super::fnv_hex(b"fo"), "08985907b541d342");
+        assert!(
+            super::fnv_hex(b"fo").starts_with('0'),
+            "fo vector must prove zero padding"
+        );
+        assert_eq!(
+            super::fnv_hex(b"fo"),
+            format!("{:016x}", clipmonger_core::hash::fnv1a64(b"fo"))
+        );
+    }
+
+    #[test]
+    fn fnv_hex_via_core_helper_matches_consumers() {
+        for (input, expected) in [
+            ("", "cbf29ce484222325"),
+            ("a", "af63dc4c8601ec8c"),
+            ("foobar", "85944171f73967e8"),
+            ("fo", "08985907b541d342"),
+        ] {
+            assert_eq!(super::fnv_hex(input.as_bytes()), expected);
+            assert_eq!(
+                super::fnv_hex(input.as_bytes()),
+                format!("{:016x}", clipmonger_core::hash::fnv1a64(input.as_bytes()))
+            );
+        }
     }
 }

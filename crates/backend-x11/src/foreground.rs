@@ -148,10 +148,31 @@ fn now_ms() -> i64 {
 
 /// FNV-1a (64-bit) title hash.
 fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    clipmonger_core::hash::fnv1a64(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fnv1a;
+
+    #[test]
+    fn fnv1a_vectors_match_core_and_known_hashes() {
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a(b"foobar"), 0x8594_4171_f739_67e8);
+        assert_eq!(fnv1a(b"fo"), 0x0898_5907_b541_d342);
+        assert_eq!(format!("{:016x}", fnv1a(b"fo")), "08985907b541d342");
+        assert_eq!(fnv1a(b"fo"), clipmonger_core::hash::fnv1a64(b"fo"));
     }
-    hash
+
+    #[test]
+    fn fnv1a_title_hash_is_byte_oriented() {
+        assert_eq!(fnv1a(b"hello"), 0xa430_d846_80aa_bd0b);
+        assert_eq!(fnv1a(b""), clipmonger_core::hash::FNV_OFFSET_BASIS);
+        assert_eq!(fnv1a(b"test"), clipmonger_core::hash::fnv1a64(b"test"));
+        assert_eq!(
+            fnv1a("café".as_bytes()),
+            clipmonger_core::hash::fnv1a64("café".as_bytes())
+        );
+    }
 }

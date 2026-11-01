@@ -84,6 +84,29 @@ fn basename(uri: &str) -> &str {
     after_slash.rsplit('\\').next().unwrap_or(after_slash)
 }
 
+pub const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+pub const FNV_PRIME: u64 = 0x0100_0000_01b3;
+
+#[must_use]
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+#[must_use]
+pub fn fnv1a64_update(hash: u64, bytes: &[u8]) -> u64 {
+    let mut h = hash;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -92,4 +115,43 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod fnv_tests {
+    use super::*;
+
+    #[test]
+    fn fnv1a64_vectors_match_canonical() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+        assert_eq!(fnv1a64(b"fo"), 0x0898_5907_b541_d342);
+        assert_eq!(format!("{:016x}", fnv1a64(b"fo")), "08985907b541d342");
+        assert_eq!(format!("{:x}", fnv1a64(b"fo")), "8985907b541d342");
+    }
+
+    #[test]
+    fn fnv1a64_update_is_split_equivalent() {
+        assert_eq!(fnv1a64(b"foobar"), fnv1a64_update(fnv1a64(b"foo"), b"bar"));
+        assert_eq!(fnv1a64(b"foobar"), fnv1a64_update(fnv1a64(b""), b"foobar"));
+        assert_eq!(fnv1a64(b"fo"), fnv1a64_update(fnv1a64(b"f"), b"o"));
+        assert_eq!(
+            fnv1a64(b"hello world"),
+            fnv1a64_update(fnv1a64_update(FNV_OFFSET_BASIS, b"hello"), b" world")
+        );
+    }
+
+    #[test]
+    fn fnv1a64_update_chaining_matches_sequential_bytes() {
+        let mut h = FNV_OFFSET_BASIS;
+        h = fnv1a64_update(h, b"text/plain");
+        h = fnv1a64_update(h, b"text/html");
+        let mut expected = FNV_OFFSET_BASIS;
+        for b in b"text/plaintext/html" {
+            expected ^= u64::from(*b);
+            expected = expected.wrapping_mul(FNV_PRIME);
+        }
+        assert_eq!(h, expected);
+    }
 }

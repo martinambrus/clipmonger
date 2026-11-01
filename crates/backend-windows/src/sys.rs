@@ -1,40 +1,48 @@
 //! Raw Win32 helpers. This is the only module in the crate that may use
 //! `unsafe`; every `unsafe` block carries a one-line safety note.
-//!
-//! Compiled only on Windows; on other systems this module is empty.
-
-#![cfg(windows)]
 #![allow(unsafe_code)]
 
+#[cfg(windows)]
 use std::ffi::{c_void, OsString};
+#[cfg(windows)]
 use std::os::windows::ffi::OsStringExt;
+#[cfg(windows)]
 use std::sync::mpsc::Sender;
 
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, HWND};
+#[cfg(windows)]
 use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_QUERY};
+#[cfg(windows)]
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, RemoveClipboardFormatListener,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+#[cfg(windows)]
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegQueryValueExW, RegSetValueExW,
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
+#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
     GetWindowThreadProcessId, PostMessageW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW,
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_MESSAGE, MSG, WM_CLIPBOARDUPDATE,
     WM_CLOSE, WM_CREATE, WM_DESTROY, WNDCLASSEXW,
 };
+#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowTextW, SetForegroundWindow,
 };
 
 /// Last Win32 error as a short string.
+#[cfg(windows)]
 pub(crate) fn last_error() -> String {
     // Safety: GetLastError only reads the calling thread's error slot.
     let code = unsafe { GetLastError() };
@@ -42,6 +50,7 @@ pub(crate) fn last_error() -> String {
 }
 
 /// Encode as nul-terminated UTF-16 for Win32 `*W` calls.
+#[cfg(windows)]
 fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -54,10 +63,13 @@ fn to_wide(value: &str) -> Vec<u16> {
 /// window makes the open exclusive: two `OpenClipboard(NULL)` callers do not
 /// exclude each other, and the other side's `CloseClipboard` ends ours
 /// mid-operation. Created, used and destroyed on the calling thread.
+#[cfg(windows)]
 pub(crate) struct ClipboardWindow(HWND);
 
+#[cfg(windows)]
 impl ClipboardWindow {
     /// Create the window, or `None` when the session refuses one.
+    #[cfg(windows)]
     pub(crate) fn new() -> Option<Self> {
         let class = to_wide("STATIC");
         // Safety: "STATIC" is a predefined class; message-only parent, no create params.
@@ -81,14 +93,18 @@ impl ClipboardWindow {
     }
 
     /// The window handle, for `OpenClipboard`.
+    #[cfg(windows)]
     pub(crate) fn hwnd(&self) -> HWND {
         self.0
     }
 }
 
+#[cfg(windows)]
 impl Drop for ClipboardWindow {
+    #[cfg(windows)]
     fn drop(&mut self) {
         // Safety: the window was created on this thread and is destroyed exactly once.
+        #[cfg(windows)]
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(self.0);
         }
@@ -103,21 +119,26 @@ impl Drop for ClipboardWindow {
 // Safety: every `WinHotkeys` is created and used from its owning pump
 // thread only (the daemon keeps one manager on the backend thread); the
 // handle is never touched concurrently.
+#[cfg(windows)]
 unsafe impl Send for crate::hotkeys::WinHotkeys {}
 
 /// RAII handle for the hidden-window clipboard listener thread.
 ///
 /// The HWND is stored as `usize` (handle values round-trip losslessly) so
 /// this handle stays `Send`; the pump thread reconstitutes it locally.
+#[cfg(windows)]
 pub(crate) struct PumpHandle {
     hwnd: usize,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+#[cfg(windows)]
 impl PumpHandle {
     /// Ask the pump thread to exit and wait for it.
+    #[cfg(windows)]
     pub(crate) fn stop(&mut self) {
         // Safety: hwnd names a live message-only window owned by the pump thread.
+        #[cfg(windows)]
         unsafe {
             PostMessageW(self.hwnd as HWND, WM_CLOSE, 0, 0);
         }
@@ -128,6 +149,7 @@ impl PumpHandle {
 }
 
 /// Window procedure: forwards `WM_CLIPBOARDUPDATE` wakes to the channel.
+#[cfg(windows)]
 unsafe extern "system" fn monitor_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -141,6 +163,7 @@ unsafe extern "system" fn monitor_wndproc(
                 &*(lparam as *const windows_sys::Win32::UI::WindowsAndMessaging::CREATESTRUCTW)
             };
             // Safety: lpCreateParams is the Box<Sender> pointer handed to CreateWindowExW.
+            #[cfg(windows)]
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
             }
@@ -161,11 +184,13 @@ unsafe extern "system" fn monitor_wndproc(
             if !ptr.is_null() {
                 drop(unsafe { Box::from_raw(ptr) });
                 // Safety: clearing USERDATA after reclaiming; window is being destroyed.
+                #[cfg(windows)]
                 unsafe {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 }
             }
             // Safety: no preconditions beyond calling on the window's thread.
+            #[cfg(windows)]
             unsafe {
                 PostQuitMessage(0);
             }
@@ -173,7 +198,10 @@ unsafe extern "system" fn monitor_wndproc(
         }
         _ => {
             // Safety: default handler for unhandled messages; hwnd is valid during dispatch.
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            #[cfg(windows)]
+            unsafe {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
         }
     }
 }
@@ -186,6 +214,7 @@ unsafe extern "system" fn monitor_wndproc(
 /// caller and pumping elsewhere would starve the pump (no wakes) and wedge
 /// `stop` (the `WM_CLOSE` wake would sit in the caller's queue while the
 /// pump's `join` waits forever).
+#[cfg(windows)]
 pub(crate) fn start_pump(wakes: Sender<()>) -> Result<PumpHandle, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<usize, String>>();
     let thread = std::thread::spawn(move || {
@@ -245,6 +274,7 @@ pub(crate) fn start_pump(wakes: Sender<()>) -> Result<PumpHandle, String> {
             // Safety: listener never attached; tearing down the window created above.
             // (DestroyWindow runs WM_DESTROY synchronously, which reclaims
             // the boxed sender, so it must not be reclaimed again here.)
+            #[cfg(windows)]
             unsafe {
                 windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
             }
@@ -256,6 +286,7 @@ pub(crate) fn start_pump(wakes: Sender<()>) -> Result<PumpHandle, String> {
         // WM_CLOSE (posted by `stop`) falls through to DefWindowProc, which
         // destroys the window; WM_DESTROY posts the quit that ends this loop,
         // so the `join` in `stop` cannot wait forever.
+        #[cfg(windows)]
         unsafe {
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0) > 0 {
@@ -263,6 +294,7 @@ pub(crate) fn start_pump(wakes: Sender<()>) -> Result<PumpHandle, String> {
             }
         }
         // Safety: listener was added; removing before thread exit.
+        #[cfg(windows)]
         unsafe {
             RemoveClipboardFormatListener(hwnd);
         }
@@ -287,6 +319,7 @@ pub(crate) fn start_pump(wakes: Sender<()>) -> Result<PumpHandle, String> {
 
 /// Foreground window handle, or `None` when there is none.
 #[must_use]
+#[cfg(windows)]
 pub fn foreground_hwnd() -> Option<HWND> {
     // Safety: GetForegroundWindow takes no arguments and has no preconditions.
     let hwnd = unsafe { GetForegroundWindow() };
@@ -300,10 +333,14 @@ pub fn foreground_hwnd() -> Option<HWND> {
 /// Whether `hwnd` still names an existing window.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[must_use]
+#[cfg(windows)]
 pub fn is_window(hwnd: HWND) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
     // Safety: IsWindow only validates the handle value.
-    unsafe { IsWindow(hwnd) != 0 }
+    #[cfg(windows)]
+    unsafe {
+        IsWindow(hwnd) != 0
+    }
 }
 
 /// Make `hwnd` the foreground window: attach to the current foreground
@@ -311,11 +348,13 @@ pub fn is_window(hwnd: HWND) -> bool {
 /// honored without our own foreground rights), raise, activate, detach.
 /// Returns whether `hwnd` is the foreground window afterwards.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[cfg(windows)]
 pub fn activate_window(hwnd: HWND) -> bool {
     use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows_sys::Win32::UI::WindowsAndMessaging::{BringWindowToTop, IsHungAppWindow};
     // Safety: plain window-manager calls on handle values; a failed attach
     // or activation only leaves the foreground unchanged.
+    #[cfg(windows)]
     unsafe {
         // Activating a hung window, or sharing input state with a hung
         // foreground thread, can block this thread indefinitely.
@@ -346,6 +385,7 @@ pub fn activate_window(hwnd: HWND) -> bool {
 /// own daemon binary).
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[must_use]
+#[cfg(windows)]
 pub fn pipe_server_pid(pipe_handle: *mut std::ffi::c_void) -> Option<u32> {
     use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
     let mut pid: u32 = 0;
@@ -361,6 +401,7 @@ pub fn pipe_server_pid(pipe_handle: *mut std::ffi::c_void) -> Option<u32> {
 
 /// Foreground window as a handle value (daemon seam, no Win32 types).
 #[must_use]
+#[cfg(windows)]
 pub fn foreground_window_id() -> Option<i64> {
     foreground_hwnd().map(|hwnd| hwnd as i64)
 }
@@ -369,6 +410,7 @@ pub fn foreground_window_id() -> Option<i64> {
 /// to `owner_pid` (the verified UI's popup). A hung window is left alone and
 /// a minimized one is restored. Returns whether it is in front afterwards.
 #[must_use]
+#[cfg(windows)]
 pub fn show_owned_window(hwnd: i64, owner_pid: u32) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         IsHungAppWindow, IsIconic, ShowWindow, SW_RESTORE, SW_SHOW,
@@ -379,6 +421,7 @@ pub fn show_owned_window(hwnd: i64, owner_pid: u32) -> bool {
         return false;
     }
     // Safety: plain window-manager calls on a window of the UI process.
+    #[cfg(windows)]
     unsafe {
         // ShowWindow waits for the window's thread, so a hung window would
         // block the caller (the daemon's hotkey thread).
@@ -398,14 +441,19 @@ pub fn show_owned_window(hwnd: i64, owner_pid: u32) -> bool {
 
 /// Pass this process's right to set the foreground window on to `pid`.
 #[must_use]
+#[cfg(windows)]
 pub fn allow_set_foreground(pid: u32) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
     // Safety: no pointers; without the right the call just fails.
-    unsafe { AllowSetForegroundWindow(pid) != 0 }
+    #[cfg(windows)]
+    unsafe {
+        AllowSetForegroundWindow(pid) != 0
+    }
 }
 
 /// Owning process id of a `WinHwnd` handle value (daemon supervisor seam).
 #[must_use]
+#[cfg(windows)]
 pub fn hwnd_owner_pid(hwnd: i64) -> Option<u32> {
     // Safety: i64 handle round-trips through HWND on 64-bit Windows (the
     // only target this backend supports); the query never frees it.
@@ -417,9 +465,11 @@ pub fn hwnd_owner_pid(hwnd: i64) -> Option<u32> {
     clippy::not_unsafe_ptr_arg_deref,
     reason = "HWND is an opaque handle validated by Windows, not a pointer to dereference"
 )]
+#[cfg(windows)]
 pub fn window_pid(hwnd: HWND) -> Option<u32> {
     let mut pid: u32 = 0;
     // Safety: pid pointer is valid for the call; return value is the thread id.
+    #[cfg(windows)]
     unsafe {
         GetWindowThreadProcessId(hwnd, &raw mut pid);
     }
@@ -431,6 +481,7 @@ pub fn window_pid(hwnd: HWND) -> Option<u32> {
 }
 
 /// Lowercased exe basename for `pid`, or `None` when it cannot be determined.
+#[cfg(windows)]
 pub(crate) fn process_basename(pid: u32) -> Option<String> {
     // Safety: OpenProcess with a query flag; handle closed below on all paths.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -442,6 +493,7 @@ pub(crate) fn process_basename(pid: u32) -> Option<String> {
     // Safety: buffer and length pointer are valid; handle has query rights.
     let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &raw mut len) };
     // Safety: handle came from OpenProcess and is still open here.
+    #[cfg(windows)]
     unsafe {
         CloseHandle(handle);
     }
@@ -454,7 +506,18 @@ pub(crate) fn process_basename(pid: u32) -> Option<String> {
     Some(base.to_ascii_lowercase())
 }
 
+#[allow(dead_code)]
+fn window_title_hash_units(units: &[u16]) -> u64 {
+    let mut hash = clipmonger_core::hash::FNV_OFFSET_BASIS;
+    for unit in units {
+        hash ^= u64::from(*unit);
+        hash = hash.wrapping_mul(clipmonger_core::hash::FNV_PRIME);
+    }
+    hash
+}
+
 /// FNV-1a hash of the window title; 0 when the title is unavailable.
+#[cfg(windows)]
 pub(crate) fn window_title_hash(hwnd: HWND) -> u64 {
     // Safety: length query first; hwnd names a window readable by this process.
     let len = unsafe { GetWindowTextW(hwnd, std::ptr::null_mut(), 0) };
@@ -468,16 +531,12 @@ pub(crate) fn window_title_hash(hwnd: HWND) -> u64 {
         return 0;
     }
     buf.truncate(usize::try_from(got).unwrap_or(0));
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for unit in buf {
-        hash ^= u64::from(unit);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    hash
+    window_title_hash_units(&buf)
 }
 
 /// Whether `pid` runs elevated, or `None` when it cannot be determined.
 #[must_use]
+#[cfg(windows)]
 pub fn process_elevated(pid: u32) -> Option<bool> {
     // Safety: OpenProcess with a query flag; handle closed below on all paths.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -486,6 +545,7 @@ pub fn process_elevated(pid: u32) -> Option<bool> {
     }
     let elevated = token_elevated(handle);
     // Safety: handle came from OpenProcess and is still open here.
+    #[cfg(windows)]
     unsafe {
         CloseHandle(handle);
     }
@@ -493,6 +553,7 @@ pub fn process_elevated(pid: u32) -> Option<bool> {
 }
 
 /// Whether the current process runs elevated.
+#[cfg(windows)]
 pub(crate) fn current_process_elevated() -> Option<bool> {
     // Safety: GetCurrentProcess returns a pseudo-handle needing no close.
     let pseudo: HANDLE = unsafe { GetCurrentProcess() };
@@ -500,6 +561,7 @@ pub(crate) fn current_process_elevated() -> Option<bool> {
 }
 
 /// Read `TokenElevation` for a process or pseudo-handle; never closes it.
+#[cfg(windows)]
 fn token_elevated(process: HANDLE) -> Option<bool> {
     let mut token: HANDLE = std::ptr::null_mut();
     // Safety: token pointer is valid; handle has query rights (or is the pseudo-handle).
@@ -520,6 +582,7 @@ fn token_elevated(process: HANDLE) -> Option<bool> {
         )
     };
     // Safety: token came from OpenProcessToken and is still open here.
+    #[cfg(windows)]
     unsafe {
         CloseHandle(token);
     }
@@ -535,18 +598,24 @@ fn token_elevated(process: HANDLE) -> Option<bool> {
 // ---------------------------------------------------------------------------
 
 /// HKCU subkey holding per-user Run values.
+#[cfg(windows)]
 const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 /// HKCU subkey holding `StartupApproved` overrides.
+#[cfg(windows)]
 const APPROVED_SUBKEY: &str =
     "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
 /// This daemon's Run value name.
+#[cfg(windows)]
 pub(crate) const RUN_VALUE_NAME: &str = "clipmonger";
 /// `RegCreateKeyExW` conflict: the window class is already registered.
+#[cfg(windows)]
 const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
 /// `RegDeleteValueW`/`RegQueryValueExW` missing value.
+#[cfg(windows)]
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 
 /// Open (creating if needed) a HKCU subkey; caller must `RegCloseKey`.
+#[cfg(windows)]
 fn open_key(
     subkey: &str,
     write: bool,
@@ -579,6 +648,7 @@ fn open_key(
 }
 
 /// Read this daemon's Run command line, or `None` when absent.
+#[cfg(windows)]
 pub(crate) fn run_value_get() -> Result<Option<String>, String> {
     let key = open_key(RUN_SUBKEY, false)?;
     let name = to_wide(RUN_VALUE_NAME);
@@ -597,6 +667,7 @@ pub(crate) fn run_value_get() -> Result<Option<String>, String> {
     };
     if status != 0 {
         // Safety: key came from open_key and is still open here.
+        #[cfg(windows)]
         unsafe {
             RegCloseKey(key);
         }
@@ -618,6 +689,7 @@ pub(crate) fn run_value_get() -> Result<Option<String>, String> {
         )
     };
     // Safety: key came from open_key and is still open here.
+    #[cfg(windows)]
     unsafe {
         RegCloseKey(key);
     }
@@ -635,6 +707,7 @@ pub(crate) fn run_value_get() -> Result<Option<String>, String> {
 }
 
 /// Write this daemon's Run command line (`REG_SZ`).
+#[cfg(windows)]
 pub(crate) fn run_value_set(command: &str) -> Result<(), String> {
     let key = open_key(RUN_SUBKEY, true)?;
     let name = to_wide(RUN_VALUE_NAME);
@@ -654,6 +727,7 @@ pub(crate) fn run_value_set(command: &str) -> Result<(), String> {
         )
     };
     // Safety: key came from open_key and is still open here.
+    #[cfg(windows)]
     unsafe {
         RegCloseKey(key);
     }
@@ -664,12 +738,14 @@ pub(crate) fn run_value_set(command: &str) -> Result<(), String> {
 }
 
 /// Delete this daemon's Run value; missing values are success.
+#[cfg(windows)]
 pub(crate) fn run_value_delete() -> Result<(), String> {
     let key = open_key(RUN_SUBKEY, true)?;
     let name = to_wide(RUN_VALUE_NAME);
     // Safety: name is nul-terminated; key opened for set; missing value (2) is success.
     let status = unsafe { RegDeleteValueW(key, name.as_ptr()) };
     // Safety: key came from open_key and is still open here.
+    #[cfg(windows)]
     unsafe {
         RegCloseKey(key);
     }
@@ -698,6 +774,7 @@ pub(crate) fn run_value_delete() -> Result<(), String> {
 ///
 /// Returns a message when the `runas` launch is refused (UAC cancel, missing
 /// binary, policy block).
+#[cfg(windows)]
 pub fn spawn_elevated_worker(exe: &str, profile: &std::path::Path) -> Result<(), String> {
     use windows_sys::Win32::UI::Shell::{
         ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
@@ -725,6 +802,7 @@ pub fn spawn_elevated_worker(exe: &str, profile: &std::path::Path) -> Result<(),
     }
     if !info.hProcess.is_null() {
         // Safety: handle came from ShellExecuteEx with NOCLOSEPROCESS.
+        #[cfg(windows)]
         unsafe {
             CloseHandle(info.hProcess);
         }
@@ -734,6 +812,7 @@ pub fn spawn_elevated_worker(exe: &str, profile: &std::path::Path) -> Result<(),
 
 /// Full image path for `pid` (peer authentication: must equal our own exe).
 #[must_use]
+#[cfg(windows)]
 pub fn process_image_path(pid: u32) -> Option<String> {
     // Safety: OpenProcess with a query flag; handle closed below on all paths.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -745,6 +824,7 @@ pub fn process_image_path(pid: u32) -> Option<String> {
     // Safety: buffer and length pointer are valid; handle has query rights.
     let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &raw mut len) };
     // Safety: handle came from OpenProcess and is still open here.
+    #[cfg(windows)]
     unsafe {
         CloseHandle(handle);
     }
@@ -758,6 +838,7 @@ pub fn process_image_path(pid: u32) -> Option<String> {
 /// Whether `pid` runs with an elevated token (daemon-side check that the
 /// helper peer is high-integrity).
 #[must_use]
+#[cfg(windows)]
 pub fn process_token_high(pid: u32) -> Option<bool> {
     // Safety: OpenProcess with a query flag; handle closed below on all paths.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -766,6 +847,7 @@ pub fn process_token_high(pid: u32) -> Option<bool> {
     }
     let elevated = token_elevated(handle);
     // Safety: handle came from OpenProcess and is still open here.
+    #[cfg(windows)]
     unsafe {
         CloseHandle(handle);
     }
@@ -780,6 +862,7 @@ pub fn process_token_high(pid: u32) -> Option<bool> {
 /// query, never dereferenced as Rust data.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[must_use]
+#[cfg(windows)]
 pub fn pipe_client_pid(pipe_handle: *mut std::ffi::c_void) -> Option<u32> {
     use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
     let mut pid: u32 = 0;
@@ -798,6 +881,7 @@ pub fn pipe_client_pid(pipe_handle: *mut std::ffi::c_void) -> Option<u32> {
 /// set for the processes it starts). Empty when it cannot be resolved; an
 /// empty path matches nothing, so the caller falls back to portable mode.
 #[must_use]
+#[cfg(windows)]
 pub fn program_files_dir() -> std::path::PathBuf {
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
@@ -815,6 +899,7 @@ pub fn program_files_dir() -> std::path::PathBuf {
     if hr >= 0 && !raw.is_null() {
         let mut len = 0;
         // Safety: on success `raw` is a nul-terminated wide string.
+        #[cfg(windows)]
         unsafe {
             while *raw.add(len) != 0 {
                 len += 1;
@@ -824,13 +909,17 @@ pub fn program_files_dir() -> std::path::PathBuf {
     }
     if !raw.is_null() {
         // Safety: allocated by SHGetKnownFolderPath; freed exactly once.
-        unsafe { CoTaskMemFree(raw.cast()) };
+        #[cfg(windows)]
+        unsafe {
+            CoTaskMemFree(raw.cast());
+        };
     }
     path
 }
 
 /// 32 hex chars of OS randomness for the helper pipe rendezvous name.
 #[must_use]
+#[cfg(windows)]
 pub fn random_pipe_segment() -> String {
     use std::fmt::Write as _;
     use windows_sys::Win32::Security::Cryptography::{
@@ -858,9 +947,11 @@ pub fn random_pipe_segment() -> String {
 }
 
 /// Non-OS fallback when the system RNG is unavailable (never preferred).
+#[cfg(windows)]
 fn fallback_pipe_segment() -> String {
     use std::fmt::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(windows)]
     static CTR: AtomicU64 = AtomicU64::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
@@ -882,6 +973,7 @@ fn fallback_pipe_segment() -> String {
 }
 
 /// Raw `StartupApproved` override blob for this daemon's value, if present.
+#[cfg(windows)]
 pub(crate) fn startup_approved_blob() -> Option<Vec<u8>> {
     let key = open_key(APPROVED_SUBKEY, false).ok()?;
     let name = to_wide(RUN_VALUE_NAME);
@@ -900,6 +992,7 @@ pub(crate) fn startup_approved_blob() -> Option<Vec<u8>> {
     };
     if status != 0 || len == 0 || len > 1 << 20 {
         // Safety: key came from open_key and is still open here.
+        #[cfg(windows)]
         unsafe {
             RegCloseKey(key);
         }
@@ -918,6 +1011,7 @@ pub(crate) fn startup_approved_blob() -> Option<Vec<u8>> {
         )
     };
     // Safety: key came from open_key and is still open here.
+    #[cfg(windows)]
     unsafe {
         RegCloseKey(key);
     }
@@ -926,4 +1020,49 @@ pub(crate) fn startup_approved_blob() -> Option<Vec<u8>> {
     }
     buf.truncate(len as usize);
     Some(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_title_hash_units;
+
+    #[test]
+    fn window_title_hash_units_ascii_matches_byte_hash_for_ascii() {
+        assert_eq!(
+            window_title_hash_units(&"abc".encode_utf16().collect::<Vec<_>>()),
+            0xe71f_a219_0541_574b
+        );
+        assert_eq!(
+            window_title_hash_units(&"Hello".encode_utf16().collect::<Vec<_>>()),
+            0x63f0_bfac_f2c0_0f6b
+        );
+        assert_eq!(window_title_hash_units(&[]), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(
+            window_title_hash_units(&"abc".encode_utf16().collect::<Vec<_>>()),
+            clipmonger_core::hash::fnv1a64(b"abc"),
+            "ASCII units and bytes coincide but must be verified"
+        );
+    }
+
+    #[test]
+    fn window_title_hash_units_non_ascii_preserves_legacy_encoding() {
+        let cafe_units: Vec<u16> = "café".encode_utf16().collect();
+        assert_eq!(window_title_hash_units(&cafe_units), 0xb538_f990_e859_62dc);
+        assert_eq!(
+            window_title_hash_units(&"é".encode_utf16().collect::<Vec<_>>()),
+            0xaf64_644c_8602_d3a4
+        );
+        let emoji_units: Vec<u16> = "😀".encode_utf16().collect();
+        assert_eq!(emoji_units, vec![0xd83d, 0xde00]);
+        assert_eq!(window_title_hash_units(&emoji_units), 0xe5e4_5a0a_241b_88d8);
+        assert_ne!(
+            window_title_hash_units(&"café".encode_utf16().collect::<Vec<_>>()),
+            clipmonger_core::hash::fnv1a64("café".as_bytes()),
+            "non-ASCII must differ from UTF-8 byte hash"
+        );
+        assert_ne!(
+            window_title_hash_units(&emoji_units),
+            clipmonger_core::hash::fnv1a64("😀".as_bytes())
+        );
+    }
 }
