@@ -27,9 +27,9 @@ run_step() {
 }
 gate() { GATE_LINES+=("$1"); }
 
-FMT_OK=0; CLIPPY_OK=0; TESTS_OK=0; X11LIB_OK=0; XVFB_OK=0; WIN_OK=0; GNOME_OK=0; CAPS_OK=0; DENY_STATE="SKIP"
+FMT_OK=0; CLIPPY_OK=0; TESTS_OK=0; X11LIB_OK=0; XVFB_OK=0; WIN_OK=0; WIN_CLIPPY_OK=0; GNOME_OK=0; CAPS_OK=0; DENY_STATE="SKIP"
 
-run_step "fmt" 60 cargo fmt --check && FMT_OK=1
+run_step "fmt" 60 cargo fmt --all --check && FMT_OK=1
 run_step "clippy" 600 cargo clippy --workspace --all-targets --all-features -- -D warnings && CLIPPY_OK=1
 # Workspace tests excluding the X11 package: the Xvfb suite's harness
 # contract is `--test-threads=1` (parallel threads race selection
@@ -38,7 +38,8 @@ run_step "clippy" 600 cargo clippy --workspace --all-targets --all-features -- -
 run_step "workspace-tests" 900 cargo test -p clipmonger-core -p clipmonger-platform -p clipmonger-ipc -p clipmonger-daemon -p clipmonger-app-cli -p clipmonger-app-ui -p clipmonger-backend-windows -p clipmonger-backend-wayland && TESTS_OK=1
 run_step "x11-lib-tests" 300 cargo test -p clipmonger-backend-x11 --lib && X11LIB_OK=1
 run_step "x11-xvfb-serial" 600 cargo test -p clipmonger-backend-x11 --test xvfb_acceptance -- --test-threads=1 && XVFB_OK=1
-run_step "windows-gnu-check" 600 cargo check --workspace --target x86_64-pc-windows-gnu && WIN_OK=1
+run_step "windows-gnu-check" 600 cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu && WIN_OK=1
+run_step "windows-gnu-clippy" 600 cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-gnu -- -D warnings && WIN_CLIPPY_OK=1
 if run_step "gnome-ext-build" 300 bash -c 'cd gnome-ext && npm run build'; then
     run_step "gnome-ext-test" 300 bash -c 'cd gnome-ext && npm test' && GNOME_OK=1
 fi
@@ -46,15 +47,17 @@ run_step "caps-golden" 120 cargo test -p clipmonger-daemon --test caps_golden &&
 
 if command -v cargo-deny >/dev/null 2>&1; then
     if run_step "cargo-deny" 300 cargo deny check; then DENY_STATE="PASS"; else DENY_STATE="FAIL"; fi
-elif command -v cargo-audit >/dev/null 2>&1; then
-    if run_step "cargo-audit" 300 cargo audit; then DENY_STATE="PASS"; else DENY_STATE="FAIL"; fi
 else
-    note "SKIP cargo-deny/cargo-audit: neither binary available (see deny.toml; install attempted separately, calibration)"
-    DENY_STATE="SKIP"
+    note "FAIL cargo-deny: required for licenses, advisories, bans and sources (see deny.toml)"
+    FAILURES=$((FAILURES + 1))
+    DENY_STATE="FAIL"
+    if command -v cargo-audit >/dev/null 2>&1; then
+        run_step "cargo-audit-advisories-only" 300 cargo audit || :
+    fi
 fi
 
 # --- seg-11 §5 gate table -------------------------------------------------
-if [ "$FMT_OK" = 1 ] && [ "$CLIPPY_OK" = 1 ] && [ "$TESTS_OK" = 1 ] && [ "$X11LIB_OK" = 1 ] && [ "$XVFB_OK" = 1 ] && [ "$WIN_OK" = 1 ] && [ "$GNOME_OK" = 1 ]; then
+if [ "$FMT_OK" = 1 ] && [ "$CLIPPY_OK" = 1 ] && [ "$TESTS_OK" = 1 ] && [ "$X11LIB_OK" = 1 ] && [ "$XVFB_OK" = 1 ] && [ "$WIN_OK" = 1 ] && [ "$WIN_CLIPPY_OK" = 1 ] && [ "$GNOME_OK" = 1 ]; then
     gate "GATE 1 full-pyramid-matrix: PASS (here legs) "
 else
     gate "GATE 1 full-pyramid-matrix: FAIL (see step FAILs above)"
@@ -79,7 +82,7 @@ gate "SKIP-MANUAL gate5-signoff-record: two-signature signoff is a user action"
 case "$DENY_STATE" in
     PASS) gate "GATE 6 dependency-review: PASS" ;;
     FAIL) gate "GATE 6 dependency-review: FAIL" ;;
-    *)    gate "GATE 6 dependency-review: SKIP (audit tool unavailable; deny.toml committed)" ;;
+    *)    gate "GATE 6 dependency-review: FAIL (full dependency review unavailable)" ;;
 esac
 gate "SKIP-MANUAL gate7 traceability-sweep: T-315..T-318 added; full F->T sweep + issue filing is user-approved"
 

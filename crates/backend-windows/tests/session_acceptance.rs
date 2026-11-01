@@ -631,6 +631,7 @@ fn t411_swap_restores_formats() {
 /// this process (still visible, or hidden like a popup dismissed with Esc),
 /// shows it and brings it to the front. Own windows only.
 #[test]
+#[allow(unsafe_code)] // Direct Win32 FFI for the test-owned window.
 fn t_show_owned_window_restores_minimized() {
     use clipmonger_backend_windows::show_owned_window;
     use windows_sys::Win32::Foundation::HWND;
