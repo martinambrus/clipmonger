@@ -607,6 +607,7 @@ dependencies = [
  "uuid",
  "windows 0.61.3",
  "winit",
+ "x11rb 0.14.0",
 ]
 
 [[package]]

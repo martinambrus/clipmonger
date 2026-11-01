@@ -3,6 +3,7 @@
 //! context. App logic runs on every pass, visible or hidden; the ui runs only
 //! while the window is shown.
 
+pub mod geometry;
 pub mod render;
 pub mod sched;
 pub mod window;
@@ -77,6 +78,14 @@ pub trait App {
     fn take_popup_activation(&mut self) -> bool {
         false
     }
+
+    /// Whether placement needs fresh desktop context.
+    fn wants_desktop_context(&self) -> bool {
+        false
+    }
+
+    /// Provide fresh desktop context snapshot.
+    fn provide_desktop_context(&mut self, _ctx: crate::placement::DesktopContext) {}
 }
 
 /// Window sizes and titles. Sizes are in points at zoom 1.
@@ -87,6 +96,7 @@ pub struct Config {
     pub popup_position: Option<[f32; 2]>,
     pub settings_title: String,
     pub settings_size: [f32; 2],
+    pub settings_state_path: Option<std::path::PathBuf>,
 }
 
 /// What the app factory receives at start.
@@ -195,10 +205,13 @@ impl Host {
         builder: &ViewportBuilder,
         class: &str,
         visibility: Visibility,
+        restore: Option<&geometry::NormalizedRestore>,
     ) -> Result<Self, RunError> {
-        let attrs = window::attributes(ctx, builder.clone(), class);
-        let window = event_loop.create_window(attrs).map_err(RunError::Window)?;
-        egui_winit::apply_viewport_builder_to_window(ctx, &window, builder);
+        let prepared = window::prepare_host(ctx, builder.clone(), class, restore);
+        let window = event_loop
+            .create_window(prepared.attributes)
+            .map_err(RunError::Window)?;
+        egui_winit::apply_viewport_builder_to_window(ctx, &window, &prepared.after_creation);
         let window = Arc::new(window);
         let state = egui_winit::State::new(
             ctx.clone(),
@@ -440,6 +453,7 @@ struct Runner<A: App> {
     last: Desired,
     pending_activation: window::Activation,
     error: Option<RunError>,
+    geometry: geometry::GeometryState,
 }
 
 impl<A: App> Runner<A> {
@@ -450,6 +464,7 @@ impl<A: App> Runner<A> {
     ) -> Self {
         let fonts = Arc::new(egui_system_font_provider::SystemFontProvider::new());
         let popup = Slot::new(WindowKind::Popup, &proxy, &fonts);
+        let geometry = geometry::GeometryState::new(config.settings_state_path.clone());
         Self {
             config,
             proxy,
@@ -463,6 +478,7 @@ impl<A: App> Runner<A> {
             last: Desired::default(),
             pending_activation: window::Activation::new(),
             error: None,
+            geometry,
         }
     }
 
@@ -495,6 +511,7 @@ impl<A: App> Runner<A> {
             .with_visible(visible),
             WindowKind::Settings => {
                 window::settings_builder(&self.config.settings_title, self.config.settings_size)
+                    .with_visible(visible)
             }
         };
         let class = match kind {
@@ -520,6 +537,29 @@ impl<A: App> Runner<A> {
             .surface_context
             .as_ref()
             .expect("surface_context must exist");
+        let restore = if kind == WindowKind::Settings {
+            let monitors: Vec<_> = event_loop
+                .available_monitors()
+                .map(|monitor| geometry::MonitorGeometry {
+                    bounds: monitor_rect(&monitor),
+                    scale: monitor.scale_factor(),
+                })
+                .collect();
+            let preferred = event_loop
+                .primary_monitor()
+                .map(|monitor| geometry::MonitorGeometry {
+                    bounds: monitor_rect(&monitor),
+                    scale: monitor.scale_factor(),
+                });
+            Some(self.geometry.normalized_for_restore(
+                self.config.settings_size,
+                &monitors,
+                preferred,
+                !self.per_show,
+            ))
+        } else {
+            None
+        };
         Host::new(
             event_loop,
             surface_context,
@@ -527,6 +567,7 @@ impl<A: App> Runner<A> {
             &builder,
             class,
             visibility,
+            restore.as_ref(),
         )
     }
 
@@ -694,6 +735,7 @@ impl<A: App> Runner<A> {
         let request = app.take_popup_activation();
         let previous = std::mem::replace(&mut self.last, desired);
         if desired.exit {
+            self.settings_geometry(geometry::Lifecycle::Exit);
             event_loop.exit();
             return;
         }
@@ -731,6 +773,16 @@ impl<A: App> Runner<A> {
                 None::<&winit::window::Window>,
                 policy,
             );
+        }
+        let context = self
+            .app
+            .as_ref()
+            .filter(|app| app.wants_desktop_context())
+            .and_then(|_| self.collect_desktop_context(event_loop));
+        if let Some(app) = self.app.as_mut() {
+            if deliver_desktop_context(app, || context) {
+                self.popup.deadline.at(Instant::now());
+            }
         }
     }
 
@@ -777,16 +829,132 @@ impl<A: App> Runner<A> {
                     slot.host = Some(host);
                 }
             }
-        } else if let Some(slot) = self.settings.as_mut() {
-            slot.host = None;
-            slot.native_input.reset();
-            slot.deadline.clear();
+        } else {
+            self.settings_geometry(geometry::Lifecycle::Close);
+            if let Some(slot) = self.settings.as_mut() {
+                slot.host = None;
+                slot.native_input.reset();
+                slot.deadline.clear();
+            }
         }
         Ok(())
     }
+
+    fn settings_geometry_event(&mut self, kind: WindowKind, event: &WindowEvent) {
+        if kind == WindowKind::Settings
+            && matches!(
+                event,
+                WindowEvent::CloseRequested
+                    | WindowEvent::Resized(_)
+                    | WindowEvent::Moved(_)
+                    | WindowEvent::ScaleFactorChanged { .. }
+            )
+        {
+            self.settings_geometry(geometry::Lifecycle::Changed);
+        }
+    }
+
+    fn settings_geometry(&mut self, lifecycle: geometry::Lifecycle) {
+        let window = self
+            .settings
+            .as_ref()
+            .and_then(|slot| slot.host.as_ref())
+            .map(|host| &*host.window);
+        self.geometry
+            .handle(lifecycle, window, !self.per_show, |message| {
+                eprintln!("{message}");
+            });
+    }
+
+    fn collect_desktop_context(
+        &self,
+        event_loop: &ActiveEventLoop,
+    ) -> Option<crate::placement::DesktopContext> {
+        // Actual host dimensions are required, including on a newly created Wayland host.
+        let host = self.popup.host.as_ref()?;
+        let size = host.window.inner_size();
+        Some(crate::placement::DesktopContext {
+            monitors: event_loop
+                .available_monitors()
+                .map(|monitor| monitor_rect(&monitor))
+                .collect(),
+            cursor: query_cursor(event_loop),
+            current_monitor: host.window.current_monitor().as_ref().map(monitor_rect),
+            primary_monitor: event_loop.primary_monitor().as_ref().map(monitor_rect),
+            popup_physical_size: (
+                i32::try_from(size.width).ok()?,
+                i32::try_from(size.height).ok()?,
+            ),
+            supports_global_position: !self.per_show,
+        })
+    }
+}
+
+/// Deliver exactly one requested native snapshot after host reconciliation.
+/// The collector is lazy: an identical Config or an already-open raise does no query.
+pub fn deliver_desktop_context(
+    app: &mut impl App,
+    collect: impl FnOnce() -> Option<crate::placement::DesktopContext>,
+) -> bool {
+    if !app.wants_desktop_context() {
+        return false;
+    }
+    let Some(context) = collect() else {
+        return false;
+    };
+    app.provide_desktop_context(context);
+    true
+}
+
+fn monitor_rect(monitor: &winit::monitor::MonitorHandle) -> crate::placement::Rect {
+    let position = monitor.position();
+    let size = monitor.size();
+    crate::placement::Rect {
+        x: position.x,
+        y: position.y,
+        w: i32::try_from(size.width).unwrap_or(i32::MAX),
+        h: i32::try_from(size.height).unwrap_or(i32::MAX),
+    }
+}
+
+fn query_cursor(event_loop: &ActiveEventLoop) -> Option<(i32, i32)> {
+    if window::is_wayland(event_loop) {
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
+        let mut point = POINT::default();
+        // SAFETY: the event-loop thread owns this valid, writable POINT.
+        #[allow(unsafe_code)]
+        if unsafe { GetCursorPos(&raw mut point) }.is_ok() {
+            return Some((point.x, point.y));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use winit::platform::x11::ActiveEventLoopExtX11 as _;
+        use x11rb::{connection::Connection as _, protocol::xproto::ConnectionExt as _};
+        if event_loop.is_x11() {
+            let (connection, _) = x11rb::connect(None).ok()?;
+            // A separate connection may default to a different X screen. The
+            // pointer belongs to the root whose same_screen response is true.
+            for screen in &connection.setup().roots {
+                let pointer = connection.query_pointer(screen.root).ok()?.reply().ok()?;
+                if pointer.same_screen {
+                    return Some((i32::from(pointer.root_x), i32::from(pointer.root_y)));
+                }
+            }
+        }
+    }
+    None
 }
 
 impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.settings_geometry(geometry::Lifecycle::Exit);
+    }
+
     /// Handle resumed event.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.app.is_some() {
@@ -846,6 +1014,7 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
             None
         });
         if let Some(kind) = kind {
+            self.settings_geometry_event(kind, &event);
             let preserve_super = self
                 .app
                 .as_ref()

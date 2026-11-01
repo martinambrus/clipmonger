@@ -3068,112 +3068,141 @@ fn rule_wake_toggle_pause_clears_the_pause_deadline() {
 // 15. Centering
 // ---------------------------------------------------------------------------
 
-/// The centre of a monitor for the popup, as `placement` computes it.
-fn centre_of(width: u16, height: u16) -> egui::Pos2 {
-    let monitor = placement::monitor_rect_from_size(Some((u32::from(width), u32::from(height))));
-    let (x, y) = placement::place(
-        placement::Placement::Center,
-        (0, 0),
-        &[monitor],
-        placement::POPUP_DEFAULT,
-    );
-    egui::pos2(
-        f32::from(i16::try_from(x).expect("a sane x")),
-        f32::from(i16::try_from(y).expect("a sane y")),
-    )
+fn desktop(cursor: Option<(i32, i32)>) -> placement::DesktopContext {
+    let monitor = placement::Rect {
+        x: -1920,
+        y: -200,
+        w: 1920,
+        h: 1080,
+    };
+    placement::DesktopContext {
+        monitors: vec![monitor],
+        cursor,
+        current_monitor: Some(monitor),
+        primary_monitor: None,
+        popup_physical_size: (720, 540),
+        supports_global_position: true,
+    }
 }
 
-fn monitor_of(width: u16, height: u16) -> egui::Vec2 {
-    egui::vec2(f32::from(width), f32::from(height))
+fn deliver(rig: &mut Rig, context: placement::DesktopContext) {
+    assert!(clipmonger_app_ui::runner::deliver_desktop_context(
+        &mut rig.app,
+        || Some(context)
+    ));
 }
 
-// rule 15: the first Popup pass with a monitor size yields exactly one OuterPosition, the
-// centre per placement; later passes none
 #[test]
-fn rule_center_first_pass_with_a_monitor_size_moves_the_popup_once() {
+fn rule_placement_waits_for_native_context_despite_monitor_size() {
     for visible in [false, true] {
-        for open in [false, true] {
-            let mut rig = Rig::with(Setup::new(open));
-            rig.monitor(Some(monitor_of(1920, 1080)));
-            let first = if visible { rig.show() } else { rig.tick() };
-            assert_eq!(
-                first.positions(),
-                vec![centre_of(1920, 1080)],
-                "visible = {visible}, open = {open}"
-            );
-            for pass in [rig.tick(), rig.show(), rig.tick(), rig.show()] {
-                assert!(
-                    pass.positions().is_empty(),
-                    "later passes send none (visible = {visible}, open = {open})"
-                );
-            }
-        }
+        let mut rig = Rig::opened();
+        rig.monitor(Some(egui::vec2(1920.0, 1080.0)));
+        let pass = if visible { rig.show() } else { rig.tick() };
+        assert_none(&pass.positions(), "placement commands");
+        assert!(rig.app.wants_desktop_context());
+        deliver(&mut rig, desktop(Some((-1700, 100))));
+        assert_eq!(rig.tick().positions(), vec![egui::pos2(-1320.0, 70.0)]);
+        assert!(!rig.app.wants_desktop_context());
+        assert_none(&rig.tick().positions(), "placement commands");
     }
 }
 
-// rule 15: the position follows the monitor that was reported
 #[test]
-fn rule_center_follows_the_reported_monitor_size() {
-    for (width, height) in [
-        (1366, 768),
-        (2560, 1440),
-        (800, 600),
-        (1920, 1200),
-        (3840, 2160),
+fn rule_placement_mode_changes_with_unchanged_desktop_and_identical_config_is_idle() {
+    let mut rig = Rig::opened();
+    let context = desktop(Some((-1700, 100)));
+    for (mode, expected) in [
+        ("center", egui::pos2(-1320.0, 70.0)),
+        ("cursor", egui::pos2(-1700.0, 100.0)),
+        ("center", egui::pos2(-1320.0, 70.0)),
     ] {
-        let mut rig = Rig::closed();
-        rig.monitor(Some(monitor_of(width, height)));
-        let pass = rig.tick();
+        rig.push(config_reply(&json!({"popup": {"placement": mode}})));
+        rig.tick();
+        deliver(&mut rig, context.clone());
+        assert_eq!(rig.tick().positions(), vec![expected]);
+        rig.push(config_reply(&json!({"popup": {"placement": mode}})));
+        assert_none(&rig.tick().positions(), "placement commands");
+        assert!(!clipmonger_app_ui::runner::deliver_desktop_context(
+            &mut rig.app,
+            || panic!("identical Config queried native desktop")
+        ));
+    }
+}
+
+#[test]
+fn rule_placement_reopens_with_fresh_cursor_but_already_open_raise_does_not_jump() {
+    let mut rig = Rig::closed();
+    rig.push(config_reply(&json!({"popup": {"placement": "cursor"}})));
+    rig.tick();
+    assert!(!clipmonger_app_ui::runner::deliver_desktop_context(
+        &mut rig.app,
+        || panic!("closed Config queried desktop")
+    ));
+    for cursor in [(-1700, 100), (-1400, 200)] {
+        rig.tray(&[TrayAction::OpenPopup]);
+        assert_none(&rig.tick().positions(), "placement commands");
+        deliver(&mut rig, desktop(Some(cursor)));
         assert_eq!(
-            pass.positions(),
-            vec![centre_of(width, height)],
-            "{width}x{height}"
+            rig.tick().positions(),
+            vec![egui::pos2(
+                f32::from(i16::try_from(cursor.0).unwrap()),
+                f32::from(i16::try_from(cursor.1).unwrap())
+            )]
         );
+        rig.push(request());
+        assert_none(&rig.tick().positions(), "placement commands");
+        assert!(!clipmonger_app_ui::runner::deliver_desktop_context(
+            &mut rig.app,
+            || panic!("open raise queried desktop")
+        ));
+        rig.tray(&[TrayAction::Toggle]);
+        rig.tick();
+        assert!(!rig.app.desired().popup_open);
     }
-    assert_ne!(centre_of(1366, 768), centre_of(2560, 1440));
 }
 
-// rule 15: without a monitor size there is no command, until one is known
 #[test]
-fn rule_center_without_a_monitor_size_sends_nothing_until_it_is_known() {
-    let mut rig = Rig::closed();
-    for _ in 0..3 {
-        assert_none(&rig.tick().positions(), "rig.tick().positions()");
-        assert_none(&rig.show().positions(), "rig.show().positions()");
+fn rule_placement_uses_actual_physical_size_and_converts_os_dpi_and_font_zoom_once() {
+    let mut rig = Rig::opened();
+    rig.popup.info.native_pixels_per_point = Some(1.5);
+    rig.push(config_reply(
+        &json!({"popup": {"placement": "cursor"}, "ui": {"theme": {"font_scale": 1.6}}}),
+    ));
+    rig.show();
+    rig.show(); // egui applies the pending zoom at the next pass.
+    deliver(&mut rig, desktop(Some((-1700, 100))));
+    let position = rig.show().positions()[0];
+    let physical = winit::dpi::PhysicalPosition::new(
+        position.x * rig.popup.ctx.pixels_per_point(),
+        position.y * rig.popup.ctx.pixels_per_point(),
+    );
+    assert!((rig.popup.ctx.pixels_per_point() - 2.4).abs() < 0.001);
+    assert!((physical.x + 1700.0).abs() < 0.001);
+    assert!((physical.y - 100.0).abs() < 0.001);
+}
+
+#[test]
+fn rule_placement_unknown_platform_fallback_and_wayland_emit_no_synthetic_position() {
+    let mut rig = Rig::opened();
+    deliver(&mut rig, desktop(None));
+    assert_eq!(rig.tick().positions(), vec![egui::pos2(-1320.0, 70.0)]);
+    for wayland in [false, true] {
+        rig.tray(&[TrayAction::Toggle]);
+        rig.tick();
+        rig.tray(&[TrayAction::OpenPopup]);
+        rig.tick();
+        let mut context = desktop(Some((-1700, 100)));
+        if wayland {
+            context.supports_global_position = false;
+        } else {
+            context.monitors.clear();
+            context.current_monitor = None;
+        }
+        deliver(&mut rig, context);
+        assert_none(&rig.tick().positions(), "placement commands");
     }
-    rig.monitor(Some(monitor_of(1280, 720)));
-    assert_eq!(rig.tick().positions(), vec![centre_of(1280, 720)]);
-    assert_none(&rig.tick().positions(), "rig.tick().positions()");
-}
-
-// rule 15: the centre is sent once even when the monitor size changes later
-#[test]
-fn rule_center_happens_once() {
-    let mut rig = Rig::closed();
-    rig.monitor(Some(monitor_of(1280, 720)));
-    assert_eq!(rig.tick().positions().len(), 1);
-    rig.monitor(Some(monitor_of(2560, 1440)));
-    assert_none(&rig.tick().positions(), "rig.tick().positions()");
-    rig.monitor(None);
-    rig.monitor(Some(monitor_of(1280, 720)));
-    assert_none(&rig.tick().positions(), "rig.tick().positions()");
-}
-
-// rule 15: only the Popup window is centred
-#[test]
-fn rule_center_settings_passes_do_not_move_anything() {
-    let mut rig = Rig::closed();
-    rig.settings.info.monitor_size = Some(monitor_of(1920, 1080));
-    assert_none(
-        &rig.tick_settings().positions(),
-        "rig.tick_settings().positions()",
-    );
-    assert_none(
-        &rig.show_settings().positions(),
-        "rig.show_settings().positions()",
-    );
-    rig.monitor(Some(monitor_of(1920, 1080)));
-    assert_eq!(rig.tick().positions(), vec![centre_of(1920, 1080)]);
+    rig.settings.info.monitor_size = Some(egui::vec2(1920.0, 1080.0));
+    assert_none(&rig.tick_settings().positions(), "placement commands");
 }
 
 // ---------------------------------------------------------------------------

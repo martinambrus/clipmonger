@@ -66,6 +66,39 @@ pub fn attributes(ctx: &Context, builder: ViewportBuilder, class: &str) -> Windo
     }
 }
 
+/// Build the attributes used by Host and retain only the fields that egui
+/// should apply after creation. Native Settings geometry bypasses font zoom.
+pub struct PreparedHost {
+    pub attributes: WindowAttributes,
+    pub after_creation: ViewportBuilder,
+}
+
+#[must_use]
+pub fn prepare_host(
+    ctx: &Context,
+    mut builder: ViewportBuilder,
+    class: &str,
+    restore: Option<&super::geometry::NormalizedRestore>,
+) -> PreparedHost {
+    let mut attrs = attributes(ctx, builder.clone(), class);
+    if let Some(restore) = restore {
+        attrs.inner_size = Some(
+            winit::dpi::LogicalSize::new(restore.logical_size[0], restore.logical_size[1]).into(),
+        );
+        attrs.position = restore
+            .physical_position
+            .map(|pos| winit::dpi::PhysicalPosition::new(pos[0], pos[1]).into());
+        // apply_viewport_builder_to_window scales these fields by OS DPI * zoom.
+        // Geometry has already been expressed in native units above.
+        builder.inner_size = None;
+        builder.position = None;
+    }
+    PreparedHost {
+        attributes: attrs,
+        after_creation: builder,
+    }
+}
+
 /// The Win32 window handle of `window` as `u64` (`hwnd as usize as u64`, never
 /// negative), `None` on other platforms. Winit refuses the handle off the
 /// event loop thread, so call this on that thread.

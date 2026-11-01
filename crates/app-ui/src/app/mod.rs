@@ -85,8 +85,10 @@ pub struct PopupApp {
     hide_unconfirmed: bool,
     /// The popup has been seen focused since it opened.
     seen_focus: bool,
-    /// The popup window was moved to the monitor centre.
-    centered: bool,
+    /// Placement pending for next desktop context.
+    placement_pending: bool,
+    placement: placement::Placement,
+    pending_physical_pos: Option<(i32, i32)>,
     /// Put the keyboard focus into the search box at the next render.
     focus_search: bool,
     /// Theme last applied to the contexts: popup, settings (dark, font scale bits).
@@ -137,7 +139,9 @@ impl PopupApp {
             paused: false,
             hide_unconfirmed: false,
             seen_focus: false,
-            centered: false,
+            placement_pending: open,
+            placement: placement::Placement::Center,
+            pending_physical_pos: None,
             focus_search: open,
             theme_applied: [None, None],
             preview_width: 80,
@@ -232,7 +236,11 @@ impl PopupApp {
                 target: context.target.is_some(),
                 gesture: context.gesture.is_some(),
             });
+            // Pending placement for closed-to-open transition; not for raise while open.
+            self.placement_pending = true;
         } else if was_open && !is_open {
+            self.pending_physical_pos = None;
+            self.placement_pending = false;
             self.record(&TraceEvent::Hide { reason });
         }
         let error_shown = is_open
@@ -468,11 +476,27 @@ impl PopupApp {
                     .get("popup.preview_width")
                     .and_then(Value::as_u64)
                     .map_or(80, |n| u32::try_from(n).unwrap_or(80));
+                let placement_str = doc
+                    .get("popup.placement")
+                    .and_then(Value::as_str)
+                    .unwrap_or("center");
+                let new_placement = match placement_str {
+                    "cursor" => placement::Placement::Cursor,
+                    _ => placement::Placement::Center,
+                };
+                let placement_changed = new_placement != self.placement;
                 if let Ok(mut config) = self.config.lock() {
                     config.doc = Some(doc);
                     config.edits.clear();
                 }
                 self.preview_width = width;
+                if placement_changed {
+                    self.placement = new_placement;
+                    // Reposition once for an effective mode change while open.
+                    if self.shell.desired().popup_open {
+                        self.placement_pending = true;
+                    }
+                }
                 self.feed(Event::Bridge(UiEvent::Config(body)));
             }
             UiEvent::Error(message) => {
@@ -646,22 +670,12 @@ impl PopupApp {
         }
     }
 
-    /// Move the popup to the monitor centre once: when the ROOT viewport knows
-    /// its monitor size, send `ViewportCommand::OuterPosition` with
-    /// `placement::place(Center, ..)` over that monitor and set `centered`.
-    fn center_popup(&mut self, ctx: &egui::Context) {
-        let size = ctx.input(|input| {
-            input
-                .raw
-                .viewports
-                .get(&egui::ViewportId::ROOT)
-                .and_then(|info| info.monitor_size)
-        });
-        if let Some(size) = size {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                popup_position_for_monitor(size),
-            ));
-            self.centered = true;
+    #[allow(clippy::cast_precision_loss)]
+    fn handle_pending_placement(&mut self, ctx: &egui::Context) {
+        if let Some(pending_pos) = self.pending_physical_pos.take() {
+            let ppp = ctx.pixels_per_point();
+            let egui_pos = egui::pos2(pending_pos.0 as f32 / ppp, pending_pos.1 as f32 / ppp);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui_pos));
         }
     }
 }
@@ -709,7 +723,7 @@ impl runner::App for PopupApp {
     ///    `last_poll` (and reset it); when the pause deadline has passed while
     ///    paused, clear it and send `MonitorToggle`;
     /// 8. `vm.set_offline(shell.offline())`, `apply_theme`;
-    /// 9. `center_popup` while not centered;
+    /// 9. emit a position supplied by the runner for this open;
     /// 10. `schedule_wake`.
     ///
     /// Settings: `apply_theme`; when the ROOT viewport events contain Close,
@@ -760,9 +774,7 @@ impl runner::App for PopupApp {
                 }
                 self.vm.set_offline(self.shell.offline());
                 self.apply_theme(ctx, kind);
-                if !self.centered {
-                    self.center_popup(ctx);
-                }
+                self.handle_pending_placement(ctx);
                 self.schedule_wake(ctx);
             }
             WindowKind::Settings => {
@@ -833,23 +845,18 @@ impl runner::App for PopupApp {
     fn take_popup_activation(&mut self) -> bool {
         std::mem::take(&mut self.pending_activation)
     }
-}
 
-/// The popup centre for a monitor of `size` points.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
-fn popup_position_for_monitor(size: egui::Vec2) -> egui::Pos2 {
-    let monitor = placement::monitor_rect_from_size(Some((size.x as u32, size.y as u32)));
-    let (px, py) = placement::place(
-        placement::Placement::Center,
-        (0, 0),
-        &[monitor],
-        placement::POPUP_DEFAULT,
-    );
-    egui::pos2(px as f32, py as f32)
+    fn wants_desktop_context(&self) -> bool {
+        self.shell.desired().popup_open && self.placement_pending
+    }
+
+    fn provide_desktop_context(&mut self, ctx: crate::placement::DesktopContext) {
+        if !self.wants_desktop_context() {
+            return;
+        }
+        self.pending_physical_pos = crate::placement::place_with_context(self.placement, &ctx);
+        self.placement_pending = false;
+    }
 }
 
 #[cfg(test)]
