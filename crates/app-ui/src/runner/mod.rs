@@ -280,22 +280,30 @@ impl NativeInput {
         kind: WindowKind,
         key: &winit::keyboard::Key,
         pressed: bool,
+        translated: &[egui::Event],
     ) -> Option<egui::Key> {
-        self.clipboard_key(key, pressed)
+        self.clipboard_key(key, pressed, translated)
             .filter(|key| app.native_key_override(kind, *key, self.modifiers))
     }
 
-    fn clipboard_key(&self, key: &winit::keyboard::Key, pressed: bool) -> Option<egui::Key> {
+    fn clipboard_key(
+        &self,
+        key: &winit::keyboard::Key,
+        pressed: bool,
+        translated: &[egui::Event],
+    ) -> Option<egui::Key> {
         if !pressed {
             return None;
         }
-        // Alt/Option can produce printable Text even when the key owns a command.
-        // The caller's exact binding check preserves all unbound text input.
+        // Use the translator's effective key, including its logical-first physical
+        // fallback. Re-mapping the native character would miss Option text like ø.
         if self.modifiers.alt {
-            return match key.as_ref() {
-                winit::keyboard::Key::Character(text) => egui::Key::from_name(text),
+            return translated.iter().find_map(|event| match event {
+                egui::Event::Key {
+                    key, pressed: true, ..
+                } => Some(*key),
                 _ => None,
-            };
+            });
         }
         if !self.modifiers.command_only() {
             return None;
@@ -842,27 +850,12 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
                 .app
                 .as_ref()
                 .is_some_and(|app| app.preserve_native_super(kind));
+            let app = self.app.as_ref();
             let slot = match kind {
-                WindowKind::Popup => Some(&self.popup),
-                WindowKind::Settings => self.settings.as_ref(),
+                WindowKind::Popup => Some(&mut self.popup),
+                WindowKind::Settings => self.settings.as_mut(),
             };
-            let override_key = slot.and_then(|slot| {
-                let WindowEvent::KeyboardInput {
-                    event,
-                    is_synthetic: false,
-                    ..
-                } = &event
-                else {
-                    return None;
-                };
-                slot.native_input.clipboard_override(
-                    self.app.as_ref()?,
-                    kind,
-                    &event.logical_key,
-                    event.state.is_pressed(),
-                )
-            });
-            if let Some(slot) = self.slot_mut(kind) {
+            if let Some(slot) = slot {
                 if let Some(host) = slot.host.as_mut() {
                     if close {
                         host.info.events.push(ViewportEvent::Close);
@@ -873,8 +866,25 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
                     }
                     let response = host.state.on_window_event(&host.window, &event);
                     if preserve_super {
-                        slot.native_input
-                            .finish(host.state.egui_input_mut(), start, override_key);
+                        let input = host.state.egui_input_mut();
+                        let override_key = app.and_then(|app| {
+                            let WindowEvent::KeyboardInput {
+                                event,
+                                is_synthetic: false,
+                                ..
+                            } = &event
+                            else {
+                                return None;
+                            };
+                            slot.native_input.clipboard_override(
+                                app,
+                                kind,
+                                &event.logical_key,
+                                event.state.is_pressed(),
+                                &input.events[start..],
+                            )
+                        });
+                        slot.native_input.finish(input, start, override_key);
                     }
                     if response.repaint || close {
                         slot.deadline.at(now);
@@ -1071,7 +1081,7 @@ mod native_input_tests {
         let native_v = winit::keyboard::Key::Character("v".into());
         assert!(ctx.text_edit_focused());
         assert_eq!(
-            adapter.clipboard_override(&app, WindowKind::Popup, &native_v, true),
+            adapter.clipboard_override(&app, WindowKind::Popup, &native_v, true, &[]),
             Some(egui::Key::V)
         );
         let mut paste = RawInput {
@@ -1095,7 +1105,8 @@ mod native_input_tests {
             ("v", egui::Event::Paste("must not enter search".into()), 2),
         ] {
             let native = winit::keyboard::Key::Character(name.into());
-            let override_key = adapter.clipboard_override(&app, WindowKind::Popup, &native, true);
+            let override_key =
+                adapter.clipboard_override(&app, WindowKind::Popup, &native, true, &[]);
             assert!(
                 override_key.is_some(),
                 "configured {name} must survive native clipboard translation"
@@ -1152,7 +1163,8 @@ mod native_input_tests {
             ]
         };
         let native_v = winit::keyboard::Key::Character("v".into());
-        let override_key = adapter.clipboard_override(&app, WindowKind::Popup, &native_v, true);
+        let override_key =
+            adapter.clipboard_override(&app, WindowKind::Popup, &native_v, true, &[]);
         let mut input = RawInput {
             events: click(search.center()),
             ..RawInput::default()
@@ -1186,7 +1198,8 @@ mod native_input_tests {
         rows.sort_by(|a, b| a.top().total_cmp(&b.top()));
         let row = rows.get(1).expect("actual second history row");
         let native_c = winit::keyboard::Key::Character("c".into());
-        let override_key = adapter.clipboard_override(&app, WindowKind::Popup, &native_c, true);
+        let override_key =
+            adapter.clipboard_override(&app, WindowKind::Popup, &native_c, true, &[]);
         let mut input = RawInput {
             events: click(row.center()),
             ..RawInput::default()
@@ -1204,33 +1217,53 @@ mod native_input_tests {
         assert_eq!(app.vm().query, "");
     }
 
-    fn alt_shortcut_control(permanent: bool) {
+    fn alt_shortcut_control(permanent: bool, fallback: bool) {
         use crate::ipc_bridge::UiCmd;
 
+        let (chord, text, effective) = if fallback {
+            ("alt+o", "ø", egui::Key::O)
+        } else {
+            ("alt+j", "j", egui::Key::J)
+        };
         let (mut app, ctx, commands) =
-            shortcut_app_with_keys(&serde_json::json!({"navigate_down":"alt+j"}), permanent);
+            shortcut_app_with_keys(&serde_json::json!({"navigate_down":chord}), permanent);
         assert!(ctx.text_edit_focused());
         let mut adapter = NativeInput::default();
         adapter.observe(
             &WindowEvent::ModifiersChanged(ModifiersState::ALT.into()),
-            false,
+            fallback,
         );
-        let native_j = winit::keyboard::Key::Character("j".into());
-        let owned = adapter.clipboard_override(&app, WindowKind::Popup, &native_j, true);
-        let mut input = RawInput::default();
-        let start = input.events.len();
-        input.events.extend([
-            key(true, egui::Modifiers::ALT),
-            egui::Event::Text("j".into()),
-        ]);
-        adapter.finish(&mut input, start, owned);
+        let native = winit::keyboard::Key::Character(text.into());
+        let mut input = RawInput {
+            // Pinned egui-winit emits logical.or(physical), then printable Text.
+            events: vec![
+                egui::Event::Key {
+                    key: effective,
+                    physical_key: Some(effective),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::ALT,
+                },
+                egui::Event::Text(text.into()),
+            ],
+            ..RawInput::default()
+        };
+        let owned =
+            adapter.clipboard_override(&app, WindowKind::Popup, &native, true, &input.events);
+        adapter.finish(&mut input, 0, owned);
         adapter.observe(
             &WindowEvent::ModifiersChanged(ModifiersState::empty().into()),
-            false,
+            fallback,
         );
         let start = input.events.len();
         input.events.extend([
-            key(false, egui::Modifiers::NONE),
+            egui::Event::Key {
+                key: effective,
+                physical_key: Some(effective),
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
             egui::Event::ModifiersChanged(egui::Modifiers::NONE),
         ]);
         adapter.finish(&mut input, start, None);
@@ -1238,7 +1271,7 @@ mod native_input_tests {
         assert_eq!(
             app.vm().query,
             "",
-            "configured Alt+J must not type its native text"
+            "configured {chord} must not type its native {text} text"
         );
         if permanent {
             assert_eq!(app.config().lock().expect("config").perm_vm.selected, 1);
@@ -1285,37 +1318,92 @@ mod native_input_tests {
 
     #[test]
     fn native_input_alt_shortcut_history_pick_uses_unchanged_query() {
-        alt_shortcut_control(false);
+        alt_shortcut_control(false, false);
     }
 
     #[test]
     fn native_input_alt_shortcut_permanent_pick_preserves_hidden_history() {
-        alt_shortcut_control(true);
+        alt_shortcut_control(true, false);
+    }
+
+    #[test]
+    fn native_input_alt_physical_fallback_history_pick_uses_unchanged_query() {
+        alt_shortcut_control(false, true);
+    }
+
+    #[test]
+    fn native_input_alt_physical_fallback_permanent_pick_preserves_hidden_history() {
+        alt_shortcut_control(true, true);
+    }
+
+    #[test]
+    fn native_input_alt_ownership_uses_logical_priority_over_physical() {
+        for (chord, expected_query, expected_selected) in [("alt+o", "j", 0), ("alt+j", "", 1)] {
+            let (mut app, ctx, _) =
+                shortcut_app_with_keys(&serde_json::json!({"navigate_down":chord}), false);
+            let mut adapter = NativeInput::default();
+            adapter.observe(
+                &WindowEvent::ModifiersChanged(ModifiersState::ALT.into()),
+                false,
+            );
+            // A recognized logical J wins over physical O in pinned egui-winit.
+            let mut input = RawInput {
+                events: vec![
+                    egui::Event::Key {
+                        key: egui::Key::J,
+                        physical_key: Some(egui::Key::O),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::ALT,
+                    },
+                    egui::Event::Text("j".into()),
+                ],
+                ..RawInput::default()
+            };
+            let owned = adapter.clipboard_override(
+                &app,
+                WindowKind::Popup,
+                &winit::keyboard::Key::Character("j".into()),
+                true,
+                &input.events,
+            );
+            adapter.finish(&mut input, 0, owned);
+            frame(&mut app, &ctx, input);
+            assert_eq!(app.vm().query, expected_query, "{chord}");
+            assert_eq!(app.vm().selected, expected_selected, "{chord}");
+        }
     }
 
     #[test]
     fn native_input_alt_shortcut_preserves_other_native_text_in_batch() {
         let (mut app, ctx, _) =
-            shortcut_app_with_keys(&serde_json::json!({"navigate_down":"alt+j"}), false);
+            shortcut_app_with_keys(&serde_json::json!({"navigate_down":"alt+o"}), false);
         let mut adapter = NativeInput::default();
         adapter.observe(
             &WindowEvent::ModifiersChanged(ModifiersState::ALT.into()),
             false,
         );
-        let owned = adapter.clipboard_override(
-            &app,
-            WindowKind::Popup,
-            &winit::keyboard::Key::Character("j".into()),
-            true,
-        );
         let mut input = RawInput {
             events: vec![
                 egui::Event::Text("before".into()),
-                key(true, egui::Modifiers::ALT),
-                egui::Event::Text("j".into()),
+                egui::Event::Key {
+                    key: egui::Key::O,
+                    physical_key: Some(egui::Key::O),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::ALT,
+                },
+                egui::Event::Text("ø".into()),
             ],
             ..RawInput::default()
         };
+        let owned = adapter.clipboard_override(
+            &app,
+            WindowKind::Popup,
+            &winit::keyboard::Key::Character("ø".into()),
+            true,
+            &input.events[1..],
+        );
         adapter.finish(&mut input, 1, owned);
         let start = input.events.len();
         input.events.push(egui::Event::Text("after".into()));
@@ -1338,13 +1426,24 @@ mod native_input_tests {
                 is_mac,
             );
             let native = winit::keyboard::Key::Character(text.into());
-            let owned = adapter.clipboard_override(&app, WindowKind::Popup, &native, true);
+            let effective = if is_mac { egui::Key::O } else { egui::Key::J };
+            let translated_key = egui::Event::Key {
+                key: effective,
+                physical_key: Some(effective),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT,
+            };
+            let owned = adapter.clipboard_override(
+                &app,
+                WindowKind::Popup,
+                &native,
+                true,
+                std::slice::from_ref(&translated_key),
+            );
             assert_eq!(owned, None, "unbound Alt/Option is ordinary text input");
             let mut input = RawInput {
-                events: vec![
-                    key(true, egui::Modifiers::ALT),
-                    egui::Event::Text(text.into()),
-                ],
+                events: vec![translated_key, egui::Event::Text(text.into())],
                 ..RawInput::default()
             };
             adapter.finish(&mut input, 0, owned);
