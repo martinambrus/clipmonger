@@ -116,8 +116,9 @@ impl Presenter {
     }
 
     /// Resize the surface to `size`, paint the frame into its buffer with
-    /// [`Rasterizer::paint`] and present it. Ok(false) when nothing was done
-    /// because `size` has a zero dimension (a minimized Windows window).
+    /// [`Rasterizer::paint`] and present it. Ok(false) when nothing was shown:
+    /// `size` has a zero dimension (a minimized Windows window) or the
+    /// rasterizer refused the frame, in which case the buffer is not presented.
     ///
     /// # Errors
     /// The softbuffer error when the surface cannot be resized or its buffer
@@ -139,7 +140,7 @@ impl Presenter {
         };
         self.surface.resize(width, height)?;
         let mut buffer = self.surface.buffer_mut()?;
-        rasterizer.paint(
+        let painted = rasterizer.paint(
             &mut buffer,
             size.width,
             size.height,
@@ -147,6 +148,9 @@ impl Presenter {
             clear,
             primitives,
         );
+        if !painted {
+            return Ok(false);
+        }
         buffer.present()?;
         Ok(true)
     }

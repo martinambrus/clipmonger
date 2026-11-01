@@ -17,10 +17,15 @@ use serde_json::Value;
 static CTR: AtomicU64 = AtomicU64::new(0);
 
 fn golden_path() -> PathBuf {
+    let file = if cfg!(target_os = "linux") {
+        "caps_headless.json"
+    } else {
+        "caps_headless_non_linux.json"
+    };
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("golden")
-        .join("caps_headless.json")
+        .join(file)
 }
 
 /// Recursively sort object keys (`serde_json` `Map` is already a

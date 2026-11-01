@@ -9,6 +9,8 @@ use clipmonger_ipc::proto::IpcError;
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::push::Wake;
+
 /// Blocking IPC call used by the bridge thread.
 pub trait Transport: Send {
     /// Call one IPC method and wait for its reply.
@@ -30,8 +32,6 @@ pub enum UiCmd {
     DeleteClip(Uuid),
     /// Pin or unpin one clip.
     PinClip(Uuid, bool),
-    /// Paste one clip through the validated target.
-    PasteClip(Uuid),
     /// Paste one clip picked in the popup: into the target window (HWND
     /// value captured when the hotkey opened the popup) when known, else
     /// into the foreground window; the pick time (unix ms) lets the daemon
@@ -89,10 +89,10 @@ pub enum UiEvent {
     Pinned(Uuid, bool),
     /// Paste accepted by the daemon.
     PasteDone(Uuid),
-    /// Daemon refused paste; the popup stays open.
-    PasteUnavailable,
-    /// Targeted paste failed; carries the daemon message.
+    /// Popup paste failed; carries the error message.
     PasteFailed(String),
+    /// Permanent execution failed; carries its id and the daemon error.
+    ExecFailed(Uuid, IpcError),
     /// Daemon acknowledged stop.
     Stopped,
     /// The stop request failed; carries the message.
@@ -160,6 +160,32 @@ impl Bridge {
         mpsc::Sender<UiEvent>,
         mpsc::Receiver<UiEvent>,
     ) {
+        Self::spawn_inner(transport, None)
+    }
+
+    /// Like [`Bridge::spawn_shared`], and `wake` runs on the bridge thread
+    /// right after every reply event it queued, so that a host asleep in its
+    /// event loop notices the reply.
+    #[must_use]
+    pub fn spawn_shared_with_wake(
+        transport: Box<dyn Transport>,
+        wake: Wake,
+    ) -> (
+        mpsc::Sender<UiCmd>,
+        mpsc::Sender<UiEvent>,
+        mpsc::Receiver<UiEvent>,
+    ) {
+        Self::spawn_inner(transport, Some(wake))
+    }
+
+    fn spawn_inner(
+        transport: Box<dyn Transport>,
+        wake: Option<Wake>,
+    ) -> (
+        mpsc::Sender<UiCmd>,
+        mpsc::Sender<UiEvent>,
+        mpsc::Receiver<UiEvent>,
+    ) {
         let (cmd_tx, cmd_rx) = mpsc::channel::<UiCmd>();
         let (push_tx, evt_rx) = mpsc::channel::<UiEvent>();
         let evt_tx = push_tx.clone();
@@ -168,6 +194,9 @@ impl Bridge {
             while let Ok(cmd) = cmd_rx.recv() {
                 let outcome = transport.call(method_for(&cmd), &params_for(&cmd));
                 let _ = evt_tx.send(handle(cmd, outcome));
+                if let Some(wake) = &wake {
+                    wake();
+                }
             }
         });
         (cmd_tx, push_tx, evt_rx)
@@ -182,7 +211,7 @@ pub fn method_for(cmd: &UiCmd) -> &'static str {
         UiCmd::ListHistory => "history.list",
         UiCmd::DeleteClip(_) => "history.delete",
         UiCmd::PinClip(_, _) => "history.pin",
-        UiCmd::PasteClip(_) | UiCmd::PasteClipTo(..) => "paste.execute",
+        UiCmd::PasteClipTo(..) => "paste.execute",
         UiCmd::Stop => "daemon.stop",
         UiCmd::ConfigGet => "config.get",
         UiCmd::ConfigSet(_, _) => "config.set",
@@ -219,7 +248,7 @@ pub fn params_for(cmd: &UiCmd) -> Value {
         UiCmd::ConfigSet(key, value) => serde_json::json!({ "key": key, "value": value }),
         UiCmd::MonitorToggle => serde_json::json!({ "toggle": true }),
         UiCmd::HistoryGet(id) => serde_json::json!({ "clip": id.to_string() }),
-        UiCmd::DeleteClip(id) | UiCmd::PasteClip(id) => {
+        UiCmd::DeleteClip(id) => {
             serde_json::json!({ "clip": id.to_string() })
         }
         UiCmd::PasteClipTo(id, target, picked_ms, gesture) => {
@@ -307,7 +336,7 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
             }
         }
         (UiCmd::ExecPermanent(id), Ok(_)) => UiEvent::PasteDone(id),
-        (UiCmd::PasteClip(id) | UiCmd::PasteClipTo(id, ..), Ok(_)) => UiEvent::PasteDone(id),
+        (UiCmd::PasteClipTo(id, ..), Ok(_)) => UiEvent::PasteDone(id),
         (UiCmd::Stop, Ok(_)) => UiEvent::Stopped,
         (UiCmd::ConfigGet, Ok(body)) => UiEvent::Config(body),
         (UiCmd::CapsGet, Ok(body)) => UiEvent::Caps(body),
@@ -380,13 +409,7 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
             UiEvent::Offline(error.message)
         }
         (UiCmd::Status | UiCmd::ListHistory, Err(error)) => UiEvent::Error(error.message),
-        (UiCmd::PasteClip(_) | UiCmd::ExecPermanent(_), Err(error))
-            if error.code == "unavailable" || error.code == "denied" =>
-        {
-            UiEvent::PasteUnavailable
-        }
-        (UiCmd::PasteClip(_), Err(error)) => UiEvent::Error(error.message),
         (UiCmd::PasteClipTo(..), Err(error)) => UiEvent::PasteFailed(error.message),
-        (UiCmd::ExecPermanent(_), Err(error)) => UiEvent::Error(error.message),
+        (UiCmd::ExecPermanent(id), Err(error)) => UiEvent::ExecFailed(id, error),
     }
 }

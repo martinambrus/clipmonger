@@ -51,12 +51,8 @@ fn restore_traversal_rejected_as_unsupported_without_escape() {
     let scratch = Scratch::new();
     let archive = scratch.0.join("traversal.zip");
     let escaped = scratch.0.join("escape.txt");
-    // restore_zip extracts into a child of temp_dir; this entry would reach
-    // our scratch directory through the parent of that extraction directory.
-    let entry = format!(
-        "../{}/escape.txt",
-        scratch.0.file_name().unwrap().to_str().unwrap()
-    );
+    // profile/.restore-*/incoming: three parents reach this owned scratch root.
+    let entry = "../../../escape.txt";
     let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
     writer
         .start_file(entry, zip::write::SimpleFileOptions::default())

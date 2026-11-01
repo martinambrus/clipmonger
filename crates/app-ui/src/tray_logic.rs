@@ -22,6 +22,10 @@ pub enum TrayUiState {
 pub enum TrayAction {
     /// Open the popup.
     OpenPopup,
+    /// Left click on the tray icon: hide the popup when it is open, else open it.
+    Toggle,
+    /// Native button-down: toggle using the press time for the focus-loss guard.
+    ToggleAt(std::time::Instant),
     /// Flip the monitoring-paused flag.
     TogglePause,
     /// Pause monitoring for one hour.
@@ -164,4 +168,23 @@ impl TrayLogic {
             })
             .collect()
     }
+}
+
+/// Left-button events delivered by the native tray.
+#[derive(Debug, Clone, Copy)]
+pub enum LeftButtonEvent {
+    /// Button pressed.
+    Down,
+    /// Button released.
+    Up,
+    /// The second press of a double-click.
+    DoubleClick,
+}
+
+/// Translate one native left-button event at an injected monotonic time.
+#[must_use]
+pub fn left_button_action(event: LeftButtonEvent, at: std::time::Instant) -> Option<TrayAction> {
+    // Windows delivers Down, Up, DoubleClick, Up for a double-click.
+    // Act on the first press only; releases cannot undo a focus-loss hide.
+    matches!(event, LeftButtonEvent::Down).then_some(TrayAction::ToggleAt(at))
 }

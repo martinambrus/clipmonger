@@ -393,16 +393,6 @@ fn ok_true(
     Ok(json!({ "ok": true }))
 }
 
-fn unavailable(
-    _m: &str,
-    _p: &serde_json::Value,
-) -> Result<serde_json::Value, clipmonger_ipc::proto::IpcError> {
-    Err(clipmonger_ipc::proto::IpcError::new(
-        "unavailable",
-        "paste unavailable".to_string(),
-    ))
-}
-
 #[test]
 fn t904_bridge_r1_stub_ok_is_unconfirmed_error() {
     use ipc_bridge::{UiCmd, UiEvent};
@@ -424,23 +414,6 @@ fn t904_bridge_r1_stub_ok_is_unconfirmed_error() {
     assert!(
         matches!(&ev, UiEvent::Error(m) if m.contains("unconfirmed")),
         "stub-ok pin must surface unconfirmed error, got {ev:?}"
-    );
-}
-
-#[test]
-fn t904_bridge_paste_unavailable_never_fake_ok() {
-    use ipc_bridge::{UiCmd, UiEvent};
-    let (tx, rx) = ipc_bridge::Bridge::spawn(Box::new(Fake {
-        respond: unavailable,
-    }));
-    let id = mkclip("22222222-2222-7222-8222-222222222222", "x", "x").id;
-    tx.send(UiCmd::PasteClip(id)).expect("send paste");
-    let ev = rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("paste event");
-    assert!(
-        matches!(ev, UiEvent::PasteUnavailable),
-        "unavailable paste must yield PasteUnavailable, got {ev:?}"
     );
 }
 
@@ -471,7 +444,7 @@ fn t904_bridge_cmd_method_mapping_smoke() {
         UiCmd::ListHistory,
         UiCmd::DeleteClip(id),
         UiCmd::PinClip(id, false),
-        UiCmd::PasteClip(id),
+        UiCmd::PasteClipTo(id, None, 0, None),
         UiCmd::Stop,
     ] {
         tx.send(cmd).expect("send");

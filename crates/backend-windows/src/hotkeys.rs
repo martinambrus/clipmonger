@@ -67,6 +67,7 @@ fn conflict(chord_text: &str, detail: impl std::fmt::Display) -> Error {
 /// Drain this thread's message queue once. `WM_HOTKEY` is dispatched to
 /// the `global-hotkey` hidden window only while its owning thread pumps.
 #[cfg(windows)]
+#[allow(unsafe_code)] // Direct Win32 FFI boundary.
 fn pump_thread_messages() {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,

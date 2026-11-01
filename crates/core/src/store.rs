@@ -8,7 +8,7 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OpenFlags};
 use sha2::{Digest as _, Sha256};
@@ -29,36 +29,40 @@ const DEDUPE_WINDOW: usize = 100;
 const RESTORE_MAX_ENTRY: u64 = 1024 * 1024 * 1024;
 /// Largest total ZIP payload accepted by restore.
 const RESTORE_MAX_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
+/// Maximum raw `config.toml` bytes accepted for backup or restore.
+/// Documented reasonable bound: 1 MiB (typical config is < 10 KiB but allows
+/// extensive comments and future unknown fields; prevents unbounded allocation).
+const CONFIG_MAX_BYTES: u64 = 1024 * 1024;
 /// DB file name inside a profile directory.
 const DB_NAME: &str = "clipstore.sqlite3";
 /// DDL for tables and indexes (the FTS table is created separately).
-const SCHEMA_SQL: &str = "
-CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS clips(
+const SCHEMA_STATEMENTS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);",
+    "CREATE TABLE IF NOT EXISTS clips(
   id TEXT PRIMARY KEY, created_ms INTEGER NOT NULL, source_app TEXT,
   source_os TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0,
   removed INTEGER NOT NULL DEFAULT 0, preview TEXT NOT NULL DEFAULT '',
   search_text TEXT NOT NULL DEFAULT '', bytes_total INTEGER NOT NULL DEFAULT 0,
   content_hash TEXT NOT NULL, rev_ms INTEGER NOT NULL, rev_dev TEXT NOT NULL,
   rev_ctr INTEGER NOT NULL DEFAULT 0, last_used_ms INTEGER NOT NULL,
-  origin_dev TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT '');
-CREATE INDEX IF NOT EXISTS idx_clips_created ON clips(created_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_clips_content ON clips(content_hash);
-CREATE TABLE IF NOT EXISTS clip_payloads(
+  origin_dev TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT '');",
+    "CREATE INDEX IF NOT EXISTS idx_clips_created ON clips(created_ms DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_clips_content ON clips(content_hash);",
+    "CREATE TABLE IF NOT EXISTS clip_payloads(
   clip_id TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
   mime TEXT NOT NULL, external INTEGER NOT NULL DEFAULT 0,
   data BLOB, blob_key TEXT, native_id TEXT,
-  PRIMARY KEY(clip_id, mime));
-CREATE TABLE IF NOT EXISTS clip_blobs(
+  PRIMARY KEY(clip_id, mime));",
+    "CREATE TABLE IF NOT EXISTS clip_blobs(
   blob_key TEXT PRIMARY KEY, sha256 TEXT NOT NULL, bytes INTEGER NOT NULL,
-  codec TEXT NOT NULL DEFAULT 'raw', created_ms INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS perm_groups(name TEXT PRIMARY KEY, system INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS permanents(
+  codec TEXT NOT NULL DEFAULT 'raw', created_ms INTEGER NOT NULL);",
+    "CREATE TABLE IF NOT EXISTS perm_groups(name TEXT PRIMARY KEY, system INTEGER NOT NULL DEFAULT 0);",
+    "CREATE TABLE IF NOT EXISTS permanents(
   id TEXT PRIMARY KEY, grp TEXT NOT NULL REFERENCES perm_groups(name),
   name TEXT NOT NULL, hotkey TEXT, kind TEXT NOT NULL,
   body TEXT NOT NULL, js TEXT,
-  rev_ms INTEGER NOT NULL, rev_dev TEXT NOT NULL, rev_ctr INTEGER NOT NULL DEFAULT 0);
-";
+  rev_ms INTEGER NOT NULL, rev_dev TEXT NOT NULL, rev_ctr INTEGER NOT NULL DEFAULT 0);",
+];
 
 /// Counter for unique scratch directory names.
 static TMP_CTR: AtomicU64 = AtomicU64::new(0);
@@ -66,11 +70,15 @@ static TMP_CTR: AtomicU64 = AtomicU64::new(0);
 /// One clip's payloads: MIME plus raw bytes.
 pub type ClipPayloads = Vec<(String, Vec<u8>)>;
 
-/// Stored payload row: MIME, external flag, inline bytes, blob key.
-type StoredPayload = (String, i64, Option<Vec<u8>>, Option<String>);
-
-/// Payload row joined with its blob digest for verification.
-type VerifiedPayload = (String, i64, Option<Vec<u8>>, Option<String>, Option<String>);
+/// Payload row joined with its blob metadata for verification.
+type VerifiedPayload = (
+    String,
+    i64,
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
 
 /// Outcome of [`Store::insert_clip`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,13 +196,55 @@ fn norm_hotkey(hotkey: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+// These operation failures exist only in unit-test builds, never in the runtime API.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreFault {
+    OldMove(usize),
+    NewMove(usize),
+    NewOpen,
+    RollbackRemove,
+    RollbackRename,
+    OldOpen,
+    Close,
+}
+#[cfg(test)]
+thread_local! {
+    static RESTORE_FAULTS: std::cell::RefCell<Vec<RestoreFault>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+fn check_restore_fault(point: RestoreFault) -> Result<(), CoreError> {
+    RESTORE_FAULTS.with(|faults| {
+        let mut faults = faults.borrow_mut();
+        if let Some(index) = faults.iter().position(|fault| *fault == point) {
+            faults.remove(index);
+            return Err(CoreError::Io(std::io::Error::other(format!(
+                "injected {point:?}"
+            ))));
+        }
+        Ok(())
+    })
+}
+macro_rules! restore_point {
+    ($point:expr) => {{
+        #[cfg(test)]
+        {
+            check_restore_fault($point)
+        }
+        #[cfg(not(test))]
+        {
+            Ok::<(), CoreError>(())
+        }
+    }};
+}
+
 /// SQLite-backed clip store.
 #[derive(Debug)]
 pub struct Store {
-    /// Path to `clipstore.sqlite3`.
-    db_path: PathBuf,
     /// Path to `blobs/`.
     blobs: PathBuf,
+    /// Path to DB file.
+    db_path: PathBuf,
     /// Connection guarded for shared `&self` use across threads.
     conn: Mutex<Connection>,
     /// True when FTS5 is available (probed at open).
@@ -256,6 +306,219 @@ fn mkdir(dir: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
+fn mkdir_if_missing(dir: &Path) -> Result<(), CoreError> {
+    if dir.exists() {
+        // The selected anchor is trusted; pin its canonical target in preparation.
+        let meta = fs::metadata(dir).map_err(CoreError::Io)?;
+        if !meta.is_dir() {
+            return Err(CoreError::Corrupt {
+                message: "profile exists as file".to_string(),
+            });
+        }
+        return Ok(());
+    }
+    fs::create_dir_all(dir).map_err(CoreError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = fs::metadata(dir).map_err(CoreError::Io)?.permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(dir, perms).map_err(CoreError::Io)?;
+    }
+    Ok(())
+}
+
+fn create_stage_root(profile: &Path) -> Result<PathBuf, CoreError> {
+    mkdir_if_missing(profile)?;
+    for _ in 0..16 {
+        let name = format!(
+            ".restore-{}-{}",
+            std::process::id(),
+            Uuid::now_v7().as_simple()
+        );
+        let dir = profile.join(&name);
+        #[cfg(unix)]
+        let result = {
+            use std::os::unix::fs::DirBuilderExt as _;
+            fs::DirBuilder::new().mode(0o700).create(&dir)
+        };
+        #[cfg(not(unix))]
+        let result = fs::create_dir(&dir);
+        match result {
+            Ok(()) => {
+                let incoming = dir.join("incoming");
+                let old = dir.join("old");
+                let children = (|| -> Result<(), CoreError> {
+                    fs::create_dir(&incoming).map_err(CoreError::Io)?;
+                    fs::create_dir(&old).map_err(CoreError::Io)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        for p in [&incoming, &old] {
+                            let mut perms = fs::metadata(p).map_err(CoreError::Io)?.permissions();
+                            perms.set_mode(0o700);
+                            fs::set_permissions(p, perms).map_err(CoreError::Io)?;
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = children {
+                    let _ = fs::remove_dir_all(&dir);
+                    return Err(error);
+                }
+                return Ok(dir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(CoreError::Io(e)),
+        }
+    }
+    Err(CoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "too many restore collisions",
+    )))
+}
+
+fn check_managed_not_symlink(path: &Path) -> Result<(), CoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(m) => {
+            if m.file_type().is_symlink() {
+                return Err(CoreError::Unsupported {
+                    message: format!("managed component is symlink: {}", path.display()),
+                });
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                if (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    return Err(CoreError::Unsupported {
+                        message: format!("managed component is reparse point: {}", path.display()),
+                    });
+                }
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(CoreError::Io(e)),
+    }
+}
+
+fn same_file(left: &Path, right: &Path) -> bool {
+    if let (Ok(left), Ok(right)) = (left.canonicalize(), right.canonicalize()) {
+        if left == right {
+            return true;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) {
+            return left.dev() == right.dev() && left.ino() == right.ino();
+        }
+    }
+    false
+}
+
+fn is_ancestor_managed(src: &Path, profile: &Path, config: bool) -> Result<bool, CoreError> {
+    let source = src.canonicalize().map_err(CoreError::Io)?;
+    for name in [
+        DB_NAME,
+        "clipstore.sqlite3-wal",
+        "clipstore.sqlite3-shm",
+        "blobs",
+    ]
+    .into_iter()
+    .chain(config.then_some("config.toml"))
+    {
+        let managed = profile.join(name);
+        if same_file(src, &managed) || source.starts_with(&managed) {
+            return Ok(true);
+        }
+        if name == "blobs" && fs::symlink_metadata(&managed).is_ok_and(|m| m.is_dir()) {
+            // Hard links cannot be resolved lexically. Inspect the managed blob leaves.
+            for entry in fs::read_dir(&managed).map_err(CoreError::Io)? {
+                if same_file(src, &entry.map_err(CoreError::Io)?.path()) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn check_restore_components(profile: &Path, config: bool) -> Result<(), CoreError> {
+    #[cfg(unix)]
+    let anchor_device = {
+        use std::os::unix::fs::MetadataExt as _;
+        fs::metadata(profile).map_err(CoreError::Io)?.dev()
+    };
+    for name in [
+        DB_NAME,
+        "clipstore.sqlite3-wal",
+        "clipstore.sqlite3-shm",
+        "blobs",
+    ]
+    .into_iter()
+    .chain(config.then_some("config.toml"))
+    {
+        let path = profile.join(name);
+        check_managed_not_symlink(&path)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(CoreError::Io(error)),
+        };
+        if (name == "blobs" && !metadata.is_dir()) || (name != "blobs" && !metadata.is_file()) {
+            return Err(CoreError::Unsupported {
+                message: format!("wrong managed component type: {}", path.display()),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if metadata.dev() != anchor_device {
+                return Err(CoreError::Unsupported {
+                    message: format!("managed component crosses filesystem: {}", path.display()),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_profile_container(profile: &Path) -> Result<(), CoreError> {
+    mkdir_if_missing(profile)
+}
+
+fn create_private_dir(prefix: &str) -> Result<PathBuf, CoreError> {
+    for _ in 0..16 {
+        let name = format!(
+            "{}-{}-{}-{}",
+            prefix,
+            std::process::id(),
+            TMP_CTR.fetch_add(1, Ordering::SeqCst),
+            Uuid::now_v7().as_simple()
+        );
+        let dir = std::env::temp_dir().join(name);
+        #[cfg(unix)]
+        let result = {
+            use std::os::unix::fs::DirBuilderExt as _;
+            fs::DirBuilder::new().mode(0o700).create(&dir)
+        };
+        #[cfg(not(unix))]
+        let result = fs::create_dir(&dir);
+        match result {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(CoreError::Io(e)),
+        }
+    }
+    Err(CoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "too many temp collisions",
+    )))
+}
+
 /// Best-effort directory fsync after renames (Unix only).
 fn fsync_dir(dir: &Path) {
     #[cfg(unix)]
@@ -283,6 +546,525 @@ fn hex_of(bytes: &[u8]) -> String {
     out
 }
 
+fn parse_blob_key(key: &str) -> Option<(String, u64)> {
+    let bytes = key.as_bytes();
+    if bytes.len() < 34 || bytes.len() > 52 {
+        return None;
+    }
+    if bytes[32] != b'-' {
+        return None;
+    }
+    let prefix = &key[..32];
+    let size_str = &key[33..];
+    if size_str.is_empty() || size_str.len() > 19 {
+        return None;
+    }
+    for &b in prefix.as_bytes() {
+        if !matches!(b, b'0'..=b'9' | b'a'..=b'f') {
+            return None;
+        }
+    }
+    if size_str == "0" {
+    } else {
+        if size_str.as_bytes()[0] == b'0' {
+            return None;
+        }
+        for &b in size_str.as_bytes() {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+        }
+    }
+    for &b in size_str.as_bytes() {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+    }
+    let size: u64 = size_str.parse().ok()?;
+    if size > i64::MAX as u64 {
+        return None;
+    }
+    if size_str != size.to_string() {
+        return None;
+    }
+    Some((prefix.to_string(), size))
+}
+
+fn is_canonical_hex(s: &str, len: usize) -> bool {
+    if s.len() != len {
+        return false;
+    }
+    s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn validate_blob_metadata(key: &str, sha256: &str, bytes: i64) -> Result<(), CoreError> {
+    let (prefix, size) = parse_blob_key(key).ok_or_else(|| CoreError::Corrupt {
+        message: "invalid blob key".to_string(),
+    })?;
+    if !is_canonical_hex(sha256, 64) {
+        return Err(CoreError::Corrupt {
+            message: "invalid blob sha256".to_string(),
+        });
+    }
+    if !sha256.starts_with(&prefix) {
+        return Err(CoreError::Corrupt {
+            message: "blob sha prefix mismatch".to_string(),
+        });
+    }
+    if bytes < 0 {
+        return Err(CoreError::Corrupt {
+            message: "invalid blob bytes".to_string(),
+        });
+    }
+    if u64::try_from(bytes).ok() != Some(size) {
+        return Err(CoreError::Corrupt {
+            message: "blob bytes mismatch".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn config_bytes_for_backup(profile: &Path) -> Result<Option<(Vec<u8>, u64, String)>, CoreError> {
+    let path = profile.join("config.toml");
+    match fs::symlink_metadata(&path) {
+        Ok(m) => {
+            if m.file_type().is_symlink() {
+                return Err(CoreError::Unsupported {
+                    message: format!("config is symlink: {}", path.display()),
+                });
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt as _;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                if (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    return Err(CoreError::Unsupported {
+                        message: format!("config is reparse point: {}", path.display()),
+                    });
+                }
+            }
+            if !m.is_file() {
+                return Err(CoreError::Unsupported {
+                    message: format!("config wrong type: {}", path.display()),
+                });
+            }
+            if m.len() > CONFIG_MAX_BYTES {
+                return Err(CoreError::Config {
+                    message: "config exceeds size cap".to_string(),
+                });
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(CoreError::Io(e)),
+    }
+    check_managed_not_symlink(&path)?;
+    let file = fs::File::open(&path).map_err(CoreError::Io)?;
+    let mut buf = Vec::new();
+    let n = file
+        .take(CONFIG_MAX_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(CoreError::Io)?;
+    if n as u64 > CONFIG_MAX_BYTES {
+        return Err(CoreError::Config {
+            message: "config exceeds size cap".to_string(),
+        });
+    }
+    let text = String::from_utf8(buf.clone()).map_err(|_| CoreError::Config {
+        message: "config not utf8".to_string(),
+    })?;
+    toml::from_str::<crate::Config>(&text).map_err(|e| CoreError::Config {
+        message: e.to_string(),
+    })?;
+    let sha = hex_of(&Sha256::digest(&buf));
+    let len = buf.len() as u64;
+    Ok(Some((buf, len, sha)))
+}
+
+fn validate_config_in_profile(tmp: &Path, man: &toml::Value) -> Result<(), CoreError> {
+    let bad = |msg: &str| CoreError::Config {
+        message: msg.to_string(),
+    };
+    let config_path = tmp.join("config.toml");
+    let file_meta = fs::symlink_metadata(&config_path);
+    let file_exists = matches!(&file_meta, Ok(m) if m.is_file());
+    let is_symlink = matches!(&file_meta, Ok(m) if m.file_type().is_symlink());
+    if is_symlink {
+        return Err(bad("config symlink rejected"));
+    }
+    if let Ok(m) = &file_meta {
+        if m.is_dir() {
+            return Err(bad("config wrong type"));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            if (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                return Err(bad("config reparse point rejected"));
+            }
+        }
+        if m.len() > CONFIG_MAX_BYTES {
+            return Err(bad("config exceeds size cap"));
+        }
+    }
+    let manifest_bytes = man.get("config_bytes");
+    let manifest_sha = man.get("config_sha256");
+    if let (false, true) = (
+        file_exists,
+        manifest_bytes.is_some() || manifest_sha.is_some(),
+    ) {
+        return Err(bad("config metadata without file"));
+    }
+    if let Some(v) = manifest_bytes {
+        let n = v
+            .as_integer()
+            .ok_or_else(|| bad("config_bytes not an integer"))?;
+        if n < 0 {
+            return Err(bad("config_bytes not a nonnegative integer"));
+        }
+        let _ = u64::try_from(n).map_err(|_| bad("config_bytes not a nonnegative integer"))?;
+    }
+    if let Some(v) = manifest_sha {
+        let s = v
+            .as_str()
+            .ok_or_else(|| bad("config_sha256 not a string"))?;
+        if !is_canonical_hex(s, 64) {
+            return Err(bad("config sha256 invalid"));
+        }
+    }
+    if file_exists {
+        let file = fs::File::open(&config_path).map_err(CoreError::Io)?;
+        let mut buf = Vec::new();
+        let n = file
+            .take(CONFIG_MAX_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map_err(CoreError::Io)?;
+        if n as u64 > CONFIG_MAX_BYTES {
+            return Err(bad("config exceeds size cap"));
+        }
+        let text = String::from_utf8(buf.clone()).map_err(|_| bad("config not utf8"))?;
+        toml::from_str::<crate::Config>(&text).map_err(|e| bad(&format!("config invalid: {e}")))?;
+        if let Some(v) = manifest_bytes {
+            let expected = u64::try_from(v.as_integer().unwrap()).unwrap();
+            if expected != buf.len() as u64 {
+                return Err(bad("config size mismatch"));
+            }
+        }
+        if let Some(v) = manifest_sha {
+            let expected = v.as_str().unwrap();
+            if hex_of(&Sha256::digest(&buf)) != expected {
+                return Err(bad("config checksum mismatch"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn blobs_root_ok(blobs: &Path) -> Result<(), CoreError> {
+    match fs::symlink_metadata(blobs) {
+        Ok(m) => {
+            if m.file_type().is_symlink() {
+                return Err(CoreError::Corrupt {
+                    message: "blobs root is symlink".to_string(),
+                });
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                if (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    return Err(CoreError::Corrupt {
+                        message: "blobs root is reparse point".to_string(),
+                    });
+                }
+            }
+            if !m.is_dir() {
+                return Err(CoreError::Corrupt {
+                    message: "blobs root not a directory".to_string(),
+                });
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(CoreError::Io(e)),
+    }
+    Ok(())
+}
+
+fn safe_blob_path(blobs: &Path, key: &str) -> Result<PathBuf, CoreError> {
+    let (prefix, size) = parse_blob_key(key).ok_or_else(|| CoreError::Corrupt {
+        message: "invalid blob key".to_string(),
+    })?;
+    let _ = prefix;
+    let _ = size;
+    blobs_root_ok(blobs)?;
+    let path = blobs.join(key);
+    match fs::symlink_metadata(&path) {
+        Ok(m) => {
+            if m.file_type().is_symlink() {
+                return Err(CoreError::Corrupt {
+                    message: "blob path is symlink".to_string(),
+                });
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                if (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    return Err(CoreError::Corrupt {
+                        message: "blob reparse point".to_string(),
+                    });
+                }
+            }
+            if !m.is_file() {
+                return Err(CoreError::Corrupt {
+                    message: "blob not a regular file".to_string(),
+                });
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(CoreError::Io(e)),
+    }
+    Ok(path)
+}
+
+fn safe_blob_read(blobs: &Path, key: &str, expect_sha: &str) -> Result<Vec<u8>, CoreError> {
+    let (prefix, size) = parse_blob_key(key).ok_or_else(|| CoreError::Corrupt {
+        message: "invalid blob key".to_string(),
+    })?;
+    let _ = prefix;
+    let path = safe_blob_path(blobs, key)?;
+    let meta = fs::symlink_metadata(&path).map_err(|_| CoreError::Corrupt {
+        message: "missing external blob".to_string(),
+    })?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(CoreError::Corrupt {
+            message: "blob not a regular file".to_string(),
+        });
+    }
+    let file_len = meta.len();
+    if file_len != size {
+        return Err(CoreError::Corrupt {
+            message: "external blob size mismatch".to_string(),
+        });
+    }
+    let file = fs::File::open(&path).map_err(|_| CoreError::Corrupt {
+        message: "missing external blob".to_string(),
+    })?;
+    let mut buf = Vec::new();
+    let n = file
+        .take(size + 1)
+        .read_to_end(&mut buf)
+        .map_err(CoreError::Io)?;
+    if n as u64 != size {
+        return Err(CoreError::Corrupt {
+            message: "external blob size mismatch".to_string(),
+        });
+    }
+    let mut h = Sha256::new();
+    h.update(&buf);
+    if hex_of(&h.finalize()) != expect_sha {
+        return Err(CoreError::Corrupt {
+            message: "external blob failed verification".to_string(),
+        });
+    }
+    Ok(buf)
+}
+
+fn validate_db_keys(conn: &Connection) -> Result<(), CoreError> {
+    validate_db_keys_opening(conn, None).map_err(|error| match error {
+        TypedOpenError::Fatal(error) => error,
+        TypedOpenError::Retryable { stage, err } => operational_err(&err, stage),
+    })
+}
+
+fn validate_db_keys_opening(
+    conn: &Connection,
+    budget: Option<&OpenBudget>,
+) -> Result<(), TypedOpenError> {
+    let refresh = || -> Result<(), TypedOpenError> {
+        if let Some(budget) = budget {
+            budget
+                .refresh(conn, OpenStage::Validate)
+                .map_err(|e| opening_error(OpenStage::Validate, e))?;
+        }
+        Ok(())
+    };
+    refresh()?;
+    let mut stmt = conn
+        .prepare("SELECT blob_key, sha256, bytes FROM clip_blobs")
+        .map_err(|e| opening_error(OpenStage::Validate, e))?;
+    refresh()?;
+    let mut query = stmt
+        .query([])
+        .map_err(|e| opening_error(OpenStage::Validate, e))?;
+    let mut rows = Vec::new();
+    loop {
+        refresh()?;
+        let Some(row) = query
+            .next()
+            .map_err(|e| opening_error(OpenStage::Validate, e))?
+        else {
+            break;
+        };
+        let value: rusqlite::Result<(String, String, i64)> =
+            (|| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))();
+        rows.push(value.map_err(|_| CoreError::Corrupt {
+            message: "invalid blob metadata types".to_string(),
+        })?);
+    }
+    drop(query);
+    drop(stmt);
+    let mut blob_keys = HashSet::new();
+    for (key, sha, bytes) in &rows {
+        validate_blob_metadata(key, sha, *bytes)?;
+        blob_keys.insert(key.clone());
+    }
+    refresh()?;
+    let mut stmt = conn
+        .prepare("SELECT external, blob_key, (data IS NOT NULL) FROM clip_payloads")
+        .map_err(|e| opening_error(OpenStage::Validate, e))?;
+    refresh()?;
+    let mut query = stmt
+        .query([])
+        .map_err(|e| opening_error(OpenStage::Validate, e))?;
+    let mut payload_rows = Vec::new();
+    loop {
+        refresh()?;
+        let Some(row) = query
+            .next()
+            .map_err(|e| opening_error(OpenStage::Validate, e))?
+        else {
+            break;
+        };
+        let value: rusqlite::Result<(i64, Option<String>, i64)> =
+            (|| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))();
+        payload_rows.push(value.map_err(|_| CoreError::Corrupt {
+            message: "invalid payload types".to_string(),
+        })?);
+    }
+    drop(query);
+    drop(stmt);
+    for (ext, key_opt, has_data) in &payload_rows {
+        if *ext != 0 && *ext != 1 {
+            return Err(CoreError::Corrupt {
+                message: "invalid external flag".to_string(),
+            }
+            .into());
+        }
+        if *ext == 1 {
+            let k = key_opt.as_deref().ok_or_else(|| CoreError::Corrupt {
+                message: "missing external blob_key".to_string(),
+            })?;
+            parse_blob_key(k).ok_or_else(|| CoreError::Corrupt {
+                message: "invalid blob key".to_string(),
+            })?;
+            if *has_data != 0 {
+                return Err(CoreError::Corrupt {
+                    message: "external payload has inline data".to_string(),
+                }
+                .into());
+            }
+            if !blob_keys.contains(k) {
+                return Err(CoreError::Corrupt {
+                    message: "missing external blob metadata".to_string(),
+                }
+                .into());
+            }
+        } else if let Some(k) = key_opt.as_deref() {
+            parse_blob_key(k).ok_or_else(|| CoreError::Corrupt {
+                message: "invalid blob key".to_string(),
+            })?;
+            return Err(CoreError::Corrupt {
+                message: "inline payload has blob_key".to_string(),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Validate one complete candidate before opening any of its blob files.
+fn load_payload_rows(blobs: &Path, rows: Vec<VerifiedPayload>) -> Result<ClipPayloads, CoreError> {
+    for (_, external, data, key, sha, bytes) in &rows {
+        match external {
+            1 => {
+                if data.is_some() {
+                    return Err(CoreError::Corrupt {
+                        message: "external payload has inline data".to_string(),
+                    });
+                }
+                let (Some(key), Some(sha), Some(bytes)) = (key, sha, bytes) else {
+                    return Err(CoreError::Corrupt {
+                        message: "missing external blob metadata".to_string(),
+                    });
+                };
+                validate_blob_metadata(key, sha, *bytes)?;
+            }
+            0 if key.is_none() => {}
+            0 => {
+                return Err(CoreError::Corrupt {
+                    message: "inline payload has blob_key".to_string(),
+                })
+            }
+            _ => {
+                return Err(CoreError::Corrupt {
+                    message: "invalid external flag".to_string(),
+                })
+            }
+        }
+    }
+    rows.into_iter()
+        .map(|(mime, _, data, key, sha, _)| {
+            let bytes = if let (Some(key), Some(sha)) = (key, sha) {
+                safe_blob_read(blobs, &key, &sha)?
+            } else {
+                data.unwrap_or_default()
+            };
+            Ok((mime, bytes))
+        })
+        .collect()
+}
+
+/// Create an exclusive quarantine directory without following existing links.
+fn create_quarantine(blobs: &Path, now: i64) -> Result<PathBuf, CoreError> {
+    for counter in 0..=100 {
+        let name = if counter == 0 {
+            format!("orphan-{now}")
+        } else {
+            format!("orphan-{now}-{counter}")
+        };
+        let path = blobs.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(m) => {
+                if m.file_type().is_symlink() {
+                    return Err(CoreError::Corrupt {
+                        message: "quarantine is symlink".to_string(),
+                    });
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt as _;
+                    if m.file_attributes() & 0x400 != 0 {
+                        return Err(CoreError::Corrupt {
+                            message: "quarantine is reparse point".to_string(),
+                        });
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&path).map_err(CoreError::Io)?;
+                blobs_root_ok(&path)?;
+                return Ok(path);
+            }
+            Err(e) => return Err(CoreError::Io(e)),
+        }
+    }
+    Err(CoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "too many quarantine collisions",
+    )))
+}
+
 /// Fallible `u64` to `i64` for SQL parameters.
 fn i64_from_u64(v: u64) -> Result<i64, CoreError> {
     i64::try_from(v).map_err(|e| CoreError::Backend {
@@ -302,6 +1084,123 @@ fn i64_from_usize(v: usize) -> Result<i64, CoreError> {
     i64_from_u64(u)
 }
 
+/// Initialization diagnostics stay private; only BUSY permits another attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenStage {
+    Header,
+    Migration,
+    Wal,
+    EnsureSchema,
+    QuickCheck,
+    Validate,
+}
+
+const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const OPEN_WAIT_SLICE: Duration = Duration::from_millis(50);
+
+struct OpenBudget {
+    started: Instant,
+    total: Duration,
+}
+
+impl OpenBudget {
+    fn remaining(&self) -> Duration {
+        self.total.saturating_sub(self.started.elapsed())
+    }
+
+    // This bounds SQLite lock waits, not CPU work or blocking filesystem I/O.
+    // Refresh at every SQL boundary, including individual DDL/meta statements.
+    fn refresh(&self, conn: &Connection, stage: OpenStage) -> rusqlite::Result<()> {
+        conn.busy_timeout(self.remaining().min(OPEN_WAIT_SLICE))?;
+        #[cfg(test)]
+        observe_open_boundary(conn, stage);
+        #[cfg(not(test))]
+        let _ = stage;
+        Ok(())
+    }
+}
+
+fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
+    matches!(err, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::DatabaseBusy)
+}
+
+fn is_sqlite_corruption(err: &rusqlite::Error) -> bool {
+    matches!(err, rusqlite::Error::SqliteFailure(e, _) if matches!(e.code,
+        rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase))
+}
+
+fn operational_err(err: &rusqlite::Error, stage: OpenStage) -> CoreError {
+    CoreError::Backend {
+        backend: "sqlite".to_string(),
+        kind: BackendKind::Internal,
+        message: format!("{stage:?}: {err}"),
+    }
+}
+
+enum TypedOpenError {
+    Retryable {
+        stage: OpenStage,
+        err: rusqlite::Error,
+    },
+    Fatal(CoreError),
+}
+
+impl From<CoreError> for TypedOpenError {
+    fn from(e: CoreError) -> Self {
+        Self::Fatal(e)
+    }
+}
+
+fn opening_error(stage: OpenStage, err: rusqlite::Error) -> TypedOpenError {
+    if is_sqlite_busy(&err) {
+        TypedOpenError::Retryable { stage, err }
+    } else if stage == OpenStage::Migration
+        && !matches!(&err, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::DatabaseLocked)
+    {
+        TypedOpenError::Fatal(CoreError::MigrationFailed {
+            version: 1,
+            message: err.to_string(),
+        })
+    } else {
+        TypedOpenError::Fatal(operational_err(&err, stage))
+    }
+}
+
+// Each unit-test thread controls only its own public opening calls. Callbacks
+// are taken out of the cell before invocation, so neither a borrow nor a lock
+// surrounds them. The BUSY callback runs after try_open_once has dropped its DB.
+#[cfg(test)]
+#[derive(Default)]
+struct OpenTestControl {
+    budget: Option<Duration>,
+    busy: Option<Box<BusyObserver>>,
+    boundary: Option<Box<BoundaryObserver>>,
+}
+#[cfg(test)]
+type BusyObserver = dyn FnMut(OpenStage, &rusqlite::Error);
+#[cfg(test)]
+type BoundaryObserver = dyn FnMut(&Connection, OpenStage);
+#[cfg(test)]
+thread_local! {
+    static OPEN_TEST_CONTROL: std::cell::RefCell<OpenTestControl> = std::cell::RefCell::new(OpenTestControl::default());
+}
+#[cfg(test)]
+fn observe_open_busy(stage: OpenStage, error: &rusqlite::Error) {
+    let callback = OPEN_TEST_CONTROL.with(|c| c.borrow_mut().busy.take());
+    if let Some(mut callback) = callback {
+        callback(stage, error);
+        OPEN_TEST_CONTROL.with(|c| c.borrow_mut().busy = Some(callback));
+    }
+}
+#[cfg(test)]
+fn observe_open_boundary(conn: &Connection, stage: OpenStage) {
+    let callback = OPEN_TEST_CONTROL.with(|c| c.borrow_mut().boundary.take());
+    if let Some(mut callback) = callback {
+        callback(conn, stage);
+        OPEN_TEST_CONTROL.with(|c| c.borrow_mut().boundary = Some(callback));
+    }
+}
+
 /// Open a connection with busy timeout, WAL, and foreign keys.
 fn open_conn(db: &Path, read_only: bool) -> Result<Connection, CoreError> {
     let conn = if read_only {
@@ -319,26 +1218,47 @@ fn open_conn(db: &Path, read_only: bool) -> Result<Connection, CoreError> {
     Ok(conn)
 }
 
-/// True when `PRAGMA quick_check` reports exactly `ok`.
-fn quick_ok(conn: &Connection) -> bool {
-    let Ok(mut stmt) = conn.prepare("PRAGMA quick_check") else {
-        return false;
-    };
-    let Ok(mapped) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
-        return false;
-    };
-    match mapped.collect::<Result<Vec<_>, _>>() {
-        Ok(v) => v.len() == 1 && v.first().map(String::as_str) == Some("ok"),
-        Err(_) => false,
+fn open_corrupt(profile: &Path, db_path: &Path, read_only: bool) -> Result<CoreError, CoreError> {
+    if read_only {
+        Ok(CoreError::Corrupt {
+            message: "restore database failed quick_check".to_string(),
+        })
+    } else {
+        let aside = preserve_aside(profile, db_path)?;
+        Ok(CoreError::Corrupt {
+            message: format!("quick_check failed; preserved aside at {}", aside.display()),
+        })
     }
 }
 
-/// Probe FTS5 support with a temp virtual table (no main-DB writes).
-fn probe_fts(conn: &Connection) -> bool {
-    conn.execute_batch(
-        "CREATE VIRTUAL TABLE temp.fts_probe USING fts5(x); DROP TABLE temp.fts_probe;",
-    )
-    .is_ok()
+fn quick_check_opening(conn: &Connection, budget: &OpenBudget) -> rusqlite::Result<bool> {
+    budget.refresh(conn, OpenStage::QuickCheck)?;
+    let mut stmt = conn.prepare("PRAGMA quick_check")?;
+    budget.refresh(conn, OpenStage::QuickCheck)?;
+    let mut rows = stmt.query([])?;
+    let mut count = 0;
+    loop {
+        budget.refresh(conn, OpenStage::QuickCheck)?;
+        let Some(row) = rows.next()? else { break };
+        let value: String = row.get(0)?;
+        if value != "ok" {
+            return Ok(false);
+        }
+        count += 1;
+    }
+    Ok(count == 1)
+}
+
+fn quick_check(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA quick_check")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let v: Vec<String> = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(v.len() == 1 && v.first().map(String::as_str) == Some("ok"))
+}
+
+#[allow(dead_code)]
+fn quick_ok(conn: &Connection) -> bool {
+    quick_check(conn).unwrap_or(false)
 }
 
 /// Create the search index: FTS5 when available, plain table otherwise.
@@ -355,54 +1275,60 @@ fn create_fts_on(conn: &Connection, fts: bool) -> Result<(), rusqlite::Error> {
 }
 
 /// Insert missing `meta` rows (fresh create and migration alike).
-fn ensure_meta(conn: &Connection, now: i64) -> Result<(), rusqlite::Error> {
-    conn.execute(
-        "INSERT OR IGNORE INTO meta(k,v) VALUES('schema_version','1')",
-        [],
-    )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO meta(k,v) VALUES('machine',?1)",
-        params![machine_name()],
-    )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO meta(k,v) VALUES('created',?1)",
-        params![now.to_string()],
-    )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO meta(k,v) VALUES('privacy_skips','0')",
-        [],
-    )?;
-    Ok(())
-}
-
-/// Run the v1 DDL, create the search index, ensure `meta`, stamp version.
-fn ensure_schema(conn: &Connection, now: i64) -> Result<(), CoreError> {
-    conn.execute_batch(SCHEMA_SQL).map_err(|e| db_err(&e))?;
-    let fts = probe_fts(conn);
-    create_fts_on(conn, fts).map_err(|e| db_err(&e))?;
-    ensure_meta(conn, now).map_err(|e| db_err(&e))?;
-    let v: i64 = conn
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .map_err(|e| db_err(&e))?;
-    if v < SCHEMA_VERSION {
-        conn.execute_batch("PRAGMA user_version=1")
-            .map_err(|e| db_err(&e))?;
+fn ensure_meta(conn: &Connection, now: i64, budget: &OpenBudget) -> rusqlite::Result<()> {
+    for (key, value) in [
+        ("schema_version", "1".to_string()),
+        ("machine", machine_name()),
+        ("created", now.to_string()),
+        ("privacy_skips", "0".to_string()),
+    ] {
+        budget.refresh(conn, OpenStage::EnsureSchema)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO meta(k,v) VALUES(?1,?2)",
+            params![key, value],
+        )?;
     }
     Ok(())
 }
 
-/// Migrate an older store to v1 inside one transaction.
-fn migrate_on(conn: &mut Connection) -> Result<(), CoreError> {
-    let fail = |e: rusqlite::Error| CoreError::MigrationFailed {
-        version: 1,
-        message: e.to_string(),
+fn ensure_schema_raw(conn: &Connection, now: i64, budget: &OpenBudget) -> rusqlite::Result<()> {
+    for statement in SCHEMA_STATEMENTS {
+        budget.refresh(conn, OpenStage::EnsureSchema)?;
+        conn.execute_batch(statement)?;
+    }
+    let fts = probe_fts_opening(conn, budget)?;
+    budget.refresh(conn, OpenStage::EnsureSchema)?;
+    create_fts_on(conn, fts)?;
+    ensure_meta(conn, now, budget)?;
+    budget.refresh(conn, OpenStage::EnsureSchema)?;
+    let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if v < SCHEMA_VERSION {
+        budget.refresh(conn, OpenStage::EnsureSchema)?;
+        conn.execute_batch("PRAGMA user_version=1")?;
+    }
+    Ok(())
+}
+
+fn probe_fts_opening(conn: &Connection, budget: &OpenBudget) -> rusqlite::Result<bool> {
+    budget.refresh(conn, OpenStage::EnsureSchema)?;
+    let fts = match conn.execute_batch("CREATE VIRTUAL TABLE temp.fts_probe USING fts5(x)") {
+        Ok(()) => true,
+        Err(rusqlite::Error::SqliteFailure(error, _)) if error.extended_code == 1 => false,
+        Err(error) => return Err(error),
     };
-    let tx = conn.transaction().map_err(fail)?;
-    tx.execute_batch(SCHEMA_SQL).map_err(fail)?;
-    create_fts_on(&tx, probe_fts(&tx)).map_err(fail)?;
-    ensure_meta(&tx, now_ms()).map_err(fail)?;
-    tx.execute_batch("PRAGMA user_version=1").map_err(fail)?;
-    tx.commit().map_err(fail)?;
+    if fts {
+        budget.refresh(conn, OpenStage::EnsureSchema)?;
+        conn.execute_batch("DROP TABLE temp.fts_probe")?;
+    }
+    Ok(fts)
+}
+
+fn migrate_on_raw(conn: &mut Connection, budget: &OpenBudget) -> rusqlite::Result<()> {
+    budget.refresh(conn, OpenStage::Migration)?;
+    let tx = conn.transaction()?;
+    ensure_schema_raw(&tx, now_ms(), budget)?;
+    budget.refresh(&tx, OpenStage::Migration)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -491,71 +1417,71 @@ impl Store {
         Self::open_inner(profile, true)
     }
 
-    /// Shared open path (D-F2): version gate, migrate, `quick_check`.
     fn open_inner(profile: &Path, read_only: bool) -> Result<Self, CoreError> {
         mkdir(profile)?;
         let db_path = profile.join(DB_NAME);
         let blobs = profile.join("blobs");
+        blobs_root_ok(&blobs)?;
         mkdir(&blobs)?;
-        if read_only {
-            return Self::open_recovery(profile, &db_path, &blobs);
-        }
-        // Single connection: the version gate runs before any write, so a
-        // refused open leaves the file byte-identical (D-F2).
-        let mut conn = Connection::open(&db_path).map_err(|e| db_err(&e))?;
-        conn.busy_timeout(Duration::from_secs(5))
-            .map_err(|e| db_err(&e))?;
-        let v = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0));
-        match v {
-            Err(_) => {
-                drop(conn);
-                let aside = preserve_aside(profile, &db_path)?;
-                return Err(CoreError::Corrupt {
-                    message: format!(
-                        "unreadable store header; preserved aside at {}",
-                        aside.display()
-                    ),
-                });
-            }
-            Ok(v) if v > SCHEMA_VERSION => {
-                return Err(CoreError::DowngradeRefused {
-                    found: v,
-                    expected: SCHEMA_VERSION,
-                });
-            }
-            Ok(v) if v < SCHEMA_VERSION => migrate_on(&mut conn)?,
-            Ok(_) => {}
-        }
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| db_err(&e))?;
-        ensure_schema(&conn, now_ms())?;
-        if !quick_ok(&conn) {
-            drop(conn);
-            let aside = preserve_aside(profile, &db_path)?;
-            return Err(CoreError::Corrupt {
-                message: format!("quick_check failed; preserved aside at {}", aside.display()),
-            });
-        }
-        let fts = probe_fts(&conn);
-        Ok(Self {
-            db_path,
-            blobs,
-            conn: Mutex::new(conn),
-            fts,
-            read_only,
-        })
-    }
-
-    /// Read-only recovery open: version gate, no writes, no schema changes.
-    fn open_recovery(profile: &Path, db_path: &Path, blobs: &Path) -> Result<Self, CoreError> {
-        if !db_path.exists() {
+        blobs_root_ok(&blobs)?;
+        if read_only && !db_path.exists() {
             return Err(CoreError::Corrupt {
                 message: "no store to recover".to_string(),
             });
         }
-        let conn = open_conn(db_path, true)?;
+        #[cfg(test)]
+        let total = OPEN_TEST_CONTROL
+            .with(|c| c.borrow().budget)
+            .unwrap_or(STORE_BUSY_TIMEOUT);
+        #[cfg(not(test))]
+        let total = STORE_BUSY_TIMEOUT;
+        let budget = OpenBudget {
+            started: Instant::now(),
+            total,
+        };
+        let mut attempt: u32 = 0;
+        loop {
+            match Self::try_open_once(profile, &db_path, &blobs, read_only, &budget) {
+                Ok(store) => return Ok(store),
+                Err(TypedOpenError::Retryable { stage, err }) => {
+                    // The entire failed attempt (including any transaction) is
+                    // gone before observation, backoff, or the next connection.
+                    #[cfg(test)]
+                    observe_open_busy(stage, &err);
+                    if budget.remaining().is_zero() {
+                        return Err(operational_err(&err, stage));
+                    }
+                    let backoff = Duration::from_millis((5u64 << attempt.min(4)).min(50));
+                    std::thread::sleep(backoff.min(budget.remaining()));
+                    // Do not start an extra attempt after backoff used the rest.
+                    if budget.remaining().is_zero() {
+                        return Err(operational_err(&err, stage));
+                    }
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(TypedOpenError::Fatal(error)) => return Err(error),
+            }
+        }
+    }
+
+    fn try_open_once(
+        profile: &Path,
+        db_path: &Path,
+        blobs: &Path,
+        read_only: bool,
+        budget: &OpenBudget,
+    ) -> Result<Self, TypedOpenError> {
+        let mut conn = if read_only {
+            Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        } else {
+            Connection::open(db_path)
+        }
+        .map_err(|e| opening_error(OpenStage::Header, e))?;
+        budget
+            .refresh(&conn, OpenStage::Header)
+            .map_err(|e| opening_error(OpenStage::Header, e))?;
         match conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)) {
-            Err(_) => {
+            Err(error) if is_sqlite_corruption(&error) => {
                 drop(conn);
                 let aside = preserve_aside(profile, db_path)?;
                 return Err(CoreError::Corrupt {
@@ -563,29 +1489,70 @@ impl Store {
                         "unreadable store header; preserved aside at {}",
                         aside.display()
                     ),
-                });
+                }
+                .into());
             }
-            Ok(v) if v > SCHEMA_VERSION => {
+            Err(error) => return Err(opening_error(OpenStage::Header, error)),
+            Ok(found) if found > SCHEMA_VERSION => {
                 return Err(CoreError::DowngradeRefused {
-                    found: v,
+                    found,
                     expected: SCHEMA_VERSION,
-                });
+                }
+                .into());
             }
-            Ok(v) if v < SCHEMA_VERSION => {
-                return Err(CoreError::MigrationFailed {
-                    version: 1,
-                    message: "migration needs a writable store".to_string(),
-                });
+            Ok(found) if found < SCHEMA_VERSION => {
+                if read_only {
+                    return Err(CoreError::MigrationFailed {
+                        version: 1,
+                        message: "migration needs a writable store".to_string(),
+                    }
+                    .into());
+                }
+                migrate_on_raw(&mut conn, budget)
+                    .map_err(|e| opening_error(OpenStage::Migration, e))?;
             }
             Ok(_) => {}
         }
-        let fts = probe_fts(&conn);
+        if !read_only {
+            budget
+                .refresh(&conn, OpenStage::Wal)
+                .map_err(|e| opening_error(OpenStage::Wal, e))?;
+            conn.execute_batch("PRAGMA journal_mode=WAL")
+                .map_err(|e| opening_error(OpenStage::Wal, e))?;
+            budget
+                .refresh(&conn, OpenStage::Wal)
+                .map_err(|e| opening_error(OpenStage::Wal, e))?;
+            conn.execute_batch("PRAGMA foreign_keys=ON")
+                .map_err(|e| opening_error(OpenStage::Wal, e))?;
+            ensure_schema_raw(&conn, now_ms(), budget)
+                .map_err(|e| opening_error(OpenStage::EnsureSchema, e))?;
+        }
+        match quick_check_opening(&conn, budget) {
+            Ok(true) => {}
+            Ok(false) => {
+                drop(conn);
+                return Err(open_corrupt(profile, db_path, read_only)?.into());
+            }
+            Err(error) if is_sqlite_corruption(&error) => {
+                drop(conn);
+                return Err(open_corrupt(profile, db_path, read_only)?.into());
+            }
+            Err(error) => return Err(opening_error(OpenStage::QuickCheck, error)),
+        }
+        validate_db_keys_opening(&conn, Some(budget))?;
+        if read_only {
+            blobs_root_ok(blobs)?;
+        }
+        let fts = probe_fts_opening(&conn, budget)
+            .map_err(|e| opening_error(OpenStage::EnsureSchema, e))?;
+        conn.busy_timeout(STORE_BUSY_TIMEOUT)
+            .map_err(|e| opening_error(OpenStage::Validate, e))?;
         Ok(Self {
-            db_path: db_path.to_path_buf(),
             blobs: blobs.to_path_buf(),
+            db_path: db_path.to_path_buf(),
             conn: Mutex::new(conn),
             fts,
-            read_only: true,
+            read_only,
         })
     }
 
@@ -594,6 +1561,63 @@ impl Store {
         self.conn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Flush committed WAL frames, refusing a busy checkpoint.
+    ///
+    /// # Errors
+    /// Returns a database error or Unavailable if another reader blocks truncation.
+    pub fn checkpoint(&self) -> Result<(), CoreError> {
+        let busy: i64 = self
+            .lock()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .map_err(|error| db_err(&error))?;
+        if busy != 0 {
+            return Err(CoreError::Backend {
+                backend: "sqlite".to_string(),
+                kind: BackendKind::Unavailable,
+                message: "checkpoint is busy".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Checkpoint and close the actual SQLite connection. Failure returns the
+    /// original Store so callers can keep serving it without moving any files.
+    ///
+    /// # Errors
+    /// Returns the original Store and the checkpoint or connection-close error.
+    #[allow(clippy::result_large_err)]
+    pub fn close(self) -> Result<(), (Self, CoreError)> {
+        if let Err(error) = self.checkpoint() {
+            return Err((self, error));
+        }
+        #[cfg(test)]
+        if let Err(error) = check_restore_fault(RestoreFault::Close) {
+            return Err((self, error));
+        }
+        let Self {
+            blobs,
+            db_path,
+            conn,
+            fts,
+            read_only,
+        } = self;
+        let connection = conn
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        connection.close().map_err(|(connection, error)| {
+            (
+                Self {
+                    blobs,
+                    db_path,
+                    conn: Mutex::new(connection),
+                    fts,
+                    read_only,
+                },
+                db_err(&error),
+            )
+        })
     }
 
     /// Content key and hex digest for one external blob.
@@ -607,72 +1631,83 @@ impl Store {
 
     /// Crash-safe external blob write: temp, fsync, atomic rename.
     fn write_blob_file(&self, key: &str, bytes: &[u8]) -> Result<(), CoreError> {
-        let final_path = self.blobs.join(key);
-        if final_path.is_file() {
+        parse_blob_key(key).ok_or_else(|| CoreError::Corrupt {
+            message: "invalid blob key".to_string(),
+        })?;
+        blobs_root_ok(&self.blobs)?;
+        let final_path = safe_blob_path(&self.blobs, key)?;
+        if fs::symlink_metadata(&final_path).is_ok() {
             return Ok(());
         }
-        let tmp = self.blobs.join(format!(
+        let tmp_name = format!(
             ".tmp-{key}-{}-{}",
             std::process::id(),
             TMP_CTR.fetch_add(1, Ordering::SeqCst)
-        ));
-        fs::write(&tmp, bytes).map_err(CoreError::Io)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mut perms = fs::metadata(&tmp).map_err(CoreError::Io)?.permissions();
-            perms.set_mode(0o600);
-            fs::set_permissions(&tmp, perms).map_err(CoreError::Io)?;
-        }
-        // Write access: Windows refuses to flush a read-only handle.
-        let f = fs::OpenOptions::new()
-            .write(true)
-            .open(&tmp)
-            .map_err(CoreError::Io)?;
-        f.sync_all().map_err(CoreError::Io)?;
-        drop(f);
-        fs::rename(&tmp, &final_path).map_err(CoreError::Io)?;
-        fsync_dir(&self.blobs);
-        Ok(())
-    }
-
-    /// Read one external blob and verify its digest.
-    fn read_verified(&self, key: &str, expect_sha: &str) -> Result<Vec<u8>, CoreError> {
-        let bytes = fs::read(self.blobs.join(key)).map_err(|_| CoreError::Corrupt {
-            message: format!("missing external blob {key}"),
-        })?;
-        let mut h = Sha256::new();
-        h.update(&bytes);
-        if hex_of(&h.finalize()) != expect_sha {
+        );
+        let tmp = self.blobs.join(&tmp_name);
+        if fs::symlink_metadata(&tmp).is_ok() {
             return Err(CoreError::Corrupt {
-                message: format!("external blob {key} failed verification"),
+                message: "blob temp path exists as symlink".to_string(),
             });
         }
-        Ok(bytes)
+        let mut created = false;
+        let res: Result<(), CoreError> = (|| {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(CoreError::Io)?;
+            created = true;
+            f.write_all(bytes).map_err(CoreError::Io)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mut perms = fs::metadata(&tmp).map_err(CoreError::Io)?.permissions();
+                perms.set_mode(0o600);
+                fs::set_permissions(&tmp, perms).map_err(CoreError::Io)?;
+            }
+            f.sync_all().map_err(CoreError::Io)?;
+            drop(f);
+            if fs::symlink_metadata(&tmp).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(CoreError::Corrupt {
+                    message: "blob temp became symlink".to_string(),
+                });
+            }
+            if fs::symlink_metadata(&final_path).is_ok() {
+                return Ok(());
+            }
+            fs::rename(&tmp, &final_path).map_err(CoreError::Io)?;
+            fsync_dir(&self.blobs);
+            Ok(())
+        })();
+        if created {
+            let _ = fs::remove_file(&tmp);
+        }
+        res
     }
 
     /// Best-effort payload load for dedupe hashing (`None` on any failure).
     fn try_load_payloads(conn: &Connection, blobs: &Path, id: &str) -> Option<ClipPayloads> {
-        let mut stmt = conn.prepare(
-            "SELECT mime, external, data, blob_key FROM clip_payloads WHERE clip_id=?1 ORDER BY rowid",
-        ).ok()?;
-        let rows: Vec<StoredPayload> = stmt
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.mime, p.external, p.data, p.blob_key, b.sha256, b.bytes FROM clip_payloads p LEFT JOIN clip_blobs b ON b.blob_key=p.blob_key WHERE p.clip_id=?1 ORDER BY p.rowid",
+            )
+            .ok()?;
+        let rows: Vec<VerifiedPayload> = stmt
             .query_map(params![id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })
             .ok()?
             .collect::<Result<_, _>>()
             .ok()?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (mime, ext, data, key) in rows {
-            if ext != 0 {
-                let bytes = fs::read(blobs.join(key?)).ok()?;
-                out.push((mime, bytes));
-            } else {
-                out.push((mime, data.unwrap_or_default()));
-            }
-        }
-        Some(out)
+        load_payload_rows(blobs, rows).ok()
     }
 
     /// Find a dedupe hit among the last live clips (D-F10).
@@ -849,32 +1884,30 @@ impl Store {
         };
         let mut stmt = conn
             .prepare(
-                "SELECT p.mime, p.external, p.data, p.blob_key, b.sha256 FROM clip_payloads p \
+                "SELECT p.mime, p.external, p.data, p.blob_key, b.sha256, b.bytes FROM clip_payloads p \
                 LEFT JOIN clip_blobs b ON b.blob_key=p.blob_key WHERE p.clip_id=?1 ORDER BY p.rowid",
             )
             .map_err(|e| db_err(&e))?;
         let mapped = stmt
             .query_map(params![id.to_string()], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                ))
             })
             .map_err(|e| db_err(&e))?;
         let rows: Vec<VerifiedPayload> =
-            mapped.collect::<Result<_, _>>().map_err(|e| db_err(&e))?;
+            mapped
+                .collect::<Result<_, _>>()
+                .map_err(|_| CoreError::Corrupt {
+                    message: "invalid payload types".to_string(),
+                })?;
         drop(stmt);
-        let mut out = Vec::with_capacity(rows.len());
-        for (mime, ext, data, key, sha) in rows {
-            if ext != 0 {
-                let k = key.ok_or_else(|| CoreError::Corrupt {
-                    message: "dangling external payload".to_string(),
-                })?;
-                let s = sha.ok_or_else(|| CoreError::Corrupt {
-                    message: "dangling external payload".to_string(),
-                })?;
-                out.push((mime, self.read_verified(&k, &s)?));
-            } else {
-                out.push((mime, data.unwrap_or_default()));
-            }
-        }
+        let out = load_payload_rows(&self.blobs, rows)?;
         clip.formats = out.iter().map(|(m, _)| m.clone()).collect();
         Ok(Some((clip.clone(), out)))
     }
@@ -1341,9 +2374,11 @@ impl Store {
         }
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(|e| db_err(&e))?;
+        validate_db_keys(&tx)?;
         let ids = removed_ids(&tx)?;
         let n = ids.len() as u64;
-        delete_clips(&tx, &self.blobs, &ids)?;
+        delete_clips(&tx, &ids)?;
+        sweep_blobs(&tx, &self.blobs)?;
         tx.commit().map_err(|e| db_err(&e))?;
         Ok(n)
     }
@@ -1360,10 +2395,12 @@ impl Store {
         }
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(|e| db_err(&e))?;
+        validate_db_keys(&tx)?;
         let mut purged = 0_u64;
-        purged += enforce_count(&tx, &self.blobs, limits.max_items)?;
-        purged += enforce_age(&tx, &self.blobs, limits.max_age_days, now_ms())?;
-        purged += enforce_bytes(&tx, &self.blobs, limits.max_store_bytes)?;
+        purged += enforce_count(&tx, limits.max_items)?;
+        purged += enforce_age(&tx, limits.max_age_days, now_ms())?;
+        purged += enforce_bytes(&tx, limits.max_store_bytes)?;
+        sweep_blobs(&tx, &self.blobs)?;
         tx.commit().map_err(|e| db_err(&e))?;
         Ok(purged)
     }
@@ -1389,6 +2426,7 @@ impl Store {
                 quarantine_dir,
             });
         }
+        blobs_root_ok(&self.blobs)?;
         let conn = self.lock();
         let referenced = referenced_keys(&conn)?;
         let mut stmt = conn
@@ -1405,17 +2443,33 @@ impl Store {
             .filter(|k| !referenced.contains(k.as_str()))
             .count();
         let dangling = u64::try_from(dangling_blobs).unwrap_or(u64::MAX);
-        mkdir(&quarantine_dir)?;
+        let quarantine_dir = create_quarantine(&self.blobs, now)?;
         let mut orphaned_files = 0_u64;
         let entries = fs::read_dir(&self.blobs).map_err(CoreError::Io)?;
         for e in entries {
             let e = e.map_err(CoreError::Io)?;
-            if !e.file_type().map_err(CoreError::Io)?.is_file() {
+            let ft = e.file_type().map_err(CoreError::Io)?;
+            if ft.is_symlink() {
+                continue;
+            }
+            if !ft.is_file() {
                 continue;
             }
             let name = e.file_name().to_string_lossy().into_owned();
             if referenced.contains(name.as_str()) {
                 continue;
+            }
+            let src_meta = fs::symlink_metadata(e.path()).map_err(CoreError::Io)?;
+            if src_meta.file_type().is_symlink() || !src_meta.is_file() {
+                continue;
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                if (src_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    continue;
+                }
             }
             fs::rename(e.path(), quarantine_dir.join(&name)).map_err(CoreError::Io)?;
             orphaned_files += 1;
@@ -1432,54 +2486,89 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns a backend or I/O error when the backup cannot be written.
+    /// Returns a backend, config, or I/O error when the backup cannot be written.
+    /// A missing `config.toml` is not an error; other config read/type/link/
+    /// parse/bounded size failures are reported before opening `dest`.
+    #[allow(clippy::too_many_lines)]
     pub fn backup_zip(&self, dest: &Path) -> Result<(), CoreError> {
         if let Some(parent) = dest.parent() {
             if !parent.as_os_str().is_empty() {
                 mkdir(parent)?;
             }
         }
-        let tag = TMP_CTR.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!("cm-backup-{}-{tag}", std::process::id()));
-        mkdir(&tmp)?;
+        let profile = self.db_path.parent().unwrap_or_else(|| Path::new("."));
+        let config_data = config_bytes_for_backup(profile)?;
+        let tmp = create_private_dir("cm-backup")?;
         let _guard = TmpGuard { path: tmp.clone() };
         let tmp_db = tmp.join("clipstore.sqlite3");
-        {
-            let src = open_conn(&self.db_path, true)?;
-            let mut out_db = Connection::open(&tmp_db).map_err(|e| db_err(&e))?;
-            let backup =
-                rusqlite::backup::Backup::new(&src, &mut out_db).map_err(|e| db_err(&e))?;
-            backup.step(-1).map_err(|e| db_err(&e))?;
-        }
-        let conn = self.lock();
-        let clips: i64 = conn
-            .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
-            .map_err(|e| db_err(&e))?;
-        let referenced = referenced_keys(&conn)?;
-        drop(conn);
-        let db_bytes = fs::read(&tmp_db).map_err(CoreError::Io)?;
-        let db_sha = hex_of(&Sha256::digest(&db_bytes));
         let tmp_blobs = tmp.join("blobs");
-        mkdir(&tmp_blobs)?;
-        let mut blob_entries = Vec::new();
-        for key in &referenced {
-            let Ok(bytes) = fs::read(self.blobs.join(key)) else {
-                continue;
-            };
-            fs::write(tmp_blobs.join(key), &bytes).map_err(CoreError::Io)?;
-            let sha = hex_of(&Sha256::digest(&bytes));
-            blob_entries.push(format!(
-                "{{key={key:?},bytes={},sha256={sha:?}}}",
-                bytes.len()
-            ));
-        }
-        let manifest = format!(
+        let (clips, referenced, blob_entries, db_bytes) = {
+            let conn = self.lock();
+            {
+                let mut out_db = Connection::open(&tmp_db).map_err(|e| db_err(&e))?;
+                let backup =
+                    rusqlite::backup::Backup::new(&conn, &mut out_db).map_err(|e| db_err(&e))?;
+                if !matches!(
+                    backup.step(-1).map_err(|e| db_err(&e))?,
+                    rusqlite::backup::StepResult::Done
+                ) {
+                    return Err(CoreError::Backend {
+                        backend: "sqlite".to_string(),
+                        kind: BackendKind::Internal,
+                        message: "backup snapshot did not complete".to_string(),
+                    });
+                }
+            }
+            let snap_conn = Connection::open(&tmp_db).map_err(|e| db_err(&e))?;
+            snap_conn
+                .busy_timeout(Duration::from_secs(5))
+                .map_err(|e| db_err(&e))?;
+            validate_db_keys(&snap_conn)?;
+            let clips: i64 = snap_conn
+                .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
+                .map_err(|e| db_err(&e))?;
+            let referenced = referenced_keys(&snap_conn)?;
+            let mut blob_metadata = Vec::with_capacity(referenced.len());
+            for key in &referenced {
+                let (sha, bytes): (String, i64) = snap_conn
+                    .query_row(
+                        "SELECT sha256, bytes FROM clip_blobs WHERE blob_key=?1",
+                        params![key],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .map_err(|e| db_err(&e))?;
+                validate_blob_metadata(key, &sha, bytes)?;
+                blob_metadata.push((key.clone(), sha));
+            }
+            let db_bytes = fs::read(&tmp_db).map_err(CoreError::Io)?;
+            mkdir(&tmp_blobs)?;
+            let mut blob_entries = Vec::new();
+            for (key, sha) in &blob_metadata {
+                let bytes = safe_blob_read(&self.blobs, key, sha)?;
+                fs::write(tmp_blobs.join(key), &bytes).map_err(CoreError::Io)?;
+                blob_entries.push(format!(
+                    "{{key={key:?},bytes={},sha256={sha:?}}}",
+                    bytes.len()
+                ));
+            }
+            drop(snap_conn);
+            (clips, referenced, blob_entries, db_bytes)
+        };
+        let db_sha = hex_of(&Sha256::digest(&db_bytes));
+        let mut manifest = format!(
             "schema_version = 1\ncreated_ms = {}\nclips = {clips}\ndb_sha256 = {db_sha:?}\n\
             db_bytes = {}\nblobs = [{}]\n",
             now_ms(),
             db_bytes.len(),
             blob_entries.join(",")
         );
+        if let Some((_, cfg_len, cfg_sha)) = &config_data {
+            use std::fmt::Write as _;
+            let _ = write!(
+                manifest,
+                "config_bytes = {cfg_len}\nconfig_sha256 = {cfg_sha:?}\n"
+            );
+        }
         fs::write(tmp.join("manifest.toml"), manifest).map_err(CoreError::Io)?;
         let file = fs::File::create(dest).map_err(CoreError::Io)?;
         let mut zip = zip::ZipWriter::new(file);
@@ -1497,11 +2586,13 @@ impl Store {
         zip.start_file("clipstore.sqlite3", opts)
             .map_err(|e| zip_err(&e))?;
         zip.write_all(&db_bytes).map_err(CoreError::Io)?;
+        if let Some((cfg_bytes, _, _)) = &config_data {
+            zip.start_file("config.toml", opts)
+                .map_err(|e| zip_err(&e))?;
+            zip.write_all(cfg_bytes).map_err(CoreError::Io)?;
+        }
         for key in &referenced {
             let path = tmp_blobs.join(key);
-            if !path.is_file() {
-                continue;
-            }
             zip.start_file(format!("blobs/{key}"), opts)
                 .map_err(|e| zip_err(&e))?;
             zip.write_all(fs::read(&path).map_err(CoreError::Io)?.as_slice())
@@ -1513,6 +2604,10 @@ impl Store {
 
     /// Transactionally restore a ZIP backup over `profile`.
     ///
+    /// This static method is for callers without an open Store handle.
+    /// It cannot close arbitrary external processes' connections; the caller
+    /// must ensure no other process holds the DB open.
+    ///
     /// # Errors
     ///
     /// Returns [`CoreError::Unsupported`] for traversal, absolute or
@@ -1521,14 +2616,19 @@ impl Store {
     /// [`CoreError::Config`] for bad manifests, or
     /// [`CoreError::Corrupt`] when the embedded DB fails validation.
     pub fn restore_zip(src: &Path, profile: &Path) -> Result<(), CoreError> {
-        let tag = TMP_CTR.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!("cm-restore-{}-{tag}", std::process::id()));
-        mkdir(&tmp)?;
-        let _guard = TmpGuard { path: tmp.clone() };
-        extract_zip(src, &tmp)?;
-        validate_profile(&tmp)?;
-        swap_profile(&tmp, profile)?;
-        Ok(())
+        let prepared = PreparedRestore::prepare(src, profile)?;
+        prepared
+            .install_and_open()
+            .map(drop)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Validate a destination-local restore while the live Store is still open.
+    ///
+    /// # Errors
+    /// Returns archive-validation, unsafe-component or I/O errors before replacement.
+    pub fn prepare_restore(src: &Path, profile: &Path) -> Result<PreparedRestore, CoreError> {
+        PreparedRestore::prepare(src, profile)
     }
 
     /// Run `integrity_check` plus `foreign_key_check` (repair path).
@@ -1585,6 +2685,207 @@ impl Store {
     }
 }
 
+/// A validated archive bound to its canonical destination and private stage.
+pub struct PreparedRestore {
+    stage_root: PathBuf,
+    incoming: PathBuf,
+    old_dir: PathBuf,
+    profile: PathBuf,
+    cleanup: bool,
+    has_config: bool,
+}
+
+/// Failed installation, with a usable original Store after successful rollback.
+/// When recovery fails, `store` is absent and `recovery_dir` is retained.
+/// An initially absent database also has no original Store to return.
+#[derive(Debug)]
+pub struct RestoreFailure {
+    pub error: CoreError,
+    pub store: Option<Store>,
+    pub recovery_dir: Option<PathBuf>,
+}
+
+impl Drop for PreparedRestore {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = fs::remove_dir_all(&self.stage_root);
+        }
+    }
+}
+
+impl PreparedRestore {
+    fn prepare(src: &Path, profile: &Path) -> Result<Self, CoreError> {
+        ensure_profile_container(profile)?;
+        let profile = profile.canonicalize().map_err(CoreError::Io)?;
+        check_restore_components(&profile, false)?;
+        if is_ancestor_managed(src, &profile, false)? {
+            return Err(CoreError::Unsupported {
+                message: "restore source aliases managed component".to_string(),
+            });
+        }
+        let stage_root = create_stage_root(&profile)?;
+        let mut prepared = Self {
+            incoming: stage_root.join("incoming"),
+            old_dir: stage_root.join("old"),
+            stage_root,
+            profile,
+            cleanup: true,
+            has_config: false,
+        };
+        extract_zip(src, &prepared.incoming)?;
+        validate_profile(&prepared.incoming)?;
+        prepared.has_config = prepared.incoming.join("config.toml").is_file();
+        // Config is managed only when the validated archive supplies it. Legacy
+        // archives must leave unrelated config links and bytes alone.
+        check_restore_components(&prepared.profile, prepared.has_config)?;
+        if is_ancestor_managed(src, &prepared.profile, prepared.has_config)? {
+            return Err(CoreError::Unsupported {
+                message: "restore source aliases managed component".to_string(),
+            });
+        }
+        let blobs = prepared.incoming.join("blobs");
+        if !blobs.exists() {
+            mkdir(&blobs)?;
+        }
+        check_restore_components(&prepared.incoming, prepared.has_config)?;
+        Ok(prepared)
+    }
+
+    #[must_use]
+    pub fn stage_root(&self) -> &Path {
+        &self.stage_root
+    }
+    #[must_use]
+    pub fn incoming(&self) -> &Path {
+        &self.incoming
+    }
+
+    /// Install with every external Store handle closed. The returned connection
+    /// is the validated serving connection; recovery is retained until it opens.
+    ///
+    /// # Errors
+    /// Returns the primary error and the reopened original Store after rollback.
+    /// Failed rollback or reopen returns no Store and retains the recovery path.
+    #[allow(clippy::result_large_err)]
+    #[allow(clippy::too_many_lines)]
+    pub fn install_and_open(mut self) -> Result<Store, RestoreFailure> {
+        let had_database = self.profile.join(DB_NAME).is_file();
+        let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut installed: Vec<PathBuf> = Vec::new();
+        let install = (|| {
+            check_restore_components(&self.profile, self.has_config)?;
+            for (index, name) in [
+                DB_NAME,
+                "clipstore.sqlite3-wal",
+                "clipstore.sqlite3-shm",
+                "blobs",
+            ]
+            .into_iter()
+            .chain(self.has_config.then_some("config.toml"))
+            .enumerate()
+            {
+                let original = self.profile.join(name);
+                match fs::symlink_metadata(&original) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(CoreError::Io(error)),
+                }
+                restore_point!(RestoreFault::OldMove(index))?;
+                let backup = self.old_dir.join(name);
+                fs::rename(&original, &backup).map_err(CoreError::Io)?;
+                moved.push((backup, original));
+                let _ = index;
+            }
+            for (index, name) in ["blobs", DB_NAME].iter().enumerate() {
+                restore_point!(RestoreFault::NewMove(index))?;
+                let target = self.profile.join(name);
+                fs::rename(self.incoming.join(name), &target).map_err(CoreError::Io)?;
+                installed.push(target);
+                let _ = index;
+            }
+            if self.has_config {
+                let name = "config.toml";
+                restore_point!(RestoreFault::NewMove(2))?;
+                let target = self.profile.join(name);
+                fs::rename(self.incoming.join(name), &target).map_err(CoreError::Io)?;
+                installed.push(target);
+            }
+            // Opening SQLite can create sidecars even when opening later fails.
+            installed.push(self.profile.join("clipstore.sqlite3-wal"));
+            installed.push(self.profile.join("clipstore.sqlite3-shm"));
+            restore_point!(RestoreFault::NewOpen)?;
+            Store::open(&self.profile)
+        })();
+        match install {
+            Ok(store) => {
+                fsync_dir(&self.profile);
+                // Cleanup errors leave an owned recovery directory; never roll back
+                // after a serving connection has been published to the caller.
+                Ok(store)
+            }
+            Err(primary) => {
+                if !had_database && moved.is_empty() && installed.is_empty() {
+                    return Err(RestoreFailure {
+                        error: primary,
+                        store: None,
+                        recovery_dir: None,
+                    });
+                }
+                let rollback = Self::rollback_moves(&mut moved, &mut installed).and_then(|()| {
+                    if !had_database {
+                        return Ok(None);
+                    }
+                    restore_point!(RestoreFault::OldOpen)?;
+                    Store::open(&self.profile).map(Some)
+                });
+                match rollback {
+                    Ok(store) => Err(RestoreFailure {
+                        error: primary,
+                        store,
+                        recovery_dir: None,
+                    }),
+                    Err(recovery) => {
+                        self.cleanup = false;
+                        Err(RestoreFailure {
+                            error: CoreError::Backend { backend: "restore".to_string(), kind: BackendKind::Unavailable,
+                                message: format!("restore failed: {primary}; recovery failed: {recovery}; recovery at {} (original components may also be in {})", self.stage_root.display(), self.profile.display()) },
+                            store: None, recovery_dir: Some(self.stage_root.clone()),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    fn rollback_moves(
+        moved: &mut Vec<(PathBuf, PathBuf)>,
+        installed: &mut Vec<PathBuf>,
+    ) -> Result<(), CoreError> {
+        while let Some(path) = installed.last() {
+            restore_point!(RestoreFault::RollbackRemove)?;
+            match fs::symlink_metadata(path) {
+                Ok(metadata) => {
+                    if metadata.is_dir() {
+                        fs::remove_dir_all(path)
+                    } else {
+                        fs::remove_file(path)
+                    }
+                    .map_err(CoreError::Io)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(CoreError::Io(error)),
+            }
+            installed.pop();
+        }
+        while let Some((backup, original)) = moved.last() {
+            restore_point!(RestoreFault::RollbackRename)?;
+            fs::rename(backup, original).map_err(CoreError::Io)?;
+            moved.pop();
+        }
+        Ok(())
+    }
+}
+
 /// `native_id` for passthrough formats, `None` for canonical ones.
 fn native_id_of(mime: &str) -> Option<String> {
     if mime.starts_with("x-os/") || mime.starts_with("x-os:") {
@@ -1626,15 +2927,15 @@ fn removed_ids(conn: &Connection) -> Result<Vec<String>, CoreError> {
     mapped.collect::<Result<_, _>>().map_err(|e| db_err(&e))
 }
 
-/// Delete clips with FTS rows, then sweep newly unreferenced blobs.
-fn delete_clips(conn: &Connection, blobs: &Path, ids: &[String]) -> Result<(), CoreError> {
+/// Delete clip and FTS rows; the caller sweeps after all SQL deletions.
+fn delete_clips(conn: &Connection, ids: &[String]) -> Result<(), CoreError> {
     for id in ids {
         conn.execute("DELETE FROM clips_fts WHERE clip_id=?1", params![id])
             .map_err(|e| db_err(&e))?;
         conn.execute("DELETE FROM clips WHERE id=?1", params![id])
             .map_err(|e| db_err(&e))?;
     }
-    sweep_blobs(conn, blobs)
+    Ok(())
 }
 
 /// Delete blob rows no payload references, with their files.
@@ -1652,17 +2953,40 @@ fn sweep_blobs(conn: &Connection, blobs: &Path) -> Result<(), CoreError> {
         .map_err(|e| db_err(&e))?;
     drop(stmt);
     for k in &keys {
+        parse_blob_key(k).ok_or_else(|| CoreError::Corrupt {
+            message: "invalid blob key".to_string(),
+        })?;
+    }
+    blobs_root_ok(blobs)?;
+    let mut pending: Vec<(String, PathBuf, bool)> = Vec::with_capacity(keys.len());
+    for k in &keys {
+        let path = safe_blob_path(blobs, k)?;
+        let exists = fs::symlink_metadata(&path).is_ok();
+        pending.push((k.clone(), path, exists));
+    }
+    for (k, path, exists) in pending {
         conn.execute("DELETE FROM clip_blobs WHERE blob_key=?1", params![k])
             .map_err(|e| db_err(&e))?;
-        let p = blobs.join(k);
-        if p.is_file() {
-            fs::remove_file(&p).map_err(CoreError::Io)?;
+        if exists {
+            let m = fs::symlink_metadata(&path).map_err(CoreError::Io)?;
+            if m.file_type().is_symlink() || !m.is_file() {
+                continue;
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                if (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    continue;
+                }
+            }
+            fs::remove_file(&path).map_err(CoreError::Io)?;
         }
     }
     Ok(())
 }
 
-/// Keys referenced by live external payload rows.
+/// Keys referenced by all external payload rows, including removed clips.
 fn referenced_keys(conn: &Connection) -> Result<HashSet<String>, CoreError> {
     let mut stmt = conn
         .prepare(
@@ -1676,7 +3000,7 @@ fn referenced_keys(conn: &Connection) -> Result<HashSet<String>, CoreError> {
 }
 
 /// Delete oldest unpinned clips while the live count exceeds `max`.
-fn enforce_count(tx: &rusqlite::Transaction<'_>, blobs: &Path, max: u64) -> Result<u64, CoreError> {
+fn enforce_count(tx: &rusqlite::Transaction<'_>, max: u64) -> Result<u64, CoreError> {
     let live: i64 = tx
         .query_row(
             "SELECT COUNT(*) FROM clips WHERE removed=0 AND pinned=0",
@@ -1698,14 +3022,13 @@ fn enforce_count(tx: &rusqlite::Transaction<'_>, blobs: &Path, max: u64) -> Resu
         .map_err(|e| db_err(&e))?;
     drop(stmt);
     let n = ids.len() as u64;
-    delete_clips(tx, blobs, &ids)?;
+    delete_clips(tx, &ids)?;
     Ok(n)
 }
 
 /// Delete oldest unpinned clips older than `max_age_days` (0 = off).
 fn enforce_age(
     tx: &rusqlite::Transaction<'_>,
-    blobs: &Path,
     max_age_days: u64,
     now: i64,
 ) -> Result<u64, CoreError> {
@@ -1723,12 +3046,12 @@ fn enforce_age(
         .map_err(|e| db_err(&e))?;
     drop(stmt);
     let n = ids.len() as u64;
-    delete_clips(tx, blobs, &ids)?;
+    delete_clips(tx, &ids)?;
     Ok(n)
 }
 
 /// Delete oldest unpinned clips while logical bytes exceed `max`.
-fn enforce_bytes(tx: &rusqlite::Transaction<'_>, blobs: &Path, max: u64) -> Result<u64, CoreError> {
+fn enforce_bytes(tx: &rusqlite::Transaction<'_>, max: u64) -> Result<u64, CoreError> {
     let total_i: i64 = tx
         .query_row(
             "SELECT COALESCE(SUM(bytes_total),0) FROM clips WHERE removed=0",
@@ -1755,7 +3078,7 @@ fn enforce_bytes(tx: &rusqlite::Transaction<'_>, blobs: &Path, max: u64) -> Resu
                 |r| r.get(0),
             )
             .map_err(|e| db_err(&e))?;
-        delete_clips(tx, blobs, std::slice::from_ref(&id))?;
+        delete_clips(tx, std::slice::from_ref(&id))?;
         total = total.saturating_sub(u128::try_from(bytes_i.max(0)).unwrap_or(u128::MAX));
         purged += 1;
     }
@@ -1805,6 +3128,9 @@ fn extract_zip(src: &Path, tmp: &Path) -> Result<(), CoreError> {
         if is_symlink_entry(&e) {
             return Err(unsupported("zip symlink entry rejected"));
         }
+        if e.is_dir() && e.enclosed_name().as_deref() == Some(Path::new("config.toml")) {
+            return Err(unsupported("config archive entry is a directory"));
+        }
         if !e.is_dir() {
             if e.size() > RESTORE_MAX_ENTRY {
                 return Err(unsupported("zip entry exceeds size cap"));
@@ -1835,6 +3161,62 @@ fn extract_zip(src: &Path, tmp: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Preflight every manifest blob before reading any blob data.
+fn validated_manifest_blobs(man: &toml::Value) -> Result<Vec<(String, u64, String)>, CoreError> {
+    let bad = |msg: &str| CoreError::Config {
+        message: msg.to_string(),
+    };
+    let Some(value) = man.get("blobs") else {
+        return Ok(Vec::new());
+    };
+    let blobs = value
+        .as_array()
+        .ok_or_else(|| bad("restore manifest blobs not an array"))?;
+    let mut out = Vec::with_capacity(blobs.len());
+    let mut keys = HashSet::with_capacity(blobs.len());
+    for blob in blobs {
+        let key = blob
+            .get("key")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| bad("restore manifest blob key missing or not a string"))?;
+        let (prefix, size) =
+            parse_blob_key(key).ok_or_else(|| bad("restore manifest invalid blob key"))?;
+        if !keys.insert(key) {
+            return Err(bad("restore manifest duplicate blob key"));
+        }
+        if size > RESTORE_MAX_ENTRY {
+            return Err(bad("restore blob exceeds size cap"));
+        }
+        if let Some(value) = blob.get("bytes") {
+            let bytes = value
+                .as_integer()
+                .ok_or_else(|| bad("restore manifest blob bytes not an integer"))?;
+            if u64::try_from(bytes).ok() != Some(size) {
+                return Err(bad("restore blob size mismatch"));
+            }
+        }
+        let sha = if let Some(value) = blob.get("sha256") {
+            let sha = value
+                .as_str()
+                .ok_or_else(|| bad("restore manifest blob sha256 not a string"))?;
+            if !is_canonical_hex(sha, 64) {
+                return Err(bad("restore blob sha256 invalid"));
+            }
+            if !sha.starts_with(&prefix) {
+                return Err(bad("restore blob sha prefix mismatch"));
+            }
+            sha.to_string()
+        } else {
+            String::new()
+        };
+        if blob.get("db_sha256").is_some_and(|v| !v.is_str()) {
+            return Err(bad("restore manifest db_sha256 not a string"));
+        }
+        out.push((key.to_string(), size, sha));
+    }
+    Ok(out)
+}
+
 /// Validate an extracted profile: manifest, checksums, DB, blobs.
 fn validate_profile(tmp: &Path) -> Result<(), CoreError> {
     let bad = |msg: &str| CoreError::Config {
@@ -1851,11 +3233,26 @@ fn validate_profile(tmp: &Path) -> Result<(), CoreError> {
     if ver != 1 {
         return Err(bad("restore manifest has unsupported schema_version"));
     }
+    if let Some(v) = man.get("db_sha256") {
+        if !v.is_str() {
+            return Err(bad("restore manifest db_sha256 not a string"));
+        }
+    }
+
     let db = tmp.join("clipstore.sqlite3");
     if !db.is_file() {
         return Err(bad("restore archive missing clipstore.sqlite3"));
     }
     let bytes = fs::read(&db).map_err(CoreError::Io)?;
+    if let Some(value) = man.get("db_bytes") {
+        let expected = value
+            .as_integer()
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(|| bad("restore manifest db_bytes not a nonnegative integer"))?;
+        if u64::try_from(bytes.len()).ok() != Some(expected) {
+            return Err(bad("restore database db_bytes mismatch"));
+        }
+    }
     if let Some(sha) = man.get("db_sha256").and_then(toml::Value::as_str) {
         if hex_of(&Sha256::digest(&bytes)) != sha {
             return Err(bad("restore database checksum mismatch"));
@@ -1873,76 +3270,31 @@ fn validate_profile(tmp: &Path) -> Result<(), CoreError> {
             message: "restore database failed quick_check".to_string(),
         });
     }
-    if let Some(blobs) = man.get("blobs").and_then(toml::Value::as_array) {
-        for b in blobs {
-            let key = b
-                .get("key")
-                .and_then(toml::Value::as_str)
-                .ok_or_else(|| bad("restore manifest blob missing key"))?;
-            let size = b
-                .get("bytes")
-                .and_then(toml::Value::as_integer)
-                .unwrap_or(-1);
-            let sha = b.get("sha256").and_then(toml::Value::as_str).unwrap_or("");
-            let bytes = fs::read(tmp.join("blobs").join(key))
-                .map_err(|_| bad("restore archive missing blob file"))?;
-            if size >= 0 && i64::try_from(bytes.len()).unwrap_or(i64::MAX) != size {
-                return Err(bad("restore blob size mismatch"));
-            }
-            if !sha.is_empty() && hex_of(&Sha256::digest(&bytes)) != sha {
-                return Err(bad("restore blob checksum mismatch"));
-            }
+    validate_db_keys(&probe)?;
+    let manifest_blobs = validated_manifest_blobs(&man)?;
+    let referenced = referenced_keys(&probe)?;
+    let manifest_keys: HashSet<_> = manifest_blobs
+        .iter()
+        .map(|(key, _, _)| key.clone())
+        .collect();
+    if manifest_keys != referenced {
+        return Err(bad("restore manifest blob reference set mismatch"));
+    }
+    let blobs_root = tmp.join("blobs");
+    for (key, _, manifest_sha) in &manifest_blobs {
+        let db_sha: String = probe
+            .query_row(
+                "SELECT sha256 FROM clip_blobs WHERE blob_key=?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .map_err(|e| db_err(&e))?;
+        let bytes = safe_blob_read(&blobs_root, key, &db_sha)?;
+        if !manifest_sha.is_empty() && hex_of(&Sha256::digest(&bytes)) != *manifest_sha {
+            return Err(bad("restore blob checksum mismatch"));
         }
     }
-    Ok(())
-}
-
-/// Atomically swap a validated profile in, keeping rollback copies on failure.
-fn swap_profile(tmp: &Path, profile: &Path) -> Result<(), CoreError> {
-    mkdir(profile)?;
-    let cur_db = profile.join(DB_NAME);
-    let cur_blobs = profile.join("blobs");
-    let prev_db = profile.join(".clipstore.prev.sqlite3");
-    let prev_blobs = profile.join(".blobs.prev");
-    let _ = fs::remove_file(&prev_db);
-    let _ = fs::remove_dir_all(&prev_blobs);
-    for suffix in ["-wal", "-shm"] {
-        let p = PathBuf::from(format!("{}{suffix}", cur_db.display()));
-        let _ = fs::remove_file(p);
-    }
-    let had_db = cur_db.is_file();
-    if had_db {
-        fs::rename(&cur_db, &prev_db).map_err(CoreError::Io)?;
-    }
-    let had_blobs = cur_blobs.is_dir();
-    if had_blobs {
-        fs::rename(&cur_blobs, &prev_blobs).map_err(CoreError::Io)?;
-    }
-    let rollback = |err: CoreError| {
-        let _ = fs::remove_file(&cur_db);
-        let _ = fs::remove_dir_all(&cur_blobs);
-        if had_db {
-            let _ = fs::rename(&prev_db, &cur_db);
-        }
-        if had_blobs {
-            let _ = fs::rename(&prev_blobs, &cur_blobs);
-        }
-        err
-    };
-    if let Err(e) = fs::rename(tmp.join("clipstore.sqlite3"), &cur_db).map_err(CoreError::Io) {
-        return Err(rollback(e));
-    }
-    let tmp_blobs = tmp.join("blobs");
-    if tmp_blobs.is_dir() {
-        if let Err(e) = fs::rename(&tmp_blobs, &cur_blobs).map_err(CoreError::Io) {
-            return Err(rollback(e));
-        }
-    } else if let Err(e) = mkdir(&cur_blobs) {
-        return Err(rollback(e));
-    }
-    let _ = fs::remove_file(&prev_db);
-    let _ = fs::remove_dir_all(&prev_blobs);
-    fsync_dir(profile);
+    validate_config_in_profile(tmp, &man)?;
     Ok(())
 }
 
@@ -2015,6 +3367,302 @@ mod tests {
             .iter()
             .map(|c| c.id)
             .collect()
+    }
+
+    struct OpenControlGuard;
+    impl OpenControlGuard {
+        fn install(control: super::OpenTestControl) -> Self {
+            super::OPEN_TEST_CONTROL.with(|c| *c.borrow_mut() = control);
+            Self
+        }
+    }
+    impl Drop for OpenControlGuard {
+        fn drop(&mut self) {
+            super::OPEN_TEST_CONTROL.with(|c| *c.borrow_mut() = super::OpenTestControl::default());
+        }
+    }
+
+    fn rollback_fixture(tag: &str) -> (PathBuf, Uuid, rusqlite::Connection) {
+        let profile = unique_dir(tag);
+        let store = Store::open(&profile).unwrap();
+        let sentinel = sample_clip(Uuid::now_v7(), "sentinel", "sentinel", 17);
+        store
+            .insert_clip(&sentinel, &text_payloads("sentinel"))
+            .unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(db_path(&profile)).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        (profile, sentinel.id, conn)
+    }
+
+    fn assert_no_asides(profile: &Path) {
+        assert!(!std::fs::read_dir(profile).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".corrupt-")
+        }));
+    }
+
+    /// The observer sees a real public-open WAL BUSY before releasing its lock.
+    #[test]
+    fn opening_wal_busy_retries_same_public_call() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::Duration;
+        let (profile, sentinel, blocker) = rollback_fixture("wal-retry");
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let observed = Rc::new(Cell::new(0));
+        let count = Rc::clone(&observed);
+        let nested_profile = unique_dir("observer-reentrant");
+        let _guard = OpenControlGuard::install(super::OpenTestControl {
+            budget: Some(Duration::from_millis(700)),
+            busy: Some(Box::new(move |stage, error| {
+                assert_eq!(stage, super::OpenStage::Wal);
+                assert!(super::is_sqlite_busy(error));
+                eprintln!("actual public Store::open BUSY stage={stage:?} code={error:?}");
+                count.set(count.get() + 1);
+                // An exclusive lock proves the failed opening connection has
+                // dropped its read transaction before this callback runs.
+                blocker
+                    .execute_batch("ROLLBACK; BEGIN EXCLUSIVE; COMMIT")
+                    .unwrap();
+                // A nested public open proves there is no callback borrow/lock.
+                drop(Store::open(&nested_profile).unwrap());
+            })),
+            ..Default::default()
+        });
+        let store = Store::open(&profile).expect("same public open must retry");
+        assert_eq!(observed.get(), 1);
+        let mode: String = store
+            .lock()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(history_ids(&store), vec![sentinel]);
+        assert_no_asides(&profile);
+    }
+
+    /// A late successful writable/recovery open must retain the serving policy.
+    #[test]
+    fn opening_late_success_restores_serving_timeout() {
+        use std::time::Duration;
+        for recovery in [false, true] {
+            let (profile, sentinel, blocker) = rollback_fixture("late-open");
+            blocker
+                .execute_batch(if recovery {
+                    "BEGIN EXCLUSIVE"
+                } else {
+                    "BEGIN IMMEDIATE"
+                })
+                .unwrap();
+            let _guard = OpenControlGuard::install(super::OpenTestControl {
+                budget: Some(Duration::from_millis(700)),
+                busy: Some(Box::new(move |_, error| {
+                    assert!(super::is_sqlite_busy(error));
+                    std::thread::sleep(Duration::from_millis(300));
+                    blocker.execute_batch("ROLLBACK").unwrap();
+                })),
+                ..Default::default()
+            });
+            let store = if recovery {
+                Store::open_readonly_recovery(&profile)
+            } else {
+                Store::open(&profile)
+            }
+            .unwrap();
+            assert_eq!(
+                store
+                    .lock()
+                    .query_row("PRAGMA busy_timeout", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                5000
+            );
+            let path = db_path(&profile);
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let lock = std::thread::spawn(move || {
+                let conn = rusqlite::Connection::open(path).unwrap();
+                conn.execute_batch(if recovery {
+                    "BEGIN EXCLUSIVE"
+                } else {
+                    "BEGIN IMMEDIATE"
+                })
+                .unwrap();
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(450));
+                conn.execute_batch("ROLLBACK").unwrap();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            if recovery {
+                assert_eq!(history_ids(&store), vec![sentinel]);
+            } else {
+                assert!(store.create_perm_group("after-contention").unwrap());
+            }
+            lock.join().unwrap();
+            assert_no_asides(&profile);
+        }
+    }
+
+    #[test]
+    fn opening_exhausted_budget_has_no_extra_attempt_or_floor() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::Duration;
+        let (profile, sentinel, blocker) = rollback_fixture("open-deadline");
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let attempts = Rc::new(Cell::new(0));
+        let count = Rc::clone(&attempts);
+        let guard = OpenControlGuard::install(super::OpenTestControl {
+            budget: Some(Duration::ZERO),
+            boundary: Some(Box::new(move |conn, stage| {
+                assert_eq!(stage, super::OpenStage::Header);
+                assert_eq!(
+                    conn.query_row("PRAGMA busy_timeout", [], |r| r.get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                count.set(count.get() + 1);
+            })),
+            ..Default::default()
+        });
+        assert!(matches!(
+            Store::open(&profile),
+            Err(crate::CoreError::Backend { .. })
+        ));
+        assert_eq!(attempts.get(), 1);
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(guard);
+        assert_eq!(history_ids(&Store::open(&profile).unwrap()), vec![sentinel]);
+        assert_no_asides(&profile);
+    }
+
+    /// Earlier successful SQLite waits must reduce a later stage's allowance.
+    #[test]
+    fn opening_successful_waits_share_one_contention_budget() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+        let (profile, sentinel, blocker) = rollback_fixture("open-waits");
+        drop(blocker);
+        let path = db_path(&profile);
+        let handles = Rc::new(RefCell::new(Vec::new()));
+        let workers = Rc::clone(&handles);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let boundaries = Rc::clone(&seen);
+        let mut stages = HashSet::new();
+        let guard = OpenControlGuard::install(super::OpenTestControl {
+            budget: Some(Duration::from_millis(90)),
+            boundary: Some(Box::new(move |conn, stage| {
+                if !matches!(
+                    stage,
+                    super::OpenStage::Header
+                        | super::OpenStage::Wal
+                        | super::OpenStage::EnsureSchema
+                ) || !stages.insert(format!("{stage:?}"))
+                {
+                    return;
+                }
+                let timeout: i64 = conn
+                    .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                    .unwrap();
+                boundaries.borrow_mut().push((stage, timeout));
+                let path = path.clone();
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                workers.borrow_mut().push(std::thread::spawn(move || {
+                    let blocker = rusqlite::Connection::open(path).unwrap();
+                    match stage {
+                        super::OpenStage::Header => {
+                            blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+                        }
+                        super::OpenStage::Wal => {
+                            blocker.execute_batch("BEGIN; SELECT * FROM meta").unwrap();
+                        }
+                        _ => blocker.execute_batch("BEGIN IMMEDIATE").unwrap(),
+                    }
+                    ready_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(
+                        if stage == super::OpenStage::EnsureSchema {
+                            250
+                        } else {
+                            25
+                        },
+                    ));
+                    blocker.execute_batch("ROLLBACK").unwrap();
+                }));
+                ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            })),
+            ..Default::default()
+        });
+        let result = Store::open(&profile);
+        for worker in handles.borrow_mut().drain(..) {
+            worker.join().unwrap();
+        }
+        assert!(
+            matches!(&result, Err(crate::CoreError::Backend { message, .. }) if message.starts_with("EnsureSchema:")),
+            "{result:?}"
+        );
+        let seen = seen.borrow();
+        eprintln!("actual successive SQL waits: {seen:?}; {result:?}");
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen[2].1 < seen[0].1,
+            "later SQL reused a stale allowance: {seen:?}"
+        );
+        drop(guard);
+        assert_eq!(history_ids(&Store::open(&profile).unwrap()), vec![sentinel]);
+        assert_no_asides(&profile);
+    }
+
+    /// Exercise actual public-opening SQL across stages and individual schema
+    /// statements. A slow earlier boundary cannot replenish the next wait.
+    #[test]
+    fn opening_budget_refreshes_across_stages_and_schema_statements() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+        let (profile, sentinel, blocker) = rollback_fixture("open-stages");
+        drop(blocker);
+        let readings = Rc::new(RefCell::new(Vec::new()));
+        let output = Rc::clone(&readings);
+        let _guard = OpenControlGuard::install(super::OpenTestControl {
+            budget: Some(Duration::from_millis(45)),
+            boundary: Some(Box::new(move |conn, stage| {
+                let timeout: i64 = conn
+                    .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                    .unwrap();
+                output.borrow_mut().push((stage, timeout));
+                if stage == super::OpenStage::Header || stage == super::OpenStage::EnsureSchema {
+                    std::thread::sleep(Duration::from_millis(12));
+                }
+            })),
+            ..Default::default()
+        });
+        let store = Store::open(&profile).unwrap();
+        let readings = readings.borrow();
+        assert!(readings.windows(2).all(|pair| pair[1].1 <= pair[0].1));
+        assert!(readings
+            .iter()
+            .any(|(stage, _)| *stage == super::OpenStage::Wal));
+        let schema: Vec<_> = readings
+            .iter()
+            .filter(|(stage, _)| *stage == super::OpenStage::EnsureSchema)
+            .collect();
+        assert!(schema.len() > super::SCHEMA_STATEMENTS.len());
+        assert!(schema.windows(2).any(|pair| pair[1].1 < pair[0].1));
+        assert!(readings.iter().any(|(_, timeout)| *timeout == 0));
+        assert_eq!(
+            store
+                .lock()
+                .query_row("PRAGMA busy_timeout", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            5000
+        );
+        assert_eq!(history_ids(&store), vec![sentinel]);
+        assert_no_asides(&profile);
     }
 
     /// Blob key shape follows `sha256hex[0..32]-<bytes>`.
@@ -2489,3 +4137,7 @@ mod tests {
         assert_eq!(history_ids(&store).len(), writers * per_writer);
     }
 }
+
+#[cfg(test)]
+#[path = "restore_tests.rs"]
+mod restore_tests;

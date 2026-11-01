@@ -117,6 +117,12 @@ pub trait OsWindow {
     fn is_visible(&self) -> Option<bool>;
     /// Winit's `Window::set_visible`.
     fn set_visible(&self, visible: bool);
+    /// Whether the window is minimized.
+    fn is_minimized(&self) -> Option<bool>;
+    /// Whether the window has the keyboard focus.
+    fn has_focus(&self) -> bool;
+    /// Bring the window to the front.
+    fn focus_window(&self);
 }
 
 impl OsWindow for Window {
@@ -126,6 +132,121 @@ impl OsWindow for Window {
 
     fn set_visible(&self, visible: bool) {
         Window::set_visible(self, visible);
+    }
+
+    fn is_minimized(&self) -> Option<bool> {
+        Window::is_minimized(self)
+    }
+
+    fn has_focus(&self) -> bool {
+        Window::has_focus(self)
+    }
+
+    fn focus_window(&self) {
+        #[cfg(not(target_os = "windows"))]
+        Window::focus_window(self);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationPolicy {
+    Supported,
+    Unsupported,
+}
+
+#[must_use]
+pub fn native_policy(per_show: bool) -> ActivationPolicy {
+    if per_show {
+        ActivationPolicy::Unsupported
+    } else {
+        #[cfg(target_os = "windows")]
+        {
+            ActivationPolicy::Unsupported
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            ActivationPolicy::Supported
+        }
+    }
+}
+
+/// Result of an activation attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationStatus {
+    /// Activation was delivered or consumed (already focused/minimized/unsupported).
+    Done,
+    /// Host not ready yet, keep pending for next tick.
+    Pending,
+}
+
+pub fn try_activate_with_policy<W: OsWindow>(
+    window: &W,
+    policy: ActivationPolicy,
+) -> ActivationStatus {
+    if policy == ActivationPolicy::Unsupported {
+        return ActivationStatus::Done;
+    }
+    if window.is_visible() != Some(true) {
+        return ActivationStatus::Pending;
+    }
+    if window.is_minimized() == Some(true) {
+        return ActivationStatus::Done;
+    }
+    if window.has_focus() {
+        return ActivationStatus::Done;
+    }
+    window.focus_window();
+    ActivationStatus::Done
+}
+
+/// Try to activate the popup window for X11/macOS.
+/// Returns `Done` when pending should be cleared, `Pending` when it should be retained.
+/// On Windows and Wayland (`per_show`), always returns `Done` without focusing.
+pub fn try_activate<W: OsWindow>(window: &W, per_show: bool) -> ActivationStatus {
+    try_activate_with_policy(window, native_policy(per_show))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Activation {
+    pending: bool,
+}
+
+impl Activation {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { pending: false }
+    }
+
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    pub fn reconcile<W: OsWindow>(
+        &mut self,
+        request: bool,
+        previous_open: bool,
+        desired_open: bool,
+        host: Option<&W>,
+        policy: ActivationPolicy,
+    ) {
+        let edge = !previous_open && desired_open;
+        let mut pending = self.pending || request || edge;
+        if !desired_open {
+            self.pending = false;
+            return;
+        }
+        if pending {
+            if let Some(window) = host {
+                match try_activate_with_policy(window, policy) {
+                    ActivationStatus::Done => pending = false,
+                    ActivationStatus::Pending => {}
+                }
+            } else if policy == ActivationPolicy::Supported {
+                pending = false;
+            }
+        }
+        self.pending = pending;
     }
 }
 

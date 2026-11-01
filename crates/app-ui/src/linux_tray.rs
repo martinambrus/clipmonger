@@ -1,5 +1,7 @@
 //! Linux tray menu model and ksni service.
 
+#[cfg(target_os = "linux")]
+use super::push::Wake;
 use super::strings;
 use super::tray_logic::{menu_entries, MenuEntry, TrayAction, TrayInputs};
 
@@ -83,6 +85,7 @@ pub fn icon_argb(inputs: &TrayInputs) -> Vec<u8> {
 struct KsniTray {
     tx: std::sync::mpsc::Sender<TrayAction>,
     inputs: TrayInputs,
+    wake: Wake,
 }
 
 #[cfg(target_os = "linux")]
@@ -123,6 +126,11 @@ impl ksni::Tray for KsniTray {
         }
     }
 
+    fn activate(&mut self, _x: i32, _y: i32) {
+        let _ = self.tx.send(TrayAction::Toggle);
+        (self.wake)();
+    }
+
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::StandardItem;
         linux_menu(&self.inputs)
@@ -131,11 +139,13 @@ impl ksni::Tray for KsniTray {
                 LinuxMenuRow::Separator => ksni::MenuItem::Separator,
                 LinuxMenuRow::Item(item) => {
                     let tx = self.tx.clone();
+                    let wake = self.wake.clone();
                     let action = item.action.clone();
                     ksni::MenuItem::Standard(StandardItem {
                         label: item.label,
                         activate: Box::new(move |_tray: &mut KsniTray| {
                             let _ = tx.send(action.clone());
+                            wake();
                         }),
                         ..Default::default()
                     })
@@ -160,8 +170,10 @@ pub struct LinuxTray {
 #[cfg(target_os = "linux")]
 impl LinuxTray {
     /// Spawn the ksni service on a dedicated thread; never blocks the caller.
+    /// `wake` runs after every queued click, so that a host asleep in its event
+    /// loop calls [`LinuxTray::poll`].
     #[must_use]
-    pub fn spawn(inputs: &TrayInputs) -> Self {
+    pub fn spawn(inputs: &TrayInputs, wake: Wake) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let (ready_tx, ready) = std::sync::mpsc::channel();
         let snapshot = *inputs;
@@ -170,6 +182,7 @@ impl LinuxTray {
             let tray = KsniTray {
                 tx,
                 inputs: snapshot,
+                wake,
             };
             let _ = ready_tx.send(tray.spawn().ok());
         });

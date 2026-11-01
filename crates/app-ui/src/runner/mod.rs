@@ -1,7 +1,7 @@
-//! The runner: our own event loop for egui on winit with a CPU rasterizer,
-//! replacing eframe. A popup window and an optional settings window, each with
-//! its own egui context. App logic runs on every pass, visible or hidden; the
-//! ui runs only while the window is shown. Not wired into the app yet.
+//! The runner: our own event loop for egui on winit with a CPU rasterizer.
+//! A popup window and an optional settings window, each with its own egui
+//! context. App logic runs on every pass, visible or hidden; the ui runs only
+//! while the window is shown.
 
 pub mod render;
 pub mod sched;
@@ -10,8 +10,12 @@ pub mod window;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui::{Context, RawInput, ViewportBuilder, ViewportEvent, ViewportId, ViewportInfo};
+use egui::{
+    ClippedPrimitive, Color32, Context, RawInput, ViewportBuilder, ViewportEvent, ViewportId,
+    ViewportInfo,
+};
 use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy, OwnedDisplayHandle};
 use winit::window::{Window, WindowId};
@@ -53,6 +57,11 @@ pub trait App {
 
     /// The logical state the app wants, read after every tick.
     fn desired(&self) -> Desired;
+
+    /// One-shot activation request for the popup, drained by the runner.
+    fn take_popup_activation(&mut self) -> bool {
+        false
+    }
 }
 
 /// Window sizes and titles. Sizes are in points at zoom 1.
@@ -157,6 +166,7 @@ struct Host {
     window: Arc<Window>,
     state: egui_winit::State,
     presenter: render::Presenter,
+    present_error_logged: bool,
     info: ViewportInfo,
     visibility: Visibility,
 }
@@ -191,9 +201,33 @@ impl Host {
             window,
             state,
             presenter,
+            present_error_logged: false,
             info,
             visibility,
         })
+    }
+}
+
+impl Host {
+    /// Present one frame. The first error of this window is printed, later
+    /// ones are dropped.
+    fn present(
+        &mut self,
+        rasterizer: &mut render::Rasterizer,
+        size: PhysicalSize<u32>,
+        pixels_per_point: f32,
+        clear: Color32,
+        primitives: &[ClippedPrimitive],
+    ) {
+        if let Err(error) =
+            self.presenter
+                .present(rasterizer, size, pixels_per_point, clear, primitives)
+        {
+            if !self.present_error_logged {
+                self.present_error_logged = true;
+                eprintln!("cannot present a frame: {error}");
+            }
+        }
     }
 }
 
@@ -207,12 +241,21 @@ struct Slot {
     host: Option<Host>,
 }
 
+/// Construct either window's egui context before it receives input.
+fn new_context() -> Context {
+    let ctx = Context::default();
+    ctx.options_mut(|options| options.zoom_with_keyboard = false);
+    ctx
+}
+
 impl Slot {
-    fn new(kind: WindowKind, proxy: &EventLoopProxy<UserEvent>) -> Self {
-        let ctx = Context::default();
-        ctx.add_font_provider(Arc::new(
-            egui_system_font_provider::SystemFontProvider::new(),
-        ));
+    fn new(
+        kind: WindowKind,
+        proxy: &EventLoopProxy<UserEvent>,
+        fonts: &Arc<egui_system_font_provider::SystemFontProvider>,
+    ) -> Self {
+        let ctx = new_context();
+        ctx.add_font_provider(fonts.clone());
         let proxy = proxy.clone();
         ctx.set_request_repaint_callback(move |info| {
             let _ = proxy.send_event(UserEvent::Repaint {
@@ -263,6 +306,7 @@ impl Slot {
 struct Runner<A: App> {
     config: Config,
     proxy: EventLoopProxy<UserEvent>,
+    fonts: Arc<egui_system_font_provider::SystemFontProvider>,
     make_app: Option<Box<dyn FnOnce(Startup) -> A>>,
     app: Option<A>,
     surface_context: Option<softbuffer::Context<OwnedDisplayHandle>>,
@@ -270,6 +314,7 @@ struct Runner<A: App> {
     popup: Slot,
     settings: Option<Slot>,
     last: Desired,
+    pending_activation: window::Activation,
     error: Option<RunError>,
 }
 
@@ -279,10 +324,12 @@ impl<A: App> Runner<A> {
         proxy: EventLoopProxy<UserEvent>,
         make_app: Box<dyn FnOnce(Startup) -> A>,
     ) -> Self {
-        let popup = Slot::new(WindowKind::Popup, &proxy);
+        let fonts = Arc::new(egui_system_font_provider::SystemFontProvider::new());
+        let popup = Slot::new(WindowKind::Popup, &proxy, &fonts);
         Self {
             config,
             proxy,
+            fonts,
             make_app: Some(make_app),
             app: None,
             surface_context: None,
@@ -290,6 +337,7 @@ impl<A: App> Runner<A> {
             popup,
             settings: None,
             last: Desired::default(),
+            pending_activation: window::Activation::new(),
             error: None,
         }
     }
@@ -446,7 +494,7 @@ impl<A: App> Runner<A> {
                 let clear = ctx.global_style().visuals.panel_fill;
                 if let Some(host) = slot.host.as_mut() {
                     let size = host.window.inner_size();
-                    let _ = host.presenter.present(
+                    host.present(
                         &mut slot.rasterizer,
                         size,
                         pixels_per_point,
@@ -514,10 +562,11 @@ impl<A: App> Runner<A> {
 
     /// Reconcile desired state with OS windows.
     fn reconcile(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(app) = self.app.as_ref() else {
+        let Some(app) = self.app.as_mut() else {
             return;
         };
         let desired = app.desired();
+        let request = app.take_popup_activation();
         let previous = std::mem::replace(&mut self.last, desired);
         if desired.exit {
             event_loop.exit();
@@ -539,6 +588,24 @@ impl<A: App> Runner<A> {
             if let Some(slot) = self.settings.as_mut() {
                 slot.deadline.at(now);
             }
+        }
+        let policy = window::native_policy(self.per_show);
+        if let Some(host) = self.popup.host.as_ref() {
+            self.pending_activation.reconcile(
+                request,
+                previous.popup_open,
+                desired.popup_open,
+                Some(&*host.window),
+                policy,
+            );
+        } else {
+            self.pending_activation.reconcile(
+                request,
+                previous.popup_open,
+                desired.popup_open,
+                None::<&winit::window::Window>,
+                policy,
+            );
         }
     }
 
@@ -569,7 +636,7 @@ impl<A: App> Runner<A> {
     ) -> Result<(), RunError> {
         if open {
             if self.settings.is_none() {
-                let slot = Slot::new(WindowKind::Settings, &self.proxy);
+                let slot = Slot::new(WindowKind::Settings, &self.proxy, &self.fonts);
                 self.settings = Some(slot);
             }
             let needs_host = self
@@ -668,5 +735,21 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
     /// Run tick on wait.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.tick(event_loop);
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    #[test]
+    fn fix_x6_both_window_contexts_disable_keyboard_zoom_at_creation() {
+        for kind in [WindowKind::Popup, WindowKind::Settings] {
+            let ctx = new_context();
+            assert!(
+                !ctx.options(|options| options.zoom_with_keyboard),
+                "{kind:?}: keyboard zoom must be off before the first pass"
+            );
+        }
     }
 }

@@ -451,8 +451,11 @@ fn paste_failed(text: &str) -> Event {
     Event::Bridge(UiEvent::PasteFailed(text.to_string()))
 }
 
-fn paste_unavailable() -> Event {
-    Event::Bridge(UiEvent::PasteUnavailable)
+fn exec_failed(code: &str, message: &str) -> Event {
+    Event::Bridge(UiEvent::ExecFailed(
+        id(77),
+        IpcError::new(code, message.to_string()),
+    ))
 }
 
 fn paste_done(n: u128) -> Event {
@@ -1409,6 +1412,39 @@ fn r10_paste_failed_reopens_the_popup_with_an_error() {
     ]);
 }
 
+#[test]
+fn r10_exec_failed_reopens_the_popup_with_an_error() {
+    let blocked = text("popup.paste_blocked");
+    run(vec![
+        Case::new("closed: unavailable uses the blocked text", false).ev(
+            100,
+            exec_failed("unavailable", "no paste"),
+            open_seq(),
+            &[open(true), no_ctx(), err(blocked)],
+        ),
+        Case::new("closed: denied uses the blocked text", false).ev(
+            100,
+            exec_failed("denied", "access refused"),
+            open_seq(),
+            &[open(true), no_ctx(), err(blocked)],
+        ),
+        Case::new("closed: backend uses the daemon message", false).ev(
+            100,
+            exec_failed("backend", "boom"),
+            open_seq(),
+            &[open(true), no_ctx(), err("boom")],
+        ),
+        Case::new("open: only the error line changes", false)
+            .ev(100, hotkey(7, 9), open_seq(), &[open(true), ctx(7, 9)])
+            .ev(
+                200,
+                exec_failed("unavailable", "no paste"),
+                nothing(),
+                &[ctx(7, 9), err(blocked)],
+            ),
+    ]);
+}
+
 // ---------------------------------------------------------------------------
 // R11: quit
 // ---------------------------------------------------------------------------
@@ -2048,17 +2084,6 @@ fn error_line_events() {
         Case::new("a later error replaces the line", true)
             .ev(100, error_ev("one"), nothing(), &[err("one")])
             .ev(200, error_ev("two"), nothing(), &[err("two")]),
-        Case::new(
-            "paste unavailable sets the catalog text while closed",
-            false,
-        )
-        .ev(100, paste_unavailable(), nothing(), &[err(blocked)]),
-        Case::new("paste unavailable sets the catalog text while open", false)
-            .ev(100, hotkey(7, 9), open_seq(), &[open(true), ctx(7, 9)])
-            .ev(200, paste_unavailable(), nothing(), &[err(blocked)]),
-        Case::new("paste unavailable replaces an older line", true)
-            .ev(100, error_ev("older"), nothing(), &[err("older")])
-            .ev(200, paste_unavailable(), nothing(), &[err(blocked)]),
         Case::new("a key clears the line", true)
             .ev(100, error_ev("boom"), nothing(), &[err("boom")])
             .ev(200, Event::Key, nothing(), &[no_err()]),
@@ -2253,11 +2278,6 @@ fn unrelated_events() -> Vec<(Event, Vec<Effect>, Vec<Then>)> {
         ),
         (config(flag_body(&json!(false))), nothing(), vec![]),
         (paste_done(9), nothing(), vec![]),
-        (
-            paste_unavailable(),
-            nothing(),
-            vec![err(text("popup.paste_blocked"))],
-        ),
         (toggle(1, 2), nothing(), vec![]),
         (pick(9), nothing(), vec![]),
         (Event::Hidden, nothing(), vec![]),
