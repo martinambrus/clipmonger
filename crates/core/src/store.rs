@@ -66,11 +66,15 @@ static TMP_CTR: AtomicU64 = AtomicU64::new(0);
 /// One clip's payloads: MIME plus raw bytes.
 pub type ClipPayloads = Vec<(String, Vec<u8>)>;
 
-/// Stored payload row: MIME, external flag, inline bytes, blob key.
-type StoredPayload = (String, i64, Option<Vec<u8>>, Option<String>);
-
-/// Payload row joined with its blob digest for verification.
-type VerifiedPayload = (String, i64, Option<Vec<u8>>, Option<String>, Option<String>);
+/// Payload row joined with its blob metadata for verification.
+type VerifiedPayload = (
+    String,
+    i64,
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
 
 /// Outcome of [`Store::insert_clip`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +260,35 @@ fn mkdir(dir: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
+fn create_private_dir(prefix: &str) -> Result<PathBuf, CoreError> {
+    for _ in 0..16 {
+        let name = format!(
+            "{}-{}-{}-{}",
+            prefix,
+            std::process::id(),
+            TMP_CTR.fetch_add(1, Ordering::SeqCst),
+            Uuid::now_v7().as_simple()
+        );
+        let dir = std::env::temp_dir().join(name);
+        #[cfg(unix)]
+        let result = {
+            use std::os::unix::fs::DirBuilderExt as _;
+            fs::DirBuilder::new().mode(0o700).create(&dir)
+        };
+        #[cfg(not(unix))]
+        let result = fs::create_dir(&dir);
+        match result {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(CoreError::Io(e)),
+        }
+    }
+    Err(CoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "too many temp collisions",
+    )))
+}
+
 /// Best-effort directory fsync after renames (Unix only).
 fn fsync_dir(dir: &Path) {
     #[cfg(unix)]
@@ -281,6 +314,339 @@ fn hex_of(bytes: &[u8]) -> String {
         out.push(lo as char);
     }
     out
+}
+
+fn parse_blob_key(key: &str) -> Option<(String, u64)> {
+    let bytes = key.as_bytes();
+    if bytes.len() < 34 || bytes.len() > 52 {
+        return None;
+    }
+    if bytes[32] != b'-' {
+        return None;
+    }
+    let prefix = &key[..32];
+    let size_str = &key[33..];
+    if size_str.is_empty() || size_str.len() > 19 {
+        return None;
+    }
+    for &b in prefix.as_bytes() {
+        if !matches!(b, b'0'..=b'9' | b'a'..=b'f') {
+            return None;
+        }
+    }
+    if size_str == "0" {
+    } else {
+        if size_str.as_bytes()[0] == b'0' {
+            return None;
+        }
+        for &b in size_str.as_bytes() {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+        }
+    }
+    for &b in size_str.as_bytes() {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+    }
+    let size: u64 = size_str.parse().ok()?;
+    if size > i64::MAX as u64 {
+        return None;
+    }
+    if size_str != size.to_string() {
+        return None;
+    }
+    Some((prefix.to_string(), size))
+}
+
+fn is_canonical_hex(s: &str, len: usize) -> bool {
+    if s.len() != len {
+        return false;
+    }
+    s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn validate_blob_metadata(key: &str, sha256: &str, bytes: i64) -> Result<(), CoreError> {
+    let (prefix, size) = parse_blob_key(key).ok_or_else(|| CoreError::Corrupt {
+        message: "invalid blob key".to_string(),
+    })?;
+    if !is_canonical_hex(sha256, 64) {
+        return Err(CoreError::Corrupt {
+            message: "invalid blob sha256".to_string(),
+        });
+    }
+    if !sha256.starts_with(&prefix) {
+        return Err(CoreError::Corrupt {
+            message: "blob sha prefix mismatch".to_string(),
+        });
+    }
+    if bytes < 0 {
+        return Err(CoreError::Corrupt {
+            message: "invalid blob bytes".to_string(),
+        });
+    }
+    if u64::try_from(bytes).ok() != Some(size) {
+        return Err(CoreError::Corrupt {
+            message: "blob bytes mismatch".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn blobs_root_ok(blobs: &Path) -> Result<(), CoreError> {
+    match fs::symlink_metadata(blobs) {
+        Ok(m) => {
+            if m.file_type().is_symlink() {
+                return Err(CoreError::Corrupt {
+                    message: "blobs root is symlink".to_string(),
+                });
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                if (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    return Err(CoreError::Corrupt {
+                        message: "blobs root is reparse point".to_string(),
+                    });
+                }
+            }
+            if !m.is_dir() {
+                return Err(CoreError::Corrupt {
+                    message: "blobs root not a directory".to_string(),
+                });
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(CoreError::Io(e)),
+    }
+    Ok(())
+}
+
+fn safe_blob_path(blobs: &Path, key: &str) -> Result<PathBuf, CoreError> {
+    let (prefix, size) = parse_blob_key(key).ok_or_else(|| CoreError::Corrupt {
+        message: "invalid blob key".to_string(),
+    })?;
+    let _ = prefix;
+    let _ = size;
+    blobs_root_ok(blobs)?;
+    let path = blobs.join(key);
+    match fs::symlink_metadata(&path) {
+        Ok(m) => {
+            if m.file_type().is_symlink() {
+                return Err(CoreError::Corrupt {
+                    message: "blob path is symlink".to_string(),
+                });
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                if (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    return Err(CoreError::Corrupt {
+                        message: "blob reparse point".to_string(),
+                    });
+                }
+            }
+            if !m.is_file() {
+                return Err(CoreError::Corrupt {
+                    message: "blob not a regular file".to_string(),
+                });
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(CoreError::Io(e)),
+    }
+    Ok(path)
+}
+
+fn safe_blob_read(blobs: &Path, key: &str, expect_sha: &str) -> Result<Vec<u8>, CoreError> {
+    let (prefix, size) = parse_blob_key(key).ok_or_else(|| CoreError::Corrupt {
+        message: "invalid blob key".to_string(),
+    })?;
+    let _ = prefix;
+    let path = safe_blob_path(blobs, key)?;
+    let meta = fs::symlink_metadata(&path).map_err(|_| CoreError::Corrupt {
+        message: "missing external blob".to_string(),
+    })?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(CoreError::Corrupt {
+            message: "blob not a regular file".to_string(),
+        });
+    }
+    let file_len = meta.len();
+    if file_len != size {
+        return Err(CoreError::Corrupt {
+            message: "external blob size mismatch".to_string(),
+        });
+    }
+    let file = fs::File::open(&path).map_err(|_| CoreError::Corrupt {
+        message: "missing external blob".to_string(),
+    })?;
+    let mut buf = Vec::new();
+    let n = file
+        .take(size + 1)
+        .read_to_end(&mut buf)
+        .map_err(CoreError::Io)?;
+    if n as u64 != size {
+        return Err(CoreError::Corrupt {
+            message: "external blob size mismatch".to_string(),
+        });
+    }
+    let mut h = Sha256::new();
+    h.update(&buf);
+    if hex_of(&h.finalize()) != expect_sha {
+        return Err(CoreError::Corrupt {
+            message: "external blob failed verification".to_string(),
+        });
+    }
+    Ok(buf)
+}
+
+fn validate_db_keys(conn: &Connection) -> Result<(), CoreError> {
+    let mut stmt = conn
+        .prepare("SELECT blob_key, sha256, bytes FROM clip_blobs")
+        .map_err(|e| db_err(&e))?;
+    let rows: Vec<(String, String, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| db_err(&e))?
+        .collect::<Result<_, _>>()
+        .map_err(|_| CoreError::Corrupt {
+            message: "invalid blob metadata types".to_string(),
+        })?;
+    drop(stmt);
+    let mut blob_keys = HashSet::new();
+    for (key, sha, bytes) in &rows {
+        validate_blob_metadata(key, sha, *bytes)?;
+        blob_keys.insert(key.clone());
+    }
+    let mut stmt = conn
+        .prepare("SELECT external, blob_key, (data IS NOT NULL) FROM clip_payloads")
+        .map_err(|e| db_err(&e))?;
+    let payload_rows: Vec<(i64, Option<String>, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| db_err(&e))?
+        .collect::<Result<_, _>>()
+        .map_err(|_| CoreError::Corrupt {
+            message: "invalid payload types".to_string(),
+        })?;
+    drop(stmt);
+    for (ext, key_opt, has_data) in &payload_rows {
+        if *ext != 0 && *ext != 1 {
+            return Err(CoreError::Corrupt {
+                message: "invalid external flag".to_string(),
+            });
+        }
+        if *ext == 1 {
+            let k = key_opt.as_deref().ok_or_else(|| CoreError::Corrupt {
+                message: "missing external blob_key".to_string(),
+            })?;
+            parse_blob_key(k).ok_or_else(|| CoreError::Corrupt {
+                message: "invalid blob key".to_string(),
+            })?;
+            if *has_data != 0 {
+                return Err(CoreError::Corrupt {
+                    message: "external payload has inline data".to_string(),
+                });
+            }
+            if !blob_keys.contains(k) {
+                return Err(CoreError::Corrupt {
+                    message: "missing external blob metadata".to_string(),
+                });
+            }
+        } else if let Some(k) = key_opt.as_deref() {
+            parse_blob_key(k).ok_or_else(|| CoreError::Corrupt {
+                message: "invalid blob key".to_string(),
+            })?;
+            return Err(CoreError::Corrupt {
+                message: "inline payload has blob_key".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate one complete candidate before opening any of its blob files.
+fn load_payload_rows(blobs: &Path, rows: Vec<VerifiedPayload>) -> Result<ClipPayloads, CoreError> {
+    for (_, external, data, key, sha, bytes) in &rows {
+        match external {
+            1 => {
+                if data.is_some() {
+                    return Err(CoreError::Corrupt {
+                        message: "external payload has inline data".to_string(),
+                    });
+                }
+                let (Some(key), Some(sha), Some(bytes)) = (key, sha, bytes) else {
+                    return Err(CoreError::Corrupt {
+                        message: "missing external blob metadata".to_string(),
+                    });
+                };
+                validate_blob_metadata(key, sha, *bytes)?;
+            }
+            0 if key.is_none() => {}
+            0 => {
+                return Err(CoreError::Corrupt {
+                    message: "inline payload has blob_key".to_string(),
+                })
+            }
+            _ => {
+                return Err(CoreError::Corrupt {
+                    message: "invalid external flag".to_string(),
+                })
+            }
+        }
+    }
+    rows.into_iter()
+        .map(|(mime, _, data, key, sha, _)| {
+            let bytes = if let (Some(key), Some(sha)) = (key, sha) {
+                safe_blob_read(blobs, &key, &sha)?
+            } else {
+                data.unwrap_or_default()
+            };
+            Ok((mime, bytes))
+        })
+        .collect()
+}
+
+/// Create an exclusive quarantine directory without following existing links.
+fn create_quarantine(blobs: &Path, now: i64) -> Result<PathBuf, CoreError> {
+    for counter in 0..=100 {
+        let name = if counter == 0 {
+            format!("orphan-{now}")
+        } else {
+            format!("orphan-{now}-{counter}")
+        };
+        let path = blobs.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(m) => {
+                if m.file_type().is_symlink() {
+                    return Err(CoreError::Corrupt {
+                        message: "quarantine is symlink".to_string(),
+                    });
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt as _;
+                    if m.file_attributes() & 0x400 != 0 {
+                        return Err(CoreError::Corrupt {
+                            message: "quarantine is reparse point".to_string(),
+                        });
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&path).map_err(CoreError::Io)?;
+                blobs_root_ok(&path)?;
+                return Ok(path);
+            }
+            Err(e) => return Err(CoreError::Io(e)),
+        }
+    }
+    Err(CoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "too many quarantine collisions",
+    )))
 }
 
 /// Fallible `u64` to `i64` for SQL parameters.
@@ -496,7 +862,9 @@ impl Store {
         mkdir(profile)?;
         let db_path = profile.join(DB_NAME);
         let blobs = profile.join("blobs");
+        blobs_root_ok(&blobs)?;
         mkdir(&blobs)?;
+        blobs_root_ok(&blobs)?;
         if read_only {
             return Self::open_recovery(profile, &db_path, &blobs);
         }
@@ -536,6 +904,7 @@ impl Store {
                 message: format!("quick_check failed; preserved aside at {}", aside.display()),
             });
         }
+        validate_db_keys(&conn)?;
         let fts = probe_fts(&conn);
         Ok(Self {
             db_path,
@@ -579,6 +948,13 @@ impl Store {
             }
             Ok(_) => {}
         }
+        if !quick_ok(&conn) {
+            return Err(CoreError::Corrupt {
+                message: "restore database failed quick_check".to_string(),
+            });
+        }
+        validate_db_keys(&conn)?;
+        blobs_root_ok(blobs)?;
         let fts = probe_fts(&conn);
         Ok(Self {
             db_path: db_path.to_path_buf(),
@@ -607,72 +983,83 @@ impl Store {
 
     /// Crash-safe external blob write: temp, fsync, atomic rename.
     fn write_blob_file(&self, key: &str, bytes: &[u8]) -> Result<(), CoreError> {
-        let final_path = self.blobs.join(key);
-        if final_path.is_file() {
+        parse_blob_key(key).ok_or_else(|| CoreError::Corrupt {
+            message: "invalid blob key".to_string(),
+        })?;
+        blobs_root_ok(&self.blobs)?;
+        let final_path = safe_blob_path(&self.blobs, key)?;
+        if fs::symlink_metadata(&final_path).is_ok() {
             return Ok(());
         }
-        let tmp = self.blobs.join(format!(
+        let tmp_name = format!(
             ".tmp-{key}-{}-{}",
             std::process::id(),
             TMP_CTR.fetch_add(1, Ordering::SeqCst)
-        ));
-        fs::write(&tmp, bytes).map_err(CoreError::Io)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mut perms = fs::metadata(&tmp).map_err(CoreError::Io)?.permissions();
-            perms.set_mode(0o600);
-            fs::set_permissions(&tmp, perms).map_err(CoreError::Io)?;
-        }
-        // Write access: Windows refuses to flush a read-only handle.
-        let f = fs::OpenOptions::new()
-            .write(true)
-            .open(&tmp)
-            .map_err(CoreError::Io)?;
-        f.sync_all().map_err(CoreError::Io)?;
-        drop(f);
-        fs::rename(&tmp, &final_path).map_err(CoreError::Io)?;
-        fsync_dir(&self.blobs);
-        Ok(())
-    }
-
-    /// Read one external blob and verify its digest.
-    fn read_verified(&self, key: &str, expect_sha: &str) -> Result<Vec<u8>, CoreError> {
-        let bytes = fs::read(self.blobs.join(key)).map_err(|_| CoreError::Corrupt {
-            message: format!("missing external blob {key}"),
-        })?;
-        let mut h = Sha256::new();
-        h.update(&bytes);
-        if hex_of(&h.finalize()) != expect_sha {
+        );
+        let tmp = self.blobs.join(&tmp_name);
+        if fs::symlink_metadata(&tmp).is_ok() {
             return Err(CoreError::Corrupt {
-                message: format!("external blob {key} failed verification"),
+                message: "blob temp path exists as symlink".to_string(),
             });
         }
-        Ok(bytes)
+        let mut created = false;
+        let res: Result<(), CoreError> = (|| {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(CoreError::Io)?;
+            created = true;
+            f.write_all(bytes).map_err(CoreError::Io)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mut perms = fs::metadata(&tmp).map_err(CoreError::Io)?.permissions();
+                perms.set_mode(0o600);
+                fs::set_permissions(&tmp, perms).map_err(CoreError::Io)?;
+            }
+            f.sync_all().map_err(CoreError::Io)?;
+            drop(f);
+            if fs::symlink_metadata(&tmp).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(CoreError::Corrupt {
+                    message: "blob temp became symlink".to_string(),
+                });
+            }
+            if fs::symlink_metadata(&final_path).is_ok() {
+                return Ok(());
+            }
+            fs::rename(&tmp, &final_path).map_err(CoreError::Io)?;
+            fsync_dir(&self.blobs);
+            Ok(())
+        })();
+        if created {
+            let _ = fs::remove_file(&tmp);
+        }
+        res
     }
 
     /// Best-effort payload load for dedupe hashing (`None` on any failure).
     fn try_load_payloads(conn: &Connection, blobs: &Path, id: &str) -> Option<ClipPayloads> {
-        let mut stmt = conn.prepare(
-            "SELECT mime, external, data, blob_key FROM clip_payloads WHERE clip_id=?1 ORDER BY rowid",
-        ).ok()?;
-        let rows: Vec<StoredPayload> = stmt
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.mime, p.external, p.data, p.blob_key, b.sha256, b.bytes FROM clip_payloads p LEFT JOIN clip_blobs b ON b.blob_key=p.blob_key WHERE p.clip_id=?1 ORDER BY p.rowid",
+            )
+            .ok()?;
+        let rows: Vec<VerifiedPayload> = stmt
             .query_map(params![id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })
             .ok()?
             .collect::<Result<_, _>>()
             .ok()?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (mime, ext, data, key) in rows {
-            if ext != 0 {
-                let bytes = fs::read(blobs.join(key?)).ok()?;
-                out.push((mime, bytes));
-            } else {
-                out.push((mime, data.unwrap_or_default()));
-            }
-        }
-        Some(out)
+        load_payload_rows(blobs, rows).ok()
     }
 
     /// Find a dedupe hit among the last live clips (D-F10).
@@ -849,32 +1236,30 @@ impl Store {
         };
         let mut stmt = conn
             .prepare(
-                "SELECT p.mime, p.external, p.data, p.blob_key, b.sha256 FROM clip_payloads p \
+                "SELECT p.mime, p.external, p.data, p.blob_key, b.sha256, b.bytes FROM clip_payloads p \
                 LEFT JOIN clip_blobs b ON b.blob_key=p.blob_key WHERE p.clip_id=?1 ORDER BY p.rowid",
             )
             .map_err(|e| db_err(&e))?;
         let mapped = stmt
             .query_map(params![id.to_string()], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                ))
             })
             .map_err(|e| db_err(&e))?;
         let rows: Vec<VerifiedPayload> =
-            mapped.collect::<Result<_, _>>().map_err(|e| db_err(&e))?;
+            mapped
+                .collect::<Result<_, _>>()
+                .map_err(|_| CoreError::Corrupt {
+                    message: "invalid payload types".to_string(),
+                })?;
         drop(stmt);
-        let mut out = Vec::with_capacity(rows.len());
-        for (mime, ext, data, key, sha) in rows {
-            if ext != 0 {
-                let k = key.ok_or_else(|| CoreError::Corrupt {
-                    message: "dangling external payload".to_string(),
-                })?;
-                let s = sha.ok_or_else(|| CoreError::Corrupt {
-                    message: "dangling external payload".to_string(),
-                })?;
-                out.push((mime, self.read_verified(&k, &s)?));
-            } else {
-                out.push((mime, data.unwrap_or_default()));
-            }
-        }
+        let out = load_payload_rows(&self.blobs, rows)?;
         clip.formats = out.iter().map(|(m, _)| m.clone()).collect();
         Ok(Some((clip.clone(), out)))
     }
@@ -1341,9 +1726,11 @@ impl Store {
         }
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(|e| db_err(&e))?;
+        validate_db_keys(&tx)?;
         let ids = removed_ids(&tx)?;
         let n = ids.len() as u64;
-        delete_clips(&tx, &self.blobs, &ids)?;
+        delete_clips(&tx, &ids)?;
+        sweep_blobs(&tx, &self.blobs)?;
         tx.commit().map_err(|e| db_err(&e))?;
         Ok(n)
     }
@@ -1360,10 +1747,12 @@ impl Store {
         }
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(|e| db_err(&e))?;
+        validate_db_keys(&tx)?;
         let mut purged = 0_u64;
-        purged += enforce_count(&tx, &self.blobs, limits.max_items)?;
-        purged += enforce_age(&tx, &self.blobs, limits.max_age_days, now_ms())?;
-        purged += enforce_bytes(&tx, &self.blobs, limits.max_store_bytes)?;
+        purged += enforce_count(&tx, limits.max_items)?;
+        purged += enforce_age(&tx, limits.max_age_days, now_ms())?;
+        purged += enforce_bytes(&tx, limits.max_store_bytes)?;
+        sweep_blobs(&tx, &self.blobs)?;
         tx.commit().map_err(|e| db_err(&e))?;
         Ok(purged)
     }
@@ -1389,6 +1778,7 @@ impl Store {
                 quarantine_dir,
             });
         }
+        blobs_root_ok(&self.blobs)?;
         let conn = self.lock();
         let referenced = referenced_keys(&conn)?;
         let mut stmt = conn
@@ -1405,17 +1795,33 @@ impl Store {
             .filter(|k| !referenced.contains(k.as_str()))
             .count();
         let dangling = u64::try_from(dangling_blobs).unwrap_or(u64::MAX);
-        mkdir(&quarantine_dir)?;
+        let quarantine_dir = create_quarantine(&self.blobs, now)?;
         let mut orphaned_files = 0_u64;
         let entries = fs::read_dir(&self.blobs).map_err(CoreError::Io)?;
         for e in entries {
             let e = e.map_err(CoreError::Io)?;
-            if !e.file_type().map_err(CoreError::Io)?.is_file() {
+            let ft = e.file_type().map_err(CoreError::Io)?;
+            if ft.is_symlink() {
+                continue;
+            }
+            if !ft.is_file() {
                 continue;
             }
             let name = e.file_name().to_string_lossy().into_owned();
             if referenced.contains(name.as_str()) {
                 continue;
+            }
+            let src_meta = fs::symlink_metadata(e.path()).map_err(CoreError::Io)?;
+            if src_meta.file_type().is_symlink() || !src_meta.is_file() {
+                continue;
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                if (src_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    continue;
+                }
             }
             fs::rename(e.path(), quarantine_dir.join(&name)).map_err(CoreError::Io)?;
             orphaned_files += 1;
@@ -1439,9 +1845,7 @@ impl Store {
                 mkdir(parent)?;
             }
         }
-        let tag = TMP_CTR.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!("cm-backup-{}-{tag}", std::process::id()));
-        mkdir(&tmp)?;
+        let tmp = create_private_dir("cm-backup")?;
         let _guard = TmpGuard { path: tmp.clone() };
         let tmp_db = tmp.join("clipstore.sqlite3");
         {
@@ -1452,22 +1856,31 @@ impl Store {
             backup.step(-1).map_err(|e| db_err(&e))?;
         }
         let conn = self.lock();
+        validate_db_keys(&conn)?;
         let clips: i64 = conn
             .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
             .map_err(|e| db_err(&e))?;
         let referenced = referenced_keys(&conn)?;
+        let mut blob_metadata = Vec::with_capacity(referenced.len());
+        for key in &referenced {
+            let sha: String = conn
+                .query_row(
+                    "SELECT sha256 FROM clip_blobs WHERE blob_key=?1",
+                    params![key],
+                    |r| r.get(0),
+                )
+                .map_err(|e| db_err(&e))?;
+            blob_metadata.push((key.clone(), sha));
+        }
         drop(conn);
         let db_bytes = fs::read(&tmp_db).map_err(CoreError::Io)?;
         let db_sha = hex_of(&Sha256::digest(&db_bytes));
         let tmp_blobs = tmp.join("blobs");
         mkdir(&tmp_blobs)?;
         let mut blob_entries = Vec::new();
-        for key in &referenced {
-            let Ok(bytes) = fs::read(self.blobs.join(key)) else {
-                continue;
-            };
+        for (key, sha) in &blob_metadata {
+            let bytes = safe_blob_read(&self.blobs, key, sha)?;
             fs::write(tmp_blobs.join(key), &bytes).map_err(CoreError::Io)?;
-            let sha = hex_of(&Sha256::digest(&bytes));
             blob_entries.push(format!(
                 "{{key={key:?},bytes={},sha256={sha:?}}}",
                 bytes.len()
@@ -1521,9 +1934,7 @@ impl Store {
     /// [`CoreError::Config`] for bad manifests, or
     /// [`CoreError::Corrupt`] when the embedded DB fails validation.
     pub fn restore_zip(src: &Path, profile: &Path) -> Result<(), CoreError> {
-        let tag = TMP_CTR.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!("cm-restore-{}-{tag}", std::process::id()));
-        mkdir(&tmp)?;
+        let tmp = create_private_dir("cm-restore")?;
         let _guard = TmpGuard { path: tmp.clone() };
         extract_zip(src, &tmp)?;
         validate_profile(&tmp)?;
@@ -1626,15 +2037,15 @@ fn removed_ids(conn: &Connection) -> Result<Vec<String>, CoreError> {
     mapped.collect::<Result<_, _>>().map_err(|e| db_err(&e))
 }
 
-/// Delete clips with FTS rows, then sweep newly unreferenced blobs.
-fn delete_clips(conn: &Connection, blobs: &Path, ids: &[String]) -> Result<(), CoreError> {
+/// Delete clip and FTS rows; the caller sweeps after all SQL deletions.
+fn delete_clips(conn: &Connection, ids: &[String]) -> Result<(), CoreError> {
     for id in ids {
         conn.execute("DELETE FROM clips_fts WHERE clip_id=?1", params![id])
             .map_err(|e| db_err(&e))?;
         conn.execute("DELETE FROM clips WHERE id=?1", params![id])
             .map_err(|e| db_err(&e))?;
     }
-    sweep_blobs(conn, blobs)
+    Ok(())
 }
 
 /// Delete blob rows no payload references, with their files.
@@ -1652,11 +2063,34 @@ fn sweep_blobs(conn: &Connection, blobs: &Path) -> Result<(), CoreError> {
         .map_err(|e| db_err(&e))?;
     drop(stmt);
     for k in &keys {
+        parse_blob_key(k).ok_or_else(|| CoreError::Corrupt {
+            message: "invalid blob key".to_string(),
+        })?;
+    }
+    blobs_root_ok(blobs)?;
+    let mut pending: Vec<(String, PathBuf, bool)> = Vec::with_capacity(keys.len());
+    for k in &keys {
+        let path = safe_blob_path(blobs, k)?;
+        let exists = fs::symlink_metadata(&path).is_ok();
+        pending.push((k.clone(), path, exists));
+    }
+    for (k, path, exists) in pending {
         conn.execute("DELETE FROM clip_blobs WHERE blob_key=?1", params![k])
             .map_err(|e| db_err(&e))?;
-        let p = blobs.join(k);
-        if p.is_file() {
-            fs::remove_file(&p).map_err(CoreError::Io)?;
+        if exists {
+            let m = fs::symlink_metadata(&path).map_err(CoreError::Io)?;
+            if m.file_type().is_symlink() || !m.is_file() {
+                continue;
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                if (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    continue;
+                }
+            }
+            fs::remove_file(&path).map_err(CoreError::Io)?;
         }
     }
     Ok(())
@@ -1676,7 +2110,7 @@ fn referenced_keys(conn: &Connection) -> Result<HashSet<String>, CoreError> {
 }
 
 /// Delete oldest unpinned clips while the live count exceeds `max`.
-fn enforce_count(tx: &rusqlite::Transaction<'_>, blobs: &Path, max: u64) -> Result<u64, CoreError> {
+fn enforce_count(tx: &rusqlite::Transaction<'_>, max: u64) -> Result<u64, CoreError> {
     let live: i64 = tx
         .query_row(
             "SELECT COUNT(*) FROM clips WHERE removed=0 AND pinned=0",
@@ -1698,14 +2132,13 @@ fn enforce_count(tx: &rusqlite::Transaction<'_>, blobs: &Path, max: u64) -> Resu
         .map_err(|e| db_err(&e))?;
     drop(stmt);
     let n = ids.len() as u64;
-    delete_clips(tx, blobs, &ids)?;
+    delete_clips(tx, &ids)?;
     Ok(n)
 }
 
 /// Delete oldest unpinned clips older than `max_age_days` (0 = off).
 fn enforce_age(
     tx: &rusqlite::Transaction<'_>,
-    blobs: &Path,
     max_age_days: u64,
     now: i64,
 ) -> Result<u64, CoreError> {
@@ -1723,12 +2156,12 @@ fn enforce_age(
         .map_err(|e| db_err(&e))?;
     drop(stmt);
     let n = ids.len() as u64;
-    delete_clips(tx, blobs, &ids)?;
+    delete_clips(tx, &ids)?;
     Ok(n)
 }
 
 /// Delete oldest unpinned clips while logical bytes exceed `max`.
-fn enforce_bytes(tx: &rusqlite::Transaction<'_>, blobs: &Path, max: u64) -> Result<u64, CoreError> {
+fn enforce_bytes(tx: &rusqlite::Transaction<'_>, max: u64) -> Result<u64, CoreError> {
     let total_i: i64 = tx
         .query_row(
             "SELECT COALESCE(SUM(bytes_total),0) FROM clips WHERE removed=0",
@@ -1755,7 +2188,7 @@ fn enforce_bytes(tx: &rusqlite::Transaction<'_>, blobs: &Path, max: u64) -> Resu
                 |r| r.get(0),
             )
             .map_err(|e| db_err(&e))?;
-        delete_clips(tx, blobs, std::slice::from_ref(&id))?;
+        delete_clips(tx, std::slice::from_ref(&id))?;
         total = total.saturating_sub(u128::try_from(bytes_i.max(0)).unwrap_or(u128::MAX));
         purged += 1;
     }
@@ -1835,6 +2268,58 @@ fn extract_zip(src: &Path, tmp: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Preflight every manifest blob before reading any blob data.
+fn validated_manifest_blobs(man: &toml::Value) -> Result<Vec<(String, u64, String)>, CoreError> {
+    let bad = |msg: &str| CoreError::Config {
+        message: msg.to_string(),
+    };
+    let Some(value) = man.get("blobs") else {
+        return Ok(Vec::new());
+    };
+    let blobs = value
+        .as_array()
+        .ok_or_else(|| bad("restore manifest blobs not an array"))?;
+    let mut out = Vec::with_capacity(blobs.len());
+    for blob in blobs {
+        let key = blob
+            .get("key")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| bad("restore manifest blob key missing or not a string"))?;
+        let (prefix, size) =
+            parse_blob_key(key).ok_or_else(|| bad("restore manifest invalid blob key"))?;
+        if size > RESTORE_MAX_ENTRY {
+            return Err(bad("restore blob exceeds size cap"));
+        }
+        if let Some(value) = blob.get("bytes") {
+            let bytes = value
+                .as_integer()
+                .ok_or_else(|| bad("restore manifest blob bytes not an integer"))?;
+            if u64::try_from(bytes).ok() != Some(size) {
+                return Err(bad("restore blob size mismatch"));
+            }
+        }
+        let sha = if let Some(value) = blob.get("sha256") {
+            let sha = value
+                .as_str()
+                .ok_or_else(|| bad("restore manifest blob sha256 not a string"))?;
+            if !is_canonical_hex(sha, 64) {
+                return Err(bad("restore blob sha256 invalid"));
+            }
+            if !sha.starts_with(&prefix) {
+                return Err(bad("restore blob sha prefix mismatch"));
+            }
+            sha.to_string()
+        } else {
+            String::new()
+        };
+        if blob.get("db_sha256").is_some_and(|v| !v.is_str()) {
+            return Err(bad("restore manifest db_sha256 not a string"));
+        }
+        out.push((key.to_string(), size, sha));
+    }
+    Ok(out)
+}
+
 /// Validate an extracted profile: manifest, checksums, DB, blobs.
 fn validate_profile(tmp: &Path) -> Result<(), CoreError> {
     let bad = |msg: &str| CoreError::Config {
@@ -1851,6 +2336,12 @@ fn validate_profile(tmp: &Path) -> Result<(), CoreError> {
     if ver != 1 {
         return Err(bad("restore manifest has unsupported schema_version"));
     }
+    if let Some(v) = man.get("db_sha256") {
+        if !v.is_str() {
+            return Err(bad("restore manifest db_sha256 not a string"));
+        }
+    }
+
     let db = tmp.join("clipstore.sqlite3");
     if !db.is_file() {
         return Err(bad("restore archive missing clipstore.sqlite3"));
@@ -1873,25 +2364,38 @@ fn validate_profile(tmp: &Path) -> Result<(), CoreError> {
             message: "restore database failed quick_check".to_string(),
         });
     }
-    if let Some(blobs) = man.get("blobs").and_then(toml::Value::as_array) {
-        for b in blobs {
-            let key = b
-                .get("key")
-                .and_then(toml::Value::as_str)
-                .ok_or_else(|| bad("restore manifest blob missing key"))?;
-            let size = b
-                .get("bytes")
-                .and_then(toml::Value::as_integer)
-                .unwrap_or(-1);
-            let sha = b.get("sha256").and_then(toml::Value::as_str).unwrap_or("");
-            let bytes = fs::read(tmp.join("blobs").join(key))
-                .map_err(|_| bad("restore archive missing blob file"))?;
-            if size >= 0 && i64::try_from(bytes.len()).unwrap_or(i64::MAX) != size {
-                return Err(bad("restore blob size mismatch"));
-            }
-            if !sha.is_empty() && hex_of(&Sha256::digest(&bytes)) != sha {
-                return Err(bad("restore blob checksum mismatch"));
-            }
+    validate_db_keys(&probe)?;
+    let manifest_blobs = validated_manifest_blobs(&man)?;
+    if !manifest_blobs.is_empty() {
+        blobs_root_ok(&tmp.join("blobs"))?;
+    }
+    for (key, size, sha) in &manifest_blobs {
+        let blobs_root = tmp.join("blobs");
+        blobs_root_ok(&blobs_root)?;
+        let path = safe_blob_path(&blobs_root, key)
+            .map_err(|_| bad("restore manifest invalid blob key"))?;
+        let meta =
+            fs::symlink_metadata(&path).map_err(|_| bad("restore archive missing blob file"))?;
+        if meta.len() != *size {
+            return Err(bad("restore blob size mismatch"));
+        }
+        if *size > RESTORE_MAX_ENTRY {
+            return Err(bad("restore blob exceeds size cap"));
+        }
+        let file = fs::File::open(&path).map_err(|_| bad("restore archive missing blob file"))?;
+        let mut buf = Vec::new();
+        let n = file
+            .take(RESTORE_MAX_ENTRY + 1)
+            .read_to_end(&mut buf)
+            .map_err(CoreError::Io)?;
+        if n as u64 > RESTORE_MAX_ENTRY {
+            return Err(bad("restore blob exceeds size cap"));
+        }
+        if u64::try_from(n).ok() != Some(*size) {
+            return Err(bad("restore blob size mismatch"));
+        }
+        if !sha.is_empty() && hex_of(&Sha256::digest(&buf)) != *sha {
+            return Err(bad("restore blob checksum mismatch"));
         }
     }
     Ok(())
