@@ -364,3 +364,130 @@ fn early_move_plus_rollback_failure_keeps_all_committed_wal_material() {
         );
     }
 }
+
+#[test]
+fn config_component_faults_restore_or_retain_all_original_components() {
+    for points in [
+        vec![RestoreFault::OldMove(4)],
+        vec![RestoreFault::NewMove(2)],
+        vec![RestoreFault::NewOpen],
+        vec![RestoreFault::NewOpen, RestoreFault::RollbackRemove],
+        vec![RestoreFault::NewOpen, RestoreFault::RollbackRename],
+        vec![RestoreFault::NewOpen, RestoreFault::OldOpen],
+        vec![RestoreFault::OldMove(4), RestoreFault::RollbackRename],
+        vec![RestoreFault::NewMove(2), RestoreFault::RollbackRemove],
+        vec![RestoreFault::NewMove(2), RestoreFault::RollbackRename],
+        vec![RestoreFault::OldMove(4), RestoreFault::OldOpen],
+    ] {
+        let scratch = Scratch::new();
+        let (archive, profile, id) = setup(&scratch);
+        fs::write(
+            scratch.0.join("source/config.toml"),
+            b"# incoming\n[history]\nmax_items = 7\n",
+        )
+        .unwrap();
+        Store::open(&scratch.0.join("source"))
+            .unwrap()
+            .backup_zip(&archive)
+            .unwrap();
+        let archive_before = fs::read(&archive).unwrap();
+        let prepared = Store::prepare_restore(&archive, &profile).unwrap();
+        faults(&points);
+        let failure = prepared.install_and_open().unwrap_err();
+        assert!(failure
+            .error
+            .to_string()
+            .contains(&format!("{:?}", points[0])));
+        if points.len() == 1 {
+            assert!(failure.recovery_dir.is_none());
+            let store = failure.store.unwrap();
+            assert_original(&store, id, &profile);
+            seed(&store, "usable original", 11);
+        } else {
+            assert!(failure.store.is_none());
+            let recovery = failure.recovery_dir.unwrap();
+            assert!(failure
+                .error
+                .to_string()
+                .contains(&format!("{:?}", points[1])));
+            // Reconstruct an owned profile from the actual retained originals.
+            // A failed rollback can split originals between old/ and profile/.
+            let recovered = scratch.0.join("recover-config");
+            fs::create_dir(&recovered).unwrap();
+            for name in [DB_NAME, "blobs", "config.toml"] {
+                let saved = recovery.join("old").join(name);
+                let source = if saved.exists() {
+                    saved
+                } else {
+                    profile.join(name)
+                };
+                if name == "blobs" {
+                    fs::create_dir(recovered.join(name)).unwrap();
+                    for entry in fs::read_dir(source).unwrap().map(Result::unwrap) {
+                        fs::copy(entry.path(), recovered.join(name).join(entry.file_name()))
+                            .unwrap();
+                    }
+                } else {
+                    fs::copy(source, recovered.join(name)).unwrap();
+                }
+            }
+            let store = Store::open(&recovered).unwrap();
+            assert_eq!(
+                store.get_clip(id).unwrap().unwrap().1,
+                vec![("image/png".into(), vec![9; 300_000])]
+            );
+            assert_eq!(
+                fs::read(recovered.join("config.toml")).unwrap(),
+                b"config.toml"
+            );
+            let old_config = recovery.join("old/config.toml");
+            let old_config_before = fs::read(&old_config).ok();
+            Store::restore_zip(&archive, &profile).unwrap();
+            assert!(recovery.is_dir());
+            assert_eq!(fs::read(&old_config).ok(), old_config_before);
+        }
+        assert_eq!(fs::read(&archive).unwrap(), archive_before);
+        for name in [
+            "audit.log",
+            "daemon.lock",
+            "rendezvous.json",
+            "clipstore.sqlite3.prev",
+            "blobs.prev",
+            ".clipstore.prev.sqlite3",
+        ] {
+            assert_eq!(fs::read(profile.join(name)).unwrap(), name.as_bytes());
+        }
+        assert_eq!(
+            fs::read(profile.join(".blobs.prev/keep")).unwrap(),
+            b"previous blobs"
+        );
+        assert_eq!(
+            fs::read(profile.join(".restore-older/keep")).unwrap(),
+            b"older recovery"
+        );
+    }
+}
+
+#[test]
+fn config_recheck_refuses_changed_type_before_any_old_move() {
+    let scratch = Scratch::new();
+    let (archive, profile, id) = setup(&scratch);
+    fs::write(scratch.0.join("source/config.toml"), b"# incoming\n").unwrap();
+    Store::open(&scratch.0.join("source"))
+        .unwrap()
+        .backup_zip(&archive)
+        .unwrap();
+    let prepared = Store::prepare_restore(&archive, &profile).unwrap();
+    fs::remove_file(profile.join("config.toml")).unwrap();
+    fs::create_dir(profile.join("config.toml")).unwrap();
+    faults(&[RestoreFault::OldMove(0)]);
+    let failure = prepared.install_and_open().unwrap_err();
+    assert!(failure
+        .error
+        .to_string()
+        .contains("wrong managed component type"));
+    RESTORE_FAULTS.with(|faults| assert_eq!(*faults.borrow(), [RestoreFault::OldMove(0)]));
+    let store = failure.store.unwrap();
+    assert!(store.get_clip(id).unwrap().is_some());
+    assert!(profile.join("config.toml").is_dir());
+}

@@ -419,14 +419,17 @@ fn same_file(left: &Path, right: &Path) -> bool {
     false
 }
 
-fn is_ancestor_managed(src: &Path, profile: &Path) -> Result<bool, CoreError> {
+fn is_ancestor_managed(src: &Path, profile: &Path, config: bool) -> Result<bool, CoreError> {
     let source = src.canonicalize().map_err(CoreError::Io)?;
     for name in [
         DB_NAME,
         "clipstore.sqlite3-wal",
         "clipstore.sqlite3-shm",
         "blobs",
-    ] {
+    ]
+    .into_iter()
+    .chain(config.then_some("config.toml"))
+    {
         let managed = profile.join(name);
         if same_file(src, &managed) || source.starts_with(&managed) {
             return Ok(true);
@@ -443,7 +446,7 @@ fn is_ancestor_managed(src: &Path, profile: &Path) -> Result<bool, CoreError> {
     Ok(false)
 }
 
-fn check_restore_components(profile: &Path) -> Result<(), CoreError> {
+fn check_restore_components(profile: &Path, config: bool) -> Result<(), CoreError> {
     #[cfg(unix)]
     let anchor_device = {
         use std::os::unix::fs::MetadataExt as _;
@@ -454,7 +457,10 @@ fn check_restore_components(profile: &Path) -> Result<(), CoreError> {
         "clipstore.sqlite3-wal",
         "clipstore.sqlite3-shm",
         "blobs",
-    ] {
+    ]
+    .into_iter()
+    .chain(config.then_some("config.toml"))
+    {
         let path = profile.join(name);
         check_managed_not_symlink(&path)?;
         let metadata = match fs::symlink_metadata(&path) {
@@ -2461,6 +2467,7 @@ pub struct PreparedRestore {
     old_dir: PathBuf,
     profile: PathBuf,
     cleanup: bool,
+    has_config: bool,
 }
 
 /// Failed installation, with a usable original Store after successful rollback.
@@ -2485,27 +2492,37 @@ impl PreparedRestore {
     fn prepare(src: &Path, profile: &Path) -> Result<Self, CoreError> {
         ensure_profile_container(profile)?;
         let profile = profile.canonicalize().map_err(CoreError::Io)?;
-        check_restore_components(&profile)?;
-        if is_ancestor_managed(src, &profile)? {
+        check_restore_components(&profile, false)?;
+        if is_ancestor_managed(src, &profile, false)? {
             return Err(CoreError::Unsupported {
                 message: "restore source aliases managed component".to_string(),
             });
         }
         let stage_root = create_stage_root(&profile)?;
-        let prepared = Self {
+        let mut prepared = Self {
             incoming: stage_root.join("incoming"),
             old_dir: stage_root.join("old"),
             stage_root,
             profile,
             cleanup: true,
+            has_config: false,
         };
         extract_zip(src, &prepared.incoming)?;
         validate_profile(&prepared.incoming)?;
+        prepared.has_config = prepared.incoming.join("config.toml").is_file();
+        // Config is managed only when the validated archive supplies it. Legacy
+        // archives must leave unrelated config links and bytes alone.
+        check_restore_components(&prepared.profile, prepared.has_config)?;
+        if is_ancestor_managed(src, &prepared.profile, prepared.has_config)? {
+            return Err(CoreError::Unsupported {
+                message: "restore source aliases managed component".to_string(),
+            });
+        }
         let blobs = prepared.incoming.join("blobs");
         if !blobs.exists() {
             mkdir(&blobs)?;
         }
-        check_restore_components(&prepared.incoming)?;
+        check_restore_components(&prepared.incoming, prepared.has_config)?;
         Ok(prepared)
     }
 
@@ -2531,14 +2548,15 @@ impl PreparedRestore {
         let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut installed: Vec<PathBuf> = Vec::new();
         let install = (|| {
-            check_restore_components(&self.profile)?;
+            check_restore_components(&self.profile, self.has_config)?;
             for (index, name) in [
                 DB_NAME,
                 "clipstore.sqlite3-wal",
                 "clipstore.sqlite3-shm",
                 "blobs",
             ]
-            .iter()
+            .into_iter()
+            .chain(self.has_config.then_some("config.toml"))
             .enumerate()
             {
                 let original = self.profile.join(name);
@@ -2553,64 +2571,6 @@ impl PreparedRestore {
                 moved.push((backup, original));
                 let _ = index;
             }
-            let has_incoming_config = matches!(fs::symlink_metadata(self.incoming.join("config.toml")), Ok(m) if m.is_file());
-            if has_incoming_config {
-                let name = "config.toml";
-                let original = self.profile.join(name);
-                match fs::symlink_metadata(&original) {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(CoreError::Io(error)),
-                }
-                if let Ok(m) = fs::symlink_metadata(&original) {
-                    if m.file_type().is_symlink() {
-                        return Err(CoreError::Unsupported {
-                            message: format!(
-                                "managed component is symlink: {}",
-                                original.display()
-                            ),
-                        });
-                    }
-                    #[cfg(windows)]
-                    {
-                        use std::os::windows::fs::MetadataExt as _;
-                        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-                        if (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-                            return Err(CoreError::Unsupported {
-                                message: format!(
-                                    "managed component is reparse point: {}",
-                                    original.display()
-                                ),
-                            });
-                        }
-                    }
-                    if !m.is_file() {
-                        return Err(CoreError::Unsupported {
-                            message: format!(
-                                "wrong managed component type: {}",
-                                original.display()
-                            ),
-                        });
-                    }
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::MetadataExt as _;
-                        let anchor_dev = fs::metadata(&self.profile).map_err(CoreError::Io)?.dev();
-                        if m.dev() != anchor_dev {
-                            return Err(CoreError::Unsupported {
-                                message: format!(
-                                    "managed component crosses filesystem: {}",
-                                    original.display()
-                                ),
-                            });
-                        }
-                    }
-                    restore_point!(RestoreFault::OldMove(4))?;
-                    let backup = self.old_dir.join(name);
-                    fs::rename(&original, &backup).map_err(CoreError::Io)?;
-                    moved.push((backup, original));
-                }
-            }
             for (index, name) in ["blobs", DB_NAME].iter().enumerate() {
                 restore_point!(RestoreFault::NewMove(index))?;
                 let target = self.profile.join(name);
@@ -2618,7 +2578,7 @@ impl PreparedRestore {
                 installed.push(target);
                 let _ = index;
             }
-            if has_incoming_config {
+            if self.has_config {
                 let name = "config.toml";
                 restore_point!(RestoreFault::NewMove(2))?;
                 let target = self.profile.join(name);
@@ -2942,6 +2902,9 @@ fn extract_zip(src: &Path, tmp: &Path) -> Result<(), CoreError> {
             .ok_or_else(|| unsupported("zip entry escapes target directory"))?;
         if is_symlink_entry(&e) {
             return Err(unsupported("zip symlink entry rejected"));
+        }
+        if e.is_dir() && e.enclosed_name().as_deref() == Some(Path::new("config.toml")) {
+            return Err(unsupported("config archive entry is a directory"));
         }
         if !e.is_dir() {
             if e.size() > RESTORE_MAX_ENTRY {
