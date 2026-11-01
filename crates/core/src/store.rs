@@ -29,6 +29,10 @@ const DEDUPE_WINDOW: usize = 100;
 const RESTORE_MAX_ENTRY: u64 = 1024 * 1024 * 1024;
 /// Largest total ZIP payload accepted by restore.
 const RESTORE_MAX_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
+/// Maximum raw `config.toml` bytes accepted for backup or restore.
+/// Documented reasonable bound: 1 MiB (typical config is < 10 KiB but allows
+/// extensive comments and future unknown fields; prevents unbounded allocation).
+const CONFIG_MAX_BYTES: u64 = 1024 * 1024;
 /// DB file name inside a profile directory.
 const DB_NAME: &str = "clipstore.sqlite3";
 /// DDL for tables and indexes (the FTS table is created separately).
@@ -610,6 +614,142 @@ fn validate_blob_metadata(key: &str, sha256: &str, bytes: i64) -> Result<(), Cor
         return Err(CoreError::Corrupt {
             message: "blob bytes mismatch".to_string(),
         });
+    }
+    Ok(())
+}
+
+fn config_bytes_for_backup(profile: &Path) -> Result<Option<(Vec<u8>, u64, String)>, CoreError> {
+    let path = profile.join("config.toml");
+    match fs::symlink_metadata(&path) {
+        Ok(m) => {
+            if m.file_type().is_symlink() {
+                return Err(CoreError::Unsupported {
+                    message: format!("config is symlink: {}", path.display()),
+                });
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt as _;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                if (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    return Err(CoreError::Unsupported {
+                        message: format!("config is reparse point: {}", path.display()),
+                    });
+                }
+            }
+            if !m.is_file() {
+                return Err(CoreError::Unsupported {
+                    message: format!("config wrong type: {}", path.display()),
+                });
+            }
+            if m.len() > CONFIG_MAX_BYTES {
+                return Err(CoreError::Config {
+                    message: "config exceeds size cap".to_string(),
+                });
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(CoreError::Io(e)),
+    }
+    check_managed_not_symlink(&path)?;
+    let file = fs::File::open(&path).map_err(CoreError::Io)?;
+    let mut buf = Vec::new();
+    let n = file
+        .take(CONFIG_MAX_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(CoreError::Io)?;
+    if n as u64 > CONFIG_MAX_BYTES {
+        return Err(CoreError::Config {
+            message: "config exceeds size cap".to_string(),
+        });
+    }
+    let text = String::from_utf8(buf.clone()).map_err(|_| CoreError::Config {
+        message: "config not utf8".to_string(),
+    })?;
+    toml::from_str::<crate::Config>(&text).map_err(|e| CoreError::Config {
+        message: e.to_string(),
+    })?;
+    let sha = hex_of(&Sha256::digest(&buf));
+    let len = buf.len() as u64;
+    Ok(Some((buf, len, sha)))
+}
+
+fn validate_config_in_profile(tmp: &Path, man: &toml::Value) -> Result<(), CoreError> {
+    let bad = |msg: &str| CoreError::Config {
+        message: msg.to_string(),
+    };
+    let config_path = tmp.join("config.toml");
+    let file_meta = fs::symlink_metadata(&config_path);
+    let file_exists = matches!(&file_meta, Ok(m) if m.is_file());
+    let is_symlink = matches!(&file_meta, Ok(m) if m.file_type().is_symlink());
+    if is_symlink {
+        return Err(bad("config symlink rejected"));
+    }
+    if let Ok(m) = &file_meta {
+        if m.is_dir() {
+            return Err(bad("config wrong type"));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            if (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                return Err(bad("config reparse point rejected"));
+            }
+        }
+        if m.len() > CONFIG_MAX_BYTES {
+            return Err(bad("config exceeds size cap"));
+        }
+    }
+    let manifest_bytes = man.get("config_bytes");
+    let manifest_sha = man.get("config_sha256");
+    if let (false, true) = (
+        file_exists,
+        manifest_bytes.is_some() || manifest_sha.is_some(),
+    ) {
+        return Err(bad("config metadata without file"));
+    }
+    if let Some(v) = manifest_bytes {
+        let n = v
+            .as_integer()
+            .ok_or_else(|| bad("config_bytes not an integer"))?;
+        if n < 0 {
+            return Err(bad("config_bytes not a nonnegative integer"));
+        }
+        let _ = u64::try_from(n).map_err(|_| bad("config_bytes not a nonnegative integer"))?;
+    }
+    if let Some(v) = manifest_sha {
+        let s = v
+            .as_str()
+            .ok_or_else(|| bad("config_sha256 not a string"))?;
+        if !is_canonical_hex(s, 64) {
+            return Err(bad("config sha256 invalid"));
+        }
+    }
+    if file_exists {
+        let file = fs::File::open(&config_path).map_err(CoreError::Io)?;
+        let mut buf = Vec::new();
+        let n = file
+            .take(CONFIG_MAX_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map_err(CoreError::Io)?;
+        if n as u64 > CONFIG_MAX_BYTES {
+            return Err(bad("config exceeds size cap"));
+        }
+        let text = String::from_utf8(buf.clone()).map_err(|_| bad("config not utf8"))?;
+        toml::from_str::<crate::Config>(&text).map_err(|e| bad(&format!("config invalid: {e}")))?;
+        if let Some(v) = manifest_bytes {
+            let expected = u64::try_from(v.as_integer().unwrap()).unwrap();
+            if expected != buf.len() as u64 {
+                return Err(bad("config size mismatch"));
+            }
+        }
+        if let Some(v) = manifest_sha {
+            let expected = v.as_str().unwrap();
+            if hex_of(&Sha256::digest(&buf)) != expected {
+                return Err(bad("config checksum mismatch"));
+            }
+        }
     }
     Ok(())
 }
@@ -2115,13 +2255,18 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns a backend or I/O error when the backup cannot be written.
+    /// Returns a backend, config, or I/O error when the backup cannot be written.
+    /// A missing `config.toml` is not an error; other config read/type/link/
+    /// parse/bounded size failures are reported before opening `dest`.
+    #[allow(clippy::too_many_lines)]
     pub fn backup_zip(&self, dest: &Path) -> Result<(), CoreError> {
         if let Some(parent) = dest.parent() {
             if !parent.as_os_str().is_empty() {
                 mkdir(parent)?;
             }
         }
+        let profile = self.db_path.parent().unwrap_or_else(|| Path::new("."));
+        let config_data = config_bytes_for_backup(profile)?;
         let tmp = create_private_dir("cm-backup")?;
         let _guard = TmpGuard { path: tmp.clone() };
         let tmp_db = tmp.join("clipstore.sqlite3");
@@ -2179,13 +2324,20 @@ impl Store {
             (clips, referenced, blob_entries, db_bytes)
         };
         let db_sha = hex_of(&Sha256::digest(&db_bytes));
-        let manifest = format!(
+        let mut manifest = format!(
             "schema_version = 1\ncreated_ms = {}\nclips = {clips}\ndb_sha256 = {db_sha:?}\n\
             db_bytes = {}\nblobs = [{}]\n",
             now_ms(),
             db_bytes.len(),
             blob_entries.join(",")
         );
+        if let Some((_, cfg_len, cfg_sha)) = &config_data {
+            use std::fmt::Write as _;
+            let _ = write!(
+                manifest,
+                "config_bytes = {cfg_len}\nconfig_sha256 = {cfg_sha:?}\n"
+            );
+        }
         fs::write(tmp.join("manifest.toml"), manifest).map_err(CoreError::Io)?;
         let file = fs::File::create(dest).map_err(CoreError::Io)?;
         let mut zip = zip::ZipWriter::new(file);
@@ -2203,6 +2355,11 @@ impl Store {
         zip.start_file("clipstore.sqlite3", opts)
             .map_err(|e| zip_err(&e))?;
         zip.write_all(&db_bytes).map_err(CoreError::Io)?;
+        if let Some((cfg_bytes, _, _)) = &config_data {
+            zip.start_file("config.toml", opts)
+                .map_err(|e| zip_err(&e))?;
+            zip.write_all(cfg_bytes).map_err(CoreError::Io)?;
+        }
         for key in &referenced {
             let path = tmp_blobs.join(key);
             zip.start_file(format!("blobs/{key}"), opts)
@@ -2368,6 +2525,7 @@ impl PreparedRestore {
     /// Returns the primary error and the reopened original Store after rollback.
     /// Failed rollback or reopen returns no Store and retains the recovery path.
     #[allow(clippy::result_large_err)]
+    #[allow(clippy::too_many_lines)]
     pub fn install_and_open(mut self) -> Result<Store, RestoreFailure> {
         let had_database = self.profile.join(DB_NAME).is_file();
         let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -2395,12 +2553,77 @@ impl PreparedRestore {
                 moved.push((backup, original));
                 let _ = index;
             }
+            let has_incoming_config = matches!(fs::symlink_metadata(self.incoming.join("config.toml")), Ok(m) if m.is_file());
+            if has_incoming_config {
+                let name = "config.toml";
+                let original = self.profile.join(name);
+                match fs::symlink_metadata(&original) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(CoreError::Io(error)),
+                }
+                if let Ok(m) = fs::symlink_metadata(&original) {
+                    if m.file_type().is_symlink() {
+                        return Err(CoreError::Unsupported {
+                            message: format!(
+                                "managed component is symlink: {}",
+                                original.display()
+                            ),
+                        });
+                    }
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::fs::MetadataExt as _;
+                        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                        if (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                            return Err(CoreError::Unsupported {
+                                message: format!(
+                                    "managed component is reparse point: {}",
+                                    original.display()
+                                ),
+                            });
+                        }
+                    }
+                    if !m.is_file() {
+                        return Err(CoreError::Unsupported {
+                            message: format!(
+                                "wrong managed component type: {}",
+                                original.display()
+                            ),
+                        });
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt as _;
+                        let anchor_dev = fs::metadata(&self.profile).map_err(CoreError::Io)?.dev();
+                        if m.dev() != anchor_dev {
+                            return Err(CoreError::Unsupported {
+                                message: format!(
+                                    "managed component crosses filesystem: {}",
+                                    original.display()
+                                ),
+                            });
+                        }
+                    }
+                    restore_point!(RestoreFault::OldMove(4))?;
+                    let backup = self.old_dir.join(name);
+                    fs::rename(&original, &backup).map_err(CoreError::Io)?;
+                    moved.push((backup, original));
+                }
+            }
             for (index, name) in ["blobs", DB_NAME].iter().enumerate() {
                 restore_point!(RestoreFault::NewMove(index))?;
                 let target = self.profile.join(name);
                 fs::rename(self.incoming.join(name), &target).map_err(CoreError::Io)?;
                 installed.push(target);
                 let _ = index;
+            }
+            if has_incoming_config {
+                let name = "config.toml";
+                restore_point!(RestoreFault::NewMove(2))?;
+                let target = self.profile.join(name);
+                fs::rename(self.incoming.join(name), &target).map_err(CoreError::Io)?;
+                installed.push(target);
             }
             // Opening SQLite can create sidecars even when opening later fails.
             installed.push(self.profile.join("clipstore.sqlite3-wal"));
@@ -2883,6 +3106,7 @@ fn validate_profile(tmp: &Path) -> Result<(), CoreError> {
             return Err(bad("restore blob checksum mismatch"));
         }
     }
+    validate_config_in_profile(tmp, &man)?;
     Ok(())
 }
 

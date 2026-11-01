@@ -1515,6 +1515,21 @@ impl DaemonState {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)]
+    fn publish_config(&self, config: clipmonger_core::Config) {
+        if let Ok(mut slot) = self.config.lock() {
+            *slot = config.clone();
+        }
+        self.set_paste_limits(config.popup.unicode_limit, config.popup.delivery_dwell_ms);
+        self.caps.set_paste_strategy(
+            "windows",
+            match config.popup.delivery {
+                clipmonger_core::PasteDelivery::ClipboardRestore => PasteStrategy::ClipboardRestore,
+                clipmonger_core::PasteDelivery::UnicodeInject => PasteStrategy::UnicodeInject,
+            },
+        );
+    }
+
     /// Current paste delivery budget; delivery is read live from the
     /// stored config so UI changes apply without a restart.
     #[cfg_attr(not(all(windows, feature = "backend-windows")), allow(dead_code))]
@@ -1964,30 +1979,21 @@ impl DaemonState {
             .and_then(Value::as_str)
             .ok_or_else(|| IpcError::new("backend", "config.set: key required".to_string()))?;
         let value = params.get("value").cloned().unwrap_or(Value::Null);
-        let updated = {
-            let mut config = self
+        let candidate = {
+            let current = self
                 .config
                 .lock()
-                .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?;
-            apply_config_key(&mut config, key, &value)
+                .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?
+                .clone();
+            let mut candidate = current;
+            apply_config_key(&mut candidate, key, &value)
                 .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
-
-            config.clone()
+            candidate
         };
-        updated
+        candidate
             .save(&profile.join("config.toml"))
             .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
-        if let Ok(mut cfg) = self.config.lock() {
-            *cfg = updated.clone();
-        }
-        self.set_paste_limits(updated.popup.unicode_limit, updated.popup.delivery_dwell_ms);
-        self.caps.set_paste_strategy(
-            "windows",
-            match updated.popup.delivery {
-                clipmonger_core::PasteDelivery::ClipboardRestore => PasteStrategy::ClipboardRestore,
-                clipmonger_core::PasteDelivery::UnicodeInject => PasteStrategy::UnicodeInject,
-            },
-        );
+        self.publish_config(candidate);
         Ok(serde_json::json!({"ok": true}))
     }
 
@@ -2035,7 +2041,21 @@ impl DaemonState {
         // Prepare before closing Store
         let prepared = Store::prepare_restore(Path::new(src), &profile)
             .map_err(|e| IpcError::new(e.code(), e.to_string()))?;
-        self.install_prepared_restore(prepared)
+        let candidate = if prepared.incoming().join("config.toml").exists() {
+            Some(
+                clipmonger_core::Config::load(&prepared.incoming().join("config.toml"))
+                    .map_err(|e| IpcError::new(e.code(), e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let result = self.install_prepared_restore(prepared);
+        if result.is_ok() {
+            if let Some(cfg) = candidate {
+                self.publish_config(cfg);
+            }
+        }
+        result
     }
 
     fn install_prepared_restore(
