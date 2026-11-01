@@ -107,6 +107,25 @@ pub fn read_rendezvous(profile_dir: &Path) -> Result<(PathBuf, String), CoreErro
 /// literal here so the daemon builds without the backend on non-Windows).
 pub const GESTURE_TTL_MS: i64 = 30_000;
 
+#[derive(Debug)]
+pub enum GestureError {
+    Entropy(clipmonger_core::entropy::Error),
+    Poisoned,
+    Exhausted,
+}
+
+impl std::fmt::Display for GestureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GestureError::Entropy(e) => write!(f, "entropy unavailable: {e}"),
+            GestureError::Poisoned => write!(f, "gesture store poisoned"),
+            GestureError::Exhausted => write!(f, "gesture entropy exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for GestureError {}
+
 /// Append one JSONL audit event to `<profile>/audit.log`.
 ///
 /// Callers pass metadata only (action, op hash, target exe name, ts,
@@ -1271,8 +1290,6 @@ pub struct DaemonState {
     /// Live single-use gesture tokens (hotkey/popup trigger path only):
     /// token -> (minted at, paste target it was minted for).
     gesture_tokens: Mutex<HashMap<u64, (i64, Option<u64>)>>,
-    /// Gesture mint sequence mixed into every token.
-    gesture_counter: Mutex<u64>,
     /// Elevation-refusal latch (caps paste Degraded until restart).
     elevation_refused: Mutex<bool>,
     /// Elevated-helper supervisor (Windows runas thread; idle elsewhere).
@@ -1320,7 +1337,6 @@ impl DaemonState {
             )),
             profile_dir: Mutex::new(PathBuf::new()),
             gesture_tokens: Mutex::new(HashMap::new()),
-            gesture_counter: Mutex::new(0),
             elevation_refused: Mutex::new(false),
             helper: Mutex::new(HelperSupervisor::new()),
             portal_bind_pending: Mutex::new(false),
@@ -1379,26 +1395,46 @@ impl DaemonState {
     /// captured one. HOTKEY/POPUP TRIGGER PATH ONLY: the generic
     /// `paste.execute` IPC arm must never call this (a same-user caller
     /// driving `paste.execute` gets standard-user paste at most).
-    pub fn mint_gesture_token(&self, target: Option<u64>) -> u64 {
+    ///
+    /// # Errors
+    /// Returns an error if entropy or token storage is unavailable, or retries exhaust.
+    pub fn mint_gesture_token(&self, target: Option<u64>) -> Result<u64, GestureError> {
         let at_ms = now_ms();
-        let seq = if let Ok(mut counter) = self.gesture_counter.lock() {
-            *counter = counter.wrapping_add(1);
-            *counter
-        } else {
-            at_ms.cast_unsigned()
-        };
-        let mut token = at_ms
-            .cast_unsigned()
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9));
-        if token == 0 {
-            token = 0x9E37_79B9_7F4A_7C15;
+        self.mint_gesture_token_with(target, at_ms, &mut || {
+            clipmonger_core::entropy::random_u64()
+        })
+    }
+
+    fn mint_gesture_token_with<F>(
+        &self,
+        target: Option<u64>,
+        at_ms: i64,
+        draw: &mut F,
+    ) -> Result<u64, GestureError>
+    where
+        F: FnMut() -> Result<u64, clipmonger_core::entropy::Error>,
+    {
+        let mut tokens = self
+            .gesture_tokens
+            .lock()
+            .map_err(|_| GestureError::Poisoned)?;
+        tokens.retain(|_, (minted, _)| {
+            at_ms
+                .checked_sub(*minted)
+                .is_some_and(|age| (0..=GESTURE_TTL_MS).contains(&age))
+        });
+        for _ in 0..8 {
+            let candidate = draw().map_err(GestureError::Entropy)?;
+            if candidate == 0 {
+                continue;
+            }
+            if tokens.contains_key(&candidate) {
+                continue;
+            }
+            tokens.insert(candidate, (at_ms, target));
+            return Ok(candidate);
         }
-        if let Ok(mut tokens) = self.gesture_tokens.lock() {
-            tokens.retain(|_, (minted, _)| at_ms >= *minted && at_ms - *minted <= GESTURE_TTL_MS);
-            tokens.insert(token, (at_ms, target));
-        }
-        token
+        Err(GestureError::Exhausted)
     }
 
     /// Consume one gesture token: true exactly once while unexpired, and
@@ -1411,8 +1447,9 @@ impl DaemonState {
             .ok()
             .and_then(|mut tokens| tokens.remove(&token));
         minted.is_some_and(|(minted, bound)| {
-            at_ms >= minted
-                && at_ms - minted <= GESTURE_TTL_MS
+            at_ms
+                .checked_sub(minted)
+                .is_some_and(|age| (0..=GESTURE_TTL_MS).contains(&age))
                 && bound.is_none_or(|bound| Some(bound) == target)
         })
     }
@@ -2669,24 +2706,196 @@ mod tests {
             !state.consume_gesture_token(12345, now_ms(), None),
             "an unknown token never spends"
         );
-        let bound = state.mint_gesture_token(Some(0x30838));
+        let bound = state.mint_gesture_token(Some(0x30838)).expect("mint");
         assert!(
             !state.consume_gesture_token(bound, now_ms(), Some(0x99)),
             "a token minted for one window refuses another"
         );
-        let bound = state.mint_gesture_token(Some(0x30838));
+        let bound = state.mint_gesture_token(Some(0x30838)).expect("mint");
         assert!(state.consume_gesture_token(bound, now_ms(), Some(0x30838)));
         assert!(
             !state.consume_gesture_token(bound, now_ms(), Some(0x30838)),
             "single use only"
         );
-        let unbound = state.mint_gesture_token(None);
+        let unbound = state.mint_gesture_token(None).expect("mint");
         assert!(state.consume_gesture_token(unbound, now_ms(), Some(0x77)));
-        let expired = state.mint_gesture_token(None);
+        let expired = state.mint_gesture_token(None).expect("mint");
         assert!(
             !state.consume_gesture_token(expired, now_ms() + super::GESTURE_TTL_MS + 1, None),
             "an expired token never spends"
         );
+    }
+
+    #[test]
+    fn gesture_entropy_failure_leaves_no_entry() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-fail-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        let mut failing = || Err(clipmonger_core::entropy::Error::UNSUPPORTED);
+        assert!(state
+            .mint_gesture_token_with(None, 1000, &mut failing)
+            .is_err());
+        assert!(state.gesture_tokens.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn gesture_zero_then_success_retries() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-zero-ok-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        let mut draws = vec![0u64, 42u64].into_iter();
+        let token = state
+            .mint_gesture_token_with(Some(1), 1000, &mut || {
+                draws
+                    .next()
+                    .ok_or(clipmonger_core::entropy::Error::UNSUPPORTED)
+            })
+            .expect("retry zero");
+        assert_eq!(token, 42);
+        assert!(state.gesture_tokens.lock().unwrap().contains_key(&42));
+    }
+
+    #[test]
+    fn gesture_repeated_zero_exhausts() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-zero-ex-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        let mut calls = 0;
+        let mut draws = || {
+            calls += 1;
+            Ok(0u64)
+        };
+        assert!(state
+            .mint_gesture_token_with(None, 1000, &mut draws)
+            .is_err());
+        assert_eq!(calls, 8);
+        assert!(state.gesture_tokens.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn gesture_collision_then_success_preserves_original() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-coll-ok-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        let first = state
+            .mint_gesture_token_with(Some(10), 1000, &mut || Ok(100))
+            .expect("first");
+        assert_eq!(first, 100);
+        let mut draws = vec![100u64, 200u64].into_iter();
+        let second = state
+            .mint_gesture_token_with(Some(20), 1001, &mut || {
+                draws
+                    .next()
+                    .ok_or(clipmonger_core::entropy::Error::UNSUPPORTED)
+            })
+            .expect("second");
+        assert_eq!(second, 200);
+        let map = state.gesture_tokens.lock().unwrap();
+        assert_eq!(map.get(&100), Some(&(1000, Some(10))));
+        assert_eq!(map.get(&200), Some(&(1001, Some(20))));
+    }
+
+    #[test]
+    fn gesture_collision_exhaustion_leaves_existing_untouched() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-coll-ex-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        state
+            .mint_gesture_token_with(Some(1), 1000, &mut || Ok(55))
+            .expect("first");
+        let mut draws = || Ok(55);
+        assert!(state
+            .mint_gesture_token_with(Some(2), 1001, &mut draws)
+            .is_err());
+        let map = state.gesture_tokens.lock().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&55), Some(&(1000, Some(1))));
+    }
+
+    #[test]
+    fn gesture_collision_then_entropy_failure_no_fallback() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-coll-fail-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        state
+            .mint_gesture_token_with(Some(1), 1000, &mut || Ok(77))
+            .expect("first");
+        let mut calls = 0;
+        let mut draw = || {
+            calls += 1;
+            if calls == 1 {
+                Ok(77)
+            } else {
+                Err(clipmonger_core::entropy::Error::UNSUPPORTED)
+            }
+        };
+        assert!(state
+            .mint_gesture_token_with(Some(2), 1001, &mut draw)
+            .is_err());
+        let map = state.gesture_tokens.lock().unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&77));
+    }
+
+    #[test]
+    fn gesture_poisoned_map_fails_without_authority() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-poison-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = state.gesture_tokens.lock().unwrap();
+            panic!("poison");
+        });
+        let mut draw = || panic!("poisoned map must not draw");
+        assert!(state
+            .mint_gesture_token_with(None, 1000, &mut draw)
+            .is_err());
+        assert!(state.gesture_tokens.is_poisoned());
+    }
+
+    #[test]
+    fn gesture_exact_ttl_and_backward_and_wrong_target_burn() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-ttl-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        let token = state
+            .mint_gesture_token_with(Some(0xAAA), 1000, &mut || Ok(12345))
+            .expect("mint");
+        assert!(state.consume_gesture_token(token, 1000 + super::GESTURE_TTL_MS, Some(0xAAA)));
+        let token2 = state
+            .mint_gesture_token_with(Some(0xBBB), 2000, &mut || Ok(23456))
+            .expect("mint2");
+        assert!(!state.consume_gesture_token(
+            token2,
+            2000 + super::GESTURE_TTL_MS + 1,
+            Some(0xBBB)
+        ));
+        let token3 = state
+            .mint_gesture_token_with(Some(0xCCC), 3000, &mut || Ok(34567))
+            .expect("mint3");
+        assert!(!state.consume_gesture_token(token3, 2999, Some(0xCCC)));
+        let bound = state
+            .mint_gesture_token_with(Some(0x30838), 4000, &mut || Ok(45678))
+            .expect("mint4");
+        assert!(!state.consume_gesture_token(bound, 4001, Some(0x99)));
+        assert!(!state.consume_gesture_token(bound, 4002, Some(0x30838)));
+        let unknown = 99999u64;
+        assert!(!state.consume_gesture_token(unknown, 5000, None));
+        let single = state
+            .mint_gesture_token_with(None, 6000, &mut || Ok(56789))
+            .expect("mint5");
+        assert!(state.consume_gesture_token(single, 6001, None));
+        assert!(!state.consume_gesture_token(single, 6002, None));
+        let extreme = state
+            .mint_gesture_token_with(None, i64::MIN, &mut || Ok(67890))
+            .unwrap();
+        assert!(!state.consume_gesture_token(extreme, i64::MAX, None));
+        state
+            .mint_gesture_token_with(None, i64::MIN, &mut || Ok(78901))
+            .unwrap();
+        assert!(state
+            .mint_gesture_token_with(None, i64::MAX, &mut || Ok(89012))
+            .is_ok());
     }
 
     fn fresh_state(name: &str) -> (std::path::PathBuf, DaemonState) {

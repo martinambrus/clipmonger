@@ -57,12 +57,29 @@ impl DaemonState {
 
     /// Show the popup for `source`; returns whether a running UI got it.
     pub fn trigger_popup(&self, source: PopupSource) -> bool {
+        self.trigger_popup_with(
+            source,
+            Instant::now(),
+            press_target,
+            &mut clipmonger_core::entropy::random_u64,
+        )
+    }
+
+    fn trigger_popup_with<F>(
+        &self,
+        source: PopupSource,
+        now: Instant,
+        capture: impl FnOnce(Option<&SubscriberInfo>) -> (Option<u64>, bool),
+        draw: &mut F,
+    ) -> bool
+    where
+        F: FnMut() -> Result<u64, clipmonger_core::entropy::Error>,
+    {
         let hub = {
             let Ok(mut trigger) = self.popup.lock() else {
                 return false;
             };
             if source == PopupSource::Press {
-                let now = Instant::now();
                 if trigger
                     .last_press
                     .is_some_and(|at| now.duration_since(at) < PRESS_DEBOUNCE)
@@ -78,11 +95,22 @@ impl DaemonState {
         };
         let ui = hub.subscribers(SHOW_POPUP_TOPIC).into_iter().next();
         let (target, toggle) = match source {
-            PopupSource::Press => press_target(ui.as_ref()),
+            PopupSource::Press => capture(ui.as_ref()),
             PopupSource::Request => (None, false),
         };
-        let gesture = (source == PopupSource::Press).then(|| self.mint_gesture_token(target));
+        let gesture = if source == PopupSource::Press && !toggle {
+            let at_ms = crate::now_ms();
+            if let Ok(token) = self.mint_gesture_token_with(target, at_ms, draw) {
+                Some(token)
+            } else {
+                eprintln!("daemon: gesture entropy unavailable");
+                None
+            }
+        } else {
+            None
+        };
         if !toggle {
+            let ui = hub.subscribers(SHOW_POPUP_TOPIC).into_iter().next();
             activate_popup(ui.as_ref());
         }
         let event = ShowPopupEvent {
@@ -279,7 +307,7 @@ fn activate_popup(_ui: Option<&SubscriberInfo>) {}
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use clipmonger_ipc::client::{Client, EventStream};
     use clipmonger_ipc::proto::methods::{ShowPopupEvent, SHOW_POPUP_TOPIC};
@@ -409,6 +437,80 @@ mod tests {
             next_show(stream, Duration::from_millis(300)).is_none(),
             "and no second show follows"
         );
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn popup_entropy_decisions_use_the_production_path() {
+        let (state, sock, _) = served("entropy-decisions").await;
+        let stream = subscribe(&sock);
+        let now = Instant::now();
+        let mut draws = 0;
+        let mut draw = || {
+            draws += 1;
+            Ok(123)
+        };
+        assert!(state.trigger_popup_with(
+            PopupSource::Request,
+            now,
+            |_| panic!("request captures no target"),
+            &mut draw
+        ));
+        let (stream, request) = next_show(stream, Duration::from_secs(2)).expect("request");
+        assert_eq!(
+            (request.gesture, request.target, request.toggle),
+            (None, None, false)
+        );
+        assert!(state.trigger_popup_with(PopupSource::Press, now, |_| (None, true), &mut draw));
+        let (stream, toggle) = next_show(stream, Duration::from_secs(2)).expect("toggle");
+        assert_eq!(
+            (toggle.gesture, toggle.target, toggle.toggle),
+            (None, None, true)
+        );
+        assert!(!state.trigger_popup_with(
+            PopupSource::Press,
+            now,
+            |_| panic!("debounced press captures no target"),
+            &mut draw
+        ));
+        assert_eq!(
+            draws, 0,
+            "requests, toggles and debounced presses draw nothing"
+        );
+        assert!(state.gesture_tokens.lock().unwrap().is_empty());
+        let mut failures = 0;
+        assert!(state.trigger_popup_with(
+            PopupSource::Press,
+            now + PRESS_DEBOUNCE,
+            |_| (Some(0x1234), false),
+            &mut || {
+                failures += 1;
+                Err(clipmonger_core::entropy::Error::UNSUPPORTED)
+            }
+        ));
+        let (stream, failure) =
+            next_show(stream, Duration::from_secs(2)).expect("normal popup on entropy failure");
+        assert_eq!(failures, 1);
+        assert_eq!(
+            (failure.gesture, failure.target, failure.toggle),
+            (None, Some(0x1234), false)
+        );
+        assert!(
+            !*state.elevation_refused.lock().unwrap(),
+            "transient failure never latches refusal"
+        );
+        assert!(state.gesture_tokens.lock().unwrap().is_empty());
+        assert!(state.trigger_popup_with(
+            PopupSource::Press,
+            now + PRESS_DEBOUNCE * 2,
+            |_| (Some(0x5678), false),
+            &mut || Ok(456)
+        ));
+        let (_, success) = next_show(stream, Duration::from_secs(2)).expect("success popup");
+        assert_eq!(
+            (success.gesture, success.target, success.toggle),
+            (Some(456), Some(0x5678), false)
+        );
+        assert!(state.consume_gesture_token(456, crate::now_ms(), Some(0x5678)));
+        assert!(!state.consume_gesture_token(456, crate::now_ms(), Some(0x5678)));
     }
 }
 

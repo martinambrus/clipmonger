@@ -10,7 +10,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::foreground::Integrity;
 
@@ -18,6 +17,23 @@ use crate::foreground::Integrity;
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Gesture-token time to live: 30 000 ms after minting.
 pub const GESTURE_TTL_MS: i64 = 30_000;
+
+#[derive(Debug)]
+pub enum GestureError {
+    Entropy(clipmonger_core::entropy::Error),
+    Exhausted,
+}
+
+impl std::fmt::Display for GestureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GestureError::Entropy(e) => write!(f, "entropy unavailable: {e}"),
+            GestureError::Exhausted => write!(f, "gesture entropy exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for GestureError {}
 /// Heartbeat deadline: 3 missed 15 s beats (45 s) since the last beat.
 pub const HEARTBEAT_DEAD_AFTER_MS: i64 = 45_000;
 
@@ -129,8 +145,6 @@ pub fn decode_job(line: &str) -> Result<Job, JobCodecError> {
 pub struct GestureTokens {
     /// Live token to mint time (`at_ms`).
     issued: HashMap<u64, i64>,
-    /// Mint sequence mixed into every token.
-    counter: u64,
 }
 
 impl GestureTokens {
@@ -139,20 +153,33 @@ impl GestureTokens {
     pub fn new() -> Self {
         Self {
             issued: HashMap::new(),
-            counter: 0,
         }
     }
 
     /// Mint one fresh token at `at_ms`.
-    pub fn mint(&mut self, at_ms: i64) -> u64 {
-        self.counter = self.counter.wrapping_add(1);
-        let mut token = mix_token(at_ms, self.counter);
-        while token == 0 || self.issued.contains_key(&token) {
-            self.counter = self.counter.wrapping_add(1);
-            token = mix_token(at_ms, self.counter);
+    ///
+    /// # Errors
+    /// Returns an error if entropy or token storage is unavailable, or retries exhaust.
+    pub fn mint(&mut self, at_ms: i64) -> Result<u64, GestureError> {
+        self.mint_with(at_ms, &mut clipmonger_core::entropy::random_u64)
+    }
+
+    fn mint_with<F>(&mut self, at_ms: i64, draw: &mut F) -> Result<u64, GestureError>
+    where
+        F: FnMut() -> Result<u64, clipmonger_core::entropy::Error>,
+    {
+        for _ in 0..8 {
+            let candidate = draw().map_err(GestureError::Entropy)?;
+            if candidate == 0 {
+                continue;
+            }
+            if self.issued.contains_key(&candidate) {
+                continue;
+            }
+            self.issued.insert(candidate, at_ms);
+            return Ok(candidate);
         }
-        self.issued.insert(token, at_ms);
-        token
+        Err(GestureError::Exhausted)
     }
 
     /// Consume `token` at `at_ms`: true exactly once while unexpired.
@@ -161,7 +188,9 @@ impl GestureTokens {
         let Some(minted) = self.issued.remove(&token) else {
             return false;
         };
-        at_ms >= minted && at_ms - minted <= GESTURE_TTL_MS
+        at_ms
+            .checked_sub(minted)
+            .is_some_and(|age| (0..=GESTURE_TTL_MS).contains(&age))
     }
 }
 
@@ -169,27 +198,6 @@ impl Default for GestureTokens {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Extra per-process entropy mixed into every token.
-static MIX_EXTRA: AtomicU64 = AtomicU64::new(0xC2B2_AE35_4D1B_9E59);
-
-/// Mix `at_ms`, a sequence number, and process entropy into a token.
-fn mix_token(at_ms: i64, counter: u64) -> u64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
-    let mut x = at_ms
-        .cast_unsigned()
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(counter.wrapping_mul(0xBF58_476D_1CE4_E5B9))
-        .wrapping_add(nanos ^ (u64::from(std::process::id()) << 32));
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^= x >> 31;
-    x.wrapping_add(MIX_EXTRA.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Protected-install-path predicate (T-414): true iff `exe` sits under the
@@ -295,26 +303,13 @@ pub fn decide_route(integrity: Integrity, portable: bool, protected_ok: bool) ->
 
 /// Random 128-bit rendezvous segment (hex) for the helper pipe name.
 /// Unguessable rendezvous, never a credential; no secret travels in argv.
-#[must_use]
-pub fn random_pipe_segment() -> String {
-    #[cfg(windows)]
-    {
-        crate::sys::random_pipe_segment()
-    }
-    #[cfg(not(windows))]
-    {
-        if let Ok(raw) = std::fs::read_to_string("/proc/sys/kernel/random/uuid") {
-            let compact: String = raw.chars().filter(char::is_ascii_hexdigit).collect();
-            if compact.len() >= 32 {
-                return compact[..32].to_string();
-            }
-        }
-        format!(
-            "{:016x}{:016x}",
-            mix_token(0, 1),
-            mix_token(nanos_now().cast_signed(), 2)
-        )
-    }
+///
+/// # Errors
+/// Returns an error when operating system entropy is unavailable.
+pub fn random_pipe_segment() -> Result<String, clipmonger_core::entropy::Error> {
+    let a = clipmonger_core::entropy::random_u64()?;
+    let b = clipmonger_core::entropy::random_u64()?;
+    Ok(format!("{a:016x}{b:016x}"))
 }
 
 /// Quote one command-line argument for the standard Windows argv parser.
@@ -330,13 +325,6 @@ pub fn quote_arg(value: &str) -> String {
 pub fn persistent_pipe_name(profile: &std::path::Path) -> String {
     let hash = clipmonger_core::hash::fnv1a64(profile.to_string_lossy().as_bytes());
     format!(r"\\.\pipe\clipmonger-persist-{hash:016x}")
-}
-
-#[cfg(not(windows))]
-fn nanos_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
 // ---------------------------------------------------------------------------
@@ -513,5 +501,120 @@ mod tests {
         assert!(!job_expired(Some(1_000), 999));
         assert!(!job_expired(Some(1_000), 1_000));
         assert!(job_expired(Some(1_000), 1_001));
+    }
+}
+
+#[cfg(test)]
+mod gesture_entropy_tests {
+    use super::*;
+
+    #[test]
+    fn t413_unit_token_entropy_failure_leaves_no_entry() {
+        const T: &str = "t413_unit_token_entropy_failure_leaves_no_entry";
+        let mut tokens = GestureTokens::new();
+        let mut failing = || Err(clipmonger_core::entropy::Error::UNSUPPORTED);
+        assert!(
+            tokens.mint_with(1000, &mut failing).is_err(),
+            "{T}: must fail"
+        );
+        assert!(tokens.issued.is_empty(), "{T}: no entry on failure");
+    }
+
+    #[test]
+    fn t413_unit_token_zero_then_success() {
+        const T: &str = "t413_unit_token_zero_then_success";
+        let mut tokens = GestureTokens::new();
+        let mut draws = vec![0u64, 42u64].into_iter();
+        let tok = tokens
+            .mint_with(1000, &mut || {
+                draws
+                    .next()
+                    .ok_or(clipmonger_core::entropy::Error::UNSUPPORTED)
+            })
+            .expect("mint");
+        assert_eq!(tok, 42, "{T}: zero retry");
+    }
+
+    #[test]
+    fn t413_unit_token_zero_exhaustion() {
+        const T: &str = "t413_unit_token_zero_exhaustion";
+        let mut tokens = GestureTokens::new();
+        let mut calls = 0;
+        let mut draws = || {
+            calls += 1;
+            Ok(0u64)
+        };
+        assert!(
+            tokens.mint_with(1000, &mut draws).is_err(),
+            "{T}: zero exhaustion must fail"
+        );
+        assert_eq!(calls, 8);
+        assert!(tokens.issued.is_empty());
+    }
+
+    #[test]
+    fn t413_unit_token_collision_then_success_preserves_original() {
+        const T: &str = "t413_unit_token_collision_then_success_preserves_original";
+        let mut tokens = GestureTokens::new();
+        let first = tokens.mint_with(1000, &mut || Ok(100)).expect("first");
+        assert_eq!(first, 100);
+        let mut draws = vec![100u64, 200u64].into_iter();
+        let second = tokens
+            .mint_with(1001, &mut || {
+                draws
+                    .next()
+                    .ok_or(clipmonger_core::entropy::Error::UNSUPPORTED)
+            })
+            .expect("second");
+        assert_eq!(second, 200);
+        assert_eq!(tokens.issued.get(&100), Some(&1000));
+        assert_eq!(tokens.issued.get(&200), Some(&1001));
+        assert!(tokens.consume(100, 1001), "{T}: first still valid");
+        assert!(tokens.consume(200, 1002), "{T}: second valid");
+    }
+
+    #[test]
+    fn t413_unit_token_collision_exhaustion_leaves_existing() {
+        const T: &str = "t413_unit_token_collision_exhaustion_leaves_existing";
+        let mut tokens = GestureTokens::new();
+        tokens.mint_with(1000, &mut || Ok(55)).expect("first");
+        let mut draws = || Ok(55);
+        assert!(
+            tokens.mint_with(1001, &mut draws).is_err(),
+            "{T}: must fail"
+        );
+        assert!(tokens.consume(55, 1001), "{T}: first still present");
+        assert!(!tokens.consume(55, 1002), "{T}: consumed once");
+    }
+
+    #[test]
+    fn t413_unit_token_collision_then_entropy_failure_no_fallback() {
+        const T: &str = "t413_unit_token_collision_then_entropy_failure_no_fallback";
+        let mut tokens = GestureTokens::new();
+        tokens.mint_with(1000, &mut || Ok(77)).expect("first");
+        let mut calls = 0;
+        let mut draw = || {
+            calls += 1;
+            if calls == 1 {
+                Ok(77)
+            } else {
+                Err(clipmonger_core::entropy::Error::UNSUPPORTED)
+            }
+        };
+        assert!(
+            tokens.mint_with(1001, &mut draw).is_err(),
+            "{T}: must fail closed"
+        );
+        assert!(tokens.consume(77, 1002), "{T}: original still present");
+    }
+
+    #[test]
+    fn backwards_and_extreme_time_burn_tokens() {
+        let mut tokens = GestureTokens::new();
+        let token = tokens.mint_with(1000, &mut || Ok(1)).unwrap();
+        assert!(!tokens.consume(token, 999));
+        assert!(!tokens.consume(token, 1000));
+        let token = tokens.mint_with(i64::MIN, &mut || Ok(2)).unwrap();
+        assert!(!tokens.consume(token, i64::MAX));
     }
 }

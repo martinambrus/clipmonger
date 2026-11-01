@@ -22,6 +22,7 @@ wl-clipboard-rs = "0.9"
 wayland-client = "0.31"
 clap = { version = "4.6", features = ["derive"] }
 zip = { version = "9.2", default-features = false, features = ["deflate"] }
+getrandom = { version = "=0.4.3" }
 
 [profile.release]
 lto = "thin"

@@ -2,6 +2,7 @@
 //! No tokio in this crate (seg-02 S8).
 
 pub mod config;
+pub mod entropy;
 pub mod error;
 pub mod hash;
 pub mod model;
