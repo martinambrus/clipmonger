@@ -227,10 +227,10 @@ async fn wpipe_second_bind_fails() {
     let first = bind_pipe_server(&name, TEST_TOKEN);
     // The first server must stay alive so the name is still taken.
     std::mem::forget(first);
-    match Server::bind_pipe(&name, TEST_TOKEN.to_string(), echo_handler()) {
-        Ok(_) => panic!("second bind on the same pipe name must fail"),
-        Err(_) => {}
-    }
+    assert!(
+        Server::bind_pipe(&name, TEST_TOKEN.to_string(), echo_handler()).is_err(),
+        "second bind on the same pipe name must fail"
+    );
 }
 
 #[cfg(feature = "server")]

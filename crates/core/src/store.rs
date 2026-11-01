@@ -1515,8 +1515,10 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Unsupported`] for traversal, symlink, or oversize
-    /// entries, [`CoreError::Config`] for bad manifests, or
+    /// Returns [`CoreError::Unsupported`] for traversal, absolute or
+    /// drive-prefixed names, symlinks, or entries whose declared size is over
+    /// the cap, [`CoreError::Io`] when entry data exceeds its declared size,
+    /// [`CoreError::Config`] for bad manifests, or
     /// [`CoreError::Corrupt`] when the embedded DB fails validation.
     pub fn restore_zip(src: &Path, profile: &Path) -> Result<(), CoreError> {
         let tag = TMP_CTR.fetch_add(1, Ordering::SeqCst);
@@ -1760,7 +1762,7 @@ fn enforce_bytes(tx: &rusqlite::Transaction<'_>, blobs: &Path, max: u64) -> Resu
     Ok(purged)
 }
 
-/// Reject symlinks via Unix mode bits (portable across `zip` versions).
+/// Reject symlinks via file type bits 0o12 in the Unix mode `zip` reports.
 fn is_symlink_entry<R: std::io::Read + std::io::Seek>(e: &zip::read::ZipFile<'_, R>) -> bool {
     e.unix_mode().is_some_and(|m| m >> 12 == 0o12)
 }
@@ -1787,10 +1789,17 @@ fn unsupported(msg: &str) -> CoreError {
 fn extract_zip(src: &Path, tmp: &Path) -> Result<(), CoreError> {
     let file = fs::File::open(src).map_err(CoreError::Io)?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| zip_err(&e))?;
-    let mut names: Vec<String> = Vec::with_capacity(zip.len());
+    let mut indices = Vec::with_capacity(zip.len());
     let mut total = 0_u64;
     for i in 0..zip.len() {
         let e = zip.by_index(i).map_err(|e| zip_err(&e))?;
+        let name = e.name().map_err(|e| zip_err(&e))?;
+        let bytes = name.as_bytes();
+        if name.starts_with(['/', '\\'])
+            || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        {
+            return Err(unsupported("zip absolute or drive-prefixed entry rejected"));
+        }
         e.enclosed_name()
             .ok_or_else(|| unsupported("zip entry escapes target directory"))?;
         if is_symlink_entry(&e) {
@@ -1804,11 +1813,11 @@ fn extract_zip(src: &Path, tmp: &Path) -> Result<(), CoreError> {
             if total > RESTORE_MAX_TOTAL {
                 return Err(unsupported("zip archive exceeds size cap"));
             }
-            names.push(e.name().to_string());
+            indices.push(i);
         }
     }
-    for name in &names {
-        let mut e = zip.by_name(name).map_err(|e| zip_err(&e))?;
+    for i in indices {
+        let mut e = zip.by_index(i).map_err(|e| zip_err(&e))?;
         let out = tmp.join(
             e.enclosed_name()
                 .ok_or_else(|| unsupported("zip entry escapes target directory"))?,

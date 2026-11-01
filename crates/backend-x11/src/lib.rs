@@ -50,7 +50,7 @@ pub fn caps(display: Option<&str>) -> clipmonger_platform::types::BackendCaps {
     #[cfg(not(unix))]
     {
         let _ = display;
-        return caps::caps_for(false, false);
+        caps::caps_for(false, false)
     }
     #[cfg(unix)]
     {

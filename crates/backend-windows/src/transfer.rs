@@ -155,9 +155,7 @@ pub(crate) mod imp {
     /// Canonical MIME for a clipboard format id, or `None` to skip it.
     pub(crate) fn mime_for_id(id: u32) -> Option<String> {
         match id {
-            CF_UNICODETEXT => Some("text/plain".to_string()),
-            CF_TEXT => Some("text/plain".to_string()),
-            CF_OEMTEXT => Some("text/plain".to_string()),
+            CF_UNICODETEXT | CF_TEXT | CF_OEMTEXT => Some("text/plain".to_string()),
             CF_DIB | CF_DIBV5 => Some("image/png".to_string()),
             CF_HDROP => Some("text/uri-list".to_string()),
             _ => {

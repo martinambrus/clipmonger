@@ -3,6 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/platform", "crates/ipc", "crates/daemon", "crates/app-cli", "crates/app-ui", "crates/backend-windows", "crates/backend-x11", "crates/backend-wayland"]
 
 [workspace.package]
+publish = false
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
@@ -20,7 +21,7 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "sign
 wl-clipboard-rs = "0.9"
 wayland-client = "0.31"
 clap = { version = "4.6", features = ["derive"] }
-zip = { version = "4", default-features = false, features = ["deflate"] }
+zip = { version = "9.2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = "thin"
