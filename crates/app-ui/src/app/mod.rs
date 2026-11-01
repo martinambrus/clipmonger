@@ -391,13 +391,17 @@ impl PopupApp {
                 self.send(UiCmd::PermGroups);
             }
             UiEvent::BackupDone(path) => {
-                if let Ok(mut config) = self.config.lock() {
-                    config.error = format!("{} {path}", strings::text("config.backup_saved"));
+                if self.shell.desired().settings_open {
+                    if let Ok(mut config) = self.config.lock() {
+                        config.error = format!("{} {path}", strings::text("config.backup_saved"));
+                    }
                 }
             }
             UiEvent::RestoreDone => {
-                if let Ok(mut config) = self.config.lock() {
-                    config.error = strings::text("config.restore_done").to_string();
+                if self.shell.desired().settings_open {
+                    if let Ok(mut config) = self.config.lock() {
+                        config.error = strings::text("config.restore_done").to_string();
+                    }
                 }
                 self.send(UiCmd::ListHistory);
             }
@@ -407,8 +411,12 @@ impl PopupApp {
                 }
             }
             UiEvent::ConfigError(message) => {
-                if let Ok(mut config) = self.config.lock() {
-                    config.error = message;
+                if self.shell.desired().settings_open {
+                    if let Ok(mut config) = self.config.lock() {
+                        config.error = message;
+                    }
+                } else {
+                    self.feed(Event::Bridge(UiEvent::Error(message)));
                 }
             }
             UiEvent::MonitorPaused(paused) => {
@@ -443,7 +451,7 @@ impl PopupApp {
             UiEvent::Error(message) => {
                 let settings_open = self.shell.desired().settings_open;
                 let routed = self.config.lock().is_ok_and(|mut config| {
-                    let routed = settings_open || !config.pending_apply.is_empty();
+                    let routed = settings_open;
                     if routed {
                         config.error.clone_from(&message);
                         config.pending_apply.clear();
@@ -705,6 +713,7 @@ impl runner::App for PopupApp {
                     self.feed(Event::SettingsClose);
                     if let Ok(mut config) = self.config.lock() {
                         config.error.clear();
+                        config.pending_apply.clear();
                     }
                 }
             }
