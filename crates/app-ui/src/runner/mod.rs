@@ -63,7 +63,7 @@ pub trait App {
         false
     }
 
-    /// Whether a configured list action overrides a native clipboard shortcut.
+    /// Whether a configured action owns native shortcut input and its text side effects.
     fn native_key_override(
         &self,
         _kind: WindowKind,
@@ -286,7 +286,18 @@ impl NativeInput {
     }
 
     fn clipboard_key(&self, key: &winit::keyboard::Key, pressed: bool) -> Option<egui::Key> {
-        if !pressed || !self.modifiers.command_only() {
+        if !pressed {
+            return None;
+        }
+        // Alt/Option can produce printable Text even when the key owns a command.
+        // The caller's exact binding check preserves all unbound text input.
+        if self.modifiers.alt {
+            return match key.as_ref() {
+                winit::keyboard::Key::Character(text) => egui::Key::from_name(text),
+                _ => None,
+            };
+        }
+        if !self.modifiers.command_only() {
             return None;
         }
         match key.as_ref() {
@@ -943,10 +954,25 @@ mod native_input_tests {
     }
 
     fn shortcut_app() -> (crate::app::PopupApp, Context) {
+        let (app, ctx, _) = shortcut_app_with_keys(
+            &serde_json::json!({"navigate_down":"super+j", "end":"ctrl+c", "home":"ctrl+x", "page_down":"ctrl+v"}),
+            false,
+        );
+        (app, ctx)
+    }
+
+    fn shortcut_app_with_keys(
+        keys: &serde_json::Value,
+        permanent: bool,
+    ) -> (
+        crate::app::PopupApp,
+        Context,
+        std::sync::mpsc::Receiver<crate::ipc_bridge::UiCmd>,
+    ) {
         use crate::app::{AppParts, PopupApp};
         use crate::ipc_bridge::{UiCmd, UiEvent};
         use serde_json::json;
-        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel::<UiCmd>();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<UiCmd>();
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let mut app = PopupApp::new(AppParts {
             profile: std::path::PathBuf::from("native-input-fixture"),
@@ -960,17 +986,31 @@ mod native_input_tests {
             allow_foreground: Box::new(|| {}),
         });
         event_tx
-            .send(UiEvent::Config(
-                json!({"config":{"popup":{"keys":{"navigate_down":"super+j", "end":"ctrl+c", "home":"ctrl+x", "page_down":"ctrl+v"}}}}),
-            ))
+            .send(UiEvent::Config(json!({"config":{"popup":{"keys":keys}}})))
             .expect("config");
         app.vm_mut().set_clips((1..=3).map(|n| serde_json::from_value(json!({
             "id":uuid::Uuid::from_u128(n), "created_ms":1, "source_os":"linux", "preview":"row", "pinned":false,
             "rev":{"wall_ms":1,"dev":"fixture"}
         })).expect("clip")).collect());
+        if permanent {
+            event_tx
+                .send(UiEvent::PermGroups(
+                    json!({"groups":[{"name":"Work","system":false,"count":3}]}),
+                ))
+                .expect("groups");
+            event_tx.send(UiEvent::Permanents(json!({"permanents":(1..=3).map(|n| json!({
+                "id":uuid::Uuid::from_u128(1000+n), "group":"Work", "name":format!("row {n}"), "kind":"Paste", "body":"row body", "hotkey":null, "js":null, "rev":{"wall_ms":1,"dev":"fixture","ctr":0}
+            })).collect::<Vec<_>>()}))).expect("permanents");
+        }
         let ctx = new_context();
         frame(&mut app, &ctx, RawInput::default());
-        (app, ctx)
+        if permanent {
+            app.config().lock().expect("config").perm_source = Some(0);
+            app.vm_mut().selected = 2;
+            frame(&mut app, &ctx, RawInput::default());
+        }
+        let _ = cmd_rx.try_iter().collect::<Vec<_>>();
+        (app, ctx, cmd_rx)
     }
 
     fn frame(app: &mut crate::app::PopupApp, ctx: &Context, input: RawInput) {
@@ -1162,6 +1202,156 @@ mod native_input_tests {
             "same-batch list click must honor configured copy chord"
         );
         assert_eq!(app.vm().query, "");
+    }
+
+    fn alt_shortcut_control(permanent: bool) {
+        use crate::ipc_bridge::UiCmd;
+
+        let (mut app, ctx, commands) =
+            shortcut_app_with_keys(&serde_json::json!({"navigate_down":"alt+j"}), permanent);
+        assert!(ctx.text_edit_focused());
+        let mut adapter = NativeInput::default();
+        adapter.observe(
+            &WindowEvent::ModifiersChanged(ModifiersState::ALT.into()),
+            false,
+        );
+        let native_j = winit::keyboard::Key::Character("j".into());
+        let owned = adapter.clipboard_override(&app, WindowKind::Popup, &native_j, true);
+        let mut input = RawInput::default();
+        let start = input.events.len();
+        input.events.extend([
+            key(true, egui::Modifiers::ALT),
+            egui::Event::Text("j".into()),
+        ]);
+        adapter.finish(&mut input, start, owned);
+        adapter.observe(
+            &WindowEvent::ModifiersChanged(ModifiersState::empty().into()),
+            false,
+        );
+        let start = input.events.len();
+        input.events.extend([
+            key(false, egui::Modifiers::NONE),
+            egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+        ]);
+        adapter.finish(&mut input, start, None);
+        frame(&mut app, &ctx, input);
+        assert_eq!(
+            app.vm().query,
+            "",
+            "configured Alt+J must not type its native text"
+        );
+        if permanent {
+            assert_eq!(app.config().lock().expect("config").perm_vm.selected, 1);
+            assert_eq!(
+                app.vm().selected,
+                2,
+                "permanent navigation must preserve hidden history"
+            );
+            assert_eq!(app.vm().clips().len(), 3);
+        } else {
+            assert_eq!(app.vm().selected, 1, "one key press must navigate once");
+        }
+        frame(
+            &mut app,
+            &ctx,
+            RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..RawInput::default()
+            },
+        );
+        assert!(!app.desired().popup_open);
+        app.logic(&ctx, WindowKind::Popup);
+        std::thread::sleep(Duration::from_millis(170));
+        app.logic(&ctx, WindowKind::Popup);
+        let picked = commands.try_iter().collect::<Vec<_>>();
+        if permanent {
+            assert_eq!(
+                picked,
+                vec![UiCmd::ExecPermanent(uuid::Uuid::from_u128(1002))]
+            );
+        } else {
+            assert!(
+                matches!(picked.as_slice(),[UiCmd::PasteClipTo(id,..)] if *id == uuid::Uuid::from_u128(2)),
+                "{picked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_input_alt_shortcut_history_pick_uses_unchanged_query() {
+        alt_shortcut_control(false);
+    }
+
+    #[test]
+    fn native_input_alt_shortcut_permanent_pick_preserves_hidden_history() {
+        alt_shortcut_control(true);
+    }
+
+    #[test]
+    fn native_input_alt_shortcut_preserves_other_native_text_in_batch() {
+        let (mut app, ctx, _) =
+            shortcut_app_with_keys(&serde_json::json!({"navigate_down":"alt+j"}), false);
+        let mut adapter = NativeInput::default();
+        adapter.observe(
+            &WindowEvent::ModifiersChanged(ModifiersState::ALT.into()),
+            false,
+        );
+        let owned = adapter.clipboard_override(
+            &app,
+            WindowKind::Popup,
+            &winit::keyboard::Key::Character("j".into()),
+            true,
+        );
+        let mut input = RawInput {
+            events: vec![
+                egui::Event::Text("before".into()),
+                key(true, egui::Modifiers::ALT),
+                egui::Event::Text("j".into()),
+            ],
+            ..RawInput::default()
+        };
+        adapter.finish(&mut input, 1, owned);
+        let start = input.events.len();
+        input.events.push(egui::Event::Text("after".into()));
+        adapter.finish(&mut input, start, None);
+        frame(&mut app, &ctx, input);
+        assert_eq!(
+            app.vm().query,
+            "beforeafter",
+            "only the owned native key's appended text may be suppressed"
+        );
+    }
+
+    #[test]
+    fn native_input_unmatched_alt_and_option_text_remains_editable() {
+        for (is_mac, text) in [(false, "j"), (true, "ø")] {
+            let (mut app, ctx) = shortcut_app();
+            let mut adapter = NativeInput::default();
+            adapter.observe(
+                &WindowEvent::ModifiersChanged(ModifiersState::ALT.into()),
+                is_mac,
+            );
+            let native = winit::keyboard::Key::Character(text.into());
+            let owned = adapter.clipboard_override(&app, WindowKind::Popup, &native, true);
+            assert_eq!(owned, None, "unbound Alt/Option is ordinary text input");
+            let mut input = RawInput {
+                events: vec![
+                    key(true, egui::Modifiers::ALT),
+                    egui::Event::Text(text.into()),
+                ],
+                ..RawInput::default()
+            };
+            adapter.finish(&mut input, 0, owned);
+            frame(&mut app, &ctx, input);
+            assert_eq!(app.vm().query, text);
+            assert!(app.desired().popup_open);
+        }
     }
 
     #[test]
