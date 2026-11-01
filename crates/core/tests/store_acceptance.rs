@@ -183,6 +183,53 @@ fn t302_schema_reopen_preserves_rows() {
     assert_eq!(corrupt_asides(&profile), [] as [PathBuf; 0]);
 }
 
+// Rollback journals require an exclusive lock to block both writable and
+// recovery header reads. WAL readers would be the wrong fixture here.
+fn opening_exclusive_lock_control(read_only: bool) {
+    let profile = unique_dir("open-exclusive");
+    let sentinel = sample_clip(Uuid::now_v7(), "sentinel", "sentinel", 17);
+    let store = Store::open(&profile).unwrap();
+    store
+        .insert_clip(&sentinel, &text_payloads("sentinel"))
+        .unwrap();
+    drop(store);
+    let blocker = rusqlite::Connection::open(db_path(&profile)).unwrap();
+    let mode: String = blocker
+        .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    assert_eq!(pragma_user_version(&db_path(&profile)), 1);
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let result = if read_only {
+        Store::open_readonly_recovery(&profile)
+    } else {
+        Store::open(&profile)
+    };
+    blocker.execute_batch("ROLLBACK").unwrap();
+    eprintln!(
+        "exclusive recovery={read_only}: {result:?}; asides={:?}",
+        corrupt_asides(&profile)
+    );
+    assert!(
+        matches!(result, Err(CoreError::Backend { .. })),
+        "must preserve operational contention: {result:?}"
+    );
+    assert_eq!(corrupt_asides(&profile), [] as [PathBuf; 0]);
+    let reopened = Store::open(&profile).unwrap();
+    assert_eq!(history_ids(&reopened), vec![sentinel.id]);
+    assert_eq!(corrupt_asides(&profile), [] as [PathBuf; 0]);
+}
+
+#[test]
+fn opening_exclusive_writable_is_operational() {
+    opening_exclusive_lock_control(false);
+}
+
+#[test]
+fn opening_exclusive_recovery_is_operational() {
+    opening_exclusive_lock_control(true);
+}
+
 // ---- T-303: open-path matrix + integrity ----
 
 #[test]
