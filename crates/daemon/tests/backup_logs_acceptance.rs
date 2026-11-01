@@ -114,6 +114,15 @@ fn backup_create_restore_roundtrip_serves_restored_clips() {
         !texts.iter().any(|t| t == "post backup clip"),
         "pre-restore clip must be gone after restore, got {texts:?}"
     );
+    seed_text(&state, "capture after restore");
+    assert!(history_texts(&state)
+        .iter()
+        .any(|text| text == "capture after restore"));
+    drop(state);
+    let reopened = DaemonState::new(Store::open(&dir).unwrap());
+    assert!(history_texts(&reopened)
+        .iter()
+        .any(|text| text == "capture after restore"));
 }
 
 // Bad restore source: typed error, daemon keeps serving the old DB.
