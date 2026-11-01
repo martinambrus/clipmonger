@@ -8,10 +8,8 @@
 //! mirroring the sibling backends (the trait carries only `ClipRef`, never
 //! payload bytes).
 
-use clipmonger_platform::traits::{ClipboardTransfer as _, PasteEngine};
-use clipmonger_platform::types::{
-    Affinity, ClipRef, Error, PasteStrategy, PasteTarget, PayloadMap, Result,
-};
+use clipmonger_platform::traits::PasteEngine;
+use clipmonger_platform::types::{Affinity, ClipRef, Error, PasteStrategy, PasteTarget, Result};
 
 use crate::paste_logic::PRESS_CTRL_V_TOAST_ID;
 use crate::transfer::WlTransfer;
@@ -46,7 +44,7 @@ impl WlPaste {
     ///
     /// Returns [`Error::Unavailable`] without a data-control write path
     /// (WSLg-style sessions) or when the write itself fails.
-    pub fn paste_payloads(&self, payloads: &PayloadMap) -> Result<PasteOutcome> {
+    pub fn paste_payloads(&self, payloads: &[(String, Vec<u8>)]) -> Result<PasteOutcome> {
         if !self.write_available {
             return Err(Error::Unavailable(
                 "wayland paste unavailable: no data-control write path".to_string(),

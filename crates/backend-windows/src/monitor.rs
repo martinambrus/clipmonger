@@ -13,9 +13,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use clipmonger_platform::traits::ClipboardMonitor;
-use clipmonger_platform::types::{Affinity, CaptureEvent, Error, Result, SubscribeKind};
 #[cfg(windows)]
-use clipmonger_platform::types::{CaptureOrigin, FormatOffer};
+use clipmonger_platform::types::CaptureOrigin;
+use clipmonger_platform::types::{
+    Affinity, CaptureEvent, Error, FormatOffer, Result, SubscribeKind,
+};
 
 /// Session clipboard monitor.
 pub struct WinMonitor {
@@ -136,9 +138,24 @@ fn current_event() -> Result<CaptureEvent> {
     })
 }
 
+#[allow(dead_code)]
+fn fingerprint_parts(text: Option<&[u8]>, offers: &[FormatOffer]) -> String {
+    let mut hash = clipmonger_core::hash::FNV_OFFSET_BASIS;
+    if let Some(bytes) = text {
+        hash = clipmonger_core::hash::fnv1a64_update(hash, bytes);
+        for o in offers {
+            hash = clipmonger_core::hash::fnv1a64_update(hash, o.mime.as_bytes());
+        }
+        return format!("{hash:x}:{}", bytes.len());
+    }
+    for o in offers {
+        hash = clipmonger_core::hash::fnv1a64_update(hash, o.mime.as_bytes());
+    }
+    format!("{hash:x}")
+}
+
 #[cfg(windows)]
 fn content_fingerprint(event: &CaptureEvent) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let read_bytes: Result<Vec<u8>> = crate::transfer::imp::with_open("fingerprint", || {
         let mut out = Vec::new();
         if clipboard_win::raw::get_string(&mut out).is_ok() && !out.is_empty() {
@@ -158,26 +175,10 @@ fn content_fingerprint(event: &CaptureEvent) -> String {
         }
         Err(Error::Unavailable("no text".to_string()))
     });
-    if let Ok(bytes) = read_bytes {
-        for b in &bytes {
-            hash ^= u64::from(*b);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
-        }
-        for o in &event.offers {
-            for b in o.mime.as_bytes() {
-                hash ^= u64::from(*b);
-                hash = hash.wrapping_mul(0x0100_0000_01b3);
-            }
-        }
-        return format!("{:x}:{}", hash, bytes.len());
+    match read_bytes {
+        Ok(bytes) => fingerprint_parts(Some(&bytes), &event.offers),
+        Err(_) => fingerprint_parts(None, &event.offers),
     }
-    for o in &event.offers {
-        for b in o.mime.as_bytes() {
-            hash ^= u64::from(*b);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
-        }
-    }
-    format!("{hash:x}")
 }
 
 impl ClipboardMonitor for WinMonitor {
@@ -291,5 +292,77 @@ impl ClipboardMonitor for WinMonitor {
                 "clipboard monitor needs a Windows session".to_string(),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fingerprint_parts;
+    use clipmonger_platform::types::FormatOffer;
+
+    fn offer(mime: &str) -> FormatOffer {
+        FormatOffer {
+            mime: mime.to_string(),
+            bytes_hint: None,
+        }
+    }
+
+    #[test]
+    fn fingerprint_empty_no_text_no_offers_is_offset_basis_unpadded() {
+        assert_eq!(fingerprint_parts(None, &[]), "cbf29ce484222325");
+    }
+
+    #[test]
+    fn fingerprint_text_only_orders_and_lengths() {
+        assert_eq!(
+            fingerprint_parts(Some(b"hello"), &[]),
+            format!("{:x}:5", clipmonger_core::hash::fnv1a64(b"hello"))
+        );
+        assert_eq!(fingerprint_parts(Some(b"a"), &[]), "af63dc4c8601ec8c:1");
+        assert_eq!(fingerprint_parts(Some(b"fo"), &[]), "8985907b541d342:2");
+        assert!(
+            !fingerprint_parts(Some(b"fo"), &[]).starts_with('0'),
+            "monitor must use unpadded hex, fo proves no leading zero"
+        );
+    }
+
+    #[test]
+    fn fingerprint_with_offers_hashes_text_then_mimes_in_order() {
+        let text = b"hello";
+        let offers = [offer("text/plain"), offer("text/html")];
+        let mut expected = clipmonger_core::hash::FNV_OFFSET_BASIS;
+        expected = clipmonger_core::hash::fnv1a64_update(expected, text);
+        expected = clipmonger_core::hash::fnv1a64_update(expected, b"text/plain");
+        expected = clipmonger_core::hash::fnv1a64_update(expected, b"text/html");
+        assert_eq!(
+            fingerprint_parts(Some(text), &offers),
+            format!("{expected:x}:{}", text.len())
+        );
+        let swapped = [offer("text/html"), offer("text/plain")];
+        assert_ne!(
+            fingerprint_parts(Some(text), &offers),
+            fingerprint_parts(Some(text), &swapped),
+            "offer order must be preserved"
+        );
+    }
+
+    #[test]
+    fn fingerprint_fallback_hashes_only_offers_without_length() {
+        let offers = [offer("text/plain")];
+        let mut expected = clipmonger_core::hash::FNV_OFFSET_BASIS;
+        expected = clipmonger_core::hash::fnv1a64_update(expected, b"text/plain");
+        assert_eq!(fingerprint_parts(None, &offers), format!("{expected:x}"));
+        assert_eq!(fingerprint_parts(None, &offers), "1f0110dcf88682e5");
+        let empty_offers: &[FormatOffer] = &[];
+        assert_eq!(fingerprint_parts(None, empty_offers), "cbf29ce484222325");
+    }
+
+    #[test]
+    fn fingerprint_padding_and_length_semantics() {
+        let empty: &[FormatOffer] = &[];
+        assert_eq!(fingerprint_parts(Some(b""), empty), "cbf29ce484222325:0");
+        assert_eq!(fingerprint_parts(Some(b"a"), empty), "af63dc4c8601ec8c:1");
+        let text = b"hello world";
+        assert!(fingerprint_parts(Some(text), empty).ends_with(":11"));
     }
 }

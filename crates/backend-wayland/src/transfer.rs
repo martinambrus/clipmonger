@@ -37,6 +37,37 @@ impl WlTransfer {
             serial: Mutex::new(0),
         })
     }
+
+    /// Multi-format atomic write of any payload slice.
+    ///
+    /// The slice form also accepts array literals and `&Vec` (via deref);
+    /// the [`ClipboardTransfer`] impl delegates here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] for an empty payload or
+    /// [`Error::Unavailable`] when the compositor write fails.
+    pub fn write(&self, payload: &[(String, Vec<u8>)]) -> Result<()> {
+        if payload.is_empty() {
+            return Err(Error::Unsupported("nothing to write".to_string()));
+        }
+        let mut options = wl_clipboard_rs::copy::Options::new();
+        options.clipboard(wl_clipboard_rs::copy::ClipboardType::Regular);
+        let sources = payload
+            .iter()
+            .map(|(mime, bytes)| wl_clipboard_rs::copy::MimeSource {
+                source: wl_clipboard_rs::copy::Source::Bytes(bytes.clone().into_boxed_slice()),
+                mime_type: wl_clipboard_rs::copy::MimeType::Specific(mime.clone()),
+            })
+            .collect();
+        options
+            .copy_multi(sources)
+            .map_err(|e| Error::Unavailable(format!("wayland write: {e}")))?;
+        if let Ok(mut serial) = self.serial.lock() {
+            *serial = serial.wrapping_add(1);
+        }
+        Ok(())
+    }
 }
 
 impl ClipboardTransfer for WlTransfer {
@@ -72,25 +103,7 @@ impl ClipboardTransfer for WlTransfer {
     }
 
     fn write(&self, payload: &PayloadMap) -> Result<()> {
-        if payload.is_empty() {
-            return Err(Error::Unsupported("nothing to write".to_string()));
-        }
-        let mut options = wl_clipboard_rs::copy::Options::new();
-        options.clipboard(wl_clipboard_rs::copy::ClipboardType::Regular);
-        let sources = payload
-            .iter()
-            .map(|(mime, bytes)| wl_clipboard_rs::copy::MimeSource {
-                source: wl_clipboard_rs::copy::Source::Bytes(bytes.clone().into_boxed_slice()),
-                mime_type: wl_clipboard_rs::copy::MimeType::Specific(mime.clone()),
-            })
-            .collect();
-        options
-            .copy_multi(sources)
-            .map_err(|e| Error::Unavailable(format!("wayland write: {e}")))?;
-        if let Ok(mut serial) = self.serial.lock() {
-            *serial = serial.wrapping_add(1);
-        }
-        Ok(())
+        self.write(payload)
     }
 
     fn unchanged_indicator(&self) -> Option<String> {

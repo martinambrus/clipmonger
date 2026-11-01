@@ -57,11 +57,7 @@ fn task_marker(exe: &Path, profile: &Path) -> String {
         exe.to_string_lossy().to_lowercase(),
         task_arguments(profile)
     );
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in source.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
+    let hash = clipmonger_core::hash::fnv1a64(source.as_bytes());
     format!("{TASK_MARKER_PREFIX}{hash:016x})")
 }
 
@@ -393,6 +389,31 @@ mod tests {
         assert_ne!(
             marker,
             task_marker(Path::new(EXE), Path::new(r"C:\Users\other\clipmonger"))
+        );
+    }
+
+    #[test]
+    fn task_marker_exact_pinned_output_and_case_preservation() {
+        assert_eq!(
+            task_marker(Path::new(EXE), Path::new(PROFILE)),
+            "(clipmonger-task 73c83236c161551f)"
+        );
+        assert_eq!(
+            task_marker(Path::new(EXE), Path::new(PROFILE)),
+            task_marker(Path::new(&EXE.to_uppercase()), Path::new(PROFILE)),
+            "exe lowercasing must be preserved via core helper"
+        );
+        let direct = {
+            let source = format!(
+                "{}\n{}",
+                Path::new(EXE).to_string_lossy().to_lowercase(),
+                task_arguments(Path::new(PROFILE))
+            );
+            clipmonger_core::hash::fnv1a64(source.as_bytes())
+        };
+        assert_eq!(
+            task_marker(Path::new(EXE), Path::new(PROFILE)),
+            format!("{TASK_MARKER_PREFIX}{direct:016x})")
         );
     }
 }
