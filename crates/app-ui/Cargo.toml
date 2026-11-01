@@ -40,13 +40,11 @@ tray-icon = "0.26"
 ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
 
 [target.'cfg(windows)'.dependencies]
-tiny-skia = { version = "0.12", optional = true }
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 [features]
 default = ["gui"]
 gui = ["dep:egui", "dep:winit", "dep:egui-winit", "dep:softbuffer", "dep:hdrshot-egui-backend", "dep:egui_system_font_provider", "dep:bytemuck"]
-software = ["dep:softbuffer", "dep:tiny-skia", "dep:winit", "dep:egui-winit", "gui", "windows/Win32_Graphics_Gdi", "windows/Win32_System_LibraryLoader", "windows/Win32_UI_Input_KeyboardAndMouse", "windows/Win32_System_SystemServices", "windows/Win32_UI_Controls", "windows/Win32_System_Threading", "windows/Win32_UI_Shell"]
 
 [dev-dependencies]
 # Live push-listener tests run a real IPC server.
