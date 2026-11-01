@@ -1,309 +1,105 @@
-//! Preview width display consumer (checkpoint 3a).
-#![allow(
-    clippy::too_many_lines,
-    clippy::needless_pass_by_value,
-    clippy::doc_markdown,
-    dead_code,
-    unused_imports,
-    unused
-)]
-//!
-//! Validates `popup.preview_width` as Unicode scalar limit applied only at
-//! display to history rows and Current Clipboard text preview. Total budget
-//! includes deterministic ellipsis. Widths 1/empty/short/5/20/80 safe, huge
-//! width does not preallocate huge capacity, no UTF-8 byte slicing.
-//! Stored `Clip.preview`/`search_text`/`payloads`/`body` and paste IDs unchanged.
-//! Config snapshot updates visible text without recapture.
+//! Popup preview width changes painted text while preserving clip data and picks.
 
-use std::any::Any;
-use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clipmonger_app_ui::app::{AppParts, PopupApp, Trace};
-use clipmonger_app_ui::ipc_bridge::{UiCmd, UiEvent};
+use clipmonger_app_ui::app::{AppParts, PopupApp};
+use clipmonger_app_ui::ipc_bridge::{method_for, params_for, UiCmd, UiEvent};
 use clipmonger_app_ui::runner::{App, WindowKind};
 use clipmonger_core::model::Clip;
+use clipmonger_ipc::proto::methods::ShowPopupEvent;
 use serde_json::json;
 use uuid::Uuid;
 
-const HOUR: Duration = Duration::from_secs(3600);
-
-struct Sink(Arc<Mutex<Vec<u8>>>);
-impl Write for Sink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("trace sink").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-struct Request {
-    delay: Duration,
-}
-struct Win {
-    ctx: egui::Context,
-    info: egui::ViewportInfo,
-    events: Vec<egui::Event>,
-    system_theme: Option<egui::Theme>,
-}
-impl Win {
-    fn new() -> Self {
-        Self {
-            ctx: egui::Context::default(),
-            info: egui::ViewportInfo::default(),
-            events: Vec::new(),
-            system_theme: None,
-        }
-    }
-}
 struct Pass {
-    commands: Vec<egui::ViewportCommand>,
     texts: Vec<String>,
-    fills: Vec<egui::Color32>,
-    bounds: Vec<(String, egui::Rect, egui::Rect)>,
 }
 impl Pass {
     fn painted(&self, text: &str) -> bool {
-        self.texts.iter().any(|p| p == text)
-    }
-    fn positions(&self) -> Vec<egui::Pos2> {
-        self.commands
-            .iter()
-            .filter_map(|c| match c {
-                egui::ViewportCommand::OuterPosition(p) => Some(*p),
-                _ => None,
-            })
-            .collect()
+        self.texts.iter().any(|painted| painted == text)
     }
 }
+
 fn collect_text(shape: &egui::Shape, out: &mut Vec<String>) {
     match shape {
-        egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
-        egui::Shape::Vec(v) => {
-            for s in v {
-                collect_text(s, out);
+        egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+        egui::Shape::Vec(shapes) => {
+            for shape in shapes {
+                collect_text(shape, out);
             }
         }
         _ => {}
     }
 }
-fn collect_fills(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
-    match shape {
-        egui::Shape::Rect(r) => out.push(r.fill),
-        egui::Shape::Vec(v) => {
-            for s in v {
-                collect_fills(s, out);
-            }
-        }
-        _ => {}
-    }
-}
-fn settings_text_bounds(
-    shape: &egui::Shape,
-    clip: egui::Rect,
-    out: &mut Vec<(String, egui::Rect, egui::Rect)>,
-) {
-    match shape {
-        egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.galley.rect, clip)),
-        egui::Shape::Vec(v) => {
-            for s in v {
-                settings_text_bounds(s, clip, out);
-            }
-        }
-        _ => {}
-    }
-}
-struct Setup {
-    open: bool,
-    status_period: Duration,
-    trace: bool,
-    hold: Option<Box<dyn Any>>,
-}
-impl Setup {
-    fn new(open: bool) -> Self {
-        Self {
-            open,
-            status_period: HOUR,
-            trace: true,
-            hold: None,
-        }
-    }
-}
+
 struct Rig {
     app: PopupApp,
-    popup: Win,
-    settings: Win,
-    cmds: Arc<Mutex<mpsc::Receiver<UiCmd>>>,
-    backlog: Arc<Mutex<Vec<UiCmd>>>,
-    at_hook: Arc<Mutex<Vec<Vec<UiCmd>>>>,
+    ctx: egui::Context,
+    input: Vec<egui::Event>,
+    cmds: mpsc::Receiver<UiCmd>,
     events: mpsc::Sender<UiEvent>,
-    tray: Arc<Mutex<Vec<clipmonger_app_ui::tray_logic::TrayAction>>>,
-    tray_polls: Arc<AtomicUsize>,
-    trace: Arc<Mutex<Vec<u8>>>,
-    foreground: Arc<AtomicUsize>,
-    requests: Arc<Mutex<Vec<Request>>>,
-    born: Instant,
 }
 impl Rig {
-    fn raw(setup: Setup) -> Self {
-        let born = Instant::now();
-        let (cmd_tx, cmd_rx) = mpsc::channel();
-        let cmd_rx = Arc::new(Mutex::new(cmd_rx));
-        let backlog = Arc::new(Mutex::new(Vec::new()));
-        let at_hook = Arc::new(Mutex::new(Vec::new()));
-        let (event_tx, event_rx) = mpsc::channel();
-        let tray = Arc::new(Mutex::new(Vec::new()));
-        let tray_polls = Arc::new(AtomicUsize::new(0));
-        let trace = Arc::new(Mutex::new(Vec::new()));
-        let foreground = Arc::new(AtomicUsize::new(0));
-        let queue = Arc::clone(&tray);
-        let polls = Arc::clone(&tray_polls);
-        let hook = Arc::clone(&foreground);
-        let hook_commands = Arc::clone(&cmd_rx);
-        let hook_backlog = Arc::clone(&backlog);
-        let hook_log = Arc::clone(&at_hook);
+    fn opened() -> Self {
+        let (cmd_tx, cmds) = mpsc::channel();
+        let (events, event_rx) = mpsc::channel();
         let app = PopupApp::new(AppParts {
             profile: PathBuf::from("rig-profile-preview"),
             cmds: cmd_tx,
             events: event_rx,
-            tray: Box::new(move || {
-                polls.fetch_add(1, Ordering::SeqCst);
-                std::mem::take(&mut *queue.lock().expect("tray"))
-            }),
-            hold: setup.hold,
-            open: setup.open,
-            status_period: setup.status_period,
-            trace: setup
-                .trace
-                .then(|| Trace::new(Box::new(Sink(Arc::clone(&trace))))),
-            allow_foreground: Box::new(move || {
-                hook.fetch_add(1, Ordering::SeqCst);
-                let mut b = hook_backlog.lock().expect("backlog");
-                b.extend(hook_commands.lock().expect("commands").try_iter());
-                hook_log.lock().expect("hook").push(b.clone());
-            }),
+            tray: Box::new(Vec::new),
+            hold: None,
+            open: true,
+            status_period: Duration::from_secs(3600),
+            trace: None,
+            allow_foreground: Box::new(|| {}),
         });
-        let popup = Win::new();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        {
-            let r = Arc::clone(&requests);
-            popup.ctx.set_request_repaint_callback(move |info| {
-                r.lock().expect("req").push(Request { delay: info.delay });
-            });
-        }
-        Self {
+        let rig = Self {
             app,
-            popup,
-            settings: Win::new(),
-            cmds: cmd_rx,
-            backlog,
-            at_hook,
-            events: event_tx,
-            tray,
-            tray_polls,
-            trace,
-            foreground,
-            requests,
-            born,
-        }
-    }
-    fn with(setup: Setup) -> Self {
-        let rig = Self::raw(setup);
-        let start = rig.cmds();
-        assert_eq!(start.len(), 5, "start cmds: {start:?}");
+            ctx: egui::Context::default(),
+            input: Vec::new(),
+            cmds,
+            events,
+        };
+        let _ = rig.cmds();
         rig
     }
-    fn opened() -> Self {
-        Self::with(Setup::new(true))
-    }
-    fn push(&self, e: UiEvent) {
-        self.events.send(e).expect("receiver");
+    fn push(&self, event: UiEvent) {
+        self.events.send(event).expect("receiver");
     }
     fn cmds(&self) -> Vec<UiCmd> {
-        let mut all = std::mem::take(&mut *self.backlog.lock().expect("backlog"));
-        all.extend(self.cmds.lock().expect("cmds").try_iter());
-        all
-    }
-    fn win_mut(&mut self, kind: WindowKind) -> &mut Win {
-        match kind {
-            WindowKind::Popup => &mut self.popup,
-            WindowKind::Settings => &mut self.settings,
-        }
-    }
-    fn pass(&mut self, kind: WindowKind, visible: bool) -> Pass {
-        let win = match kind {
-            WindowKind::Popup => &mut self.popup,
-            WindowKind::Settings => &mut self.settings,
-        };
-        let mut raw = egui::RawInput {
-            viewports: std::iter::once((egui::ViewportId::ROOT, win.info.clone())).collect(),
-            system_theme: win.system_theme,
-            ..egui::RawInput::default()
-        };
-        win.info.events.clear();
-        let app = &mut self.app;
-        if visible {
-            raw.screen_rect = Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                match kind {
-                    WindowKind::Popup => egui::vec2(480.0, 360.0),
-                    WindowKind::Settings => egui::vec2(960.0, 680.0) / win.ctx.zoom_factor(),
-                },
-            ));
-            raw.events = std::mem::take(&mut win.events);
-            let mut runs = 0;
-            let output = win.ctx.run_ui(raw, |ui| {
-                runs += 1;
-                app.logic(ui.ctx(), kind);
-                app.ui(ui, kind);
-            });
-            assert_eq!(runs, 1, "egui discarded pass");
-            let egui::FullOutput {
-                mut textures_delta,
-                shapes,
-                mut viewport_output,
-                ..
-            } = output;
-            textures_delta.clear();
-            let mut texts = Vec::new();
-            let mut fills = Vec::new();
-            let mut bounds = Vec::new();
-            for clipped in &shapes {
-                settings_text_bounds(&clipped.shape, clipped.clip_rect, &mut bounds);
-                collect_text(&clipped.shape, &mut texts);
-                collect_fills(&clipped.shape, &mut fills);
-            }
-            Pass {
-                commands: viewport_output
-                    .remove(&egui::ViewportId::ROOT)
-                    .map(|v| v.commands)
-                    .unwrap_or_default(),
-                texts,
-                fills,
-                bounds,
-            }
-        } else {
-            let mut output = win.ctx.run_logic(&raw, |ctx| app.logic(ctx, kind));
-            Pass {
-                commands: output
-                    .viewport_commands
-                    .remove(&egui::ViewportId::ROOT)
-                    .unwrap_or_default(),
-                texts: Vec::new(),
-                fills: Vec::new(),
-                bounds: Vec::new(),
-            }
-        }
+        self.cmds.try_iter().collect()
     }
     fn show(&mut self) -> Pass {
-        self.pass(WindowKind::Popup, true)
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(480.0, 360.0),
+            )),
+            events: std::mem::take(&mut self.input),
+            ..egui::RawInput::default()
+        };
+        let app = &mut self.app;
+        let mut runs = 0;
+        let mut output = self.ctx.run_ui(raw, |ui| {
+            runs += 1;
+            app.logic(ui.ctx(), WindowKind::Popup);
+            app.ui(ui, WindowKind::Popup);
+        });
+        output.textures_delta.clear(); // No renderer consumes textures in this headless rig.
+        assert_eq!(runs, 1, "egui discarded pass");
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut texts);
+        }
+        Pass { texts }
     }
-    fn tick(&mut self) -> Pass {
-        self.pass(WindowKind::Popup, false)
+    fn tick(&mut self) {
+        let app = &mut self.app;
+        let _ = self.ctx.run_logic(&egui::RawInput::default(), |ctx| {
+            app.logic(ctx, WindowKind::Popup);
+        });
     }
     fn load(&mut self, clips: &[Clip]) {
         self.push(history(clips));
@@ -323,7 +119,23 @@ fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
 fn clip(n: u128, preview: &str) -> Clip {
-    serde_json::from_value(json!({"id": id(n).to_string(), "created_ms": 1_700_000_000_000_i64, "source_os": "linux", "preview": preview, "search_text": preview, "pinned": false, "rev": {"wall_ms": 1, "dev": "test-dev"}})).expect("clip")
+    serde_json::from_value(json!({
+        "id": id(n).to_string(),
+        "created_ms": 1_700_000_000_000_i64,
+        "source_os": "linux",
+        "preview": preview,
+        "search_text": format!("{preview} SEARCH_ONLY_{n}"),
+        "source_app": "preview fixture",
+        "formats": ["text/plain", "text/html"],
+        "bytes_total": 4096,
+        "content_hash": "fixture-digest",
+        "origin_dev": "fixture-device",
+        "origin": "x11",
+        "last_used_ms": 1_700_000_000_001_i64,
+        "pinned": false,
+        "rev": {"wall_ms": 1, "dev": "test-dev"},
+    }))
+    .expect("clip")
 }
 fn history(clips: &[Clip]) -> UiEvent {
     UiEvent::History(json!({"clips": clips}))
@@ -349,19 +161,15 @@ fn long_multibyte() -> String {
     }
     s
 }
-fn assert_stored_unchanged(rig: &Rig, id: Uuid, original: &str) {
+fn assert_stored_unchanged(rig: &Rig, original: &Clip) {
     let stored = rig
         .app
         .vm()
         .clips()
         .iter()
-        .find(|c| c.id == id)
+        .find(|clip| clip.id == original.id)
         .expect("stored clip");
-    assert_eq!(
-        stored.preview, original,
-        "stored preview must stay original"
-    );
-    assert_eq!(stored.search_text, original, "stored search_text unchanged");
+    assert_eq!(stored, original, "complete stored clip must stay unchanged");
 }
 
 // history rows at 5/20/80 show truncated multibyte, not verbatim long
@@ -389,7 +197,7 @@ fn preview_history_truncates_at_5_20_80() {
         } else {
             assert!(pass.painted(&long));
         }
-        assert_stored_unchanged(&rig, id(1), &long);
+        assert_stored_unchanged(&rig, &clip1);
     }
 }
 
@@ -397,86 +205,132 @@ fn preview_history_truncates_at_5_20_80() {
 #[test]
 fn preview_current_clipboard_truncates() {
     let mut rig = Rig::opened();
-    let long = long_multibyte();
-    rig.config_width(5);
-    rig.push(history(&[clip(1, "history short")]));
-    rig.push(UiEvent::HistoryClip(
-        json!({"clip": serde_json::to_value(clip(2, &long)).unwrap()}),
-    ));
+    let current = clip(2, &long_multibyte());
+    let history_clip = clip(1, "history short");
+    rig.load(std::slice::from_ref(&history_clip));
+    rig.push(UiEvent::HistoryClip(json!({"clip": current})));
     rig.tick();
-    let _ = rig.cmds();
-    let pass = rig.show();
-    let expected = expected_truncate(&long, 5);
-    assert!(
-        pass.painted(&expected),
-        "current clipboard must be truncated at 5 to `{expected}` {:?}",
-        pass.texts
-    );
-    assert!(!pass.painted(&long));
-    // stored current unchanged
-    let cur = rig.app.vm().current().expect("current").preview.clone();
-    assert_eq!(cur, long);
+    for width in [5, 20, 80] {
+        rig.config_width(width);
+        let pass = rig.show();
+        let expected = expected_truncate(&current.preview, width);
+        assert!(pass.painted(&expected), "width {width}: {:?}", pass.texts);
+        assert!(!pass.painted(&current.preview));
+        assert_eq!(rig.app.vm().current(), Some(&current));
+        assert_stored_unchanged(&rig, &history_clip);
+    }
 }
 
 // reload/change updates visible without recapture
 #[test]
 fn preview_reload_updates_display() {
     let mut rig = Rig::opened();
-    let long = long_multibyte();
-    rig.load(&[clip(1, &long)]);
-    rig.config_width(5);
-    let pass5 = rig.show();
-    let exp5 = expected_truncate(&long, 5);
-    assert!(pass5.painted(&exp5));
-    rig.config_width(20);
-    let pass20 = rig.show();
-    let exp20 = expected_truncate(&long, 20);
-    assert!(
-        pass20.painted(&exp20),
-        "after reload to 20 must paint {exp20} {:?}",
-        pass20.texts
-    );
-    assert!(!pass20.painted(&exp5));
-    // no re-load needed, stored still original
-    assert_stored_unchanged(&rig, id(1), &long);
+    let original = clip(1, &long_multibyte());
+    rig.load(std::slice::from_ref(&original));
+    // Each reply is a fresh Config snapshot, as received after change/reload.
+    // No new history/current reply or clipboard capture occurs in this loop.
+    for width in [5, 20, 80, 5] {
+        rig.config_width(width);
+        let pass = rig.show();
+        let expected = expected_truncate(&original.preview, width);
+        assert_eq!(
+            pass.texts.iter().filter(|text| **text == expected).count(),
+            2,
+            "history and current must both reflect snapshot width {width}"
+        );
+        assert!(!pass.painted(&original.preview));
+        assert_stored_unchanged(&rig, &original);
+        assert_eq!(rig.app.vm().current(), Some(&original));
+    }
 }
 
-// full query matching still finds original, activation correct ID/body, preserves IDs
+// Search and Enter use the actual popup input and emitted IPC command boundary.
 #[test]
 fn preview_full_query_still_finds_original_and_activation_correct() {
-    let mut rig = Rig::opened();
-    let long = "abcdefghijABCDEFGHIJ0123456789-UNIQUE_TAIL_12345";
-    let clip1 = clip(10, long);
-    let clip2 = clip(11, "other short");
-    rig.config_width(5);
-    rig.load(&[clip1.clone(), clip2.clone()]);
-    let pass = rig.show();
-    let exp = expected_truncate(long, 5);
-    assert!(pass.painted(&exp));
-    // query that matches only beyond truncated prefix must still find clip
-    rig.app.vm_mut().query = "UNIQUE_TAIL".to_string();
-    // clamp not needed for visible check
-    let visible = rig.app.vm().visible();
-    assert_eq!(
-        visible.len(),
-        1,
-        "query beyond truncation must still match original preview"
-    );
-    let idx = visible[0];
-    let found = &rig.app.vm().clips()[idx];
-    assert_eq!(found.id, id(10));
-    // activation via Enter should paste correct ID (check via VmEffect through key handling)
-    // Simulate Enter via popup vm action
-    let effect = rig
-        .app
-        .vm_mut()
-        .on_action(clipmonger_app_ui::keymap::Action::Paste);
-    match effect {
-        clipmonger_app_ui::popup::VmEffect::Paste(pid) => assert_eq!(pid, id(10)),
-        other => panic!("expected Paste, got {other:?}"),
+    let original = clip(10, &format!("{}-UNIQUE_TAIL_12345", long_multibyte()));
+    let decoy = clip(11, "other short");
+    for width in [5, 20, 80] {
+        for query in ["UNIQUE_TAIL_12345", "SEARCH_ONLY_10"] {
+            assert!(!expected_truncate(&original.preview, width).contains(query));
+            let mut rig = Rig::opened();
+            rig.push(UiEvent::ShowPopup(ShowPopupEvent {
+                source: "hotkey".to_string(),
+                target: Some(77),
+                gesture: Some(99),
+                ..ShowPopupEvent::default()
+            }));
+            rig.tick();
+            rig.config_width(width);
+            rig.load(&[decoy.clone(), original.clone()]);
+            rig.show(); // Focus the search field before delivering text.
+            rig.input.push(egui::Event::Text(query.to_string()));
+            rig.show(); // TextEdit updates the query after this frame's rows.
+            let filtered = rig.show();
+            assert_eq!(rig.app.vm().query, query);
+            assert_eq!(rig.app.vm().visible(), vec![1]);
+            assert_eq!(rig.app.vm().clip_at(0), Some(&original));
+            assert!(filtered.painted(&expected_truncate(&original.preview, width)));
+            assert_eq!(
+                filtered
+                    .texts
+                    .iter()
+                    .filter(|text| **text == expected_truncate(&decoy.preview, width))
+                    .count(),
+                1,
+                "the decoy remains only in Current Clipboard, never in filtered rows"
+            );
+            assert_stored_unchanged(&rig, &original);
+            assert_stored_unchanged(&rig, &decoy);
+            assert!(rig.cmds().is_empty(), "typing must not paste");
+
+            rig.input.push(egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let before = now_ms();
+            rig.show();
+            let after = now_ms();
+            let commands = rig.cmds();
+            let [command] = commands.as_slice() else {
+                panic!("expected one paste command: {commands:?}");
+            };
+            let UiCmd::PasteClipTo(picked, target, picked_ms, gesture) = command else {
+                panic!("expected PasteClipTo: {command:?}");
+            };
+            assert_eq!(
+                (*picked, *target, *gesture),
+                (original.id, Some(77), Some(99))
+            );
+            assert!((before..=after).contains(picked_ms));
+            assert_eq!(method_for(command), "paste.execute");
+            assert_eq!(
+                params_for(command),
+                json!({
+                    "clip": original.id.to_string(),
+                    "target_hwnd": 77,
+                    "gesture": 99,
+                    "picked_ms": picked_ms,
+                })
+            );
+            assert_stored_unchanged(&rig, &original);
+            assert_stored_unchanged(&rig, &decoy);
+            rig.tick();
+            assert!(rig.cmds().is_empty(), "Enter must emit the paste only once");
+        }
     }
-    // stored preview unchanged after query
-    assert_stored_unchanged(&rig, id(10), long);
+}
+
+fn now_ms() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("timestamp fits")
 }
 
 // width 1, empty, short, large preserved
