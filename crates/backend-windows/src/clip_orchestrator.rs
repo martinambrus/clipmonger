@@ -1224,20 +1224,58 @@ mod tests {
 
     #[test]
     fn b_text_supplementary_and_replacement_preserves_unicode() {
+        use crate::text_encoding::testing::{calls, Call};
         crate::text_encoding::clear_injected_locale();
         crate::text_encoding::set_injected_locale(0x0409, 1252, 437);
         let payloads = vec![("text/plain".into(), "a🌍b".as_bytes().to_vec())];
         let ops = prepare_ops(&payloads).unwrap();
-        assert_eq!(ops.len(), 4);
-        let unicode_expected: Vec<u8> = "a🌍b"
-            .encode_utf16()
-            .chain([0])
-            .flat_map(u16::to_le_bytes)
-            .collect();
-        assert_eq!(ops[0].1, unicode_expected);
-        // Supplementary U+1F30D cannot be represented in 1252/437 -> '?' 0x3F, Unicode authoritative exact
-        assert_eq!(ops[2].1, vec![b'a', b'?', b'b', 0]);
-        assert_eq!(ops[3].1, vec![b'a', b'?', b'b', 0]);
+        assert_eq!(
+            ops,
+            vec![
+                (13, vec![97, 0, 60, 216, 13, 223, 98, 0, 0, 0]),
+                (16, vec![9, 4, 0, 0]),
+                (1, b"a??b\0".to_vec()),
+                (7, b"a??b\0".to_vec()),
+            ]
+        );
+        let mut expected_calls = vec![Call::Lcid, Call::Ansi(0x0409), Call::Oem];
+        for (cp, output) in [(1252, 0), (1252, 5), (437, 0), (437, 5)] {
+            expected_calls.push(Call::Convert {
+                cp,
+                flags: 0x400,
+                wide: vec![97, 0xD83C, 0xDF0D, 98, 0],
+                count: 5,
+                output,
+                default_char_null: true,
+                used_default_null: true,
+            });
+        }
+        assert_eq!(calls(), expected_calls);
+        crate::text_encoding::clear_injected_locale();
+    }
+
+    #[test]
+    fn b_text_bmp_loss_and_literal_question_marks_remain_distinct() {
+        for (text, unicode, legacy) in [
+            ("a☃b", vec![97, 0, 3, 38, 98, 0, 0, 0], b"a?b\0".to_vec()),
+            (
+                "a??b",
+                vec![97, 0, 63, 0, 63, 0, 98, 0, 0, 0],
+                b"a??b\0".to_vec(),
+            ),
+        ] {
+            crate::text_encoding::set_injected_locale(0x0409, 1252, 437);
+            let ops = prepare_ops(&[("text/plain".into(), text.as_bytes().to_vec())]).unwrap();
+            assert_eq!(
+                ops,
+                vec![
+                    (13, unicode),
+                    (16, vec![9, 4, 0, 0]),
+                    (1, legacy.clone()),
+                    (7, legacy),
+                ]
+            );
+        }
         crate::text_encoding::clear_injected_locale();
     }
 
@@ -1376,28 +1414,36 @@ mod tests {
                         flags,
                         wide: vec![104, 105, 0],
                         count: 3,
-                        output: 0
+                        output: 0,
+                        default_char_null: true,
+                        used_default_null: true,
                     },
                     Call::Convert {
                         cp: ansi,
                         flags,
                         wide: vec![104, 105, 0],
                         count: 3,
-                        output: 3
+                        output: 3,
+                        default_char_null: true,
+                        used_default_null: true,
                     },
                     Call::Convert {
                         cp: oem,
                         flags,
                         wide: vec![104, 105, 0],
                         count: 3,
-                        output: 0
+                        output: 0,
+                        default_char_null: true,
+                        used_default_null: true,
                     },
                     Call::Convert {
                         cp: oem,
                         flags,
                         wide: vec![104, 105, 0],
                         count: 3,
-                        output: 3
+                        output: 3,
+                        default_char_null: true,
+                        used_default_null: true,
                     },
                 ]
             );

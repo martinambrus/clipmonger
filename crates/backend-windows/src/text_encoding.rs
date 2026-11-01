@@ -270,6 +270,8 @@ pub(crate) mod testing {
             wide: Vec<u16>,
             count: i32,
             output: usize,
+            default_char_null: bool,
+            used_default_null: bool,
         },
     }
     #[derive(Clone, Copy)]
@@ -338,6 +340,8 @@ pub(crate) mod testing {
                 wide: request.wide.to_vec(),
                 count: request.count,
                 output: output.as_ref().map_or(0, |out| out.len()),
+                default_char_null: request.default_char.is_none(),
+                used_default_null: request.used_default.is_none(),
             });
             if let Some(Fault::Size(cp, result)) = self.fault {
                 if cp == request.cp && output.is_none() {
@@ -358,6 +362,9 @@ pub(crate) mod testing {
                     (1252, 'é') => bytes.push(0xe9),
                     (437, 'é') => bytes.push(0x82),
                     (932, 'あ') => bytes.extend_from_slice(&[0x82, 0xa0]),
+                    // Only these fixture legacy pages model one default per
+                    // unmapped UTF-16 unit, including both surrogate units.
+                    (1252 | 437 | 932, ch) => bytes.resize(bytes.len() + ch.len_utf16(), b'?'),
                     _ => bytes.push(b'?'),
                 }
             }
@@ -418,9 +425,34 @@ mod native_tests {
         );
         let ops = super::encode_with_api(&mut api, "あ", 0x0411, 932, 437).unwrap();
         assert_eq!(ops[2].1, vec![0x82, 0xa0, 0]);
-        let ops = super::encode_with_api(&mut api, "a🌍b", 0x0409, 1252, 437).unwrap();
-        assert_eq!(ops[0].1, vec![97, 0, 60, 216, 13, 223, 98, 0, 0, 0]);
-        assert_eq!(ops[2].1, vec![97, 63, 98, 0]);
-        assert_eq!(ops[3].1, vec![97, 63, 98, 0]);
+        // Fixed legacy-page expectations: supplementary loss uses two defaults;
+        // BMP loss uses one. Literal question marks must survive unchanged.
+        for (text, unicode, legacy) in [
+            (
+                "a🌍b",
+                vec![97, 0, 60, 216, 13, 223, 98, 0, 0, 0],
+                b"a??b\0".to_vec(),
+            ),
+            ("a☃b", vec![97, 0, 3, 38, 98, 0, 0, 0], b"a?b\0".to_vec()),
+            (
+                "a??b",
+                vec![97, 0, 63, 0, 63, 0, 98, 0, 0, 0],
+                b"a??b\0".to_vec(),
+            ),
+        ] {
+            let ops = super::encode_with_api(&mut api, text, 0x0409, 1252, 437).unwrap();
+            // Emit both actual outputs before any assertion can hide the OEM result.
+            eprintln!("{text:?}: CP1252={:?}; CP437={:?}", ops[2].1, ops[3].1);
+            assert_eq!(
+                ops,
+                vec![
+                    (13, unicode),
+                    (16, vec![9, 4, 0, 0]),
+                    (1, legacy.clone()),
+                    (7, legacy),
+                ],
+                "fixed legacy fixture {text:?}"
+            );
+        }
     }
 }
