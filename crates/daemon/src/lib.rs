@@ -1264,8 +1264,8 @@ pub struct DaemonState {
     caps: CapsAggregator,
     /// Monitor pause flag toggled by `monitor.set`.
     monitoring_paused: Mutex<bool>,
-    /// Paste delivery budget (`popup.unicode_limit`, `popup.delivery_dwell_ms`).
-    paste_limits: Mutex<(u64, u64)>,
+    /// One coherent paste snapshot: unicode limit, dwell, delivery and restore.
+    paste_limits: Mutex<(u64, u64, clipmonger_core::PasteDelivery, bool)>,
     /// Profile dir for the audit log (set once at startup).
     profile_dir: Mutex<PathBuf>,
     /// Live single-use gesture tokens (hotkey/popup trigger path only):
@@ -1285,6 +1285,8 @@ pub struct DaemonState {
     profile_op: Mutex<()>,
     #[cfg(test)]
     restore_hook: Mutex<Option<RestoreHook>>,
+    #[cfg(test)]
+    publication_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// In-flight `blob.put` assemblies keyed by `(clip, mime)`.
     blob_buf: Mutex<HashMap<(String, String), BlobAsm>>,
     /// Latest `hotkey.conflict` note surfaced in caps notes.
@@ -1310,7 +1312,12 @@ impl DaemonState {
             store: RwLock::new(Some(store)),
             caps: CapsAggregator::new(),
             monitoring_paused: Mutex::new(false),
-            paste_limits: Mutex::new((65536, 1000)),
+            paste_limits: Mutex::new((
+                config.popup.unicode_limit,
+                config.popup.delivery_dwell_ms,
+                config.popup.delivery,
+                config.popup.restore_clipboard,
+            )),
             profile_dir: Mutex::new(PathBuf::new()),
             gesture_tokens: Mutex::new(HashMap::new()),
             gesture_counter: Mutex::new(0),
@@ -1321,6 +1328,8 @@ impl DaemonState {
             profile_op: Mutex::new(()),
             #[cfg(test)]
             restore_hook: Mutex::new(None),
+            #[cfg(test)]
+            publication_hook: Mutex::new(None),
             blob_buf: Mutex::new(HashMap::new()),
             hotkey_conflict_note: Mutex::new(None),
             popup: Mutex::new(popup::PopupTrigger::default()),
@@ -1331,9 +1340,7 @@ impl DaemonState {
 
     /// Replace the stored config (call once at startup with the loaded one).
     pub fn set_config(&self, config: clipmonger_core::Config) {
-        if let Ok(mut slot) = self.config.lock() {
-            *slot = config;
-        }
+        self.publish_config(config);
     }
 
     /// Flip the GNOME extension link state in caps.
@@ -1511,25 +1518,50 @@ impl DaemonState {
     /// Override the paste delivery budget from config.
     pub fn set_paste_limits(&self, unicode_limit: u64, dwell_ms: u64) {
         if let Ok(mut limits) = self.paste_limits.lock() {
-            *limits = (unicode_limit, dwell_ms);
+            limits.0 = unicode_limit;
+            limits.1 = dwell_ms;
         }
     }
 
-    /// Current paste delivery budget; delivery is read live from the
-    /// stored config so UI changes apply without a restart.
+    #[allow(clippy::needless_pass_by_value)]
+    fn publish_config(&self, config: clipmonger_core::Config) {
+        if let Ok(mut slot) = self.config.lock() {
+            *slot = config.clone();
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.publication_hook.lock().unwrap().take() {
+            hook();
+        }
+        if let Ok(mut settings) = self.paste_limits.lock() {
+            *settings = (
+                config.popup.unicode_limit,
+                config.popup.delivery_dwell_ms,
+                config.popup.delivery,
+                config.popup.restore_clipboard,
+            );
+        }
+        self.caps.set_paste_strategy(
+            "windows",
+            match config.popup.delivery {
+                clipmonger_core::PasteDelivery::ClipboardRestore => PasteStrategy::ClipboardRestore,
+                clipmonger_core::PasteDelivery::UnicodeInject => PasteStrategy::UnicodeInject,
+            },
+        );
+    }
+
+    /// Snapshot all settings used by one paste. Restore publishes this tuple
+    /// in one assignment, so a delivery cannot combine two configurations.
     #[cfg_attr(not(all(windows, feature = "backend-windows")), allow(dead_code))]
-    fn paste_budget(&self) -> (u64, u64, clipmonger_core::PasteDelivery) {
-        let (unicode_limit, dwell_ms) = self
-            .paste_limits
-            .lock()
-            .map_or((65536, 1000), |limits| *limits);
-        let delivery = self
-            .config
-            .lock()
-            .map_or(clipmonger_core::PasteDelivery::ClipboardRestore, |config| {
-                config.popup.delivery
-            });
-        (unicode_limit, dwell_ms, delivery)
+    fn paste_budget(&self) -> (u64, u64, clipmonger_core::PasteDelivery, bool) {
+        self.paste_limits.lock().map_or(
+            (
+                65536,
+                1000,
+                clipmonger_core::PasteDelivery::ClipboardRestore,
+                true,
+            ),
+            |settings| *settings,
+        )
     }
 
     /// Mark a portal shortcut bind as outstanding or settled (W-F4).
@@ -1964,30 +1996,21 @@ impl DaemonState {
             .and_then(Value::as_str)
             .ok_or_else(|| IpcError::new("backend", "config.set: key required".to_string()))?;
         let value = params.get("value").cloned().unwrap_or(Value::Null);
-        let updated = {
-            let mut config = self
+        let candidate = {
+            let current = self
                 .config
                 .lock()
-                .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?;
-            apply_config_key(&mut config, key, &value)
+                .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?
+                .clone();
+            let mut candidate = current;
+            apply_config_key(&mut candidate, key, &value)
                 .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
-
-            config.clone()
+            candidate
         };
-        updated
+        candidate
             .save(&profile.join("config.toml"))
             .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
-        if let Ok(mut cfg) = self.config.lock() {
-            *cfg = updated.clone();
-        }
-        self.set_paste_limits(updated.popup.unicode_limit, updated.popup.delivery_dwell_ms);
-        self.caps.set_paste_strategy(
-            "windows",
-            match updated.popup.delivery {
-                clipmonger_core::PasteDelivery::ClipboardRestore => PasteStrategy::ClipboardRestore,
-                clipmonger_core::PasteDelivery::UnicodeInject => PasteStrategy::UnicodeInject,
-            },
-        );
+        self.publish_config(candidate);
         Ok(serde_json::json!({"ok": true}))
     }
 
@@ -2035,7 +2058,21 @@ impl DaemonState {
         // Prepare before closing Store
         let prepared = Store::prepare_restore(Path::new(src), &profile)
             .map_err(|e| IpcError::new(e.code(), e.to_string()))?;
-        self.install_prepared_restore(prepared)
+        let candidate = if prepared.incoming().join("config.toml").exists() {
+            Some(
+                clipmonger_core::Config::load(&prepared.incoming().join("config.toml"))
+                    .map_err(|e| IpcError::new(e.code(), e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let result = self.install_prepared_restore(prepared);
+        if result.is_ok() {
+            if let Some(cfg) = candidate {
+                self.publish_config(cfg);
+            }
+        }
+        result
     }
 
     fn install_prepared_restore(
@@ -2308,11 +2345,7 @@ impl DaemonState {
         {
             use clipmonger_backend_windows::Integrity;
             use clipmonger_platform::traits::PasteEngine as _;
-            let (unicode_limit, dwell_ms, delivery) = self.paste_budget();
-            let restore = self
-                .config
-                .lock()
-                .map_or(true, |cfg| cfg.popup.restore_clipboard);
+            let settings @ (unicode_limit, dwell_ms, delivery, restore) = self.paste_budget();
             let paste = clipmonger_backend_windows::WinPaste::new(
                 usize::try_from(unicode_limit).unwrap_or(65536),
             )
@@ -2360,7 +2393,7 @@ impl DaemonState {
                         "paste.execute: elevation refused (gesture required)".to_string(),
                     ));
                 }
-                let res = self.paste_via_helper(&target, payloads, deadline_ms);
+                let res = self.paste_via_helper(&target, payloads, deadline_ms, settings);
                 if res.is_ok() {
                     let _ = self
                         .store_read()?
@@ -2431,6 +2464,7 @@ impl DaemonState {
         target: &clipmonger_platform::types::PasteTarget,
         payloads: &[(String, Vec<u8>)],
         deadline_ms: i64,
+        settings: (u64, u64, clipmonger_core::PasteDelivery, bool),
     ) -> Result<Value, IpcError> {
         use clipmonger_platform::types::PlatformHandle;
         let hwnd = match &target.handle {
@@ -2451,11 +2485,7 @@ impl DaemonState {
         if !self.helper_connected() {
             return Err(helper_ipc_error(self, target, HELPER_NOT_RUNNING));
         }
-        let (_, dwell_ms, delivery) = self.paste_budget();
-        let restore = self
-            .config
-            .lock()
-            .map_or(true, |cfg| cfg.popup.restore_clipboard);
+        let (_, dwell_ms, delivery, restore) = settings;
         if delivery == clipmonger_core::PasteDelivery::ClipboardRestore {
             let swap = clipmonger_backend_windows::paste::ClipboardSwap::begin(payloads, restore)
                 .map_err(|e| IpcError::new("backend", format!("paste.execute: {e}")))?;
