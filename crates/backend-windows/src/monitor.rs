@@ -138,7 +138,7 @@ fn current_event() -> Result<CaptureEvent> {
 
 #[cfg(windows)]
 fn content_fingerprint(event: &CaptureEvent) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let read_bytes: Result<Vec<u8>> = crate::transfer::imp::with_open("fingerprint", || {
         let mut out = Vec::new();
         if clipboard_win::raw::get_string(&mut out).is_ok() && !out.is_empty() {
@@ -160,24 +160,24 @@ fn content_fingerprint(event: &CaptureEvent) -> String {
     });
     if let Ok(bytes) = read_bytes {
         for b in &bytes {
-            hash ^= *b as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
         }
         for o in &event.offers {
             for b in o.mime.as_bytes() {
-                hash ^= *b as u64;
-                hash = hash.wrapping_mul(0x100000001b3);
+                hash ^= u64::from(*b);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
             }
         }
         return format!("{:x}:{}", hash, bytes.len());
     }
     for o in &event.offers {
         for b in o.mime.as_bytes() {
-            hash ^= *b as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
         }
     }
-    format!("{:x}", hash)
+    format!("{hash:x}")
 }
 
 impl ClipboardMonitor for WinMonitor {
@@ -241,11 +241,9 @@ impl ClipboardMonitor for WinMonitor {
                                     self.last_hash = Some(content_fingerprint(&event));
                                     events.push(event);
                                     std::thread::sleep(std::time::Duration::from_millis(30));
-                                    continue;
                                 }
                                 Err(Error::Timeout(_)) => {
                                     std::thread::sleep(std::time::Duration::from_millis(20));
-                                    continue;
                                 }
                                 Err(e) => return Err(e),
                             }
