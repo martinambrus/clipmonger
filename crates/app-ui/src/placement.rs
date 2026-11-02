@@ -56,6 +56,66 @@ fn pick(cursor: (i32, i32), monitors: &[Rect]) -> Rect {
     best
 }
 
+/// Monitor that `place_with_context` would use for either placement mode.
+#[must_use]
+pub(crate) fn destination_monitor(
+    cursor: Option<(i32, i32)>,
+    monitors: &[Rect],
+    current_monitor: Option<Rect>,
+    primary_monitor: Option<Rect>,
+) -> Option<Rect> {
+    if monitors.is_empty() {
+        return None;
+    }
+    if let Some(pos) = cursor {
+        Some(pick(pos, monitors))
+    } else {
+        current_monitor
+            .or(primary_monitor)
+            .or_else(|| monitors.first().copied())
+    }
+}
+
+/// Scale-aware physical size prediction for mixed-DPI moves.
+///
+/// `current_physical` is the host window's present physical size on its
+/// current monitor at `current_scale`. The logical size is
+/// `current_physical / current_scale` and the predicted destination size is
+/// `logical * dest_scale` rounded to nearest physical pixel. Falls back to
+/// `current_physical` when scales are non-finite or non-positive.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "rounded physical dimensions intentionally saturate to i32"
+)]
+#[must_use]
+pub(crate) fn predicted_physical_size(
+    current_physical: (u32, u32),
+    current_scale: f64,
+    dest_scale: f64,
+) -> (i32, i32) {
+    let unchanged = (
+        i32::try_from(current_physical.0).unwrap_or(i32::MAX),
+        i32::try_from(current_physical.1).unwrap_or(i32::MAX),
+    );
+    if !current_scale.is_finite()
+        || current_scale <= 0.0
+        || !dest_scale.is_finite()
+        || dest_scale <= 0.0
+        || (current_scale - dest_scale).abs() <= f64::EPSILON
+    {
+        return unchanged;
+    }
+    let logical_w = f64::from(current_physical.0) / current_scale;
+    let logical_h = f64::from(current_physical.1) / current_scale;
+    let pred_w = (logical_w * dest_scale).round() as i32;
+    let pred_h = (logical_h * dest_scale).round() as i32;
+    if pred_w > 0 && pred_h > 0 {
+        (pred_w, pred_h)
+    } else {
+        unchanged
+    }
+}
+
 /// Shell window size in the popup state.
 pub const POPUP_DEFAULT: (i32, i32) = (480, 360);
 

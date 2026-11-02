@@ -4,6 +4,8 @@
 //! while the window is shown.
 
 pub mod geometry;
+#[cfg(test)]
+mod placement_tests;
 pub mod render;
 pub mod sched;
 mod shutdown;
@@ -962,23 +964,56 @@ impl<A: App> Runner<A> {
         &self,
         event_loop: &ActiveEventLoop,
     ) -> Option<crate::placement::DesktopContext> {
-        // Actual host dimensions are required, including on a newly created Wayland host.
         let host = self.popup.host.as_ref()?;
-        let size = host.window.inner_size();
-        Some(crate::placement::DesktopContext {
-            monitors: event_loop
-                .available_monitors()
-                .map(|monitor| monitor_rect(&monitor))
-                .collect(),
-            cursor: query_cursor(event_loop),
-            current_monitor: host.window.current_monitor().as_ref().map(monitor_rect),
-            primary_monitor: event_loop.primary_monitor().as_ref().map(monitor_rect),
-            popup_physical_size: (
-                i32::try_from(size.width).ok()?,
-                i32::try_from(size.height).ok()?,
-            ),
-            supports_global_position: !self.per_show,
-        })
+        let physical = host.window.inner_size();
+        let current_scale = host.window.scale_factor();
+        let monitors: Vec<_> = event_loop
+            .available_monitors()
+            .map(|monitor| (monitor_rect(&monitor), monitor.scale_factor()))
+            .collect();
+        Some(desktop_context_from_snapshot(
+            (physical.width, physical.height),
+            current_scale,
+            &monitors,
+            query_cursor(event_loop),
+            host.window.current_monitor().as_ref().map(monitor_rect),
+            event_loop.primary_monitor().as_ref().map(monitor_rect),
+            !self.per_show,
+        ))
+    }
+}
+
+/// Build placement context from one native snapshot, predicting the physical size
+/// after a move to the destination monitor without querying the desktop again.
+fn desktop_context_from_snapshot(
+    current_physical: (u32, u32),
+    current_scale: f64,
+    raw_monitors: &[(crate::placement::Rect, f64)],
+    cursor: Option<(i32, i32)>,
+    current_monitor: Option<crate::placement::Rect>,
+    primary_monitor: Option<crate::placement::Rect>,
+    supports_global_position: bool,
+) -> crate::placement::DesktopContext {
+    let monitors: Vec<_> = raw_monitors.iter().map(|(rect, _)| *rect).collect();
+    let destination =
+        crate::placement::destination_monitor(cursor, &monitors, current_monitor, primary_monitor);
+    // Without a matching destination scale, preserve the known physical size.
+    let destination_scale = raw_monitors
+        .iter()
+        .find(|(rect, _)| Some(*rect) == destination)
+        .map_or(current_scale, |(_, scale)| *scale);
+    let popup_physical_size = crate::placement::predicted_physical_size(
+        current_physical,
+        current_scale,
+        destination_scale,
+    );
+    crate::placement::DesktopContext {
+        monitors,
+        cursor,
+        current_monitor,
+        primary_monitor,
+        popup_physical_size,
+        supports_global_position,
     }
 }
 
