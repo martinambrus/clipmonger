@@ -4511,6 +4511,59 @@ fn click_popup_widget(rig: &mut Rig, label: &str) {
     );
 }
 
+#[test]
+fn history_row_context_menu_handles_text_and_thumbnail_clicks() {
+    for thumbnail in [false, true] {
+        for pin in [true, false] {
+            let mut rig = active_list_rig(false, 3);
+            // Resolve the actual clickable text child before aiming at it.
+            let child = popup_widget(&mut rig, "History row 2");
+            let pass = rig.show();
+            let text = pass
+                .bounds
+                .iter()
+                .find(|(label, _, _)| label == "History row 2")
+                .unwrap()
+                .1;
+            assert!(child.rect.contains(text.center()));
+            let position = if thumbnail {
+                egui::pos2(text.left() - 24.0, text.center().y)
+            } else {
+                text.center()
+            };
+            rig.input(egui::Event::PointerMoved(position));
+            rig.show();
+            for pressed in [true, false] {
+                rig.input(egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                rig.show();
+            }
+            let menu = rig.show();
+            assert!(menu.painted(strings::text("popup.pin")));
+            assert!(menu.painted(strings::text("popup.delete")));
+            assert!(
+                rig.cmds().is_empty(),
+                "opening a menu must not activate the row"
+            );
+            click_popup_widget(
+                &mut rig,
+                strings::text(if pin { "popup.pin" } else { "popup.delete" }),
+            );
+            let expected = if pin {
+                UiCmd::PinClip(id(2), true)
+            } else {
+                UiCmd::DeleteClip(id(2))
+            };
+            assert_eq!(rig.cmds(), vec![expected]);
+            assert!(rig.is_open());
+        }
+    }
+}
+
 fn finish_popup_pick(rig: &mut Rig) {
     assert!(!rig.is_open(), "pick must close popup before execution");
     rig.tick();

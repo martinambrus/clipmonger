@@ -334,8 +334,10 @@ fn build_app(
         |hwnd| serde_json::json!({ "popup_hwnd": hwnd }),
     );
     start_push_listener(profile.clone(), extra, push_events, wake.clone());
+    let worker =
+        clipmonger_app_ui::thumbnail_worker::Worker::start(profile.clone(), wake.clone()).ok();
     let tray = create_tray(wake, online);
-    app::PopupApp::new(app::AppParts {
+    let mut app = app::PopupApp::new(app::AppParts {
         profile,
         cmds,
         events,
@@ -345,7 +347,11 @@ fn build_app(
         status_period: app::STATUS_PERIOD,
         trace: app::Trace::from_env(),
         allow_foreground: Box::new(foreground::allow_any),
-    })
+    });
+    if let Some(worker) = worker {
+        app.attach_thumbnails(worker);
+    }
+    app
 }
 
 #[allow(clippy::cast_precision_loss)]

@@ -95,9 +95,35 @@ struct State {
     active: Option<(Request, tokio::sync::watch::Sender<bool>)>,
     stopped: bool,
 }
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct WorkerTrace {
+    pub(crate) event: &'static str,
+    pub(crate) id: Uuid,
+    pub(crate) epoch: u64,
+}
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    #[cfg(test)]
+    trace_enabled: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    trace: Mutex<Vec<WorkerTrace>>,
+}
+impl Shared {
+    #[cfg(test)]
+    fn trace(&self, event: &'static str, request: &Request) {
+        if self.trace_enabled.load(Ordering::Relaxed) {
+            let mut trace = self.trace.lock().unwrap_or_else(|p| p.into_inner());
+            if trace.len() < 1024 {
+                trace.push(WorkerTrace {
+                    event,
+                    id: request.key.clip,
+                    epoch: request.epoch,
+                });
+            }
+        }
+    }
 }
 
 /// A single owned thread and its bounded request and completion channels.
@@ -138,6 +164,10 @@ impl Worker {
                 stopped: false,
             }),
             changed: Condvar::new(),
+            #[cfg(test)]
+            trace_enabled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            trace: Mutex::new(Vec::new()),
         });
         let (result_tx, results) = mpsc::sync_channel(QUEUE_CAP);
         let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -176,6 +206,18 @@ impl Worker {
             results,
             thread: Some(thread),
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn diagnostic_enable(&self) {
+        self.shared.trace_enabled.store(true, Ordering::Relaxed);
+    }
+    #[cfg(test)]
+    pub(crate) fn diagnostic_snapshot(&self) -> Vec<WorkerTrace> {
+        self.shared
+            .trace
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
     /// Replace visible identities. Excess entries are ignored and may be retried later.
     pub fn set_visible(&self, keys: impl IntoIterator<Item = Key>) {
@@ -218,6 +260,8 @@ impl Worker {
             return Admission::Deferred;
         }
         state.pending.insert(request.clone());
+        #[cfg(test)]
+        self.shared.trace("admitted", &request);
         state.queue.push_back(Job {
             request,
             deadline: Instant::now() + Duration::from_secs(3),
@@ -281,6 +325,8 @@ fn run(
                 return;
             }
             let job = state.queue.pop_front().unwrap();
+            #[cfg(test)]
+            shared.trace("active_started", &job.request);
             let (tx, rx) = tokio::sync::watch::channel(false);
             state.active = Some((job.request.clone(), tx));
             (job, rx)
@@ -328,6 +374,8 @@ fn run(
                 drop(state);
                 wake();
             } else {
+                #[cfg(test)]
+                shared.trace("result_dropped_full", &request);
                 state.pending.remove(&request);
             }
         } else {

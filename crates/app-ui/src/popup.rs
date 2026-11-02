@@ -248,11 +248,13 @@ impl PopupVm {
             return HistoryApply::Malformed;
         };
         if self.clips.len() == list.len()
-            && self
-                .clips
-                .iter()
-                .zip(list.iter())
-                .all(|(a, b)| a.id == b.id && a.preview == b.preview && a.pinned == b.pinned)
+            && self.clips.iter().zip(list.iter()).all(|(a, b)| {
+                a.id == b.id
+                    && a.preview == b.preview
+                    && a.pinned == b.pinned
+                    && a.content_hash == b.content_hash
+                    && a.formats == b.formats
+            })
         {
             return HistoryApply::Unchanged;
         }

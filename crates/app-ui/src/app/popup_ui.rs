@@ -254,6 +254,20 @@ impl PopupApp {
         ui.button(strings::text("config.open_config")).clicked()
     }
 
+    fn thumbnail_slot(
+        &mut self,
+        ui: &mut egui::Ui,
+        clip: &clipmonger_core::model::Clip,
+        demand: &mut Vec<crate::thumbnail_worker::Key>,
+    ) {
+        if let Some(thumbs) = &mut self.thumbnails {
+            thumbs.slot(ui, clip, demand);
+        } else {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+            super::thumbnail_ui::placeholder(ui, rect);
+        }
+    }
+
     /// Render the popup window contents.
     #[allow(clippy::too_many_lines)]
     pub(super) fn render(&mut self, ui: &mut egui::Ui) {
@@ -266,6 +280,10 @@ impl PopupApp {
         let mut delete_row: Option<usize> = Option::None;
         let mut search_focused = false;
         let mut open_settings = false;
+        let mut thumbnail_demand = Vec::new();
+        if let Some(thumbs) = &mut self.thumbnails {
+            thumbs.begin_frame();
+        }
         if let Ok(mut config) = self.config.lock() {
             if config.perm_source.is_some() {
                 if !self.shell.desired().settings_open {
@@ -323,10 +341,15 @@ impl PopupApp {
                 field.request_focus();
             }
             search_focused = field.has_focus();
-            if let Some(current) = self.vm.current() {
+            if let Some(current) = self.vm.current().cloned() {
                 ui.label(strings::text("popup.current"));
-                ui.label(strings::text(popup::preview_kind(current)));
-                ui.label(popup::display_preview(&current.preview, self.preview_width));
+                ui.horizontal(|ui| {
+                    self.thumbnail_slot(ui, &current, &mut thumbnail_demand);
+                    ui.vertical(|ui| {
+                        ui.label(strings::text(popup::preview_kind(&current)));
+                        ui.label(popup::display_preview(&current.preview, self.preview_width));
+                    });
+                });
             }
             let group_names = self
                 .config
@@ -403,12 +426,18 @@ impl PopupApp {
                 if count == 0 {
                     ui.label(strings::text("popup.empty"));
                 }
-                egui::ScrollArea::vertical()
+                #[cfg(test)]
+                let mut history_clip = None;
+                let _history_area = egui::ScrollArea::vertical()
                     .animated(false)
                     .id_salt("popup_history")
                     .show(ui, |ui| {
+                        #[cfg(test)]
+                        {
+                            history_clip = Some(ui.clip_rect());
+                        }
                         for row in 0..count {
-                            let Some(clip) = self.vm.clip_at(row) else {
+                            let Some(clip) = self.vm.clip_at(row).cloned() else {
                                 continue;
                             };
                             let clip_id = clip.id;
@@ -416,7 +445,12 @@ impl PopupApp {
                             let selected = self.vm.selected == row;
                             let truncated =
                                 popup::display_preview(&clip.preview, self.preview_width);
-                            let response = ui.selectable_label(selected, &truncated);
+                            let row_ui = ui.horizontal(|ui| {
+                                self.thumbnail_slot(ui, &clip, &mut thumbnail_demand);
+                                ui.selectable_label(selected, &truncated)
+                            });
+                            let label = row_ui.inner;
+                            let response = row_ui.response.interact(egui::Sense::click());
                             if selected
                                 && pending.as_ref().is_some_and(
                                     |(source, selected, selected_id)| {
@@ -428,10 +462,10 @@ impl PopupApp {
                             {
                                 response.scroll_to_me(None);
                             }
-                            if response.clicked() {
+                            if response.clicked() || label.clicked() {
                                 clicked_row = Some(row);
                             }
-                            response.context_menu(|ui| {
+                            response.container_context_menu(|ui| {
                                 let pin_label = if pinned {
                                     strings::text("popup.unpin")
                                 } else {
@@ -449,6 +483,15 @@ impl PopupApp {
                             });
                         }
                     });
+                #[cfg(test)]
+                if let Some(thumbs) = &mut self.thumbnails {
+                    thumbs.history_area = Some((
+                        _history_area
+                            .inner_rect
+                            .intersect(history_clip.expect("history clip")),
+                        _history_area.state.offset(),
+                    ));
+                }
             }
             let mut footer = ui.new_child(egui::UiBuilder::new().id_salt("popup_footer").max_rect(
                 egui::Rect::from_min_max(
@@ -459,6 +502,9 @@ impl PopupApp {
             open_settings = self.render_footer(&mut footer);
             ui.expand_to_include_rect(footer.min_rect());
         });
+        if let Some(thumbs) = &mut self.thumbnails {
+            thumbs.update(ui.ctx(), thumbnail_demand);
+        }
         if open_settings {
             self.open_settings(None);
         }

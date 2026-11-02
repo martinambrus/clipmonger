@@ -4,6 +4,7 @@
 
 mod popup_ui;
 mod settings_ui;
+mod thumbnail_ui;
 pub mod trace;
 
 use std::any::Any;
@@ -99,6 +100,7 @@ pub struct PopupApp {
     pending_reveal: Option<(Option<String>, usize, uuid::Uuid)>,
     last_reveal: Option<(Option<String>, usize, uuid::Uuid)>,
     last_query: String,
+    thumbnails: Option<thumbnail_ui::Thumbnails>,
 }
 
 impl PopupApp {
@@ -151,6 +153,7 @@ impl PopupApp {
             pending_reveal: None,
             last_reveal: None,
             last_query: String::new(),
+            thumbnails: None,
         };
         app.apply_effects(Shell::start());
         if open {
@@ -161,6 +164,11 @@ impl PopupApp {
             });
         }
         app
+    }
+
+    /// Attach the owned thumbnail worker to this popup.
+    pub fn attach_thumbnails(&mut self, worker: crate::thumbnail_worker::Worker) {
+        self.thumbnails = Some(thumbnail_ui::Thumbnails::new(worker));
     }
 
     /// The shell state machine.
@@ -358,12 +366,23 @@ impl PopupApp {
             }
             UiEvent::History(body) => {
                 if self.vm.apply_history(&body) == popup::HistoryApply::Changed {
+                    if let Some(thumbs) = &mut self.thumbnails {
+                        thumbs.revoke_visibility();
+                    }
                     let current = self.vm.clips().first().cloned();
                     self.vm.set_current(current);
                 }
                 self.feed(Event::Bridge(UiEvent::History(body)));
             }
-            UiEvent::Deleted(id) => self.vm.remove_clip(id),
+            UiEvent::Deleted(id) => {
+                if let Some(thumbs) = &mut self.thumbnails {
+                    thumbs.reset();
+                }
+                self.vm.remove_clip(id);
+                if self.vm.current().is_some_and(|clip| clip.id == id) {
+                    self.vm.set_current(None);
+                }
+            }
             UiEvent::Pinned(id, pinned) => self.vm.apply_pin(id, pinned),
             UiEvent::PasteDone(_) | UiEvent::Purged(_) => {}
             UiEvent::HistoryClip(body) => {
@@ -432,6 +451,9 @@ impl PopupApp {
                 }
             }
             UiEvent::RestoreDone => {
+                if let Some(thumbs) = &mut self.thumbnails {
+                    thumbs.reset();
+                }
                 if self.shell.desired().settings_open {
                     if let Ok(mut config) = self.config.lock() {
                         config.error = strings::text("config.restore_done").to_string();
@@ -757,6 +779,9 @@ impl runner::App for PopupApp {
         });
         match kind {
             WindowKind::Popup => {
+                if let Some(thumbs) = &mut self.thumbnails {
+                    thumbs.context(ctx);
+                }
                 if std::mem::take(&mut self.hide_unconfirmed) {
                     self.feed(Event::Hidden);
                 }
@@ -791,6 +816,12 @@ impl runner::App for PopupApp {
                     self.pause_deadline = None;
                     self.send(UiCmd::MonitorToggle);
                 }
+                if let Some(thumbs) = &mut self.thumbnails {
+                    if !self.shell.desired().popup_open {
+                        thumbs.revoke_visibility();
+                    }
+                    thumbs.drain();
+                }
                 self.vm.set_offline(self.shell.offline());
                 self.apply_theme(ctx, kind);
                 self.handle_pending_placement(ctx);
@@ -820,6 +851,9 @@ impl runner::App for PopupApp {
                 if self.shell.desired().popup_open {
                     self.render(ui);
                 } else {
+                    if let Some(thumbs) = &mut self.thumbnails {
+                        thumbs.revoke_visibility();
+                    }
                     egui::CentralPanel::default().show(ui, |_| {});
                 }
             }
