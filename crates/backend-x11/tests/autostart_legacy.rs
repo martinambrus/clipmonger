@@ -26,10 +26,22 @@ impl Drop for OwnedRoot {
 #[test]
 fn legacy_manager_writes_exact_descriptors_and_roundtrips() {
     let cases = [
-        ("/usr/bin/clipmonger", r#""/usr/bin/clipmonger" --minimized"#),
-        ("/opt/My Apps/é clipmonger", r#""/opt/My Apps/é clipmonger" --minimized"#),
-        ("/opt/$cash/%f/%u/100%", r#""/opt/\\$cash/%%f/%%u/100%%" --minimized"#),
-        ("/opt/back\\slash/`tick/\"quote", r#""/opt/back\\\\slash/\\`tick/\\"quote" --minimized"#),
+        (
+            "/usr/bin/clipmonger",
+            r#""/usr/bin/clipmonger" --minimized"#,
+        ),
+        (
+            "/opt/My Apps/é clipmonger",
+            r#""/opt/My Apps/é clipmonger" --minimized"#,
+        ),
+        (
+            "/opt/$cash/%f/%u/100%",
+            r#""/opt/\\$cash/%%f/%%u/100%%" --minimized"#,
+        ),
+        (
+            "/opt/back\\slash/`tick/\"quote",
+            r#""/opt/back\\\\slash/\\`tick/\\"quote" --minimized"#,
+        ),
         ("/opt/trailing\\", r#""/opt/trailing\\\\" --minimized"#),
     ];
     let root = OwnedRoot::new();

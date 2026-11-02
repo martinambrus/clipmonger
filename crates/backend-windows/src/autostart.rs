@@ -36,11 +36,7 @@ impl WinAutostart {
     ///
     /// Returns `Error::Unavailable` when either path is unrepresentable as a Windows
     /// command-line argument.
-    pub fn with_profile(
-        ui_exe: PathBuf,
-        profile_dir: PathBuf,
-        portable: bool,
-    ) -> Result<Self> {
+    pub fn with_profile(ui_exe: PathBuf, profile_dir: PathBuf, portable: bool) -> Result<Self> {
         crate::autostart_logic::run_value_with_profile(&ui_exe, &profile_dir, true)?;
         Ok(Self {
             exe: ui_exe,
@@ -50,11 +46,12 @@ impl WinAutostart {
     }
 
     /// Fallible variant accepting borrowed paths for testing parity.
-    pub fn try_with_profile(
-        ui_exe: &Path,
-        profile_dir: &Path,
-        portable: bool,
-    ) -> Result<Self> {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Unavailable` if either path is not a valid Windows
+    /// autostart command argument.
+    pub fn try_with_profile(ui_exe: &Path, profile_dir: &Path, portable: bool) -> Result<Self> {
         crate::autostart_logic::run_value_with_profile(ui_exe, profile_dir, true)?;
         Ok(Self {
             exe: ui_exe.to_path_buf(),
@@ -178,7 +175,7 @@ mod tests {
         let mut m = WinAutostart::new(Path::new("C:\\clipmonger.exe").to_path_buf(), true);
         assert!(m.enable().is_ok());
         assert!(m.disable().is_ok());
-        assert_eq!(m.is_enabled().unwrap(), false);
+        assert!(!m.is_enabled().unwrap());
         let mut mp = WinAutostart::with_profile(
             Path::new("C:\\clipmonger.exe").to_path_buf(),
             Path::new("C:\\profiles\\work").to_path_buf(),
@@ -187,7 +184,7 @@ mod tests {
         .unwrap();
         assert!(mp.enable().is_ok());
         assert!(mp.disable().is_ok());
-        assert_eq!(mp.is_enabled().unwrap(), false);
+        assert!(!mp.is_enabled().unwrap());
     }
 
     #[test]
@@ -197,6 +194,9 @@ mod tests {
             Path::new("C:\\bad\"path").to_path_buf(),
             false,
         );
-        assert!(bad.is_err(), "should not create manager with malformed profile");
+        assert!(
+            bad.is_err(),
+            "should not create manager with malformed profile"
+        );
     }
 }

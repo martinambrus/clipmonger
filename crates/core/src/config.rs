@@ -346,6 +346,17 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Serialize using the same format as the saved configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CoreError::Config` if TOML serialization fails.
+    pub fn to_toml(&self) -> Result<String, CoreError> {
+        toml::to_string(self).map_err(|e| CoreError::Config {
+            message: e.to_string(),
+        })
+    }
+
     /// Save as TOML with user-only (0600) file permissions on Unix.
     ///
     /// # Errors
@@ -358,9 +369,7 @@ impl Config {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let text = toml::to_string(self).map_err(|e| CoreError::Config {
-            message: e.to_string(),
-        })?;
+        let text = self.to_toml()?;
         std::fs::write(path, text)?;
         #[cfg(unix)]
         {

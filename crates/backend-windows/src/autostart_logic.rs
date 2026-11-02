@@ -28,24 +28,33 @@ pub fn run_value(profile_exe: &Path, minimized: bool) -> String {
 }
 
 fn windows_path_str(path: &Path) -> Result<&str> {
-    let s = path.to_str().ok_or_else(|| Error::Unavailable("autostart path is not Unicode".to_string()))?;
+    let s = path
+        .to_str()
+        .ok_or_else(|| Error::Unavailable("autostart path is not Unicode".to_string()))?;
     let bytes = s.as_bytes();
-    let drive = bytes.len() >= 3 && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/');
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
     let unc = if s.starts_with("\\\\") || s.starts_with("//") {
-        let mut parts = s[2..].split(|c| c == '\\' || c == '/');
+        let mut parts = s[2..].split(['\\', '/']);
         matches!((parts.next(), parts.next()), (Some(server), Some(share)) if !server.is_empty() && server != "." && server != ".." && !share.is_empty())
     } else {
         false
     };
     if !drive && !unc {
-        return Err(Error::Unavailable("autostart path must be an absolute drive or UNC path".to_string()));
+        return Err(Error::Unavailable(
+            "autostart path must be an absolute drive or UNC path".to_string(),
+        ));
     }
     for (i, ch) in s.char_indices() {
-        if ch.is_control() || matches!(ch, '"' | '<' | '>' | '|' | '?' | '*')
+        if ch.is_control()
+            || matches!(ch, '"' | '<' | '>' | '|' | '?' | '*')
             || (ch == ':' && !(drive && i == 1))
         {
-            return Err(Error::Unavailable("autostart path contains an invalid Windows character".to_string()));
+            return Err(Error::Unavailable(
+                "autostart path contains an invalid Windows character".to_string(),
+            ));
         }
     }
     Ok(s)
@@ -69,6 +78,11 @@ fn quote_windows_arg(path: &Path) -> Result<String> {
 /// Trailing backslashes in the profile are doubled before the closing quote
 /// to preserve the exact argv. Returns `Error::Unavailable` for unrepresentable paths
 /// (NUL, quote, control characters) rather than performing lossy conversion.
+///
+/// # Errors
+///
+/// Returns `Error::Unavailable` if either path is non-Unicode, not an absolute
+/// drive or UNC path, or contains an invalid Windows path character.
 pub fn run_value_with_profile(
     ui_exe: &Path,
     profile_dir: &Path,
@@ -186,7 +200,10 @@ mod tests {
         let exe = Path::new("C:\\clipmonger.exe");
         let profile = Path::new("C:\\my--minimized-profile");
         let v = run_value_with_profile(exe, profile, true).unwrap();
-        assert_eq!(v, "\"C:\\clipmonger.exe\" --minimized --profile-dir \"C:\\my--minimized-profile\"");
+        assert_eq!(
+            v,
+            "\"C:\\clipmonger.exe\" --minimized --profile-dir \"C:\\my--minimized-profile\""
+        );
     }
 
     #[test]
@@ -214,11 +231,36 @@ mod tests {
     #[test]
     fn windows_absolute_and_invalid_path_vectors() {
         let exe = Path::new(r"C:\clipmonger.exe");
-        for valid in [r"C:\", "D:/profiles/é space", r"\\server\share\profile", "//server/share/profile"] {
-            assert!(run_value_with_profile(exe, Path::new(valid), true).is_ok(), "{valid:?}");
+        for valid in [
+            r"C:\",
+            "D:/profiles/é space",
+            r"\\server\share\profile",
+            "//server/share/profile",
+        ] {
+            assert!(
+                run_value_with_profile(exe, Path::new(valid), true).is_ok(),
+                "{valid:?}"
+            );
         }
-        for invalid in ["", "relative", r"C:relative", r"\rooted", "/rooted", r"xC:\bad", r"\\server", r"\\server\\share", r"C:\bad*name", r"C:\bad|name", r"C:\bad:name", r"C:\bad<name", r"C:\bad?name"] {
-            assert!(run_value_with_profile(exe, Path::new(invalid), true).is_err(), "{invalid:?}");
+        for invalid in [
+            "",
+            "relative",
+            r"C:relative",
+            r"\rooted",
+            "/rooted",
+            r"xC:\bad",
+            r"\\server",
+            r"\\server\\share",
+            r"C:\bad*name",
+            r"C:\bad|name",
+            r"C:\bad:name",
+            r"C:\bad<name",
+            r"C:\bad?name",
+        ] {
+            assert!(
+                run_value_with_profile(exe, Path::new(invalid), true).is_err(),
+                "{invalid:?}"
+            );
         }
     }
 
@@ -227,15 +269,25 @@ mod tests {
     fn windows_rejects_non_unicode_os_path() {
         use std::os::unix::ffi::OsStrExt;
         let bad = Path::new(std::ffi::OsStr::from_bytes(b"C:\\bad\xff"));
-        assert!(matches!(run_value_with_profile(Path::new(r"C:\clipmonger.exe"), bad, true), Err(Error::Unavailable(_))));
+        assert!(matches!(
+            run_value_with_profile(Path::new(r"C:\clipmonger.exe"), bad, true),
+            Err(Error::Unavailable(_))
+        ));
     }
 
     #[cfg(windows)]
     #[test]
     fn windows_rejects_unpaired_utf16() {
         use std::os::windows::ffi::OsStringExt;
-        let bad = std::ffi::OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0xd800]);
-        assert!(matches!(run_value_with_profile(Path::new(r"C:\clipmonger.exe"), Path::new(&bad), true), Err(Error::Unavailable(_))));
+        let bad = std::ffi::OsString::from_wide(&[
+            u16::from(b'C'),
+            u16::from(b':'),
+            u16::from(b'\\'),
+            0xd800,
+        ]);
+        assert!(matches!(
+            run_value_with_profile(Path::new(r"C:\clipmonger.exe"), Path::new(&bad), true),
+            Err(Error::Unavailable(_))
+        ));
     }
-
 }

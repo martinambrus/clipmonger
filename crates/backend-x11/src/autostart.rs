@@ -15,7 +15,8 @@ pub struct X11Autostart {
 }
 
 fn path_str(path: &Path) -> Result<&str> {
-    path.to_str().ok_or_else(|| Error::Unavailable("autostart path is not Unicode".to_string()))
+    path.to_str()
+        .ok_or_else(|| Error::Unavailable("autostart path is not Unicode".to_string()))
 }
 
 impl X11Autostart {
@@ -46,7 +47,12 @@ impl X11Autostart {
         profile_dir: PathBuf,
         portable: bool,
     ) -> Result<Self> {
-        crate::desktop::try_render_desktop(path_str(&exe)?, true, false, Some(path_str(&profile_dir)?))?;
+        crate::desktop::try_render_desktop(
+            path_str(&exe)?,
+            true,
+            false,
+            Some(path_str(&profile_dir)?),
+        )?;
         root.push("autostart");
         root.push("clipmonger.desktop");
         Ok(Self {
@@ -58,13 +64,23 @@ impl X11Autostart {
     }
 
     /// Borrowed-path variant for testing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `exe` or `profile_dir` is non-Unicode or invalid
+    /// for a desktop entry.
     pub fn try_with_profile(
         exe: &Path,
         root: &Path,
         profile_dir: &Path,
         portable: bool,
     ) -> Result<Self> {
-        crate::desktop::try_render_desktop(path_str(exe)?, true, false, Some(path_str(profile_dir)?))?;
+        crate::desktop::try_render_desktop(
+            path_str(exe)?,
+            true,
+            false,
+            Some(path_str(profile_dir)?),
+        )?;
         let mut file = root.to_path_buf();
         file.push("autostart");
         file.push("clipmonger.desktop");
@@ -167,7 +183,10 @@ mod tests {
         let text = std::fs::read_to_string(&file).expect("file written");
         let entry = crate::desktop::parse_desktop(&text).expect("parse written");
         assert_eq!(entry.exec, exe.to_string_lossy());
-        assert_eq!(entry.profile.as_deref(), Some(profile.to_string_lossy().as_ref()));
+        assert_eq!(
+            entry.profile.as_deref(),
+            Some(profile.to_string_lossy().as_ref())
+        );
         assert!(entry.minimized);
         assert!(!entry.hidden);
         assert!(m.is_enabled().unwrap(), "should be enabled");
@@ -193,16 +212,22 @@ mod tests {
         m.enable().unwrap();
         let file = root.join("autostart").join("clipmonger.desktop");
         let text = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(text, r#"[Desktop Entry]
+        assert_eq!(
+            text,
+            r#"[Desktop Entry]
 Type=Application
 Name=Clipmonger
 Exec="/opt/My Apps/clipmonger" --minimized --profile-dir "/home/alice/profiles/foo%%bar\\$baz\\\\qux\\`tick\\"quote"
 Hidden=false
 Terminal=false
-"#);
+"#
+        );
         let entry = crate::desktop::parse_desktop(&text).unwrap();
         assert_eq!(entry.exec, exe.to_string_lossy());
-        assert_eq!(entry.profile.unwrap(), profile.to_string_lossy().to_string());
+        assert_eq!(
+            entry.profile.unwrap(),
+            profile.to_string_lossy().to_string()
+        );
         assert!(m.is_enabled().unwrap());
         m.disable().unwrap();
         assert!(!m.is_enabled().unwrap());
@@ -224,7 +249,7 @@ Terminal=false
         .unwrap();
         m.enable().unwrap();
         assert!(!root.join("autostart").join("clipmonger.desktop").exists());
-        assert_eq!(m.is_enabled().unwrap(), false);
+        assert!(!m.is_enabled().unwrap());
         m.disable().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -245,7 +270,11 @@ Terminal=false
 
     fn tempfile_like_root() -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("clipmonger-test-{}-{}", std::process::id(), uuid::Uuid::now_v7()));
+        p.push(format!(
+            "clipmonger-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -256,10 +285,12 @@ Terminal=false
         let root = tempfile_like_root();
         let bad = Path::new(std::ffi::OsStr::from_bytes(b"/bad\xff"));
         for (exe, profile) in [(bad, Path::new("/profile")), (Path::new("/exe"), bad)] {
-            assert!(matches!(X11Autostart::try_with_profile(exe, &root, profile, false), Err(Error::Unavailable(_))));
+            assert!(matches!(
+                X11Autostart::try_with_profile(exe, &root, profile, false),
+                Err(Error::Unavailable(_))
+            ));
             assert!(!root.join("autostart").exists());
         }
         std::fs::remove_dir_all(&root).unwrap();
     }
-
 }

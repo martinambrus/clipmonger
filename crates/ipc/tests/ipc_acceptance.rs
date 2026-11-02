@@ -466,7 +466,19 @@ fn t201_backup_restore() {
     roundtrip(&BackupRestoreParams {
         src: "/tmp/backup.zip".to_string(),
     });
-    roundtrip(&BackupRestoreResult { ok: true });
+    roundtrip(&BackupRestoreResult {
+        ok: true,
+        autostart_warning: None,
+    });
+    let old: BackupRestoreResult = serde_json::from_value(json!({"ok":true})).unwrap();
+    assert_eq!(old.autostart_warning, None);
+    let warned: BackupRestoreResult =
+        serde_json::from_value(json!({"ok":true,"autostart_warning":{"code":"apply_failed"}}))
+            .unwrap();
+    assert_eq!(
+        serde_json::to_value(warned).unwrap()["autostart_warning"]["code"],
+        "apply_failed"
+    );
 }
 
 #[test]

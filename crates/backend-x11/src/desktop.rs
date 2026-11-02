@@ -83,7 +83,7 @@ fn encode_exec_arg(arg: &str) -> Result<String, Error> {
             _ => inner.push(ch),
         }
     }
-    Ok(format!("\"{}\"", inner))
+    Ok(format!("\"{inner}\""))
 }
 
 /// Render with profile support, fallible.
@@ -91,6 +91,11 @@ fn encode_exec_arg(arg: &str) -> Result<String, Error> {
 /// Validates `exe` and `profile_dir` for unrepresentable characters
 /// (NUL/CR/LF) and encodes them with two-layer desktop escaping.
 /// Returns `Err` rather than losing data via lossy conversion.
+///
+/// # Errors
+///
+/// Returns an error if a path is empty, non-absolute, or contains NUL, CR,
+/// or LF, or if the executable path contains `=`.
 pub fn try_render_desktop(
     exe: &str,
     minimized: bool,
@@ -99,7 +104,9 @@ pub fn try_render_desktop(
 ) -> Result<String, Error> {
     validate_desktop_path(exe)?;
     if exe.contains('=') {
-        return Err(Error::Unavailable("desktop executable contains '='".to_string()));
+        return Err(Error::Unavailable(
+            "desktop executable contains '='".to_string(),
+        ));
     }
     if let Some(p) = profile {
         validate_desktop_path(p)?;
@@ -119,6 +126,10 @@ pub fn try_render_desktop(
 }
 
 /// Render with a profile directory, rejecting invalid arguments.
+///
+/// # Errors
+///
+/// Returns an error for paths rejected by [`try_render_desktop`].
 pub fn render_desktop_with_profile(
     exe: &str,
     minimized: bool,
@@ -136,9 +147,7 @@ fn string_decode(input: &str) -> Result<String, Error> {
             match chars.next() {
                 Some('\\') => out.push('\\'),
                 Some(other) => {
-                    return Err(Error::Internal(format!(
-                        "invalid string escape \\{other}"
-                    )))
+                    return Err(Error::Internal(format!("invalid string escape \\{other}")))
                 }
                 None => {
                     return Err(Error::Internal(
@@ -170,9 +179,7 @@ fn exec_tokenize(input: &str) -> Result<Vec<(String, bool)>, Error> {
                     Some('$') => current.push('$'),
                     Some('\\') => current.push('\\'),
                     Some(other) => {
-                        return Err(Error::Internal(format!(
-                            "invalid Exec escape \\{other}"
-                        )))
+                        return Err(Error::Internal(format!("invalid Exec escape \\{other}")))
                     }
                     None => {
                         return Err(Error::Internal(
@@ -190,10 +197,14 @@ fn exec_tokenize(input: &str) -> Result<Vec<(String, bool)>, Error> {
                     chars.next();
                     token_started = true;
                 } else {
-                    return Err(Error::Internal("unescaped % in Exec quoted arg".to_string()));
+                    return Err(Error::Internal(
+                        "unescaped % in Exec quoted arg".to_string(),
+                    ));
                 }
             } else if c == '$' || c == '`' {
-                return Err(Error::Internal("unescaped reserved character in Exec".to_string()));
+                return Err(Error::Internal(
+                    "unescaped reserved character in Exec".to_string(),
+                ));
             } else {
                 current.push(c);
                 token_started = true;
@@ -206,7 +217,9 @@ fn exec_tokenize(input: &str) -> Result<Vec<(String, bool)>, Error> {
                     quote_closed = false;
                 }
             } else if quote_closed {
-                return Err(Error::Internal("text glued to quoted Exec token".to_string()));
+                return Err(Error::Internal(
+                    "text glued to quoted Exec token".to_string(),
+                ));
             } else if c == '"' {
                 if token_started {
                     return Err(Error::Internal(
@@ -215,8 +228,27 @@ fn exec_tokenize(input: &str) -> Result<Vec<(String, bool)>, Error> {
                 }
                 in_quote = true;
                 token_started = true;
-            } else if matches!(c, '\\' | '%' | '\'' | '>' | '<' | '~' | '|' | '&' | ';' | '$' | '*' | '?' | '#' | '(' | ')' | '`') {
-                return Err(Error::Internal("reserved character in unquoted Exec token".to_string()));
+            } else if matches!(
+                c,
+                '\\' | '%'
+                    | '\''
+                    | '>'
+                    | '<'
+                    | '~'
+                    | '|'
+                    | '&'
+                    | ';'
+                    | '$'
+                    | '*'
+                    | '?'
+                    | '#'
+                    | '('
+                    | ')'
+                    | '`'
+            ) {
+                return Err(Error::Internal(
+                    "reserved character in unquoted Exec token".to_string(),
+                ));
             } else {
                 current.push(c);
                 token_started = true;
@@ -238,9 +270,12 @@ fn exec_tokenize(input: &str) -> Result<Vec<(String, bool)>, Error> {
 ///
 /// Returns [`Error::Internal`] when the `[Desktop Entry]` header or a
 /// usable `Exec=` value is missing.
+#[allow(clippy::too_many_lines)] // Keep desktop and Exec validation in one ordered parse.
 pub fn parse_desktop(text: &str) -> Result<DesktopEntry, Error> {
     if text.contains('\0') || text.contains('\r') {
-        return Err(Error::Internal("desktop entry contains NUL or CR".to_string()));
+        return Err(Error::Internal(
+            "desktop entry contains NUL or CR".to_string(),
+        ));
     }
     let mut lines = text.lines().map(str::trim);
     let header = lines.next().unwrap_or("");
@@ -277,7 +312,9 @@ pub fn parse_desktop(text: &str) -> Result<DesktopEntry, Error> {
                     _ => return Err(Error::Internal("invalid Hidden value".to_string())),
                 };
             }
-            "Name" | "Exec" | "Hidden" => return Err(Error::Internal("duplicate desktop key".to_string())),
+            "Name" | "Exec" | "Hidden" => {
+                return Err(Error::Internal("duplicate desktop key".to_string()))
+            }
             _ => {}
         }
     }
@@ -306,12 +343,16 @@ pub fn parse_desktop(text: &str) -> Result<DesktopEntry, Error> {
         }
         match tokens[idx].0.as_str() {
             "--minimized" => {
-                if minimized { return Err(Error::Internal("duplicate --minimized".to_string())); }
+                if minimized {
+                    return Err(Error::Internal("duplicate --minimized".to_string()));
+                }
                 minimized = true;
                 idx += 1;
             }
             "--profile-dir" => {
-                if profile.is_some() { return Err(Error::Internal("duplicate --profile-dir".to_string())); }
+                if profile.is_some() {
+                    return Err(Error::Internal("duplicate --profile-dir".to_string()));
+                }
                 idx += 1;
                 if idx >= tokens.len() || !tokens[idx].1 || tokens[idx].0.starts_with("--") {
                     return Err(Error::Internal(
@@ -388,9 +429,13 @@ mod tests {
 
     #[test]
     fn roundtrip_with_profile_simple() {
-        let text =
-            try_render_desktop("/usr/bin/clipmonger", true, false, Some("/home/alice/.config/clipmonger/profiles/work"))
-                .unwrap();
+        let text = try_render_desktop(
+            "/usr/bin/clipmonger",
+            true,
+            false,
+            Some("/home/alice/.config/clipmonger/profiles/work"),
+        )
+        .unwrap();
         let entry = parse_desktop(&text).unwrap();
         assert_eq!(entry.exec, "/usr/bin/clipmonger");
         assert!(entry.minimized);
@@ -405,13 +450,16 @@ mod tests {
         let exe = "/opt/My Apps/clipmonger";
         let profile = "/home/alice/profiles/foo%bar$baz\\qux`tick\"quote";
         let text = try_render_desktop(exe, true, false, Some(profile)).unwrap();
-        assert_eq!(text, r#"[Desktop Entry]
+        assert_eq!(
+            text,
+            r#"[Desktop Entry]
 Type=Application
 Name=Clipmonger
 Exec="/opt/My Apps/clipmonger" --minimized --profile-dir "/home/alice/profiles/foo%%bar\\$baz\\\\qux\\`tick\\"quote"
 Hidden=false
 Terminal=false
-"#);
+"#
+        );
         let entry = parse_desktop(&text).unwrap();
         assert_eq!(entry.exec, exe);
         assert_eq!(entry.profile.as_deref(), Some(profile));
@@ -430,13 +478,16 @@ Terminal=false
     fn trailing_backslash_roundtrip() {
         let profile = "/home/alice/profiles/work\\";
         let text = try_render_desktop("/usr/bin/clipmonger", true, false, Some(profile)).unwrap();
-        assert_eq!(text, r#"[Desktop Entry]
+        assert_eq!(
+            text,
+            r#"[Desktop Entry]
 Type=Application
 Name=Clipmonger
 Exec="/usr/bin/clipmonger" --minimized --profile-dir "/home/alice/profiles/work\\\\"
 Hidden=false
 Terminal=false
-"#);
+"#
+        );
         let entry = parse_desktop(&text).unwrap();
         assert_eq!(entry.profile.as_deref(), Some(profile));
     }
@@ -444,16 +495,26 @@ Terminal=false
     #[test]
     fn rejects_nul_cr_lf_in_render() {
         assert!(try_render_desktop("/usr/bin/clipmonger\0", true, false, None).is_err());
-        assert!(try_render_desktop("/usr/bin/clipmonger", true, false, Some("/bad\npath")).is_err());
-        assert!(try_render_desktop("/usr/bin/clipmonger", true, false, Some("/bad\rpath")).is_err());
+        assert!(
+            try_render_desktop("/usr/bin/clipmonger", true, false, Some("/bad\npath")).is_err()
+        );
+        assert!(
+            try_render_desktop("/usr/bin/clipmonger", true, false, Some("/bad\rpath")).is_err()
+        );
     }
 
     #[test]
     fn rejects_malformed_exec() {
         // unclosed quote
-        assert!(parse_desktop("[Desktop Entry]\nExec=\"/usr/bin/clipmonger\nHidden=false\nTerminal=false\n").is_err());
+        assert!(parse_desktop(
+            "[Desktop Entry]\nExec=\"/usr/bin/clipmonger\nHidden=false\nTerminal=false\n"
+        )
+        .is_err());
         // unknown field code
-        assert!(parse_desktop("[Desktop Entry]\nExec=\"/usr/bin/clipmonger\" %f\nHidden=false\nTerminal=false\n").is_err());
+        assert!(parse_desktop(
+            "[Desktop Entry]\nExec=\"/usr/bin/clipmonger\" %f\nHidden=false\nTerminal=false\n"
+        )
+        .is_err());
         // Unrelated well-formed keys remain tolerated.
         assert!(parse_desktop("[Desktop Entry]\nExec=\"/usr/bin/clipmonger\" --minimized\nHidden=false\nTerminal=false\nInjected=bad").is_ok());
         let injection = "[Desktop Entry]\nExec=\"/usr/bin/a\" --minimized\r\nHidden=false\n";
@@ -471,9 +532,18 @@ Terminal=false
         assert!(entry.minimized);
         assert_eq!(entry.profile.as_deref(), Some(profile));
         // token count ensures --minimized is separate
-        let decoded = string_decode(&text.lines().find(|l| l.starts_with("Exec=")).unwrap()["Exec=".len()..].trim()).unwrap();
+        let decoded = string_decode(
+            text.lines().find(|l| l.starts_with("Exec=")).unwrap()["Exec=".len()..].trim(),
+        )
+        .unwrap();
         let tokens = exec_tokenize(&decoded).unwrap();
-        assert_eq!(tokens.iter().filter(|(t, _)| t.as_str() == "--minimized").count(), 1);
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|(t, _)| t.as_str() == "--minimized")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -502,14 +572,19 @@ Hidden=false
             r#""/bin/a" %f"#,
             r#""/bin/a" --profile-dir "/bad\q""#,
         ] {
-            assert!(parse_desktop(&format!("[Desktop Entry]\nExec={exec}\n")).is_err(), "{exec}");
+            assert!(
+                parse_desktop(&format!("[Desktop Entry]\nExec={exec}\n")).is_err(),
+                "{exec}"
+            );
         }
         for input in [
             "[Desktop Entry]\nExec=\"/bin/a\"\n[Other]\nHidden=false\n",
             "[Desktop Entry]\nExec=\"/bin/a\"\n[Other\nHidden=false\n",
             "[Desktop Entry]\nExec=\"/bin/a\"\nExec=\"/bin/b\"\n",
             "[Desktop Entry]\nExec=\"/bin/a\"\r\nHidden=false\n",
-        ] { assert!(parse_desktop(input).is_err(), "{input:?}"); }
+        ] {
+            assert!(parse_desktop(input).is_err(), "{input:?}");
+        }
         assert!(try_render_desktop("/opt/a=b", true, false, Some("/p")).is_err());
         assert!(try_render_desktop("/opt/a", true, false, Some("/p=a")).is_ok());
     }
@@ -541,8 +616,10 @@ Hidden=false
             "/tmp/a'bad --minimized",
             "\"/bin/a\" \"--minimized\"",
         ] {
-            assert!(parse_desktop(&format!("[Desktop Entry]\nExec={exec}\n")).is_err(), "{exec}");
+            assert!(
+                parse_desktop(&format!("[Desktop Entry]\nExec={exec}\n")).is_err(),
+                "{exec}"
+            );
         }
     }
-
 }
