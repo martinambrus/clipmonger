@@ -9,6 +9,7 @@ pub mod model;
 pub mod policy;
 pub mod runtime_log;
 pub mod store;
+pub(crate) mod substring_matcher;
 
 pub use config::{AppPaths, Config, PasteDelivery};
 pub use error::{BackendKind, CoreError};
