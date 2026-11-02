@@ -22,4 +22,6 @@ pub mod strings;
 pub mod target_session;
 #[cfg(feature = "gui")]
 pub mod thumbnail_transport;
+#[cfg(feature = "gui")]
+pub mod thumbnail_worker;
 pub mod tray_logic;
