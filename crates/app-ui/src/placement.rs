@@ -56,6 +56,66 @@ fn pick(cursor: (i32, i32), monitors: &[Rect]) -> Rect {
     best
 }
 
+/// Monitor that `place_with_context` would use for either placement mode.
+#[must_use]
+pub(crate) fn destination_monitor(
+    cursor: Option<(i32, i32)>,
+    monitors: &[Rect],
+    current_monitor: Option<Rect>,
+    primary_monitor: Option<Rect>,
+) -> Option<Rect> {
+    if monitors.is_empty() {
+        return None;
+    }
+    if let Some(pos) = cursor {
+        Some(pick(pos, monitors))
+    } else {
+        current_monitor
+            .or(primary_monitor)
+            .or_else(|| monitors.first().copied())
+    }
+}
+
+/// Scale-aware physical size prediction for mixed-DPI moves.
+///
+/// `current_physical` is the host window's present physical size on its
+/// current monitor at `current_scale`. The logical size is
+/// `current_physical / current_scale` and the predicted destination size is
+/// `logical * dest_scale` rounded to nearest physical pixel. Falls back to
+/// `current_physical` when scales are non-finite or non-positive.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "rounded physical dimensions intentionally saturate to i32"
+)]
+#[must_use]
+pub(crate) fn predicted_physical_size(
+    current_physical: (u32, u32),
+    current_scale: f64,
+    dest_scale: f64,
+) -> (i32, i32) {
+    let unchanged = (
+        i32::try_from(current_physical.0).unwrap_or(i32::MAX),
+        i32::try_from(current_physical.1).unwrap_or(i32::MAX),
+    );
+    if !current_scale.is_finite()
+        || current_scale <= 0.0
+        || !dest_scale.is_finite()
+        || dest_scale <= 0.0
+        || (current_scale - dest_scale).abs() <= f64::EPSILON
+    {
+        return unchanged;
+    }
+    let logical_w = f64::from(current_physical.0) / current_scale;
+    let logical_h = f64::from(current_physical.1) / current_scale;
+    let pred_w = (logical_w * dest_scale).round() as i32;
+    let pred_h = (logical_h * dest_scale).round() as i32;
+    if pred_w > 0 && pred_h > 0 {
+        (pred_w, pred_h)
+    } else {
+        unchanged
+    }
+}
+
 /// Shell window size in the popup state.
 pub const POPUP_DEFAULT: (i32, i32) = (480, 360);
 
@@ -126,5 +186,172 @@ pub fn place(
             };
             (x, y)
         }
+    }
+}
+
+/// Snapshot of physical desktop for placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopContext {
+    pub monitors: Vec<Rect>,
+    pub cursor: Option<(i32, i32)>,
+    pub current_monitor: Option<Rect>,
+    pub primary_monitor: Option<Rect>,
+    pub popup_physical_size: (i32, i32),
+    pub supports_global_position: bool,
+}
+
+/// Compute placement from full desktop context, honoring cursor/center rules and fallbacks.
+#[must_use]
+pub fn place_with_context(mode: Placement, ctx: &DesktopContext) -> Option<(i32, i32)> {
+    if !ctx.supports_global_position {
+        return None;
+    }
+    if ctx.monitors.is_empty() {
+        return None;
+    }
+    match mode {
+        Placement::Cursor => {
+            if let Some(cursor) = ctx.cursor {
+                Some(place(
+                    Placement::Cursor,
+                    cursor,
+                    &ctx.monitors,
+                    ctx.popup_physical_size,
+                ))
+            } else {
+                // without cursor, center on known current/primary
+                let fallback = ctx
+                    .current_monitor
+                    .or(ctx.primary_monitor)
+                    .or_else(|| ctx.monitors.first().copied())?;
+                let size = ctx.popup_physical_size;
+                let x = if size.0 >= fallback.w {
+                    fallback.x
+                } else {
+                    fallback.x + (fallback.w - size.0) / 2
+                };
+                let y = if size.1 >= fallback.h {
+                    fallback.y
+                } else {
+                    fallback.y + (fallback.h - size.1) / 2
+                };
+                Some((x, y))
+            }
+        }
+        Placement::Center => {
+            if let Some(cursor) = ctx.cursor {
+                // center on cursor's containing/nearest monitor
+                let monitor = pick(cursor, &ctx.monitors);
+                let size = ctx.popup_physical_size;
+                let x = if size.0 >= monitor.w {
+                    monitor.x
+                } else {
+                    monitor.x + (monitor.w - size.0) / 2
+                };
+                let y = if size.1 >= monitor.h {
+                    monitor.y
+                } else {
+                    monitor.y + (monitor.h - size.1) / 2
+                };
+                Some((x, y))
+            } else {
+                let fallback = ctx
+                    .current_monitor
+                    .or(ctx.primary_monitor)
+                    .or_else(|| ctx.monitors.first().copied())?;
+                let size = ctx.popup_physical_size;
+                let x = if size.0 >= fallback.w {
+                    fallback.x
+                } else {
+                    fallback.x + (fallback.w - size.0) / 2
+                };
+                let y = if size.1 >= fallback.h {
+                    fallback.y
+                } else {
+                    fallback.y + (fallback.h - size.1) / 2
+                };
+                Some((x, y))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod placement_context_tests {
+    use super::*;
+    #[test]
+    fn cursor_uses_containing_monitor_with_negative_origin() {
+        let monitors = vec![
+            Rect {
+                x: -1920,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+        ];
+        let ctx = DesktopContext {
+            monitors,
+            cursor: Some((-1000, 500)),
+            current_monitor: None,
+            primary_monitor: None,
+            popup_physical_size: (480, 360),
+            supports_global_position: true,
+        };
+        let pos = place_with_context(Placement::Cursor, &ctx).unwrap();
+        assert!(pos.0 < 0, "should be on negative monitor: {pos:?}");
+    }
+    #[test]
+    fn unknown_cursor_falls_back_to_primary() {
+        let monitors = vec![Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        }];
+        let ctx = DesktopContext {
+            monitors: monitors.clone(),
+            cursor: None,
+            current_monitor: None,
+            primary_monitor: Some(monitors[0]),
+            popup_physical_size: (480, 360),
+            supports_global_position: true,
+        };
+        let pos = place_with_context(Placement::Center, &ctx).unwrap();
+        assert_eq!(pos, (720, 360));
+    }
+    #[test]
+    fn wayland_no_position() {
+        let ctx = DesktopContext {
+            monitors: vec![Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            }],
+            cursor: Some((100, 100)),
+            current_monitor: None,
+            primary_monitor: None,
+            popup_physical_size: (480, 360),
+            supports_global_position: false,
+        };
+        assert!(place_with_context(Placement::Cursor, &ctx).is_none());
+    }
+    #[test]
+    fn empty_monitors_no_position() {
+        let ctx = DesktopContext {
+            monitors: vec![],
+            cursor: Some((0, 0)),
+            current_monitor: None,
+            primary_monitor: None,
+            popup_physical_size: (480, 360),
+            supports_global_position: true,
+        };
+        assert!(place_with_context(Placement::Center, &ctx).is_none());
     }
 }

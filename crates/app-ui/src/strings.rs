@@ -226,6 +226,7 @@ pub const IDS: &[&str] = &[
     "config.restore_done",
     "config.logs_title",
     "config.logs_refresh",
+    "config.logs_source",
     "config.about_version",
     "config.accesskit_note",
     "config.caps_title",

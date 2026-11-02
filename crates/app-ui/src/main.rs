@@ -385,6 +385,7 @@ fn main() -> ExitCode {
         popup_position: Option::None,
         settings_title: strings::text("config.title").to_string(),
         settings_size: [settings_w as f32, settings_h as f32],
+        settings_state_path: Some(profile.join("ui-window-state.json")),
     };
     let result = runner::run(config, move |startup| {
         build_app(&startup, profile, transport, online, !hidden)

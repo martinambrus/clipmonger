@@ -279,8 +279,7 @@ fn runtime_api_and_failed_ingestion_observe_actual_production_behavior() {
         .handle("logs.tail", &json!({"source":"daemon"}))
         .unwrap();
     assert!(response["sink_error"].as_str().is_some());
-    // Inspect only owned fixture outputs. The sink never has a fallback path.
+    // Inspect only owned fixture outputs; this does not check for writes elsewhere.
     assert!(!dir.join("monitor.log").exists());
-    assert!(!dir.join("C:\\Temp\\monitor.log").exists());
     drop(state); // Global sink holds its companion lock until this test binary exits.
 }

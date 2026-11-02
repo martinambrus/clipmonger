@@ -314,6 +314,7 @@ fn main() {
         popup_position: position,
         settings_title: "clipmonger smoke settings".to_string(),
         settings_size: [400.0, 300.0],
+        settings_state_path: None,
     };
 
     let trace_clone = trace.clone();
