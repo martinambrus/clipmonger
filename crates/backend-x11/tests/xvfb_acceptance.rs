@@ -25,6 +25,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use std::sync::mpsc;
+
 use clipmonger_backend_x11::{
     caps, MonitorOpts, X11Autostart, X11Hotkeys, X11Monitor, X11Paste, X11Transfer,
 };
@@ -306,6 +308,40 @@ struct OwnerConfig {
     reown: Arc<AtomicUsize>,
     /// Set once the owner thread holds the selection.
     owned: Arc<AtomicBool>,
+    /// Optional gated TARGETS hold for overlap control (None = default ungated).
+    targets_gate: Option<Arc<TargetsGate>>,
+}
+
+type GateResponseSender = mpsc::Sender<(Instant, Instant, Window, Atom)>;
+
+#[derive(Debug)]
+struct TargetsGate {
+    gated: AtomicBool,
+    publication: Mutex<Option<(Instant, Window)>>,
+    signal_tx: Mutex<Option<mpsc::Sender<(Instant, Window, Atom)>>>,
+    release_rx: Mutex<Option<mpsc::Receiver<()>>>,
+    response_tx: Mutex<Option<GateResponseSender>>,
+}
+
+type GateReceipts = (
+    Arc<TargetsGate>,
+    mpsc::Receiver<(Instant, Window, Atom)>,
+    mpsc::Sender<()>,
+    mpsc::Receiver<(Instant, Instant, Window, Atom)>,
+);
+
+fn make_targets_gate() -> GateReceipts {
+    let (sig_tx, sig_rx) = mpsc::channel();
+    let (rel_tx, rel_rx) = mpsc::channel();
+    let (response_tx, response_rx) = mpsc::channel();
+    let gate = Arc::new(TargetsGate {
+        gated: AtomicBool::new(true),
+        publication: Mutex::new(None),
+        signal_tx: Mutex::new(Some(sig_tx)),
+        release_rx: Mutex::new(Some(rel_rx)),
+        response_tx: Mutex::new(Some(response_tx)),
+    });
+    (gate, sig_rx, rel_tx, response_rx)
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +358,9 @@ enum OwnerNote {
     },
     IncrTruncated,
     SaveTargetsNotifySeen,
+    SaveTargetsNotifyProperty {
+        property: u32,
+    },
     SelectionCleared,
 }
 
@@ -369,6 +408,28 @@ fn serve_request(
         return Ok(true);
     }
     if target == atoms.targets {
+        let mut release_at = None;
+        if let Some(gate) = &behavior.targets_gate {
+            if gate.gated.swap(false, Ordering::SeqCst) {
+                let tx = gate
+                    .signal_tx
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or("missing gate signal")?;
+                tx.send((Instant::now(), requestor, property))
+                    .map_err(|e| format!("gate signal: {e}"))?;
+                let rx = gate
+                    .release_rx
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or("missing gate release")?;
+                rx.recv_timeout(Duration::from_secs(5))
+                    .map_err(|e| format!("gate release not received: {e}"))?;
+                release_at = Some(Instant::now());
+            }
+        }
         let list = atom_bytes(&[
             atoms.targets,
             atoms.timestamp,
@@ -396,6 +457,17 @@ fn serve_request(
             },
         );
         send_notify(conn, requestor, req_time, selection, target, property)?;
+        if let Some(released_at) = release_at {
+            let gate = behavior.targets_gate.as_ref().ok_or("missing gate")?;
+            let tx = gate
+                .response_tx
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or("missing response receipt")?;
+            tx.send((released_at, Instant::now(), requestor, property))
+                .map_err(|e| format!("response receipt: {e}"))?;
+        }
         return Ok(true);
     }
     if target == atoms.timestamp {
@@ -677,6 +749,9 @@ fn spawn_owner(
             eprintln!("owner: create_window failed");
             return;
         }
+        if let Some(gate) = &behavior.targets_gate {
+            *gate.publication.lock().unwrap() = Some((Instant::now(), win));
+        }
         if xproto::set_selection_owner(&conn, win, selection, x11rb::CURRENT_TIME)
             .map_err(|e| format!("owner set_selection_owner: {e}"))
             .and_then(|cookie| {
@@ -745,7 +820,17 @@ fn spawn_owner(
                 }
                 Event::SelectionNotify(notify) => {
                     if notify.target == atoms.save_targets {
-                        note(&log, OwnerNote::SaveTargetsNotifySeen);
+                        let mut entries = log
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let at = Instant::now();
+                        entries.push((at, OwnerNote::SaveTargetsNotifySeen));
+                        entries.push((
+                            at,
+                            OwnerNote::SaveTargetsNotifyProperty {
+                                property: notify.property,
+                            },
+                        ));
                     }
                 }
                 Event::SelectionClear(_) => {
@@ -870,6 +955,7 @@ fn start_owned_clipboard(
         truncate_incr: false,
         reown: Arc::new(AtomicUsize::new(0)),
         owned: Arc::new(AtomicBool::new(false)),
+        targets_gate: None,
     };
     let stop = Arc::new(AtomicBool::new(false));
     let log: OwnerLog = Arc::new(Mutex::new(Vec::new()));
@@ -904,6 +990,48 @@ fn stop_owner(stop: &Arc<AtomicBool>, handle: thread::JoinHandle<()>) {
         thread::sleep(Duration::from_millis(20));
     }
     let _ = handle.join();
+}
+
+fn start_gated_clipboard(
+    display: &str,
+    text: Vec<u8>,
+    html: Vec<u8>,
+    gate: Arc<TargetsGate>,
+) -> (
+    OwnerConfig,
+    Arc<AtomicBool>,
+    OwnerLog,
+    thread::JoinHandle<()>,
+) {
+    let behavior = OwnerConfig {
+        selection: "CLIPBOARD",
+        text: Arc::new(Mutex::new(text)),
+        html: Arc::new(Mutex::new(html)),
+        silent: false,
+        incr_threshold: 0,
+        truncate_incr: false,
+        reown: Arc::new(AtomicUsize::new(0)),
+        owned: Arc::new(AtomicBool::new(false)),
+        targets_gate: Some(gate),
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let log: OwnerLog = Arc::new(Mutex::new(Vec::new()));
+    let win_slot = Arc::new(Mutex::new(None));
+    let handle = spawn_owner(
+        display,
+        behavior.clone(),
+        Arc::clone(&stop),
+        Arc::clone(&log),
+        Arc::clone(&win_slot),
+    );
+    assert!(
+        poll_until(Duration::from_secs(5), || {
+            behavior.owned.load(Ordering::SeqCst).then_some(())
+        })
+        .is_some(),
+        "gated owner never claimed CLIPBOARD"
+    );
+    (behavior, stop, log, handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,6 +1230,202 @@ fn t505_save_targets_dying_owner() {
     assert_eq!(after_html, html);
 }
 
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the overlap oracle preserves the ordered timing and handoff assertions"
+)]
+fn t505_save_targets_gated_overlap() {
+    let Some((_guard, xvfb)) = fixture("t505_save_targets_gated_overlap") else {
+        return;
+    };
+    let display = xvfb.addr().to_string();
+    let text = b"save-me-gated text".to_vec();
+    let html = b"<p>save-me-gated html</p>".to_vec();
+    let mut monitor = X11Monitor::connect(Some(display.as_str()), default_opts(false, 0))
+        .expect("monitor connect");
+    monitor
+        .subscribe(&[SubscribeKind::Clipboard])
+        .expect("monitor subscribe");
+
+    let (probe_conn, _) = x11rb::connect(Some(display.as_str())).expect("probe connect");
+    let atoms = Atoms::intern(&probe_conn).expect("probe atoms");
+    let manager_atom = xproto::intern_atom(&probe_conn, false, b"CLIPBOARD_MANAGER")
+        .expect("intern manager request")
+        .reply()
+        .expect("intern manager reply")
+        .atom;
+    let manager_win = poll_until(Duration::from_secs(5), || {
+        let owner = xproto::get_selection_owner(&probe_conn, manager_atom)
+            .ok()?
+            .reply()
+            .ok()?
+            .owner;
+        (owner != 0).then_some(owner)
+    })
+    .expect("backend must own CLIPBOARD_MANAGER within 5 s");
+    let previous = xproto::get_selection_owner(&probe_conn, atoms.clipboard)
+        .expect("previous owner request")
+        .reply()
+        .expect("previous owner reply")
+        .owner;
+    assert_eq!(
+        previous, 0,
+        "fresh server must have no previous clipboard owner"
+    );
+    eprintln!("gated: manager={manager_win} previous clipboard={previous}");
+
+    let (gate, sig_rx, rel_tx, response_rx) = make_targets_gate();
+    let (_behavior, stop, log, owner) =
+        start_gated_clipboard(&display, text.clone(), html.clone(), Arc::clone(&gate));
+    let (publication_at, owner_win) = gate
+        .publication
+        .lock()
+        .unwrap()
+        .expect("publication submit timestamp");
+    let (gate_at, requestor, property) = sig_rx.recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|error| {
+            eprintln!("inconclusive: gate error={error:?}, owner log={:?}, owner_finished={}, monitor.poll={:?}",
+                log.lock().unwrap().clone(), owner.is_finished(), monitor.poll(Duration::from_millis(200)));
+            panic!("TARGETS gate not established");
+        });
+    assert_eq!(
+        requestor, manager_win,
+        "inconclusive: TARGETS requestor differs from manager"
+    );
+    assert_ne!(property, 0, "inconclusive: TARGETS request has no property");
+    let current_owner = xproto::get_selection_owner(&probe_conn, atoms.clipboard)
+        .expect("clipboard owner request")
+        .reply()
+        .expect("clipboard owner reply")
+        .owner;
+    let current_manager = xproto::get_selection_owner(&probe_conn, manager_atom)
+        .expect("manager owner request")
+        .reply()
+        .expect("manager owner reply")
+        .owner;
+    assert_eq!(
+        current_owner, owner_win,
+        "inconclusive: clipboard owner changed"
+    );
+    assert_eq!(
+        current_manager, manager_win,
+        "inconclusive: manager owner changed"
+    );
+    let sent_at = Instant::now();
+    let send_result = send_save_targets(&probe_conn, manager_win, atoms.save_targets, 0);
+    eprintln!("gated: send result={send_result:?}");
+    if let Err(error) = send_result {
+        eprintln!("inconclusive: send error={error}, owner log={:?}, owner_finished={}, monitor.poll={:?}",
+            log.lock().unwrap().clone(), owner.is_finished(), monitor.poll(Duration::from_millis(200)));
+        panic!("checked SAVE_TARGETS send failed");
+    }
+    let roundtrip_owner = xproto::get_selection_owner(&probe_conn, manager_atom)
+        .expect("server round trip request")
+        .reply()
+        .expect("server round trip reply")
+        .owner;
+    let roundtrip_at = Instant::now();
+    assert_eq!(
+        roundtrip_owner, manager_win,
+        "inconclusive: manager changed during send"
+    );
+    rel_tx.send(()).expect("inconclusive: gate release failed");
+    let (released_at, response_at, response_requestor, response_property) = response_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|error| {
+            eprintln!("inconclusive: response error={error:?}, owner log={:?}, owner_finished={}, monitor.poll={:?}",
+                log.lock().unwrap().clone(), owner.is_finished(), monitor.poll(Duration::from_millis(200)));
+            panic!("owner did not acknowledge release with checked TARGETS response");
+        });
+    assert_eq!(
+        (response_requestor, response_property),
+        (requestor, property)
+    );
+    let overlap_bound = Duration::from_secs(5);
+    eprintln!("gated: publication={publication_at:?} gate={gate_at:?} send={sent_at:?} roundtrip={roundtrip_at:?} release_received={released_at:?} response={response_at:?} owner={owner_win} requestor={requestor} property={property} elapsed={:?}", response_at.saturating_duration_since(publication_at));
+    assert!(
+        publication_at <= gate_at
+            && gate_at <= sent_at
+            && sent_at <= roundtrip_at
+            && roundtrip_at <= released_at
+            && released_at <= response_at
+            && response_at.duration_since(publication_at) < overlap_bound,
+        "inconclusive: conversion timing bound was not established"
+    );
+
+    let outcome = poll_until(Duration::from_secs(15), || {
+        let entries = log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let converted = entries
+            .iter()
+            .find_map(|(at, note)| matches!(note, OwnerNote::SaveTargetsConvert).then_some(*at))?;
+        let (notified, property) = entries.iter().find_map(|(at, note)| match note {
+            OwnerNote::SaveTargetsNotifyProperty { property } => Some((*at, *property)),
+            _ => None,
+        })?;
+        entries
+            .iter()
+            .any(|(at, note)| *at == notified && matches!(note, OwnerNote::SaveTargetsNotifySeen))
+            .then_some((converted, notified, property))
+    });
+    let entries = log
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let poll_after = monitor.poll(Duration::from_millis(200));
+    eprintln!("gated outcome={outcome:?} owner log={entries:?} post-outcome monitor.poll={poll_after:?} owner_finished={}", owner.is_finished());
+    let (converted, notified, notify_property) = outcome.expect(
+        "inconclusive failure: SAVE_TARGETS conversion/notify missing; event loss and other failures remain possible",
+    );
+    assert_ne!(
+        notify_property, 0,
+        "SAVE_TARGETS notify must indicate success"
+    );
+    assert!(
+        converted < notified,
+        "notify must follow SAVE_TARGETS conversion"
+    );
+    for target in ["TEXT", "text/html"] {
+        assert!(
+            entries.iter().any(|(at, note)| *at > converted
+                && *at < notified
+                && matches!(note, OwnerNote::Served { target: served } if served == target)),
+            "{target} must be served after SAVE_TARGETS conversion and before notification"
+        );
+    }
+    let persisted_owner = poll_until(Duration::from_secs(5), || {
+        let current = xproto::get_selection_owner(&probe_conn, atoms.clipboard)
+            .ok()?
+            .reply()
+            .ok()?
+            .owner;
+        (current == manager_win).then_some(current)
+    })
+    .expect("manager did not claim persisted clipboard within 5 s");
+    eprintln!("gated: persisted clipboard owner={persisted_owner}");
+    stop.store(true, Ordering::SeqCst);
+    assert!(
+        poll_until(Duration::from_secs(5), || owner.is_finished().then_some(())).is_some(),
+        "owner did not exit within 5 s"
+    );
+    owner.join().expect("owner thread panicked");
+    let transfer = X11Transfer::connect(Some(display.as_str())).expect("transfer connect");
+    assert_eq!(
+        transfer
+            .read("text/plain;charset=utf-8", 64 << 20)
+            .expect("persisted text"),
+        text
+    );
+    assert_eq!(
+        transfer
+            .read("text/html", 64 << 20)
+            .expect("persisted html"),
+        html
+    );
+}
+
 // ---------------------------------------------------------------------------
 // t505 INCR: 5 MiB via INCR, then a truncated owner
 // ---------------------------------------------------------------------------
@@ -1125,6 +1449,7 @@ fn t505_incr_5mib() {
         truncate_incr: false,
         reown: Arc::new(AtomicUsize::new(0)),
         owned: Arc::new(AtomicBool::new(false)),
+        targets_gate: None,
     };
     let stop = Arc::new(AtomicBool::new(false));
     let log: OwnerLog = Arc::new(Mutex::new(Vec::new()));
@@ -1170,6 +1495,7 @@ fn t505_incr_5mib() {
         truncate_incr: true,
         reown: Arc::new(AtomicUsize::new(0)),
         owned: Arc::new(AtomicBool::new(false)),
+        targets_gate: None,
     };
     let stop = Arc::new(AtomicBool::new(false));
     let log: OwnerLog = Arc::new(Mutex::new(Vec::new()));
@@ -1222,6 +1548,7 @@ fn t505_owner_timeout() {
         truncate_incr: false,
         reown: Arc::new(AtomicUsize::new(0)),
         owned: Arc::new(AtomicBool::new(false)),
+        targets_gate: None,
     };
     let stop = Arc::new(AtomicBool::new(false));
     let log: OwnerLog = Arc::new(Mutex::new(Vec::new()));
@@ -1367,6 +1694,10 @@ fn t509_existing_manager_capture_only() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the primary policy cases share one owner and ordered lifecycle"
+)]
 fn t511_primary_policy() {
     let Some((_guard, xvfb)) = fixture("t511_primary_policy") else {
         return;
@@ -1382,6 +1713,7 @@ fn t511_primary_policy() {
         truncate_incr: false,
         reown: Arc::new(AtomicUsize::new(0)),
         owned: Arc::new(AtomicBool::new(false)),
+        targets_gate: None,
     };
     let stop = Arc::new(AtomicBool::new(false));
     let log: OwnerLog = Arc::new(Mutex::new(Vec::new()));

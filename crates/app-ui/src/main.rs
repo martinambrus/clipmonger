@@ -29,10 +29,10 @@ const SPAWN_WAIT: Duration = Duration::from_millis(100);
 const RECONNECT_EVERY: Duration = Duration::from_secs(2);
 
 /// Bridge transport to the daemon. Without a link (daemon not up yet, or
-/// gone) a call first reconnects, starting the daemon if needed, at most
-/// every [`RECONNECT_EVERY`]. A failed call is never retried, so a paste can
-/// never run twice; while offline every call fails as unavailable and the
-/// window stays open.
+/// gone) ordinary calls reconnect, starting the daemon if needed, at most
+/// every [`RECONNECT_EVERY`]. An offline Stop returns unavailable without
+/// connecting or starting a daemon. A failed call is never retried, so a
+/// paste can never run twice.
 struct DaemonTransport {
     profile: PathBuf,
     client: Option<Client>,
@@ -49,23 +49,34 @@ impl DaemonTransport {
     }
 }
 
-impl ipc_bridge::Transport for DaemonTransport {
-    fn call(&mut self, method: &str, params: &Value) -> Result<Value, IpcError> {
-        if self.client.is_none()
-            && self
-                .last_attempt
-                .is_none_or(|at| at.elapsed() >= RECONNECT_EVERY)
+fn is_stop_method(method: &str) -> bool {
+    method == "daemon.stop"
+}
+
+impl DaemonTransport {
+    fn call_inner<C>(
+        client: &mut Option<C>,
+        last_attempt: &mut Option<Instant>,
+        method: &str,
+        params: &Value,
+        mut try_connect: impl FnMut() -> Option<C>,
+        mut spawn_daemon: impl FnMut() -> bool,
+        mut do_call: impl FnMut(&C, &str, Value) -> Result<Value, IpcError>,
+    ) -> Result<Value, IpcError> {
+        if client.is_none()
+            && !is_stop_method(method)
+            && last_attempt.is_none_or(|at| at.elapsed() >= RECONNECT_EVERY)
         {
-            self.last_attempt = Some(Instant::now());
-            self.client = try_connect(&self.profile).or_else(|| {
-                if spawn_daemon(&self.profile) {
-                    try_connect(&self.profile)
+            *last_attempt = Some(Instant::now());
+            *client = try_connect().or_else(|| {
+                if spawn_daemon() {
+                    try_connect()
                 } else {
                     Option::None
                 }
             });
         }
-        let Some(client) = &self.client else {
+        let Some(target) = client.as_ref() else {
             return Err(IpcError {
                 code: "unavailable".to_string(),
                 message: "daemon not running".to_string(),
@@ -73,14 +84,28 @@ impl ipc_bridge::Transport for DaemonTransport {
                 backend: Option::None,
             });
         };
-        let outcome = client.call(method, params.clone());
+        let outcome = do_call(target, method, params.clone());
         if outcome
             .as_ref()
             .is_err_and(|e| matches!(e.code.as_str(), "io_failed" | "connection_closed"))
         {
-            self.client = Option::None;
+            *client = Option::None;
         }
         outcome
+    }
+}
+
+impl ipc_bridge::Transport for DaemonTransport {
+    fn call(&mut self, method: &str, params: &Value) -> Result<Value, IpcError> {
+        DaemonTransport::call_inner(
+            &mut self.client,
+            &mut self.last_attempt,
+            method,
+            params,
+            || try_connect(&self.profile),
+            || spawn_daemon(&self.profile),
+            clipmonger_ipc::client::Client::call,
+        )
     }
 }
 
@@ -385,5 +410,459 @@ fn main() -> ExitCode {
             eprintln!("shell failed: {error}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod daemon_transport_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FakeClient(u32);
+
+    fn io_failed() -> IpcError {
+        IpcError {
+            code: "io_failed".to_string(),
+            message: "io".to_string(),
+            retryable: false,
+            backend: None,
+        }
+    }
+
+    fn connection_closed() -> IpcError {
+        IpcError {
+            code: "connection_closed".to_string(),
+            message: "closed".to_string(),
+            retryable: false,
+            backend: None,
+        }
+    }
+
+    fn server_error() -> IpcError {
+        IpcError {
+            code: "internal".to_string(),
+            message: "boom".to_string(),
+            retryable: false,
+            backend: None,
+        }
+    }
+
+    #[test]
+    fn offline_stop_zero_attempts_unavailable() {
+        let mut client: Option<FakeClient> = None;
+        let mut last: Option<Instant> = None;
+        let connect_calls = Rc::new(Cell::new(0));
+        let spawn_calls = Rc::new(Cell::new(0));
+        let cc = connect_calls.clone();
+        let sc = spawn_calls.clone();
+        let result = DaemonTransport::call_inner(
+            &mut client,
+            &mut last,
+            "daemon.stop",
+            &serde_json::json!({}),
+            move || {
+                cc.set(cc.get() + 1);
+                None
+            },
+            move || {
+                sc.set(sc.get() + 1);
+                true
+            },
+            |_, _, _| panic!("should not call"),
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.code, "unavailable");
+        assert_eq!(err.message, "daemon not running");
+        assert!(err.retryable);
+        assert!(err.backend.is_none());
+        assert_eq!(connect_calls.get(), 0);
+        assert_eq!(spawn_calls.get(), 0);
+        assert!(client.is_none());
+        assert!(last.is_none());
+        // A second offline Stop also leaves the daemon unstarted.
+        let mut client2: Option<FakeClient> = None;
+        let mut last2: Option<Instant> = None;
+        let sc2 = Rc::new(Cell::new(0));
+        let sc2c = sc2.clone();
+        let err2 = DaemonTransport::call_inner(
+            &mut client2,
+            &mut last2,
+            "daemon.stop",
+            &serde_json::json!({}),
+            || None,
+            move || {
+                sc2c.set(sc2c.get() + 1);
+                true
+            },
+            |_, _, _| Ok(serde_json::json!({})),
+        )
+        .unwrap_err();
+        assert_eq!(err2.code, "unavailable");
+        assert_eq!(sc2.get(), 0);
+        assert!(last2.is_none());
+    }
+
+    #[test]
+    fn offline_stop_preserves_recent_ordinary_throttle() {
+        let mut client: Option<FakeClient> = None;
+        let mut last = Some(Instant::now());
+        let original_last = last;
+        let connect_calls = Rc::new(Cell::new(0));
+        let spawn_calls = Rc::new(Cell::new(0));
+        let cc = connect_calls.clone();
+        let sc = spawn_calls.clone();
+        let result = DaemonTransport::call_inner(
+            &mut client,
+            &mut last,
+            "history.list",
+            &serde_json::json!({}),
+            move || {
+                cc.set(cc.get() + 1);
+                Some(FakeClient(1))
+            },
+            move || {
+                sc.set(sc.get() + 1);
+                true
+            },
+            |_, _, _| Ok(serde_json::json!({"ok": true})),
+        );
+        assert_eq!(result.unwrap_err().code, "unavailable");
+        assert_eq!(connect_calls.get(), 0);
+        assert_eq!(spawn_calls.get(), 0);
+        assert!(client.is_none());
+        let cc2 = connect_calls.clone();
+        let sc2 = spawn_calls.clone();
+        // Stop under the same throttle makes no attempt and leaves it unchanged.
+        let mut call_seen = false;
+        let result2 = DaemonTransport::call_inner(
+            &mut client,
+            &mut last,
+            "daemon.stop",
+            &serde_json::json!({}),
+            move || {
+                cc2.set(cc2.get() + 1);
+                Some(FakeClient(99))
+            },
+            move || {
+                sc2.set(sc2.get() + 1);
+                true
+            },
+            |c, m, _| {
+                assert_eq!(c, &FakeClient(99));
+                assert_eq!(m, "daemon.stop");
+                call_seen = true;
+                Ok(serde_json::json!({"stopped": true}))
+            },
+        );
+        assert_eq!(result2.unwrap_err().code, "unavailable");
+        assert!(!call_seen);
+        assert_eq!(connect_calls.get(), 0);
+        assert_eq!(spawn_calls.get(), 0);
+        assert!(client.is_none());
+        assert_eq!(last, original_last);
+    }
+
+    #[test]
+    fn offline_ordinary_connect_spawn_reconnect_once_and_throttle() {
+        let mut client: Option<FakeClient> = None;
+        let mut last: Option<Instant> = None;
+        let connect_calls = Rc::new(Cell::new(0));
+        let spawn_calls = Rc::new(Cell::new(0));
+        let cc = connect_calls.clone();
+        let sc = spawn_calls.clone();
+        let mut call_count = 0;
+        let result = DaemonTransport::call_inner(
+            &mut client,
+            &mut last,
+            "history.list",
+            &serde_json::json!({}),
+            {
+                let cc = cc.clone();
+                move || {
+                    let n = cc.get();
+                    cc.set(n + 1);
+                    if n == 0 {
+                        None
+                    } else {
+                        Some(FakeClient(2))
+                    }
+                }
+            },
+            move || {
+                sc.set(sc.get() + 1);
+                true
+            },
+            |c, m, _| {
+                call_count += 1;
+                assert_eq!(c, &FakeClient(2));
+                assert_eq!(m, "history.list");
+                Ok(serde_json::json!({"ok": true}))
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(call_count, 1);
+        assert_eq!(connect_calls.get(), 2);
+        assert_eq!(spawn_calls.get(), 1);
+        assert!(client.is_some());
+        assert!(last.is_some());
+        let mut client2: Option<FakeClient> = None;
+        let mut last2 = Some(Instant::now());
+        let cc2 = Rc::new(Cell::new(0));
+        let sc2 = Rc::new(Cell::new(0));
+        let cc2c = cc2.clone();
+        let sc2c = sc2.clone();
+        let result2 = DaemonTransport::call_inner(
+            &mut client2,
+            &mut last2,
+            "history.list",
+            &serde_json::json!({}),
+            move || {
+                cc2c.set(cc2c.get() + 1);
+                Some(FakeClient(3))
+            },
+            move || {
+                sc2c.set(sc2c.get() + 1);
+                true
+            },
+            |_, _, _| Ok(serde_json::json!({})),
+        );
+        assert!(result2.is_err());
+        assert_eq!(result2.unwrap_err().code, "unavailable");
+        assert_eq!(cc2.get(), 0);
+        assert_eq!(sc2.get(), 0);
+    }
+
+    #[test]
+    fn connected_stop_forwarded_once() {
+        let mut client = Some(FakeClient(10));
+        let mut last: Option<Instant> = None;
+        let connect_calls = Rc::new(Cell::new(0));
+        let spawn_calls = Rc::new(Cell::new(0));
+        let cc = connect_calls.clone();
+        let sc = spawn_calls.clone();
+        let mut call_count = 0;
+        let mut seen_method = String::new();
+        let result = DaemonTransport::call_inner(
+            &mut client,
+            &mut last,
+            "daemon.stop",
+            &serde_json::json!({}),
+            move || {
+                cc.set(cc.get() + 1);
+                Some(FakeClient(11))
+            },
+            move || {
+                sc.set(sc.get() + 1);
+                true
+            },
+            |c, m, p| {
+                call_count += 1;
+                seen_method = m.to_string();
+                assert_eq!(c, &FakeClient(10));
+                assert_eq!(p, serde_json::json!({}));
+                Ok(serde_json::json!({"ok": true}))
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(call_count, 1);
+        assert_eq!(seen_method, "daemon.stop");
+        assert_eq!(connect_calls.get(), 0);
+        assert_eq!(spawn_calls.get(), 0);
+        assert!(client.is_some());
+    }
+
+    #[test]
+    fn stale_stop_io_failed_clears_link_no_retry() {
+        let mut client = Some(FakeClient(20));
+        let mut last: Option<Instant> = None;
+        let connect_calls = Rc::new(Cell::new(0));
+        let spawn_calls = Rc::new(Cell::new(0));
+        let cc = connect_calls.clone();
+        let sc = spawn_calls.clone();
+        let result = DaemonTransport::call_inner(
+            &mut client,
+            &mut last,
+            "daemon.stop",
+            &serde_json::json!({}),
+            move || {
+                cc.set(cc.get() + 1);
+                Some(FakeClient(21))
+            },
+            move || {
+                sc.set(sc.get() + 1);
+                true
+            },
+            |_, _, _| Err(io_failed()),
+        );
+        assert_eq!(result.unwrap_err().code, "io_failed");
+        assert!(client.is_none());
+        assert_eq!(connect_calls.get(), 0);
+        assert_eq!(spawn_calls.get(), 0);
+        let mut client2 = Some(FakeClient(20));
+        let mut last2: Option<Instant> = None;
+        let cc2 = Rc::new(Cell::new(0));
+        let cc2c = cc2.clone();
+        let result2 = DaemonTransport::call_inner(
+            &mut client2,
+            &mut last2,
+            "daemon.stop",
+            &serde_json::json!({}),
+            move || {
+                cc2c.set(cc2c.get() + 1);
+                None
+            },
+            || true,
+            |_, _, _| Err(connection_closed()),
+        );
+        assert_eq!(result2.unwrap_err().code, "connection_closed");
+        assert!(client2.is_none());
+        assert_eq!(cc2.get(), 0);
+    }
+
+    #[test]
+    fn stale_stop_connection_closed_clears_link_no_retry() {
+        let mut client = Some(FakeClient(30));
+        let mut last: Option<Instant> = None;
+        let result = DaemonTransport::call_inner(
+            &mut client,
+            &mut last,
+            "daemon.stop",
+            &serde_json::json!({}),
+            || Some(FakeClient(31)),
+            || true,
+            |_, _, _| Err(connection_closed()),
+        );
+        assert_eq!(result.unwrap_err().code, "connection_closed");
+        assert!(client.is_none());
+    }
+
+    #[test]
+    fn non_io_server_error_retains_link() {
+        let mut client = Some(FakeClient(40));
+        let mut last: Option<Instant> = None;
+        let connect_calls = Rc::new(Cell::new(0));
+        let cc = connect_calls.clone();
+        let result = DaemonTransport::call_inner(
+            &mut client,
+            &mut last,
+            "daemon.stop",
+            &serde_json::json!({}),
+            move || {
+                cc.set(cc.get() + 1);
+                Some(FakeClient(41))
+            },
+            || true,
+            |_, _, _| Err(server_error()),
+        );
+        assert_eq!(result.unwrap_err().code, "internal");
+        assert!(client.is_some());
+        assert_eq!(client, Some(FakeClient(40)));
+        assert_eq!(connect_calls.get(), 0);
+        let mut client2 = Some(FakeClient(50));
+        let mut last2: Option<Instant> = None;
+        let result2 = DaemonTransport::call_inner(
+            &mut client2,
+            &mut last2,
+            "history.list",
+            &serde_json::json!({}),
+            || Some(FakeClient(51)),
+            || true,
+            |_, _, _| Err(server_error()),
+        );
+        assert_eq!(result2.unwrap_err().code, "internal");
+        assert!(client2.is_some());
+    }
+
+    #[test]
+    fn is_stop_method_exact_only() {
+        assert!(is_stop_method("daemon.stop"));
+        assert!(!is_stop_method("daemon.stop.extra"));
+        assert!(!is_stop_method("daemon.stopping"));
+        assert!(!is_stop_method("history.list"));
+        assert!(!is_stop_method(""));
+    }
+
+    #[test]
+    fn offline_stop_order_no_attempt() {
+        let mut client: Option<FakeClient> = None;
+        let mut last: Option<Instant> = None;
+        let order = Rc::new(Cell::new(Vec::<String>::new()));
+        let order_c = order.clone();
+        let order_s = order.clone();
+        let cc = Rc::new(Cell::new(0));
+        let cc_c = cc.clone();
+        let sc = Rc::new(Cell::new(0));
+        let sc_c = sc.clone();
+        let result = DaemonTransport::call_inner(
+            &mut client,
+            &mut last,
+            "daemon.stop",
+            &serde_json::json!({}),
+            move || {
+                let mut v = order_c.take();
+                v.push("connect".to_string());
+                order_c.set(v);
+                cc_c.set(cc_c.get() + 1);
+                None
+            },
+            move || {
+                let mut v = order_s.take();
+                v.push("spawn".to_string());
+                order_s.set(v);
+                sc_c.set(sc_c.get() + 1);
+                true
+            },
+            |_, _, _| Ok(serde_json::json!({})),
+        );
+        assert_eq!(result.unwrap_err().code, "unavailable");
+        assert_eq!(cc.get(), 0);
+        assert_eq!(sc.get(), 0);
+        assert!(order.take().is_empty());
+        assert!(last.is_none());
+    }
+
+    #[test]
+    fn offline_ordinary_order_connect_spawn_connect() {
+        let mut client: Option<FakeClient> = None;
+        let mut last: Option<Instant> = None;
+        let order = Rc::new(Cell::new(Vec::<String>::new()));
+        let order_c = order.clone();
+        let order_s = order.clone();
+        let cc = Rc::new(Cell::new(0));
+        let cc_c = cc.clone();
+        let sc = Rc::new(Cell::new(0));
+        let sc_c = sc.clone();
+        let result = DaemonTransport::call_inner(
+            &mut client,
+            &mut last,
+            "history.list",
+            &serde_json::json!({}),
+            move || {
+                let mut v = order_c.take();
+                v.push("connect".to_string());
+                order_c.set(v);
+                let n = cc_c.get();
+                cc_c.set(n + 1);
+                if n == 0 {
+                    None
+                } else {
+                    Some(FakeClient(99))
+                }
+            },
+            move || {
+                let mut v = order_s.take();
+                v.push("spawn".to_string());
+                order_s.set(v);
+                sc_c.set(sc_c.get() + 1);
+                true
+            },
+            |c, _, _| Ok(serde_json::json!({"ok": c.0})),
+        );
+        assert!(result.is_ok());
+        assert_eq!(cc.get(), 2);
+        assert_eq!(sc.get(), 1);
+        assert_eq!(order.take(), vec!["connect", "spawn", "connect"]);
     }
 }
