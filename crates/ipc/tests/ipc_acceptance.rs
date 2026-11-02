@@ -1187,35 +1187,40 @@ async fn t205_oversize_drop() {
     let (mut w, mut r, welcome) = raw_hello(&sock, "h1", TEST_TOKEN);
     assert!(welcome.error.is_none());
 
+    use std::io::{ErrorKind, Read};
+    w.set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("write timeout must be settable");
+    r.get_ref()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout must be settable");
+    let allow_peer_close = |result: std::io::Result<()>| {
+        if let Err(error) = result {
+            assert!(
+                matches!(
+                    error.kind(),
+                    ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+                ),
+                "unexpected write failure: {error}"
+            );
+        }
+    };
     let big = vec![b'z'; 2 * 1024 * 1024];
-    w.write_all(&big).expect("oversize write");
-    w.write_all(b"\n").expect("newline write");
-    let _ = w.flush();
-    // The poisoned connection must never serve again: a follow-up echo on it
-    // gets no response (EOF or timeout both read as None here). The write
-    // itself may fail with EPIPE if the server already closed: that also
-    // proves the drop, so write errors are ignored here.
-    if let Ok(mut bytes) = framing::encode_line(&req("r9", "echo", json!({"lost": true}))) {
-        if !bytes.ends_with(b"\n") {
-            bytes.push(b'\n');
-        }
-        let _ = w.write_all(&bytes);
-        let _ = w.flush();
+    allow_peer_close(w.write_all(&big));
+    allow_peer_close(w.write_all(b"\n"));
+    let bytes = framing::encode_line(&req("r9", "echo", json!({"lost": true})))
+        .expect("follow-up request must encode");
+    allow_peer_close(w.write_all(&bytes));
+    allow_peer_close(w.flush());
+
+    // No response is allowed on the poisoned connection, including the r9
+    // echo. A timeout is not evidence that the peer closed.
+    let mut byte = [0u8; 1];
+    match r.read(&mut byte) {
+        Ok(0) => {}
+        Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+        Ok(_) => panic!("oversize connection produced a response instead of closing"),
+        Err(error) => panic!("expected EOF or connection reset, got: {error}"),
     }
-    let mut r9_answered = false;
-    for _ in 0..6 {
-        match recv_env(&mut r) {
-            Some(f) if f.id == "r9" => {
-                r9_answered = true;
-                break;
-            }
-            _ => {}
-        }
-    }
-    assert!(
-        !r9_answered,
-        "oversize connection must be dropped, not served"
-    );
     // A fresh client still gets served: the server itself survived.
     #[allow(unused_mut)]
     let mut client = connect_client(&sock, TEST_TOKEN);
