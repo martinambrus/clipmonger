@@ -31,27 +31,44 @@ fn windows_path_str(path: &Path) -> Result<&str> {
     let s = path
         .to_str()
         .ok_or_else(|| Error::Unavailable("autostart path is not Unicode".to_string()))?;
-    let bytes = s.as_bytes();
-    let drive = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/');
-    let unc = if s.starts_with("\\\\") || s.starts_with("//") {
-        let mut parts = s[2..].split(['\\', '/']);
+    let valid_unc = |rest: &str| {
+        let mut parts = rest.split(['\\', '/']);
         matches!((parts.next(), parts.next()), (Some(server), Some(share)) if !server.is_empty() && server != "." && server != ".." && !share.is_empty())
-    } else {
-        false
     };
-    if !drive && !unc {
-        return Err(Error::Unavailable(
-            "autostart path must be an absolute drive or UNC path".to_string(),
-        ));
-    }
-    for (i, ch) in s.char_indices() {
-        if ch.is_control()
-            || matches!(ch, '"' | '<' | '>' | '|' | '?' | '*')
-            || (ch == ':' && !(drive && i == 1))
+    let drive_prefix = |path: &str| {
+        let bytes = path.as_bytes();
+        bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/')
+    };
+    let components = if let Some(rest) = s.strip_prefix(r"\\?\") {
+        // Verbatim paths use backslashes and only drive or UNC namespaces.
+        if rest.contains('/') {
+            None
+        } else if drive_prefix(rest) {
+            Some(&rest[2..])
+        } else if rest
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC\\"))
+            && valid_unc(&rest[4..])
         {
+            Some(&rest[4..])
+        } else {
+            None
+        }
+    } else if drive_prefix(s)
+        || ((s.starts_with("\\\\") || s.starts_with("//")) && valid_unc(&s[2..]))
+    {
+        Some(&s[2..])
+    } else {
+        None
+    };
+    let components = components.ok_or_else(|| {
+        Error::Unavailable("autostart path must be an absolute drive or UNC path".to_string())
+    })?;
+    for ch in components.chars() {
+        if ch.is_control() || matches!(ch, '"' | '<' | '>' | '|' | '?' | '*' | ':') {
             return Err(Error::Unavailable(
                 "autostart path contains an invalid Windows character".to_string(),
             ));
@@ -236,10 +253,16 @@ mod tests {
             "D:/profiles/é space",
             r"\\server\share\profile",
             "//server/share/profile",
+            r"\\?\C:\Program Files\é",
+            r"\\?\UNC\server\share\é space",
         ] {
             assert!(
                 run_value_with_profile(exe, Path::new(valid), true).is_ok(),
                 "{valid:?}"
+            );
+            assert!(
+                run_value_with_profile(Path::new(valid), exe, true).is_ok(),
+                "executable {valid:?}"
             );
         }
         for invalid in [
@@ -256,12 +279,74 @@ mod tests {
             r"C:\bad:name",
             r"C:\bad<name",
             r"C:\bad?name",
+            r"\\?\",
+            r"\\?\C:",
+            r"\\?\C:relative",
+            r"\\?\UNC\",
+            r"\\?\UNC\server",
+            r"\\?\UNC\server\",
+            r"\\?\UNC\\share\path",
+            r"\\?\UNC\server\\path",
+            r"\\?\C:\bad?name",
+            "\\\\?\\C:\\bad\0name",
+            "\\\\?\\C:\\bad\"name",
+            r"\\?\C:/bad",
+            r"\\?\C:\bad*name",
+            r"\\?\C:\bad:name",
+            r"\\?\UNC\server\share\bad?name",
+            r"\\?\UNC\server\share\bad*name",
+            r"\\?\UNC\server\share\bad:name",
+            r"\\.\C:\path",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\path",
+            r"\\?\pipe\name",
+            r"\\.\pipe\name",
         ] {
             assert!(
                 run_value_with_profile(exe, Path::new(invalid), true).is_err(),
                 "{invalid:?}"
             );
+            assert!(
+                run_value_with_profile(Path::new(invalid), exe, true).is_err(),
+                "executable {invalid:?}"
+            );
         }
+    }
+
+    #[test]
+    fn windows_extended_paths_keep_exact_quoted_arguments() {
+        let exe = Path::new(r"\\?\C:\Program Files\é\clipmonger.exe");
+        let profile = Path::new(r"\\?\UNC\server\share\My Profile\");
+        assert_eq!(
+            run_value_with_profile(exe, profile, true).unwrap(),
+            r#""\\?\C:\Program Files\é\clipmonger.exe" --minimized --profile-dir "\\?\UNC\server\share\My Profile\\""#
+        );
+        let exe = Path::new(r"\\?\UNC\server\share\app.exe");
+        let profile = Path::new(r"\\?\D:\é Profiles\work\");
+        assert_eq!(
+            run_value_with_profile(exe, profile, false).unwrap(),
+            r#""\\?\UNC\server\share\app.exe" --profile-dir "\\?\D:\é Profiles\work\\""#
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_canonical_paths_are_accepted() {
+        let root = std::env::temp_dir().join(format!(
+            "clipmonger-canonical-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let exe = root.join("clipmonger.exe");
+        std::fs::write(&exe, b"").unwrap();
+        let canonical_exe = std::fs::canonicalize(&exe).unwrap();
+        let canonical_profile = std::fs::canonicalize(&root).unwrap();
+        let result = run_value_with_profile(&canonical_exe, &canonical_profile, true);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(result.is_ok(), "canonical paths: {result:?}");
     }
 
     #[cfg(unix)]
