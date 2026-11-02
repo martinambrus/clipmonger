@@ -140,6 +140,30 @@ pub fn hwnd(window: &Window) -> Option<u64> {
     }
 }
 
+/// Whether the owned window is native-maximized via Win32 `IsZoomed`.
+/// Returns `None` if a Windows handle cannot be obtained; other platforms report `Some(false)`.
+/// The caller must be on the owning event-loop thread and keep `window` alive for the call.
+#[must_use]
+pub fn is_window_zoomed(window: &Window) -> Option<bool> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::IsZoomed;
+        let raw = hwnd(window)? as *mut std::ffi::c_void;
+        let handle = HWND(raw);
+        // SAFETY: `handle` is a live borrowed HWND from `window` on the owning event-loop thread.
+        // `IsZoomed` only inspects window state and does not retain the handle.
+        #[allow(unsafe_code)]
+        let zoomed = unsafe { IsZoomed(handle).as_bool() };
+        Some(zoomed)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        Some(false)
+    }
+}
+
 /// Whether the event loop runs on Wayland, where winit can neither hide,
 /// raise nor place a window: the popup is then created per show and destroyed
 /// on hide.

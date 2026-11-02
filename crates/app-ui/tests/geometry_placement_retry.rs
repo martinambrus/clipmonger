@@ -29,6 +29,7 @@ struct Native {
     position: [i32; 2],
     minimized: bool,
     maximized: bool,
+    os_zoomed: Option<bool>,
     fullscreen: bool,
     position_queries: Cell<usize>,
 }
@@ -41,6 +42,7 @@ impl Native {
             position: [-1800, -150],
             minimized: false,
             maximized: false,
+            os_zoomed: Some(false),
             fullscreen: false,
             position_queries: Cell::new(0),
         }
@@ -68,6 +70,9 @@ impl GeometryWindow for Native {
     fn outer_position(&self) -> Option<PhysicalPosition<i32>> {
         self.position_queries.set(self.position_queries.get() + 1);
         Some(PhysicalPosition::new(self.position[0], self.position[1]))
+    }
+    fn is_native_maximized(&self) -> Option<bool> {
+        self.os_zoomed
     }
 }
 
@@ -391,4 +396,359 @@ fn size_only_prefers_primary_monitor_scale_and_unknown_monitor_preserves_native_
     let unknown = state.normalized_for_restore([960.0, 680.0], &[], None, false);
     close(unknown.logical_size[0], 8000.0);
     assert!(unknown.physical_position.is_none());
+}
+
+#[test]
+fn maximized_changed_disagreement_then_exit_preserves_g3() {
+    let path = fixture();
+    let g2 = Native {
+        size: PhysicalSize::new(1136, 580),
+        scale: 1.0,
+        position: [230, 123],
+        maximized: false,
+        os_zoomed: Some(false),
+        minimized: false,
+        fullscreen: false,
+        position_queries: Cell::new(0),
+    };
+    let mut seed = GeometryState::new(Some(path.clone()));
+    seed.handle(Lifecycle::Close, Some(&g2), true, |m| panic!("{m}"));
+    assert!(path.exists());
+    let persisted_g2 = geometry::load(&path).unwrap();
+    assert_eq!(persisted_g2.logical_width, 1136.0);
+    assert_eq!(persisted_g2.logical_height, 580.0);
+    assert_eq!(persisted_g2.physical_x, Some(230));
+    assert_eq!(persisted_g2.physical_y, Some(123));
+
+    let mut state = GeometryState::new(Some(path.clone()));
+    assert_eq!(state.load_for_restore().unwrap().logical_width, 1136.0);
+
+    let g3 = Native {
+        size: PhysicalSize::new(1280, 720),
+        scale: 1.0,
+        position: [100, 100],
+        maximized: false,
+        os_zoomed: Some(false),
+        minimized: false,
+        fullscreen: false,
+        position_queries: Cell::new(0),
+    };
+    state.handle(Lifecycle::Changed, Some(&g3), true, |m| panic!("{m}"));
+    assert_eq!(
+        geometry::load(&path).unwrap().logical_width,
+        1136.0,
+        "Changed must not eagerly write"
+    );
+    assert_eq!(state.load_for_restore().unwrap().logical_width, 1280.0);
+    assert_eq!(state.load_for_restore().unwrap().physical_x, Some(100));
+    assert_eq!(g3.position_queries.get(), 1);
+
+    let maximized_disagreement = Native {
+        size: PhysicalSize::new(1920, 1009),
+        scale: 1.0,
+        position: [-8, -8],
+        maximized: false,
+        os_zoomed: Some(true),
+        minimized: false,
+        fullscreen: false,
+        position_queries: Cell::new(0),
+    };
+    state.handle(
+        Lifecycle::Changed,
+        Some(&maximized_disagreement),
+        true,
+        |m| panic!("{m}"),
+    );
+
+    let maximized_agreed = Native {
+        size: PhysicalSize::new(1920, 1009),
+        scale: 1.0,
+        position: [-8, -8],
+        maximized: true,
+        os_zoomed: Some(true),
+        minimized: false,
+        fullscreen: false,
+        position_queries: Cell::new(0),
+    };
+    state.handle(Lifecycle::Changed, Some(&maximized_agreed), true, |m| {
+        panic!("{m}")
+    });
+    state.handle(Lifecycle::Exit, Some(&maximized_agreed), true, |m| {
+        panic!("{m}")
+    });
+    let saved = geometry::load(&path).unwrap();
+    assert_eq!(saved.logical_width, 1280.0);
+    assert_eq!(saved.logical_height, 720.0);
+    assert_eq!(saved.physical_x, Some(100));
+    assert_eq!(saved.physical_y, Some(100));
+    assert_ne!(saved.logical_width, 1136.0);
+    assert_ne!(saved.logical_width, 1920.0);
+    let reloaded = GeometryState::new(Some(path.clone()));
+    assert_eq!(reloaded.load_for_restore().unwrap(), saved);
+    assert_eq!(reloaded.load_for_restore().unwrap().physical_x, Some(100));
+    assert_eq!(
+        maximized_disagreement.position_queries.get(),
+        0,
+        "rejected maximized must not query position"
+    );
+    assert_eq!(state.load_for_restore().unwrap().logical_width, 1280.0);
+    assert_eq!(state.load_for_restore().unwrap().logical_height, 720.0);
+    assert_eq!(state.load_for_restore().unwrap().physical_x, Some(100));
+    assert_eq!(maximized_agreed.position_queries.get(), 0);
+    assert_eq!(state.load_for_restore().unwrap().logical_width, 1280.0);
+    assert_eq!(maximized_agreed.position_queries.get(), 0);
+}
+
+#[test]
+fn maximized_close_and_direct_exit_disagreement_preserves_g3() {
+    for lifecycle in [Lifecycle::Close, Lifecycle::Exit] {
+        let path = fixture();
+        let g2 = Native {
+            size: PhysicalSize::new(1136, 580),
+            scale: 1.0,
+            position: [230, 123],
+            maximized: false,
+            os_zoomed: Some(false),
+            ..Native::normal()
+        };
+        let mut seed = GeometryState::new(Some(path.clone()));
+        seed.handle(Lifecycle::Close, Some(&g2), true, |m| panic!("{m}"));
+        let mut state = GeometryState::new(Some(path.clone()));
+        let g3 = Native {
+            size: PhysicalSize::new(1280, 720),
+            scale: 1.0,
+            position: [100, 100],
+            maximized: false,
+            os_zoomed: Some(false),
+            ..Native::normal()
+        };
+        state.handle(Lifecycle::Changed, Some(&g3), true, |m| panic!("{m}"));
+        assert_eq!(state.load_for_restore().unwrap().logical_width, 1280.0);
+        let maximized_disagreement = Native {
+            size: PhysicalSize::new(1920, 1009),
+            scale: 1.0,
+            position: [-8, -8],
+            maximized: false,
+            os_zoomed: Some(true),
+            ..Native::normal()
+        };
+        state.handle(lifecycle, Some(&maximized_disagreement), true, |m| {
+            panic!("{m}")
+        });
+        assert_eq!(maximized_disagreement.position_queries.get(), 0);
+        let saved = geometry::load(&path).unwrap();
+        assert_eq!(
+            saved.logical_width, 1280.0,
+            "lifecycle {lifecycle:?} must preserve G3"
+        );
+        assert_eq!(saved.physical_x, Some(100));
+    }
+}
+
+#[test]
+fn cached_true_native_false_restore_still_rejected() {
+    let path = fixture();
+    let normal = Native {
+        size: PhysicalSize::new(1280, 720),
+        scale: 1.0,
+        position: [100, 100],
+        maximized: false,
+        os_zoomed: Some(false),
+        ..Native::normal()
+    };
+    let mut state = GeometryState::new(Some(path.clone()));
+    state.handle(Lifecycle::Changed, Some(&normal), true, |m| panic!("{m}"));
+    state.handle(Lifecycle::Close, Some(&normal), true, |m| panic!("{m}"));
+    assert_eq!(geometry::load(&path).unwrap().logical_width, 1280.0);
+
+    let mut state2 = GeometryState::new(Some(path.clone()));
+    let restore_disagreement = Native {
+        size: PhysicalSize::new(1920, 1009),
+        scale: 1.0,
+        position: [-8, -8],
+        maximized: true,
+        os_zoomed: Some(false),
+        ..Native::normal()
+    };
+    state2.handle(Lifecycle::Changed, Some(&restore_disagreement), true, |m| {
+        panic!("{m}")
+    });
+    assert_eq!(restore_disagreement.position_queries.get(), 0);
+    assert_eq!(state2.load_for_restore().unwrap().logical_width, 1280.0);
+    state2.handle(Lifecycle::Exit, Some(&restore_disagreement), true, |m| {
+        panic!("{m}")
+    });
+    assert_eq!(geometry::load(&path).unwrap().logical_width, 1280.0);
+}
+
+#[test]
+fn unknown_native_observation_preserves_g3_and_recovers() {
+    for lifecycle in [Lifecycle::Close, Lifecycle::Exit] {
+        let path = fixture();
+        let g2 = Native {
+            size: PhysicalSize::new(1136, 580),
+            scale: 1.0,
+            position: [230, 123],
+            ..Native::normal()
+        };
+        let mut seed = GeometryState::new(Some(path.clone()));
+        seed.handle(Lifecycle::Close, Some(&g2), true, |m| panic!("{m}"));
+        let mut state = GeometryState::new(Some(path.clone()));
+        let g3 = Native {
+            size: PhysicalSize::new(1280, 720),
+            scale: 1.0,
+            position: [100, 100],
+            ..Native::normal()
+        };
+        state.handle(Lifecycle::Changed, Some(&g3), true, |m| panic!("{m}"));
+        assert_eq!(geometry::load(&path).unwrap().logical_width, 1136.0);
+        let unknown = Native {
+            size: PhysicalSize::new(1920, 1009),
+            scale: 1.0,
+            position: [-8, -8],
+            os_zoomed: None,
+            ..Native::normal()
+        };
+        state.handle(Lifecycle::Changed, Some(&unknown), true, |m| panic!("{m}"));
+        assert_eq!(unknown.position_queries.get(), 0);
+        assert_eq!(state.load_for_restore().unwrap().logical_width, 1280.0);
+        state.handle(lifecycle, Some(&unknown), true, |m| panic!("{m}"));
+        assert_eq!(unknown.position_queries.get(), 0);
+        let saved = geometry::load(&path).unwrap();
+        assert_eq!(saved.logical_width, 1280.0);
+        assert_eq!(saved.logical_height, 720.0);
+        assert_eq!((saved.physical_x, saved.physical_y), (Some(100), Some(100)));
+        assert_eq!(
+            GeometryState::new(Some(path.clone())).load_for_restore(),
+            Some(saved)
+        );
+
+        let normal = Native {
+            size: PhysicalSize::new(1400, 800),
+            scale: 1.0,
+            position: [200, 200],
+            ..Native::normal()
+        };
+        state.handle(Lifecycle::Changed, Some(&normal), true, |m| panic!("{m}"));
+        assert_eq!(normal.position_queries.get(), 1);
+        state.handle(lifecycle, Some(&normal), true, |m| panic!("{m}"));
+        let recovered = geometry::load(&path).unwrap();
+        assert_eq!(recovered.logical_width, 1400.0);
+        assert_eq!(
+            (recovered.physical_x, recovered.physical_y),
+            (Some(200), Some(200))
+        );
+    }
+}
+
+#[test]
+fn subsequent_normal_capture_after_rejected_succeeds_and_wayland_no_position() {
+    let path = fixture();
+    let g3 = Native {
+        size: PhysicalSize::new(1280, 720),
+        scale: 1.0,
+        position: [100, 100],
+        maximized: false,
+        os_zoomed: Some(false),
+        ..Native::normal()
+    };
+    let mut state = GeometryState::new(Some(path.clone()));
+    state.handle(Lifecycle::Changed, Some(&g3), true, |m| panic!("{m}"));
+    assert_eq!(state.load_for_restore().unwrap().logical_width, 1280.0);
+
+    let maximized = Native {
+        size: PhysicalSize::new(1920, 1009),
+        scale: 1.0,
+        position: [-8, -8],
+        maximized: false,
+        os_zoomed: Some(true),
+        ..Native::normal()
+    };
+    state.handle(Lifecycle::Changed, Some(&maximized), true, |m| {
+        panic!("{m}")
+    });
+    assert_eq!(state.load_for_restore().unwrap().logical_width, 1280.0);
+
+    let g4 = Native {
+        size: PhysicalSize::new(1400, 800),
+        scale: 1.0,
+        position: [200, 200],
+        maximized: false,
+        os_zoomed: Some(false),
+        ..Native::normal()
+    };
+    state.handle(Lifecycle::Changed, Some(&g4), true, |m| panic!("{m}"));
+    assert_eq!(g4.position_queries.get(), 1);
+    assert_eq!(state.load_for_restore().unwrap().logical_width, 1400.0);
+    assert_eq!(state.load_for_restore().unwrap().physical_x, Some(200));
+    state.handle(Lifecycle::Close, Some(&g4), true, |m| panic!("{m}"));
+    assert_eq!(geometry::load(&path).unwrap().logical_width, 1400.0);
+
+    let mut state_wayland = GeometryState::new(None);
+    let normal_no_global = Native {
+        size: PhysicalSize::new(1280, 720),
+        scale: 1.0,
+        position: [100, 100],
+        maximized: false,
+        os_zoomed: Some(false),
+        ..Native::normal()
+    };
+    state_wayland.handle(Lifecycle::Changed, Some(&normal_no_global), false, |m| {
+        panic!("{m}")
+    });
+    assert_eq!(
+        normal_no_global.position_queries.get(),
+        0,
+        "Wayland/global_position false must not query outer position"
+    );
+    assert_eq!(
+        state_wayland.load_for_restore().unwrap().logical_width,
+        1280.0
+    );
+    assert_eq!(state_wayland.load_for_restore().unwrap().physical_x, None);
+
+    let maximized_no_global = Native {
+        size: PhysicalSize::new(1920, 1009),
+        scale: 1.0,
+        position: [-8, -8],
+        maximized: false,
+        os_zoomed: Some(true),
+        ..Native::normal()
+    };
+    state_wayland.handle(Lifecycle::Changed, Some(&maximized_no_global), false, |m| {
+        panic!("{m}")
+    });
+    assert_eq!(
+        maximized_no_global.position_queries.get(),
+        0,
+        "rejected maximized with no global must not query position"
+    );
+    assert_eq!(
+        state_wayland.load_for_restore().unwrap().logical_width,
+        1280.0
+    );
+}
+
+#[test]
+fn large_truly_normal_window_persists() {
+    let path = fixture();
+    let large_normal = Native {
+        size: PhysicalSize::new(1920, 1009),
+        scale: 1.0,
+        position: [-8, -8],
+        maximized: false,
+        os_zoomed: Some(false),
+        ..Native::normal()
+    };
+    let mut state = GeometryState::new(Some(path.clone()));
+    state.handle(Lifecycle::Changed, Some(&large_normal), true, |m| {
+        panic!("{m}")
+    });
+    assert_eq!(large_normal.position_queries.get(), 1);
+    assert_eq!(state.load_for_restore().unwrap().logical_width, 1920.0);
+    assert_eq!(state.load_for_restore().unwrap().physical_x, Some(-8));
+    state.handle(Lifecycle::Close, Some(&large_normal), true, |m| {
+        panic!("{m}")
+    });
+    assert_eq!(geometry::load(&path).unwrap().logical_width, 1920.0);
 }

@@ -38,6 +38,11 @@ pub trait GeometryWindow {
     fn is_maximized(&self) -> bool;
     fn is_fullscreen(&self) -> bool;
     fn outer_position(&self) -> Option<PhysicalPosition<i32>>;
+    /// `None` means a required native observation was unavailable; reject capture.
+    /// Platforms without a native query report `Some(false)`.
+    fn is_native_maximized(&self) -> Option<bool> {
+        Some(false)
+    }
 }
 
 impl GeometryWindow for Window {
@@ -61,6 +66,9 @@ impl GeometryWindow for Window {
     }
     fn outer_position(&self) -> Option<PhysicalPosition<i32>> {
         Self::outer_position(self).ok()
+    }
+    fn is_native_maximized(&self) -> Option<bool> {
+        crate::runner::window::is_window_zoomed(self)
     }
 }
 
@@ -118,7 +126,11 @@ impl GeometryState {
     }
 
     fn capture_window(&mut self, window: &impl GeometryWindow, global_position: bool) {
-        if window.is_minimized() == Some(true) || window.is_maximized() || window.is_fullscreen() {
+        if window.is_minimized() == Some(true)
+            || window.is_maximized()
+            || window.is_native_maximized() != Some(false)
+            || window.is_fullscreen()
+        {
             return;
         }
         let physical = window.inner_size();
