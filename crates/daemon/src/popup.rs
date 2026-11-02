@@ -103,6 +103,11 @@ impl DaemonState {
             if let Ok(token) = self.mint_gesture_token_with(target, at_ms, draw) {
                 Some(token)
             } else {
+                crate::daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "popup.gesture_failed",
+                    &[("class", "entropy_unavailable")],
+                );
                 eprintln!("daemon: gesture entropy unavailable");
                 None
             }
@@ -151,6 +156,11 @@ impl DaemonState {
         };
         if let Some(launch) = launcher {
             if !launch() {
+                crate::daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "popup.spawn_failed",
+                    &[("class", "launcher_unavailable")],
+                );
                 eprintln!("daemon: could not start the UI for the popup");
             }
         }
@@ -207,6 +217,13 @@ impl PopupChord {
                 Some(ChordStatus::Held)
             }
             Err(e) => {
+                if !retry {
+                    crate::daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "hotkey.register_failed",
+                        &[("class", crate::runtime_platform_class(&e))],
+                    );
+                }
                 self.refused = Some((wanted.to_string(), now));
                 (!retry).then(|| ChordStatus::Refused(format!("{wanted}: {e}")))
             }
@@ -256,6 +273,11 @@ pub fn run_hotkeys<H: HotkeyManager>(
                     hotkeys = Some(replacement);
                 }
                 Err(error) => {
+                    crate::daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "hotkey.init_failed",
+                        &[("class", crate::runtime_platform_class(&error))],
+                    );
                     report(ChordStatus::Refused(error.to_string()));
                     ready();
                     sleep(delay);
@@ -305,6 +327,14 @@ pub fn run_hotkeys<H: HotkeyManager>(
                 }
             }
             Err(error) => {
+                crate::daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "hotkey.poll_failed",
+                    &[
+                        ("operation", "hotkey_poll"),
+                        ("class", crate::runtime_platform_class(&error)),
+                    ],
+                );
                 report(ChordStatus::Refused(error.to_string()));
                 // Drop before waiting/constructing the replacement, including
                 // its native window and registrations on the owning thread.
