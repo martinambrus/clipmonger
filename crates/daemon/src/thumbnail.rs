@@ -270,17 +270,107 @@ pub struct ThumbnailService {
     timeout: Duration,
     active: Arc<Mutex<bool>>,
     shutdown: Arc<AtomicBool>,
+    init_error: Option<String>,
     #[cfg(test)] fixture: Option<(PathBuf, Arc<Mutex<Option<(u32, bool, bool)>>>)>,
+    #[cfg(test)] cleanup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)] live_checks: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)] wait_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+pub struct ThumbnailPermit<'a> {
+    service: &'a ThumbnailService,
+    _guard: std::sync::MutexGuard<'a, bool>,
+}
+
+impl<'a> ThumbnailPermit<'a> {
+    pub fn decode(&self, input: &[u8], max_px: u32) -> Result<ThumbnailOutput, ThumbnailError> {
+        self.decode_with_cancel(input, max_px, None)
+    }
+    pub fn decode_with_cancel(&self, input: &[u8], max_px: u32, cancel: Option<Arc<AtomicBool>>) -> Result<ThumbnailOutput, ThumbnailError> {
+        if !(MIN_PX..=MAX_PX).contains(&max_px) {
+            return Err(ThumbnailError::InvalidInput("max_px out of range".to_string()));
+        }
+        if input.len() > MAX_INPUT_BYTES {
+            return Err(ThumbnailError::TooLarge("input exceeds 16MiB".to_string()));
+        }
+        if let Some(err) = self.service.check_unavailable() {
+            return Err(err);
+        }
+        self.service.spawn_and_wait(input, max_px, cancel)
+    }
+}
+
+impl<'a> Drop for ThumbnailPermit<'a> {
+    fn drop(&mut self) {
+        *self._guard = false;
+    }
 }
 impl ThumbnailService {
     pub fn new() -> Result<Self, ThumbnailError> {
         let exe = current_exe_absolute().map_err(|_| ThumbnailError::SpawnFailed("exe resolve failed".to_string()))?;
-        Ok(Self { exe, timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS), active: Arc::new(Mutex::new(false)), shutdown: Arc::new(AtomicBool::new(false)), #[cfg(test)] fixture: None })
+        Ok(Self { exe, timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS), active: Arc::new(Mutex::new(false)), shutdown: Arc::new(AtomicBool::new(false)), init_error: None, #[cfg(test)] fixture: None, #[cfg(test)] cleanup_hook: None, #[cfg(test)] live_checks: None, #[cfg(test)] wait_hook: None })
+    }
+    pub fn new_for_daemon() -> Self {
+        match current_exe_absolute() {
+            Ok(exe) => Self { exe, timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS), active: Arc::new(Mutex::new(false)), shutdown: Arc::new(AtomicBool::new(false)), init_error: None, #[cfg(test)] fixture: None, #[cfg(test)] cleanup_hook: None, #[cfg(test)] live_checks: None, #[cfg(test)] wait_hook: None },
+            Err(_) => Self { exe: PathBuf::new(), timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS), active: Arc::new(Mutex::new(false)), shutdown: Arc::new(AtomicBool::new(false)), init_error: Some("exe resolve failed".to_string()), #[cfg(test)] fixture: None, #[cfg(test)] cleanup_hook: None, #[cfg(test)] live_checks: None, #[cfg(test)] wait_hook: None },
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn controlled_fixture(path: PathBuf, observation: Arc<Mutex<Option<(u32, bool, bool)>>>, hook: Option<Arc<dyn Fn() + Send + Sync>>, live_checks: Arc<std::sync::atomic::AtomicUsize>, wait_hook: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
+        let mut service = Self::new_with_exe(std::env::current_exe().expect("test executable"), Duration::from_secs(5));
+        service.fixture = Some((path, observation));
+        service.cleanup_hook = hook;
+        service.live_checks = Some(live_checks);
+        service.wait_hook = wait_hook;
+        service
+    }
+    fn check_unavailable(&self) -> Option<ThumbnailError> {
+        self.init_error.as_ref().map(|m| ThumbnailError::SpawnFailed(m.clone()))
+    }
+    pub fn try_admit(&self) -> Result<ThumbnailPermit<'_>, ThumbnailError> {
+        if let Some(err) = self.check_unavailable() {
+            return Err(err);
+        }
+        if self.is_shutdown() {
+            return Err(ThumbnailError::Shutdown);
+        }
+        let mut guard = match self.active.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(ThumbnailError::Busy),
+        };
+        if *guard {
+            return Err(ThumbnailError::Busy);
+        }
+        *guard = true;
+        if self.is_shutdown() {
+            *guard = false;
+            return Err(ThumbnailError::Shutdown);
+        }
+        if let Some(err) = self.check_unavailable() {
+            *guard = false;
+            return Err(err);
+        }
+        Ok(ThumbnailPermit { service: self, _guard: guard })
+    }
+    pub fn shutdown_and_wait(&self) {
+        self.shutdown();
+        self.wait_idle();
+    }
+    pub fn wait_idle(&self) {
+        #[cfg(test)]
+        if let Some(hook) = &self.wait_hook { hook(); }
+        let guard = match self.active.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _ = *guard;
     }
     #[doc(hidden)]
     pub fn new_with_exe(exe: PathBuf, timeout: Duration) -> Self {
         let bounded = timeout.clamp(Duration::from_millis(50), Duration::from_millis(10_000));
-        Self { exe, timeout: bounded, active: Arc::new(Mutex::new(false)), shutdown: Arc::new(AtomicBool::new(false)), #[cfg(test)] fixture: None }
+        Self { exe, timeout: bounded, active: Arc::new(Mutex::new(false)), shutdown: Arc::new(AtomicBool::new(false)), init_error: None, #[cfg(test)] fixture: None, #[cfg(test)] cleanup_hook: None, #[cfg(test)] live_checks: None, #[cfg(test)] wait_hook: None }
     }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout.clamp(Duration::from_millis(10), Duration::from_millis(10_000));
@@ -292,18 +382,10 @@ impl ThumbnailService {
         self.decode_with_cancel(input, max_px, None)
     }
     pub fn decode_with_cancel(&self, input: &[u8], max_px: u32, cancel: Option<Arc<AtomicBool>>) -> Result<ThumbnailOutput, ThumbnailError> {
-        if self.is_shutdown() { return Err(ThumbnailError::Shutdown); }
         if !(MIN_PX..=MAX_PX).contains(&max_px) { return Err(ThumbnailError::InvalidInput("max_px out of range".to_string())); }
         if input.len() > MAX_INPUT_BYTES { return Err(ThumbnailError::TooLarge("input exceeds 16MiB".to_string())); }
-        let mut guard = match self.active.try_lock() {
-            Ok(g) => g,
-            Err(_) => return Err(ThumbnailError::Busy),
-        };
-        if *guard { return Err(ThumbnailError::Busy); }
-        *guard = true;
-        let result = self.spawn_and_wait(input, max_px, cancel);
-        *guard = false;
-        result
+        let permit = self.try_admit()?;
+        permit.decode_with_cancel(input, max_px, cancel)
     }
     fn spawn_and_wait(&self, input: &[u8], max_px: u32, cancel: Option<Arc<AtomicBool>>) -> Result<ThumbnailOutput, ThumbnailError> {
         use std::process::{Command, Stdio};
@@ -367,7 +449,11 @@ impl ThumbnailService {
             if Instant::now() >= deadline { break Some(ThumbnailError::Timeout); }
             match guard.child.as_mut().unwrap().try_wait() {
                 Ok(Some(_)) => break None,
-                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Ok(None) => {
+                    #[cfg(test)]
+                    if let Some(checks) = &self.live_checks { checks.fetch_add(1, Ordering::SeqCst); }
+                    std::thread::sleep(Duration::from_millis(5));
+                },
                 Err(_) => break Some(ThumbnailError::Io("child wait failed".into())),
             }
         };
@@ -385,6 +471,7 @@ impl ThumbnailService {
         #[cfg(test)]
         if let Some((_, observation)) = &self.fixture {
             *observation.lock().unwrap() = Some((child_pid, true, true));
+            if let Some(hook) = &self.cleanup_hook { hook(); }
         }
         if let Some(reason) = reason { return Err(reason); }
         if Instant::now() >= deadline { return Err(ThumbnailError::Timeout); }
@@ -517,6 +604,27 @@ mod tests {
             output.write_all(&[0]).unwrap(); // invalid protocol version
         }
         output.flush().unwrap();
+        if path.to_string_lossy().ends_with("controlled") {
+            let end = Instant::now() + Duration::from_secs(5);
+            let release = PathBuf::from(&path).with_extension("release");
+            while !release.exists() && Instant::now() < end { std::thread::sleep(Duration::from_millis(5)); }
+            if !release.exists() { return; }
+            let mut input = request.as_slice();
+            let mut version = [0];
+            input.read_exact(&mut version).unwrap();
+            assert_eq!(version[0], PROTOCOL_VERSION);
+            let max_px = read_u32_be(&mut input).unwrap();
+            let len = read_u32_be(&mut input).unwrap() as usize;
+            assert_eq!(len, input.len());
+            let result = decode_thumbnail(input, max_px).unwrap();
+            output.write_all(&[PROTOCOL_VERSION, 0]).unwrap();
+            write_u32_be(&mut output, result.width).unwrap();
+            write_u32_be(&mut output, result.height).unwrap();
+            write_u32_be(&mut output, result.png.len() as u32).unwrap();
+            output.write_all(&result.png).unwrap();
+            output.flush().unwrap();
+            std::process::exit(0);
+        }
         // No shell or descendants; finite fallback if the parent fails to kill us.
         let end = Instant::now() + Duration::from_secs(5);
         while Instant::now() < end { std::thread::sleep(Duration::from_millis(10)); }

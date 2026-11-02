@@ -1084,6 +1084,9 @@ async fn async_main(args: Vec<String>) {
             ],
         );
         eprintln!("daemon: rendezvous failed: {e}");
+        if !shutdown_thumbnails(&state).await {
+            eprintln!("daemon: thumbnail cleanup task failed");
+        }
         std::process::exit(1);
     }
     eprintln!(
@@ -1102,7 +1105,23 @@ async fn async_main(args: Vec<String>) {
             }
         } => {}
     }
+    let cleanup_ok = shutdown_thumbnails(&state).await;
     let _ = fs::remove_file(profile.join("rendezvous.json"));
     #[cfg(unix)]
     let _ = fs::remove_file(&socket);
+    if !cleanup_ok {
+        eprintln!("daemon: thumbnail cleanup task failed");
+        std::process::exit(1);
+    }
+}
+
+async fn shutdown_thumbnails(state: &Arc<DaemonState>) -> bool {
+    let thumb_state = Arc::clone(state);
+    if let Err(error) = tokio::task::spawn_blocking(move || thumb_state.thumbnail_shutdown_and_wait()).await {
+        eprintln!("daemon: thumbnail cleanup join failed: {error}");
+        // Attempt cleanup again, but retain the failure status.
+        state.thumbnail_shutdown_and_wait();
+        return false;
+    }
+    true
 }

@@ -1230,7 +1230,8 @@ fn decode_report_payloads(
 }
 
 /// Decode standard padded base64; `None` on any malformed input.
-fn b64_decode(text: &str) -> Option<Vec<u8>> {
+#[doc(hidden)]
+pub fn b64_decode(text: &str) -> Option<Vec<u8>> {
     fn value(byte: u8) -> Option<u8> {
         match byte {
             b'A'..=b'Z' => Some(byte - b'A'),
@@ -1268,6 +1269,15 @@ fn b64_decode(text: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+// IPC chunks are independently padded, so use three-byte-aligned segment boundaries.
+fn encode_thumbnail_png(png: &[u8]) -> String {
+    let segment_len = clipmonger_ipc::proto::CHUNK_RAW_BYTES / 3 * 3;
+    png.chunks(segment_len)
+        .flat_map(clipmonger_ipc::framing::chunk_blob)
+        .map(|chunk| chunk.data_b64)
+        .collect()
 }
 
 /// Lowercase hex SHA-256 of `data` (self-contained FIPS 180-4).
@@ -1724,6 +1734,9 @@ pub struct DaemonState {
     /// Dual-backend merge window state (seg-06 S8, W-F5: 2000 ms).
     #[cfg(all(unix, feature = "backend-wayland"))]
     merger: Mutex<clipmonger_backend_wayland::merge::Merger>,
+    thumbnail: crate::thumbnail::ThumbnailService,
+    #[cfg(test)]
+    thumbnail_snapshot_hook: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl DaemonState {
@@ -1762,6 +1775,23 @@ impl DaemonState {
             popup: Mutex::new(popup::PopupTrigger::default()),
             #[cfg(all(unix, feature = "backend-wayland"))]
             merger: Mutex::new(clipmonger_backend_wayland::merge::Merger::new(2000)),
+            thumbnail: crate::thumbnail::ThumbnailService::new_for_daemon(),
+            #[cfg(test)]
+            thumbnail_snapshot_hook: Mutex::new(None),
+        }
+    }
+    pub fn new_with_thumbnail(store: Store, thumbnail: crate::thumbnail::ThumbnailService) -> Self {
+        let mut state = Self::new(store);
+        state.thumbnail = thumbnail;
+        state
+    }
+    pub fn thumbnail_shutdown_and_wait(&self) {
+        self.thumbnail.shutdown_and_wait();
+    }
+    #[cfg(test)]
+    pub fn set_thumbnail_snapshot_hook(&self, hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+        if let Ok(mut slot) = self.thumbnail_snapshot_hook.lock() {
+            *slot = hook;
         }
     }
 
@@ -2526,11 +2556,80 @@ impl DaemonState {
                     .purge_removed();
                 Ok(serde_json::json!({"purged": purged}))
             }
+            "history.thumbnail" => self.handle_history_thumbnail(params),
             other => Err(IpcError::new(
                 "unknown_method",
                 format!("unknown method: {other}"),
             )),
         }
+    }
+
+    fn handle_history_thumbnail(&self, params: &Value) -> Result<Value, IpcError> {
+        use crate::thumbnail::{DEFAULT_MAX_PX, MAX_INPUT_BYTES, MAX_PX, MIN_PX};
+        // --- validation before admission ---
+        let clip_val = params.get("clip").ok_or_else(|| IpcError::new("invalid_params", "clip required".to_string()))?;
+        let clip_str = clip_val.as_str().ok_or_else(|| IpcError::new("invalid_params", "clip must be a string".to_string()))?;
+        let clip_id = clip_str.parse::<uuid::Uuid>().map_err(|_| IpcError::new("invalid_params", "invalid clip".to_string()))?;
+        let max_px = match params.get("max_px") {
+            None => DEFAULT_MAX_PX,
+            Some(v) => {
+                let n = v.as_u64().ok_or_else(|| IpcError::new("invalid_params", "max_px must be an integer".to_string()))?;
+                if !(MIN_PX as u64 ..= MAX_PX as u64).contains(&n) {
+                    return Err(IpcError::new("invalid_params", "max_px out of range".to_string()));
+                }
+                n as u32
+            }
+        };
+        if let Some(mime_val) = params.get("mime") {
+            let mime_str = mime_val.as_str().ok_or_else(|| IpcError::new("invalid_params", "mime must be a string".to_string()))?;
+            if mime_str != "image/png" {
+                return Err(IpcError::new("invalid_params", "mime must be image/png".to_string()));
+            }
+        }
+        // --- admission before store allocation ---
+        let permit = self.thumbnail.try_admit().map_err(|e| match e {
+            crate::thumbnail::ThumbnailError::Busy => IpcError::new("busy", "thumbnail busy".to_string()),
+            crate::thumbnail::ThumbnailError::Shutdown => IpcError::new("shutdown", "thumbnail shutdown".to_string()),
+            crate::thumbnail::ThumbnailError::SpawnFailed(_) => IpcError::new("unavailable", "thumbnail unavailable".to_string()),
+            _ => IpcError::new(e.code(), "thumbnail unavailable".to_string()),
+        })?;
+        // --- snapshot within with_store then release guard before child ---
+        let snapshot_opt = {
+            let result: Result<Option<clipmonger_core::PayloadSnapshot>, IpcError> = self.with_store(|store| {
+                #[cfg(test)]
+                {
+                    let hook = self.thumbnail_snapshot_hook.lock().ok().and_then(|slot| slot.clone());
+                    if let Some(hook) = hook { hook(); }
+                }
+                match store.get_payload(clip_id, "image/png", MAX_INPUT_BYTES) {
+                    Ok(opt) => Ok(opt),
+                    Err(e) => Err(IpcError::new(e.code(), "store error".to_string())),
+                }
+            });
+            result?
+        };
+        let snapshot = match snapshot_opt {
+            None => return Ok(serde_json::json!({"thumbnail": null})),
+            Some(s) => s,
+        };
+        let output = permit.decode_with_cancel(&snapshot.data, max_px, None).map_err(|e| match e {
+            crate::thumbnail::ThumbnailError::Busy => IpcError::new("busy", "thumbnail busy".to_string()),
+            crate::thumbnail::ThumbnailError::Shutdown => IpcError::new("shutdown", "thumbnail shutdown".to_string()),
+            crate::thumbnail::ThumbnailError::Timeout => IpcError::new("timeout", "thumbnail timeout".to_string()),
+            crate::thumbnail::ThumbnailError::Cancelled => IpcError::new("cancelled", "thumbnail cancelled".to_string()),
+            _ => IpcError::new(e.code(), "thumbnail decode failed".to_string()),
+        })?;
+        let b64 = encode_thumbnail_png(&output.png);
+        Ok(serde_json::json!({
+            "thumbnail": {
+                "clip": snapshot.clip_id,
+                "content_hash": snapshot.content_hash,
+                "mime": "image/png",
+                "width": output.width,
+                "height": output.height,
+                "png_base64": b64
+            }
+        }))
     }
 
     /// Dispatch `monitor.set`: explicit state wins, `toggle` flips the flag.
@@ -4539,3 +4638,6 @@ mod oversize_source_controls {
             .expect_err("production paste entry refuses on every feature set");
     }
 }
+
+#[cfg(test)]
+mod thumbnail_endpoint_unit;

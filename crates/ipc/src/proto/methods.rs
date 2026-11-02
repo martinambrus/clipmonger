@@ -404,3 +404,28 @@ pub struct HistoryPurgeRemovedParams {}
 pub struct HistoryPurgeRemovedResult {
     pub purged: u64,
 }
+/// Params for `history.thumbnail`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryThumbnailParams {
+    pub clip: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_px: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+}
+/// One thumbnail result for `history.thumbnail`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryThumbnail {
+    pub clip: Uuid,
+    pub content_hash: String,
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
+    pub png_base64: String,
+}
+/// Output for `history.thumbnail`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryThumbnailResult {
+    #[serde(default)]
+    pub thumbnail: Option<HistoryThumbnail>,
+}
