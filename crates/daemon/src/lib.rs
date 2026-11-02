@@ -18,6 +18,43 @@ use serde_json::Value;
 
 pub mod capture;
 
+fn daemon_runtime_emit(
+    sev: clipmonger_core::runtime_log::Severity,
+    event: &str,
+    fields: &[(&str, &str)],
+) {
+    let _ = clipmonger_core::runtime_log::global_emit(
+        clipmonger_core::runtime_log::Role::Daemon,
+        sev,
+        event,
+        fields,
+    );
+}
+
+/// Classify before formatting; backend messages can contain user-controlled text.
+#[must_use]
+pub fn runtime_platform_class(error: &clipmonger_platform::types::Error) -> &'static str {
+    use clipmonger_platform::types::Error;
+    match error {
+        Error::Unavailable(_) => "unavailable",
+        Error::Denied(_) => "denied",
+        Error::Timeout(_) => "timeout",
+        Error::TooLarge(_) => "too_large",
+        Error::Unsupported(_) => "unsupported",
+        Error::Io(_) => "io",
+        Error::Internal(_) => "internal",
+    }
+}
+fn runtime_origin(origin: &str) -> &'static str {
+    match origin {
+        "windows" => "windows",
+        "x11" => "x11",
+        "wayland" => "wayland",
+        "gnome" => "gnome",
+        _ => "other",
+    }
+}
+
 /// Protocol tag written to the rendezvous file.
 pub const PROTOCOL: &str = "ipc/v1";
 pub mod popup;
@@ -1088,6 +1125,19 @@ enum StoreDecision {
     Failed,
 }
 
+struct StoreFailure {
+    class: &'static str,
+    code: String,
+}
+impl StoreFailure {
+    fn fixed(class: &'static str) -> Self {
+        Self {
+            class,
+            code: class.into(),
+        }
+    }
+}
+
 /// Store real monitor payloads: sensitive events only bump `privacy_skips`,
 /// everything else becomes a clip row. `origin` names the capture backend
 /// (`windows`, `x11`, ...); `id_seed` feeds id generation.
@@ -1097,7 +1147,7 @@ fn store_payloads(
     sensitive: bool,
     payloads: &[(String, Vec<u8>)],
     id_seed: u64,
-) -> (StoreDecision, Option<String>) {
+) -> (StoreDecision, Option<StoreFailure>) {
     if sensitive {
         let _ = store.record_privacy_skip();
         return (StoreDecision::Sensitive, None);
@@ -1105,7 +1155,7 @@ fn store_payloads(
     if payloads.is_empty() {
         return (
             StoreDecision::Failed,
-            Some("no readable payload".to_string()),
+            Some(StoreFailure::fixed("no_payload")),
         );
     }
     let now = now_ms();
@@ -1141,16 +1191,22 @@ fn store_payloads(
     });
     let clip: clipmonger_core::model::Clip = match serde_json::from_value(clip_json) {
         Ok(clip) => clip,
-        Err(e) => {
+        Err(_) => {
             return (
                 StoreDecision::Failed,
-                Some(format!("clip build failed: {e}")),
+                Some(StoreFailure::fixed("clip_build")),
             );
         }
     };
     match store.insert_clip(&clip, payloads) {
         Ok(_) => (StoreDecision::Stored, None),
-        Err(e) => (StoreDecision::Failed, Some(format!("store failed: {e}"))),
+        Err(e) => (
+            StoreDecision::Failed,
+            Some(StoreFailure {
+                class: clipmonger_core::runtime_log::core_class(&e),
+                code: clipmonger_core::runtime_log::core_code(&e),
+            }),
+        ),
     }
 }
 
@@ -1671,6 +1727,11 @@ impl DaemonState {
         match self.ingest_capture_checked(origin, sensitive, payloads) {
             Ok(stored) => stored,
             Err(error) => {
+                daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Error,
+                    "capture.unavailable",
+                    &[("operation", "capture"), ("class", "unavailable")],
+                );
                 eprintln!("daemon: capture unavailable: {error}");
                 false
             }
@@ -1713,15 +1774,47 @@ impl DaemonState {
             }
         }
         let seed = u64::try_from(now_ms().max(0)).unwrap_or_default();
-        let stored = matches!(
-            store_payloads(store, origin, sensitive, payloads, seed),
-            (StoreDecision::Stored, _)
-        );
+        let (decision, reason) = store_payloads(store, origin, sensitive, payloads, seed);
+        let stored = matches!(decision, StoreDecision::Stored);
+        if matches!(decision, StoreDecision::Failed) {
+            let failure = reason.unwrap_or_else(|| StoreFailure::fixed("store_failed"));
+            daemon_runtime_emit(
+                clipmonger_core::runtime_log::Severity::Error,
+                "capture.store_failed",
+                &[
+                    ("operation", "store_insert"),
+                    ("origin", runtime_origin(origin)),
+                    ("class", failure.class),
+                    ("code", &failure.code),
+                ],
+            );
+        }
         if stored {
             match store.enforce_retention(&limits) {
                 Ok(0) => {}
-                Ok(purged) => eprintln!("daemon: retention purged {purged} clips"),
-                Err(e) => eprintln!("daemon: retention failed: {e}"),
+                Ok(purged) => {
+                    daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Info,
+                        "retention.purged",
+                        &[
+                            ("count", &purged.to_string()),
+                            ("origin", runtime_origin(origin)),
+                        ],
+                    );
+                    eprintln!("daemon: retention purged {purged} clips");
+                }
+                Err(e) => {
+                    daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "retention.failed",
+                        &[
+                            ("operation", "retention"),
+                            ("class", clipmonger_core::runtime_log::core_class(&e)),
+                            ("code", &clipmonger_core::runtime_log::core_code(&e)),
+                        ],
+                    );
+                    eprintln!("daemon: retention failed: {e}");
+                }
             }
         }
         Ok(stored)
@@ -2194,34 +2287,91 @@ impl DaemonState {
     }
 
     /// Dispatch `logs.tail`: the last `lines` of `<profile>/audit.log`,
-    /// capped at 1000. A missing log is an empty Ok; only audit lines
-    /// are ever returned, never clipboard payload bytes.
+    /// capped at 1000. Omitted/audit source preserves the audit contract;
+    /// daemon/ui select fixed bounded active runtime files, never backups.
     fn handle_logs_tail(&self, params: &Value) -> Result<Value, IpcError> {
         let want = params
             .get("lines")
             .and_then(Value::as_u64)
             .unwrap_or(100)
             .min(1000) as usize;
-        let path = self
-            .profile_dir
-            .lock()
-            .map_or_else(|_| PathBuf::new(), |dir| dir.join("audit.log"));
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(serde_json::json!({"lines": []}));
+        if params.get("source").is_some() && params.get("source").and_then(Value::as_str).is_none()
+        {
+            return Err(IpcError::new(
+                "invalid_params",
+                "logs.tail: source must be a string".to_string(),
+            ));
+        }
+        let source = params.get("source").and_then(Value::as_str);
+        match source {
+            None | Some("audit") => {
+                let path = self
+                    .profile_dir
+                    .lock()
+                    .map_or_else(|_| PathBuf::new(), |dir| dir.join("audit.log"));
+                let text = match fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(serde_json::json!({"lines": []}));
+                    }
+                    Err(e) => {
+                        return Err(IpcError::new(
+                            "backend",
+                            format!("logs.tail: cannot read audit log: {e}"),
+                        ));
+                    }
+                };
+                let all: Vec<&str> = text.lines().collect();
+                let start = all.len().saturating_sub(want);
+                let lines: Vec<&str> = all[start..].to_vec();
+                Ok(serde_json::json!({"lines": lines}))
             }
-            Err(e) => {
-                return Err(IpcError::new(
-                    "backend",
-                    format!("logs.tail: cannot read audit log: {e}"),
-                ));
+            Some("daemon" | "ui") => {
+                let role = if source == Some("daemon") {
+                    clipmonger_core::runtime_log::Role::Daemon
+                } else {
+                    clipmonger_core::runtime_log::Role::Ui
+                };
+                let profile = self
+                    .profile_dir
+                    .lock()
+                    .map_err(|_| IpcError::new("internal", "profile state poisoned".to_string()))?
+                    .clone();
+                if profile.as_os_str().is_empty() {
+                    return Err(IpcError::new(
+                        "unavailable",
+                        "logs.tail: no profile dir".to_string(),
+                    ));
+                }
+                match clipmonger_core::runtime_log::global_tail(&profile, role, want) {
+                    Ok(lines) => {
+                        if let Some(err) = (role == clipmonger_core::runtime_log::Role::Daemon)
+                            .then(|| clipmonger_core::runtime_log::global_status(role))
+                            .flatten()
+                        {
+                            return Ok(serde_json::json!({"lines": lines, "sink_error": err}));
+                        }
+                        Ok(serde_json::json!({"lines": lines}))
+                    }
+                    Err(e) => Err(IpcError::new(
+                        "backend",
+                        format!("logs.tail: cannot read {} log: {e}", role.as_str()),
+                    )),
+                }
             }
-        };
-        let all: Vec<&str> = text.lines().collect();
-        let start = all.len().saturating_sub(want);
-        let lines: Vec<&str> = all[start..].to_vec();
-        Ok(serde_json::json!({"lines": lines}))
+            Some(other) => {
+                if other.contains('/') || other.contains('\\') || other.contains("..") {
+                    return Err(IpcError::new(
+                        "invalid_params",
+                        format!("logs.tail: invalid source {other}"),
+                    ));
+                }
+                Err(IpcError::new(
+                    "invalid_params",
+                    format!("logs.tail: unknown source {other}"),
+                ))
+            }
+        }
     }
 
     /// Dispatch one `permanent.*` method (perm.md §2).
@@ -2414,6 +2564,10 @@ impl DaemonState {
     /// refused without ever spawning.
     // `self` is only used by the Windows arm; other backends are stateless.
     #[allow(clippy::unused_self)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep paste transaction and its error logging together"
+    )]
     fn paste_payloads(
         &self,
         clip: clipmonger_platform::types::ClipRef,
@@ -2441,6 +2595,11 @@ impl DaemonState {
                 .map_or(now, |picked| picked.min(now))
                 + PASTE_DEADLINE_MS;
             if now > deadline_ms {
+                daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "paste.failed",
+                    &[("operation", "paste_deadline"), ("class", "expired")],
+                );
                 return Err(IpcError::new(
                     "unavailable",
                     format!("paste.execute: {PASTE_EXPIRED}"),
@@ -2454,7 +2613,17 @@ impl DaemonState {
                 }
                 None => paste.capture_target(),
             }
-            .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
+            .map_err(|e| {
+                daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "paste.failed",
+                    &[
+                        ("operation", "paste_target_or_delivery"),
+                        ("class", runtime_platform_class(&e)),
+                    ],
+                );
+                IpcError::new("unavailable", format!("paste.execute: {e}"))
+            })?;
             if clipmonger_backend_windows::target_integrity(&target.handle) == Integrity::High {
                 let target_id = match target.handle {
                     clipmonger_platform::types::PlatformHandle::WinHwnd(hwnd) => {
@@ -2466,6 +2635,11 @@ impl DaemonState {
                 let token_ok =
                     token.is_some_and(|t| self.consume_gesture_token(t, now_ms(), target_id));
                 if !token_ok {
+                    daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "paste.failed",
+                        &[("operation", "paste_gesture"), ("class", "denied")],
+                    );
                     self.audit_elevation_refused("missing or invalid gesture token");
                     return Err(IpcError::new(
                         "denied",
@@ -2473,6 +2647,16 @@ impl DaemonState {
                     ));
                 }
                 let res = self.paste_via_helper(&target, payloads, deadline_ms, settings);
+                if res.is_err() {
+                    daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "paste.failed",
+                        &[
+                            ("operation", "paste_helper_route"),
+                            ("class", "helper_unavailable_or_refused"),
+                        ],
+                    );
+                }
                 if res.is_ok() {
                     let _ = self
                         .store_read()?
@@ -2484,6 +2668,14 @@ impl DaemonState {
             paste
                 .paste_payloads(&target, &clip, payloads)
                 .map_err(|e| {
+                    daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "paste.failed",
+                        &[
+                            ("operation", "paste_delivery"),
+                            ("class", runtime_platform_class(&e)),
+                        ],
+                    );
                     let message = e.to_string();
                     if message.starts_with("denied") || message.contains("refused") {
                         IpcError::new("denied", format!("paste.execute: {e}"))
@@ -2508,6 +2700,14 @@ impl DaemonState {
         )))]
         {
             let _ = (self, clip, payloads, params);
+            daemon_runtime_emit(
+                clipmonger_core::runtime_log::Severity::Warn,
+                "paste.failed",
+                &[
+                    ("operation", "paste_delivery"),
+                    ("class", "backend_unavailable"),
+                ],
+            );
             Err(IpcError::new(
                 "unavailable",
                 format!("paste unavailable: {SKELETON_NOTE}"),
@@ -2522,9 +2722,17 @@ impl DaemonState {
         let has_data =
             probe_current().protocol != clipmonger_backend_wayland::probe::Protocol::None;
         let paste = WlPaste::new(has_data);
-        let outcome = paste
-            .paste_payloads(payloads)
-            .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
+        let outcome = paste.paste_payloads(payloads).map_err(|e| {
+            daemon_runtime_emit(
+                clipmonger_core::runtime_log::Severity::Warn,
+                "paste.failed",
+                &[
+                    ("operation", "paste_target_or_delivery"),
+                    ("class", runtime_platform_class(&e)),
+                ],
+            );
+            IpcError::new("unavailable", format!("paste.execute: {e}"))
+        })?;
         let mut result = serde_json::json!({"pasted": true});
         if let Some(toast) = outcome.toast {
             result["toast"] = Value::from(toast);

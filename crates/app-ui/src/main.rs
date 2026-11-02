@@ -280,6 +280,12 @@ fn create_tray(wake: push::Wake, online: bool) -> TrayParts {
         }
     } else {
         eprintln!("tray unavailable: degraded, window still opens");
+        let _ = clipmonger_core::runtime_log::global_emit(
+            clipmonger_core::runtime_log::Role::Ui,
+            clipmonger_core::runtime_log::Severity::Warn,
+            "tray.unavailable",
+            &[("class", "tray_build_failed")],
+        );
         TrayParts {
             poll: Box::new(Vec::new),
             hold: Option::None,
@@ -356,6 +362,11 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
+    if let Err(e) =
+        clipmonger_core::runtime_log::init_global(&profile, clipmonger_core::runtime_log::Role::Ui)
+    {
+        eprintln!("ui: runtime log init failed: {e}");
+    }
     let client = try_connect(&profile).or_else(|| {
         if spawn_daemon(&profile) {
             try_connect(&profile)
@@ -382,6 +393,12 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            let _ = clipmonger_core::runtime_log::global_emit(
+                clipmonger_core::runtime_log::Role::Ui,
+                clipmonger_core::runtime_log::Severity::Error,
+                "ui.shell_failed",
+                &[("class", error.runtime_class())],
+            );
             eprintln!("shell failed: {error}");
             ExitCode::from(1)
         }

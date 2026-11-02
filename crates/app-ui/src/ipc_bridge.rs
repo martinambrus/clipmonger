@@ -72,8 +72,10 @@ pub enum UiCmd {
     BackupCreate(String),
     /// Restore a backup ZIP over the profile.
     BackupRestore(String),
-    /// Fetch the last N audit log lines.
+    /// Fetch the last N audit log lines (compat).
     LogsTail(u64),
+    /// Fetch the last N log lines with explicit source.
+    LogsTailSource { lines: u64, source: String },
 }
 
 /// Event delivered from the bridge thread to the shell.
@@ -128,8 +130,14 @@ pub enum UiEvent {
     BackupDone(String),
     /// Restore completed; history now serves restored clips.
     RestoreDone,
-    /// Audit log tail lines.
-    LogsTail(Vec<String>),
+    /// Log tail lines with source identity for stale-reply protection.
+    LogsTail {
+        source: String,
+        lines: Vec<String>,
+        sink_error: Option<String>,
+    },
+    /// Log tail lines error with source.
+    LogsTailError { source: String, message: String },
     /// Config-window error text (never an offline misreport).
     ConfigError(String),
     /// Daemon push: show the popup (hotkey press or `popup.open`).
@@ -229,7 +237,7 @@ pub fn method_for(cmd: &UiCmd) -> &'static str {
         UiCmd::ExecPermanent(_) => "permanent.exec",
         UiCmd::BackupCreate(_) => "backup.create",
         UiCmd::BackupRestore(_) => "backup.restore",
-        UiCmd::LogsTail(_) => "logs.tail",
+        UiCmd::LogsTail(_) | UiCmd::LogsTailSource { .. } => "logs.tail",
     }
 }
 
@@ -274,6 +282,9 @@ pub fn params_for(cmd: &UiCmd) -> Value {
         UiCmd::BackupCreate(dest) => serde_json::json!({ "dest": dest }),
         UiCmd::BackupRestore(src) => serde_json::json!({ "src": src }),
         UiCmd::LogsTail(lines) => serde_json::json!({ "lines": lines }),
+        UiCmd::LogsTailSource { lines, source } => {
+            serde_json::json!({ "lines": lines, "source": source })
+        }
         UiCmd::PinClip(id, pinned) => {
             serde_json::json!({ "clip": id.to_string(), "pinned": pinned })
         }
@@ -370,21 +381,24 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
                 UiEvent::ConfigError("unconfirmed backup.restore".to_string())
             }
         }
-        (UiCmd::LogsTail(_), Ok(body)) => {
-            if let Some(items) = body.get("lines").and_then(Value::as_array) {
-                UiEvent::LogsTail(
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(ToString::to_string)
-                        .collect(),
-                )
-            } else {
-                UiEvent::ConfigError("unconfirmed logs.tail".to_string())
+        (UiCmd::LogsTail(_), Ok(body)) => log_reply("audit".to_string(), &body),
+        (UiCmd::LogsTailSource { source, .. }, Ok(body)) => log_reply(source, &body),
+        (UiCmd::BackupCreate(_) | UiCmd::BackupRestore(_), Err(error)) => {
+            UiEvent::ConfigError(error.message)
+        }
+        (UiCmd::LogsTail(lines), Err(error)) => {
+            let _ = lines;
+            UiEvent::LogsTailError {
+                source: "audit".to_string(),
+                message: error.message,
             }
         }
-        (UiCmd::BackupCreate(_) | UiCmd::BackupRestore(_) | UiCmd::LogsTail(_), Err(error)) => {
-            UiEvent::ConfigError(error.message)
+        (UiCmd::LogsTailSource { lines: _, source }, Err(error)) => {
+            let src = source.clone();
+            UiEvent::LogsTailError {
+                source: src,
+                message: error.message,
+            }
         }
         (
             UiCmd::ConfigGet
@@ -411,5 +425,37 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
         (UiCmd::Status | UiCmd::ListHistory, Err(error)) => UiEvent::Error(error.message),
         (UiCmd::PasteClipTo(..), Err(error)) => UiEvent::PasteFailed(error.message),
         (UiCmd::ExecPermanent(id), Err(error)) => UiEvent::ExecFailed(id, error),
+    }
+}
+
+fn log_reply(source: String, body: &Value) -> UiEvent {
+    let Some(items) = body.get("lines").and_then(Value::as_array) else {
+        return UiEvent::LogsTailError {
+            source,
+            message: "unconfirmed logs.tail".into(),
+        };
+    };
+    if items.iter().any(|item| !item.is_string()) {
+        return UiEvent::LogsTailError {
+            source,
+            message: "invalid logs.tail lines".into(),
+        };
+    }
+    let sink_error = if source == "ui" {
+        // The UI owns this static; the daemon cannot report UI process state.
+        clipmonger_core::runtime_log::global_status(clipmonger_core::runtime_log::Role::Ui)
+    } else {
+        body.get("sink_error")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    UiEvent::LogsTail {
+        source,
+        lines: items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        sink_error,
     }
 }

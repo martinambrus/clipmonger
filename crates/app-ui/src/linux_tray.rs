@@ -204,6 +204,12 @@ impl LinuxTray {
                     eprintln!(
                         "tray unavailable on Linux in this build: degraded, window still opens"
                     );
+                    let _ = clipmonger_core::runtime_log::global_emit(
+                        clipmonger_core::runtime_log::Role::Ui,
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "tray.unavailable",
+                        &[("class", "tray_unavailable"), ("origin", "linux")],
+                    );
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }

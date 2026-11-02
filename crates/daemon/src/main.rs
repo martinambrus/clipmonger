@@ -132,6 +132,15 @@ fn ui_launcher(profile: PathBuf) -> clipmonger_daemon::popup::UiLauncher {
                 true
             }
             Err(e) => {
+                let _ = clipmonger_core::runtime_log::global_emit(
+                    clipmonger_core::runtime_log::Role::Daemon,
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "ui.spawn_failed",
+                    &[
+                        ("class", "io"),
+                        ("code", &e.raw_os_error().unwrap_or(0).to_string()),
+                    ],
+                );
                 eprintln!("daemon: UI start failed: {e}");
                 false
             }
@@ -285,15 +294,19 @@ fn setup_windows_backend(
                             match transfer.read(&offer.mime, max_bytes) {
                                 Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
                                 Err(e) => {
+                                    let _ = clipmonger_core::runtime_log::global_emit(
+                                        clipmonger_core::runtime_log::Role::Daemon,
+                                        clipmonger_core::runtime_log::Severity::Warn,
+                                        "capture.read_skipped",
+                                        &[
+                                            ("operation", "capture_read"),
+                                            (
+                                                "class",
+                                                clipmonger_daemon::runtime_platform_class(&e),
+                                            ),
+                                        ],
+                                    );
                                     eprintln!("daemon: payload read skipped ({}): {e}", offer.mime);
-                                    let _ = std::fs::OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open("C:\\Temp\\monitor.log")
-                                        .and_then(|mut f| {
-                                            use std::io::Write;
-                                            writeln!(f, "read skipped {}: {}", offer.mime, e)
-                                        });
                                 }
                             }
                         }
@@ -452,6 +465,12 @@ fn setup_x11_backend(
     let transfer = match X11Transfer::connect(None) {
         Ok(transfer) => Some(Arc::new(transfer)),
         Err(e) => {
+            let _ = clipmonger_core::runtime_log::global_emit(
+                clipmonger_core::runtime_log::Role::Daemon,
+                clipmonger_core::runtime_log::Severity::Warn,
+                "capture.transfer_init_failed",
+                &[("class", clipmonger_daemon::runtime_platform_class(&e))],
+            );
             eprintln!("daemon: x11 transfer unavailable: {e}");
             None
         }
@@ -547,15 +566,19 @@ fn setup_x11_backend(
                             match transfer.read(&offer.mime, max_bytes) {
                                 Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
                                 Err(e) => {
+                                    let _ = clipmonger_core::runtime_log::global_emit(
+                                        clipmonger_core::runtime_log::Role::Daemon,
+                                        clipmonger_core::runtime_log::Severity::Warn,
+                                        "capture.read_skipped",
+                                        &[
+                                            ("operation", "capture_read"),
+                                            (
+                                                "class",
+                                                clipmonger_daemon::runtime_platform_class(&e),
+                                            ),
+                                        ],
+                                    );
                                     eprintln!("daemon: payload read skipped ({}): {e}", offer.mime);
-                                    let _ = std::fs::OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open("C:\\Temp\\monitor.log")
-                                        .and_then(|mut f| {
-                                            use std::io::Write;
-                                            writeln!(f, "read skipped {}: {}", offer.mime, e)
-                                        });
                                 }
                             }
                         }
@@ -640,6 +663,12 @@ fn setup_wayland_backend(
     let transfer = match WlTransfer::connect() {
         Ok(transfer) => Some(Arc::new(transfer)),
         Err(e) => {
+            let _ = clipmonger_core::runtime_log::global_emit(
+                clipmonger_core::runtime_log::Role::Daemon,
+                clipmonger_core::runtime_log::Severity::Warn,
+                "capture.transfer_init_failed",
+                &[("class", clipmonger_daemon::runtime_platform_class(&e))],
+            );
             eprintln!("daemon: wayland transfer unavailable: {e}");
             None
         }
@@ -714,6 +743,18 @@ fn setup_wayland_backend(
                             match transfer.read(&offer.mime, max_bytes) {
                                 Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
                                 Err(e) => {
+                                    let _ = clipmonger_core::runtime_log::global_emit(
+                                        clipmonger_core::runtime_log::Role::Daemon,
+                                        clipmonger_core::runtime_log::Severity::Warn,
+                                        "capture.read_skipped",
+                                        &[
+                                            ("operation", "capture_read"),
+                                            (
+                                                "class",
+                                                clipmonger_daemon::runtime_platform_class(&e),
+                                            ),
+                                        ],
+                                    );
                                     eprintln!(
                                         "daemon: wayland payload read skipped ({}): {e}",
                                         offer.mime
@@ -942,9 +983,26 @@ async fn main() {
         }
     };
 
+    if let Err(e) = clipmonger_core::runtime_log::init_global(
+        &profile,
+        clipmonger_core::runtime_log::Role::Daemon,
+    ) {
+        eprintln!("daemon: runtime log init failed: {e}");
+    }
+
     let store = match clipmonger_core::Store::open(&profile) {
         Ok(store) => store,
         Err(e) => {
+            let _ = clipmonger_core::runtime_log::global_emit(
+                clipmonger_core::runtime_log::Role::Daemon,
+                clipmonger_core::runtime_log::Severity::Error,
+                "startup.store_open_failed",
+                &[
+                    ("operation", "store_open"),
+                    ("class", clipmonger_core::runtime_log::core_class(&e)),
+                    ("code", &clipmonger_core::runtime_log::core_code(&e)),
+                ],
+            );
             eprintln!("daemon: store open failed: {e}");
             std::process::exit(1);
         }
@@ -953,6 +1011,12 @@ async fn main() {
     let token = match write_token(&profile) {
         Ok(token) => token,
         Err(e) => {
+            let _ = clipmonger_core::runtime_log::global_emit(
+                clipmonger_core::runtime_log::Role::Daemon,
+                clipmonger_core::runtime_log::Severity::Error,
+                "startup.token_failed",
+                &[("class", "io")],
+            );
             eprintln!("daemon: {e}");
             std::process::exit(1);
         }
@@ -965,6 +1029,15 @@ async fn main() {
     #[cfg(unix)]
     if let Some(parent) = socket.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
+            let _ = clipmonger_core::runtime_log::global_emit(
+                clipmonger_core::runtime_log::Role::Daemon,
+                clipmonger_core::runtime_log::Severity::Error,
+                "startup.socket_dir_failed",
+                &[
+                    ("class", "io"),
+                    ("code", &e.raw_os_error().unwrap_or(0).to_string()),
+                ],
+            );
             eprintln!("daemon: socket dir failed: {e}");
             std::process::exit(1);
         }
@@ -972,7 +1045,15 @@ async fn main() {
 
     // WIN-F2: load `<profile>/config.toml`, defaults when missing. The popup
     // hotkey and paste budget below are wired from it on Windows.
-    let config = Config::load(&profile.join("config.toml")).unwrap_or_default();
+    let config = Config::load(&profile.join("config.toml")).unwrap_or_else(|error| {
+        let _ = clipmonger_core::runtime_log::global_emit(
+            clipmonger_core::runtime_log::Role::Daemon,
+            clipmonger_core::runtime_log::Severity::Warn,
+            "startup.config_failed",
+            &[("class", clipmonger_core::runtime_log::core_class(&error))],
+        );
+        Config::default()
+    });
 
     let state = Arc::new(DaemonState::new(store));
     state.set_profile_dir(&profile);
@@ -1035,6 +1116,16 @@ async fn main() {
     if let Err(e) =
         clipmonger_ipc::server::Server::bind_with(&socket, token, handler, options).await
     {
+        let _ = clipmonger_core::runtime_log::global_emit(
+            clipmonger_core::runtime_log::Role::Daemon,
+            clipmonger_core::runtime_log::Severity::Warn,
+            "startup.bind_failed",
+            &[
+                ("operation", "ipc_bind"),
+                ("class", "ipc"),
+                ("code", "bind_failed"),
+            ],
+        );
         eprintln!("daemon: bind failed: {e}");
         std::process::exit(1);
     }
@@ -1045,10 +1136,29 @@ async fn main() {
         handler,
         options,
     ) {
+        let _ = clipmonger_core::runtime_log::global_emit(
+            clipmonger_core::runtime_log::Role::Daemon,
+            clipmonger_core::runtime_log::Severity::Warn,
+            "startup.bind_failed",
+            &[
+                ("operation", "ipc_bind"),
+                ("class", "ipc"),
+                ("code", "bind_failed"),
+            ],
+        );
         eprintln!("daemon: bind failed: {e}");
         std::process::exit(1);
     }
     if let Err(e) = write_rendezvous(&profile, &socket) {
+        let _ = clipmonger_core::runtime_log::global_emit(
+            clipmonger_core::runtime_log::Role::Daemon,
+            clipmonger_core::runtime_log::Severity::Warn,
+            "startup.rendezvous_failed",
+            &[
+                ("class", clipmonger_core::runtime_log::core_class(&e)),
+                ("code", &clipmonger_core::runtime_log::core_code(&e)),
+            ],
+        );
         eprintln!("daemon: rendezvous failed: {e}");
         std::process::exit(1);
     }
