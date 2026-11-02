@@ -1,11 +1,8 @@
 //! Paste engine: integrity-first routing with Unicode injection preferred.
 //!
-//! Order is load-bearing (seg-04 S4): the target's integrity is detected
-//! FIRST; elevated targets take the helper route ONLY and never see blind
-//! `SendInput` (UIPI drops it silently). All strategies run after the
-//! target re-focus step. Rich payloads (or text the target ignores) fall
-//! back to `ClipboardRestore` with a guarded restore: the saved value is
-//! restored only when the clipboard still equals our temporary write.
+//! Target integrity is checked before input delivery; elevated targets take
+//! the helper route. All strategies run after target re-focus. Rich payloads
+//! use a guarded clipboard swap with a conservative in-open sequence check.
 
 #[cfg(windows)]
 use clipmonger_platform::paste_policy::check_target;
@@ -77,6 +74,7 @@ impl WinPaste {
         self
     }
 
+    /// Enable guarded clipboard restoration after delivery.
     #[must_use]
     pub fn with_restore_clipboard(mut self, restore: bool) -> Self {
         self.restore_clipboard = restore;
@@ -107,16 +105,11 @@ impl WinPaste {
             if crate::foreground::target_integrity(&target.handle)
                 == crate::foreground::Integrity::High
             {
-                // Route::Helper decision surface: the backend layer never
-                // spawns the helper; the daemon owns that channel, so until
-                // it provides one this is HelperUnavailable.
                 return Err(Error::Unavailable(
                     "helper unavailable: elevated target needs the helper route".to_string(),
                 ));
             }
-            // Safety: handle round-trips through HWND; it is only queried
-            // and activated, never freed.
-            let raw = hwnd_of(&target.handle) as windows_sys::Win32::Foundation::HWND;
+            let raw = hwnd_of(&target.handle);
             settle_foreground(raw)?;
             let current = crate::foreground::capture_foreground().ok();
             check_target(target, current.as_ref())?;
@@ -140,17 +133,21 @@ impl WinPaste {
         {
             let _ = (target, clip, payloads);
             Err(Error::Unavailable(
-                "paste needs a Windows session".to_string(),
+                "paste delivery needs a Windows session".to_string(),
             ))
         }
     }
 }
 
 #[cfg(windows)]
-fn hwnd_of(handle: &clipmonger_platform::types::PlatformHandle) -> i64 {
+fn hwnd_of(
+    handle: &clipmonger_platform::types::PlatformHandle,
+) -> windows_sys::Win32::Foundation::HWND {
     match handle {
-        clipmonger_platform::types::PlatformHandle::WinHwnd(hwnd) => *hwnd,
-        _ => 0,
+        clipmonger_platform::types::PlatformHandle::WinHwnd(hwnd) => {
+            *hwnd as windows_sys::Win32::Foundation::HWND
+        }
+        _ => std::ptr::null_mut(),
     }
 }
 
@@ -204,14 +201,8 @@ pub fn worker_send_input_batch(payload: &str) -> std::result::Result<(), String>
 pub fn worker_press_paste_chord() -> std::result::Result<(), String> {
     #[cfg(windows)]
     {
-        use enigo::{Direction, Enigo, Key, Keyboard, Settings};
-        let mut enigo =
-            Enigo::new(&Settings::default()).map_err(|e| format!("enigo unavailable: {e}"))?;
-        enigo
-            .key(Key::Control, Direction::Press)
-            .and_then(|()| enigo.key(Key::V, Direction::Click))
-            .and_then(|()| enigo.key(Key::Control, Direction::Release))
-            .map_err(|e| format!("{e}"))
+        let mut driver = crate::clip_orchestrator::EnigoChordDriver::new();
+        crate::clip_orchestrator::run_chord(&mut driver)
     }
     #[cfg(not(windows))]
     {
@@ -222,7 +213,7 @@ pub fn worker_press_paste_chord() -> std::result::Result<(), String> {
 /// Formats a guarded restore puts back, by registered name (text, bitmaps
 /// and file lists have fixed ids). The opt-out markers come back too, so a
 /// restored secret stays out of clipboard histories, ours included.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const RESTORE_FORMATS: [&str; 8] = [
     "HTML Format",
     "Rich Text Format",
@@ -234,12 +225,23 @@ const RESTORE_FORMATS: [&str; 8] = [
     crate::optout::VIEWER_IGNORE,
 ];
 
+#[cfg(any(windows, test))]
+pub(crate) fn restore_ids() -> Result<Vec<u32>> {
+    use crate::transfer::imp;
+    let mut ids = vec![imp::CF_UNICODETEXT, imp::CF_DIB, imp::CF_HDROP];
+    for name in RESTORE_FORMATS {
+        ids.push(imp::register(name)?);
+    }
+    Ok(ids)
+}
+
 /// Largest single format the restore snapshot keeps: a raw 32-bit bitmap
 /// of three 4K screens (about 100 MB) still fits.
 #[cfg(windows)]
 const RESTORE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Longest the snapshot may delay a paste before the restore is dropped.
+/// Snapshot deadline checked around native calls; delayed rendering cannot
+/// be preempted. An expired snapshot refuses publication before emptying.
 #[cfg(windows)]
 const RESTORE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -247,13 +249,11 @@ const RESTORE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500
 /// the helper presses Ctrl+V, then [`ClipboardSwap::finish`] restores the
 /// saved clipboard only while it still equals the temporary write.
 pub struct ClipboardSwap {
-    #[cfg_attr(not(windows), allow(dead_code))]
-    saved: Option<Vec<(u32, Vec<u8>)>>,
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pre_state: Option<String>,
-    #[cfg_attr(not(windows), allow(dead_code))]
-    post_state: Option<String>,
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg(windows)]
+    saved: crate::clip_orchestrator::SnapshotKind,
+    #[cfg(windows)]
+    expected_seq: Option<String>,
+    #[cfg(windows)]
     temp_text: Option<Vec<u8>>,
 }
 
@@ -263,44 +263,30 @@ impl ClipboardSwap {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] when there are no payload bytes, or
-    /// the transfer layer's error when the write fails.
+    /// Returns an error before emptying for invalid payloads or an unavailable
+    /// required snapshot. Publication errors attempt same-session rollback;
+    /// the first error wins and bounded cleanup status goes to diagnostics.
+    /// A failed close returns an error without an active swap.
     pub fn begin(payloads: &[(String, Vec<u8>)], restore: bool) -> Result<Self> {
         #[cfg(windows)]
         {
-            use super::transfer::{imp, WinTransfer};
-            use clipmonger_platform::traits::ClipboardTransfer as _;
-            if payloads.is_empty() {
-                return Err(Error::Unsupported(
-                    "clipboard restore needs stored payload bytes".to_string(),
-                ));
+            let ids = if restore { restore_ids()? } else { Vec::new() };
+            let mut backend = crate::clip_orchestrator::WinBackend::new()?;
+            match crate::clip_orchestrator::begin_transaction(
+                &mut backend,
+                payloads,
+                restore,
+                &ids,
+                RESTORE_MAX_BYTES,
+                RESTORE_BUDGET,
+            ) {
+                Ok(succ) => Ok(Self {
+                    saved: succ.saved,
+                    expected_seq: succ.seq,
+                    temp_text: succ.temp_text,
+                }),
+                Err(e) => Err(e.into_primary()),
             }
-            let transfer = WinTransfer::new();
-            let saved = if restore {
-                let mut ids = vec![imp::CF_UNICODETEXT, imp::CF_DIB, imp::CF_HDROP];
-                ids.extend(
-                    RESTORE_FORMATS
-                        .iter()
-                        .filter_map(|name| imp::register(name).ok()),
-                );
-                imp::snapshot(&ids, RESTORE_MAX_BYTES, RESTORE_BUDGET)
-                    .filter(|saved| !saved.is_empty())
-            } else {
-                None
-            };
-            let pre_state = transfer.unchanged_indicator();
-            transfer.write(payloads)?;
-            let post_state = transfer.unchanged_indicator();
-            let temp_text = payloads
-                .iter()
-                .find(|(mime, _)| mime == "text/plain")
-                .map(|(_, bytes)| bytes.clone());
-            Ok(Self {
-                saved,
-                pre_state,
-                post_state,
-                temp_text,
-            })
         }
         #[cfg(not(windows))]
         {
@@ -319,35 +305,21 @@ impl ClipboardSwap {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(dwell_ms));
-            guarded_restore(&self);
+            let Ok(mut backend) = crate::clip_orchestrator::WinBackend::new() else {
+                return;
+            };
+            let _ = crate::clip_orchestrator::finish_transaction(
+                &mut backend,
+                &self.saved,
+                self.expected_seq.as_deref(),
+                self.temp_text.as_deref(),
+                restore,
+            );
         }
         #[cfg(not(windows))]
         {
             let _ = (dwell_ms, restore);
         }
-    }
-}
-
-/// Restore `swap.saved` only when the clipboard still equals the swap's
-/// temporary write (sequence indicator AND text content). Shared tail of
-/// `clipboard_restore` and [`ClipboardSwap::finish`]; user copies win.
-#[cfg(windows)]
-fn guarded_restore(swap: &ClipboardSwap) {
-    use super::transfer::WinTransfer;
-    use clipmonger_platform::traits::ClipboardTransfer as _;
-    let transfer = WinTransfer::new();
-    let unchanged = transfer.unchanged_indicator() == swap.post_state;
-    let current = transfer.read("text/plain", 4 * 1024 * 1024).ok();
-    let hash_same = match (&current, &swap.temp_text) {
-        (Some(now), Some(temp)) => now == temp,
-        (None, None) => true,
-        _ => false,
-    };
-    if clipmonger_platform::paste_policy::guarded_restore_decision(unchanged, hash_same) {
-        if let Some(saved) = &swap.saved {
-            let _ = super::transfer::imp::restore(saved);
-        }
-        let _ = &swap.pre_state;
     }
 }
 
@@ -365,13 +337,30 @@ fn inject_text(bytes: &[u8]) -> std::result::Result<(), String> {
 }
 
 /// `ClipboardRestore`: save, write payloads, Ctrl+V, restore only when the
-/// slot still equals our temporary write (user copies always win).
+/// slot passes the conservative in-open sequence and bounded text checks.
 #[cfg(windows)]
 fn clipboard_restore(payloads: &[(String, Vec<u8>)], dwell_ms: u64, restore: bool) -> Result<()> {
     let swap = ClipboardSwap::begin(payloads, restore)?;
-    worker_press_paste_chord().map_err(|e| Error::Io(format!("paste chord failed: {e}")))?;
-    swap.finish(dwell_ms, restore);
-    Ok(())
+    finalize_paste(
+        swap,
+        dwell_ms,
+        restore,
+        worker_press_paste_chord,
+        ClipboardSwap::finish,
+    )
+}
+
+#[cfg(any(windows, test))]
+fn finalize_paste<S>(
+    swap: S,
+    dwell_ms: u64,
+    restore: bool,
+    chord: impl FnOnce() -> std::result::Result<(), String>,
+    finish: impl FnOnce(S, u64, bool),
+) -> Result<()> {
+    let result = chord().map_err(|e| Error::Io(format!("paste chord failed: {e}")));
+    finish(swap, if result.is_ok() { dwell_ms } else { 0 }, restore);
+    result
 }
 
 impl PasteEngine for WinPaste {
@@ -423,5 +412,71 @@ mod tests {
             DeliveryRoute::Clipboard
         );
         assert_eq!(delivery_route(false, None, 10), DeliveryRoute::Clipboard);
+    }
+}
+
+#[cfg(test)]
+mod finalization_tests {
+    use super::finalize_paste;
+    use crate::clip_orchestrator::{run_chord, ChordAction, ChordDriver};
+    use std::cell::RefCell;
+
+    struct Driver<'a> {
+        success: bool,
+        events: &'a RefCell<Vec<&'static str>>,
+    }
+    impl ChordDriver for Driver<'_> {
+        fn init(&mut self) -> std::result::Result<(), String> {
+            self.events.borrow_mut().push("init");
+            Ok(())
+        }
+        fn perform(&mut self, action: ChordAction) -> std::result::Result<(), String> {
+            match action {
+                ChordAction::PressCtrl => self.events.borrow_mut().push("press"),
+                ChordAction::ClickV => {
+                    self.events.borrow_mut().push("click");
+                    if !self.success {
+                        return Err("click failed".into());
+                    }
+                }
+                ChordAction::ReleaseCtrl => self.events.borrow_mut().push("release"),
+            }
+            Ok(())
+        }
+    }
+    #[test]
+    fn c2_real_caller_finalizes_once_on_success_and_error() {
+        for success in [false, true] {
+            for restore in [false, true] {
+                let events = RefCell::new(Vec::new());
+                let mut driver = Driver {
+                    success,
+                    events: &events,
+                };
+                let mut calls = Vec::new();
+                let result = finalize_paste(
+                    17,
+                    250,
+                    restore,
+                    || run_chord(&mut driver),
+                    |swap, dwell, enabled| {
+                        events.borrow_mut().push("finish");
+                        calls.push((swap, dwell, enabled));
+                    },
+                );
+                assert_eq!(
+                    events.into_inner(),
+                    ["init", "press", "click", "release", "finish"]
+                );
+                assert_eq!(calls, [(17, if success { 250 } else { 0 }, restore)]);
+                assert_eq!(result.is_ok(), success);
+                if !success {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        "io: paste chord failed: click failed"
+                    );
+                }
+            }
+        }
     }
 }
