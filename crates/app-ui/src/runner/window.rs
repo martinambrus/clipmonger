@@ -66,6 +66,69 @@ pub fn attributes(ctx: &Context, builder: ViewportBuilder, class: &str) -> Windo
     }
 }
 
+/// Build the attributes used by Host and retain only the fields that egui
+/// should apply after creation. Native Settings geometry bypasses font zoom.
+pub struct PreparedHost {
+    pub attributes: WindowAttributes,
+    pub after_creation: ViewportBuilder,
+    show_after_setup: bool,
+}
+
+impl PreparedHost {
+    /// Complete the actual host setup before explicitly showing a restored window.
+    ///
+    /// # Errors
+    /// Returns the setup error without showing the window.
+    pub fn finish_setup<W: OsWindow, T, E>(
+        &self,
+        window: &W,
+        configure: impl FnOnce(&ViewportBuilder) -> Result<T, E>,
+    ) -> Result<(T, Visibility), E> {
+        let configured = configure(&self.after_creation)?;
+        let mut visibility = if self.attributes.visible {
+            Visibility::shown()
+        } else {
+            Visibility::hidden()
+        };
+        if self.show_after_setup {
+            visibility.show(window);
+        }
+        Ok((configured, visibility))
+    }
+}
+
+#[must_use]
+pub fn prepare_host(
+    ctx: &Context,
+    mut builder: ViewportBuilder,
+    class: &str,
+    restore: Option<&super::geometry::NormalizedRestore>,
+) -> PreparedHost {
+    let mut attrs = attributes(ctx, builder.clone(), class);
+    let show_after_setup = restore.is_some() && attrs.visible;
+    if let Some(restore) = restore {
+        attrs.inner_size = Some(
+            winit::dpi::LogicalSize::new(restore.logical_size[0], restore.logical_size[1]).into(),
+        );
+        attrs.position = restore
+            .physical_position
+            .map(|pos| winit::dpi::PhysicalPosition::new(pos[0], pos[1]).into());
+        // apply_viewport_builder_to_window scales these fields by OS DPI * zoom.
+        // Geometry has already been expressed in native units above.
+        builder.inner_size = None;
+        builder.position = None;
+        // Pinned winit on Windows applies visibility before size and position.
+        // Keep construction and post-creation setup hidden, then show explicitly.
+        attrs.visible = false;
+        builder.visible = Some(false);
+    }
+    PreparedHost {
+        attributes: attrs,
+        after_creation: builder,
+        show_after_setup,
+    }
+}
+
 /// The Win32 window handle of `window` as `u64` (`hwnd as usize as u64`, never
 /// negative), `None` on other platforms. Winit refuses the handle off the
 /// event loop thread, so call this on that thread.
@@ -74,6 +137,30 @@ pub fn hwnd(window: &Window) -> Option<u64> {
     match window.window_handle().ok()?.as_raw() {
         RawWindowHandle::Win32(handle) => Some(handle.hwnd.get().cast_unsigned() as u64),
         _ => None,
+    }
+}
+
+/// Whether the owned window is native-maximized via Win32 `IsZoomed`.
+/// Returns `None` if a Windows handle cannot be obtained; other platforms report `Some(false)`.
+/// The caller must be on the owning event-loop thread and keep `window` alive for the call.
+#[must_use]
+pub fn is_window_zoomed(window: &Window) -> Option<bool> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::IsZoomed;
+        let raw = hwnd(window)? as *mut std::ffi::c_void;
+        let handle = HWND(raw);
+        // SAFETY: `handle` is a live borrowed HWND from `window` on the owning event-loop thread.
+        // `IsZoomed` only inspects window state and does not retain the handle.
+        #[allow(unsafe_code)]
+        let zoomed = unsafe { IsZoomed(handle).as_bool() };
+        Some(zoomed)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        Some(false)
     }
 }
 
