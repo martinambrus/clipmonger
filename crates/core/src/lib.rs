@@ -8,6 +8,7 @@ pub mod hash;
 pub mod model;
 pub mod policy;
 pub mod runtime_log;
+mod sql_text_stream;
 pub mod store;
 pub(crate) mod substring_matcher;
 
