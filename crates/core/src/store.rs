@@ -19,6 +19,9 @@ use crate::hash::content_hash;
 use crate::model::{Clip, PermanentClip, PermanentKind, Rev};
 use crate::policy::{self, DedupeCandidate, Limits};
 
+#[path = "compact_registry.rs"]
+pub(crate) mod compact_registry;
+
 /// Schema version this code reads and writes (D-F1).
 const SCHEMA_VERSION: i64 = 1;
 /// Per-payload inline limit in bytes (D-F3, KiB = 1024).
@@ -264,6 +267,8 @@ pub struct Store {
     fts: bool,
     /// True for recovery handles: every write is refused.
     read_only: bool,
+    /// Owned read snapshots; no connection escapes this registry.
+    compact_snapshots: Mutex<compact_registry::Registry>,
 }
 
 /// Wrap a `rusqlite` failure as a backend error.
@@ -1701,6 +1706,7 @@ impl Store {
             conn: Mutex::new(conn),
             fts,
             read_only,
+            compact_snapshots: Mutex::new(compact_registry::Registry::default()),
         })
     }
 
@@ -1737,6 +1743,7 @@ impl Store {
     /// Returns the original Store and the checkpoint or connection-close error.
     #[allow(clippy::result_large_err)]
     pub fn close(self) -> Result<(), (Self, CoreError)> {
+        self.drain_compact_snapshots();
         if let Err(error) = self.checkpoint() {
             return Err((self, error));
         }
@@ -1750,6 +1757,7 @@ impl Store {
             conn,
             fts,
             read_only,
+            compact_snapshots,
         } = self;
         let connection = conn
             .into_inner()
@@ -1762,6 +1770,7 @@ impl Store {
                     conn: Mutex::new(connection),
                     fts,
                     read_only,
+                    compact_snapshots,
                 },
                 db_err(&error),
             )
