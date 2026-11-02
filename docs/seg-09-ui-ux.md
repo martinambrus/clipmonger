@@ -23,6 +23,10 @@ Fallback reuses the same `PopupVm`/`ConfigDoc`/`Placement`/`IPC bridge`
 - Bar (v2): frameless micro-strip, on-top, edge-docked per config.
 - Per-OS quirks (positioning, focus steal prevention, Wayland
   xdg-positioner limits) MUST be recorded in code + manual-QA per OS.
+  Windows and X11 use physical cursor/monitor geometry for Cursor and Center.
+  Wayland leaves placement to the compositor for both modes; Settings remembers
+  size only there. Settings normal geometry is saved per profile on close and
+  exit; font zoom does not change its native size.
 
 ## 2. Popup (F-201–208)
 

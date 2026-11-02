@@ -3,17 +3,18 @@
 //! context. App logic runs on every pass, visible or hidden; the ui runs only
 //! while the window is shown.
 
+pub mod geometry;
+#[cfg(test)]
+mod placement_tests;
 pub mod render;
 pub mod sched;
+mod shutdown;
 pub mod window;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui::{
-    ClippedPrimitive, Color32, Context, RawInput, ViewportBuilder, ViewportEvent, ViewportId,
-    ViewportInfo,
-};
+use egui::{ClippedPrimitive, Color32, Context, RawInput, ViewportEvent, ViewportId, ViewportInfo};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
@@ -58,10 +59,36 @@ pub trait App {
     /// The logical state the app wants, read after every tick.
     fn desired(&self) -> Desired;
 
+    /// Preserve physical Super in popup shortcut events; other apps keep egui defaults.
+    fn preserve_native_super(&self, _kind: WindowKind) -> bool {
+        false
+    }
+
+    /// Whether a configured action owns native shortcut input and its text side effects.
+    fn native_key_override(
+        &self,
+        _kind: WindowKind,
+        _key: egui::Key,
+        _modifiers: egui::Modifiers,
+    ) -> bool {
+        false
+    }
+
     /// One-shot activation request for the popup, drained by the runner.
     fn take_popup_activation(&mut self) -> bool {
         false
     }
+
+    /// Whether placement needs fresh desktop context.
+    fn wants_desktop_context(&self) -> bool {
+        false
+    }
+
+    /// Provide fresh desktop context snapshot.
+    fn provide_desktop_context(&mut self, _ctx: crate::placement::DesktopContext) {}
+
+    /// A native geometry change can resolve a previously unavailable monitor.
+    fn desktop_geometry_changed(&mut self) {}
 }
 
 /// Window sizes and titles. Sizes are in points at zoom 1.
@@ -72,6 +99,7 @@ pub struct Config {
     pub popup_position: Option<[f32; 2]>,
     pub settings_title: String,
     pub settings_size: [f32; 2],
+    pub settings_state_path: Option<std::path::PathBuf>,
 }
 
 /// What the app factory receives at start.
@@ -111,6 +139,7 @@ pub enum RunError {
     EventLoop(winit::error::EventLoopError),
     Window(winit::error::OsError),
     Surface(softbuffer::SoftBufferError),
+    Teardown(String),
 }
 
 impl std::fmt::Display for RunError {
@@ -119,6 +148,7 @@ impl std::fmt::Display for RunError {
             Self::EventLoop(e) => write!(f, "event loop: {e}"),
             Self::Window(e) => write!(f, "window: {e}"),
             Self::Surface(e) => write!(f, "surface: {e}"),
+            Self::Teardown(m) => write!(f, "teardown: {m}"),
         }
     }
 }
@@ -155,10 +185,8 @@ pub fn run<A: App + 'static>(
         .map_err(RunError::EventLoop)?;
     let proxy = event_loop.create_proxy();
     let mut runner = Runner::new(config, proxy, Box::new(make_app));
-    event_loop
-        .run_app(&mut runner)
-        .map_err(RunError::EventLoop)?;
-    runner.error.map_or(Ok(()), Err)
+    let loop_result = event_loop.run_app(&mut runner).map_err(RunError::EventLoop);
+    shutdown::finish(runner.error, loop_result)
 }
 
 /// The OS window of a slot and everything bound to it.
@@ -169,43 +197,6 @@ struct Host {
     present_error_logged: bool,
     info: ViewportInfo,
     visibility: Visibility,
-}
-
-impl Host {
-    #[allow(clippy::cast_possible_truncation)]
-    fn new(
-        event_loop: &ActiveEventLoop,
-        surface_context: &softbuffer::Context<OwnedDisplayHandle>,
-        ctx: &Context,
-        builder: &ViewportBuilder,
-        class: &str,
-        visibility: Visibility,
-    ) -> Result<Self, RunError> {
-        let attrs = window::attributes(ctx, builder.clone(), class);
-        let window = event_loop.create_window(attrs).map_err(RunError::Window)?;
-        egui_winit::apply_viewport_builder_to_window(ctx, &window, builder);
-        let window = Arc::new(window);
-        let state = egui_winit::State::new(
-            ctx.clone(),
-            ViewportId::ROOT,
-            &*window,
-            Some(window.scale_factor() as f32),
-            window.theme(),
-            None,
-        );
-        let presenter = render::Presenter::new(surface_context, Arc::clone(&window))
-            .map_err(RunError::Surface)?;
-        let mut info = ViewportInfo::default();
-        egui_winit::update_viewport_info(&mut info, ctx, &window, true);
-        Ok(Self {
-            window,
-            state,
-            presenter,
-            present_error_logged: false,
-            info,
-            visibility,
-        })
-    }
 }
 
 impl Host {
@@ -231,6 +222,113 @@ impl Host {
     }
 }
 
+/// Native modifier snapshots are applied only to events appended by one translation.
+#[derive(Default)]
+struct NativeInput {
+    modifiers: egui::Modifiers,
+}
+
+impl NativeInput {
+    fn observe(&mut self, event: &WindowEvent, is_mac: bool) {
+        match event {
+            WindowEvent::ModifiersChanged(mods) => {
+                let state = mods.state();
+                self.modifiers = egui::Modifiers {
+                    alt: state.alt_key(),
+                    ctrl: state.control_key(),
+                    shift: state.shift_key(),
+                    mac_cmd: state.super_key(),
+                    command: if is_mac {
+                        state.super_key()
+                    } else {
+                        state.control_key()
+                    },
+                };
+            }
+            WindowEvent::Focused(false) | WindowEvent::Destroyed => self.reset(),
+            _ => {}
+        }
+    }
+
+    fn clipboard_override<A: App>(
+        &self,
+        app: &A,
+        kind: WindowKind,
+        key: &winit::keyboard::Key,
+        pressed: bool,
+        translated: &[egui::Event],
+    ) -> Option<egui::Key> {
+        self.clipboard_key(key, pressed, translated)
+            .filter(|key| app.native_key_override(kind, *key, self.modifiers))
+    }
+
+    fn clipboard_key(
+        &self,
+        key: &winit::keyboard::Key,
+        pressed: bool,
+        translated: &[egui::Event],
+    ) -> Option<egui::Key> {
+        if !pressed {
+            return None;
+        }
+        // Use the translator's effective key, including its logical-first physical
+        // fallback. Re-mapping the native character would miss Option text like ø.
+        if self.modifiers.alt {
+            return translated.iter().find_map(|event| match event {
+                egui::Event::Key {
+                    key, pressed: true, ..
+                } => Some(*key),
+                _ => None,
+            });
+        }
+        if !self.modifiers.command_only() {
+            return None;
+        }
+        match key.as_ref() {
+            winit::keyboard::Key::Character("c" | "C") => Some(egui::Key::C),
+            winit::keyboard::Key::Character("x" | "X") => Some(egui::Key::X),
+            winit::keyboard::Key::Character("v" | "V") => Some(egui::Key::V),
+            _ => None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.modifiers = egui::Modifiers::NONE;
+    }
+
+    fn finish(&self, input: &mut RawInput, start: usize, override_key: Option<egui::Key>) {
+        // egui-winit can append Text after Key for printable Super chords on non-Mac.
+        let mut appended = input.events.split_off(start);
+        let has_key = appended
+            .iter()
+            .any(|event| matches!(event, egui::Event::Key { .. }));
+        appended.retain_mut(|event| match event {
+            egui::Event::Key { modifiers, .. } | egui::Event::ModifiersChanged(modifiers) => {
+                *modifiers = self.modifiers;
+                true
+            }
+            egui::Event::Text(_)
+                if override_key.is_some() || (has_key && self.modifiers.mac_cmd) =>
+            {
+                false
+            }
+            _ => true,
+        });
+        if !has_key {
+            if let Some(key) = override_key {
+                appended.push(egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: self.modifiers,
+                });
+            }
+        }
+        input.events.extend(appended);
+    }
+}
+
 /// One egui context with its rasterizer, deadline and, while it exists, its OS window.
 struct Slot {
     kind: WindowKind,
@@ -239,6 +337,7 @@ struct Slot {
     pending_raw: RawInput,
     deadline: sched::Deadline,
     host: Option<Host>,
+    native_input: NativeInput,
 }
 
 /// Construct either window's egui context before it receives input.
@@ -271,6 +370,7 @@ impl Slot {
             pending_raw: RawInput::default(),
             deadline: sched::Deadline::new(),
             host: None,
+            native_input: NativeInput::default(),
         }
     }
 
@@ -316,6 +416,9 @@ struct Runner<A: App> {
     last: Desired,
     pending_activation: window::Activation,
     error: Option<RunError>,
+    geometry: geometry::GeometryState,
+    shutdown: Option<shutdown::Shutdown>,
+    orphan_pending: std::collections::HashSet<WindowId>,
 }
 
 impl<A: App> Runner<A> {
@@ -326,6 +429,7 @@ impl<A: App> Runner<A> {
     ) -> Self {
         let fonts = Arc::new(egui_system_font_provider::SystemFontProvider::new());
         let popup = Slot::new(WindowKind::Popup, &proxy, &fonts);
+        let geometry = geometry::GeometryState::new(config.settings_state_path.clone());
         Self {
             config,
             proxy,
@@ -339,6 +443,9 @@ impl<A: App> Runner<A> {
             last: Desired::default(),
             pending_activation: window::Activation::new(),
             error: None,
+            geometry,
+            shutdown: None,
+            orphan_pending: std::collections::HashSet::new(),
         }
     }
 
@@ -349,15 +456,94 @@ impl<A: App> Runner<A> {
         }
     }
 
-    /// Remember the error and leave the event loop.
+    fn resumed_running(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(app) = self.app.as_mut() {
+            if notify_desktop_geometry(app, DesktopGeometrySignal::Resumed) {
+                self.popup.deadline.at(Instant::now());
+                self.set_flow(event_loop);
+            }
+            return;
+        }
+        if let Err(e) = self.start(event_loop) {
+            self.fail(event_loop, e);
+        }
+    }
+
+    fn user_event_running(&mut self, event_loop: &ActiveEventLoop, event: &UserEvent) {
+        let now = Instant::now();
+        match *event {
+            UserEvent::Wake => {
+                self.popup.deadline.at(now);
+                if let Some(slot) = self.settings.as_mut() {
+                    slot.deadline.at(now);
+                }
+            }
+            UserEvent::Repaint { kind, delay, pass } => {
+                if let Some(slot) = self.slot_mut(kind) {
+                    let current = slot.ctx.cumulative_pass_nr_for(ViewportId::ROOT);
+                    slot.deadline.request(now, delay, pass, current);
+                }
+            }
+        }
+        self.set_flow(event_loop);
+    }
+
+    /// Save geometry and release complete hosts through the shared transition.
+    fn begin_shutdown(&mut self, event_loop: &ActiveEventLoop) {
+        let geometry = &mut self.geometry;
+        let global_position = !self.per_show;
+        let directive = shutdown::begin(
+            &mut self.shutdown,
+            &mut self.popup.host,
+            self.settings.as_mut().map(|slot| &mut slot.host),
+            &mut self.orphan_pending,
+            Instant::now(),
+            |host| {
+                geometry.handle(
+                    geometry::Lifecycle::Exit,
+                    host.map(|host: &Host| &*host.window),
+                    global_position,
+                    |message| eprintln!("{message}"),
+                );
+            },
+            |host| host.window.id(),
+        );
+        self.popup.native_input.reset();
+        self.popup.deadline.clear();
+        if let Some(slot) = self.settings.as_mut() {
+            slot.native_input.reset();
+            slot.deadline.clear();
+        }
+        self.apply_shutdown(event_loop, directive);
+    }
+
+    /// Apply a terminal decision without dropping the permanent shutdown guard.
+    fn apply_shutdown(&mut self, event_loop: &ActiveEventLoop, directive: shutdown::Directive) {
+        shutdown::record_timeout(directive, &mut self.error, |pending| {
+            RunError::Teardown(format!(
+                "teardown timed out with {pending} pending after {:?}",
+                shutdown::TEARDOWN_TIMEOUT
+            ))
+        });
+        match directive {
+            shutdown::Directive::Run => {}
+            shutdown::Directive::WaitUntil(deadline) => {
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+            }
+            shutdown::Directive::Exit | shutdown::Directive::TimedOut(_) => event_loop.exit(),
+        }
+    }
+
+    /// Remember the first error and enter shutdown drain.
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: RunError) {
-        self.error = Some(error);
-        event_loop.exit();
+        shutdown::record_error(&mut self.error, error);
+        self.begin_shutdown(event_loop);
     }
 
     /// Create the OS window for a slot.
+    #[allow(clippy::cast_possible_truncation)]
     fn create_host(
-        &self,
+        &mut self,
         event_loop: &ActiveEventLoop,
         kind: WindowKind,
         visible: bool,
@@ -371,16 +557,12 @@ impl<A: App> Runner<A> {
             .with_visible(visible),
             WindowKind::Settings => {
                 window::settings_builder(&self.config.settings_title, self.config.settings_size)
+                    .with_visible(visible)
             }
         };
         let class = match kind {
             WindowKind::Popup => window::POPUP_CLASS,
             WindowKind::Settings => window::SETTINGS_CLASS,
-        };
-        let visibility = if visible {
-            Visibility::shown()
-        } else {
-            Visibility::hidden()
         };
         let ctx = match kind {
             WindowKind::Popup => &self.popup.ctx,
@@ -396,14 +578,72 @@ impl<A: App> Runner<A> {
             .surface_context
             .as_ref()
             .expect("surface_context must exist");
-        Host::new(
-            event_loop,
-            surface_context,
-            ctx,
-            &builder,
-            class,
-            visibility,
-        )
+        let restore = if kind == WindowKind::Settings {
+            let monitors: Vec<_> = event_loop
+                .available_monitors()
+                .map(|monitor| geometry::MonitorGeometry {
+                    bounds: monitor_rect(&monitor),
+                    scale: monitor.scale_factor(),
+                })
+                .collect();
+            let preferred = event_loop
+                .primary_monitor()
+                .map(|monitor| geometry::MonitorGeometry {
+                    bounds: monitor_rect(&monitor),
+                    scale: monitor.scale_factor(),
+                });
+            Some(self.geometry.normalized_for_restore(
+                self.config.settings_size,
+                &monitors,
+                preferred,
+                !self.per_show,
+            ))
+        } else {
+            None
+        };
+        // Explicit window creation to capture WindowId if Presenter fails.
+        let prepared = window::prepare_host(ctx, builder.clone(), class, restore.as_ref());
+        let window = Arc::new(
+            event_loop
+                .create_window(prepared.attributes.clone())
+                .map_err(RunError::Window)?,
+        );
+        let window_id = window.id();
+        let host_res = (|| {
+            let ((state, presenter, info), visibility) = prepared.finish_setup(&*window, |b| {
+                egui_winit::apply_viewport_builder_to_window(ctx, &window, b);
+                let state = egui_winit::State::new(
+                    ctx.clone(),
+                    ViewportId::ROOT,
+                    &*window,
+                    Some(window.scale_factor() as f32),
+                    window.theme(),
+                    None,
+                );
+                let presenter = render::Presenter::new(surface_context, Arc::clone(&window))
+                    .map_err(RunError::Surface)?;
+                let mut info = ViewportInfo::default();
+                egui_winit::update_viewport_info(&mut info, ctx, &window, true);
+                Ok::<_, RunError>((state, presenter, info))
+            })?;
+            Ok::<_, RunError>(Host {
+                window,
+                state,
+                presenter,
+                present_error_logged: false,
+                info,
+                visibility,
+            })
+        })();
+        match host_res {
+            Ok(host) => Ok(host),
+            Err(e) => {
+                // Window was created and will be dropped here, posting Destroy.
+                // Track its id so shutdown drain can account for it if needed.
+                self.orphan_pending.insert(window_id);
+                Err(e)
+            }
+        }
     }
 
     /// Initialize the runner on first resume.
@@ -416,6 +656,7 @@ impl<A: App> Runner<A> {
         if !self.per_show {
             let host = self.create_host(event_loop, WindowKind::Popup, false)?;
             popup_hwnd = window::hwnd(&host.window);
+            self.popup.native_input.reset();
             self.popup.host = Some(host);
         }
         let make_app = self.make_app.take().expect("make_app already taken");
@@ -430,6 +671,12 @@ impl<A: App> Runner<A> {
 
     /// Update the event loop control flow from deadlines.
     fn set_flow(&self, event_loop: &ActiveEventLoop) {
+        if let Some(shutdown) = &self.shutdown {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                shutdown.deadline(),
+            ));
+            return;
+        }
         let deadlines = [
             self.popup.deadline.next(),
             self.settings.as_ref().and_then(|s| s.deadline.next()),
@@ -439,6 +686,11 @@ impl<A: App> Runner<A> {
 
     /// Run due passes and reconcile.
     fn tick(&mut self, event_loop: &ActiveEventLoop) {
+        let directive = shutdown::poll(&mut self.shutdown, Instant::now());
+        if directive != shutdown::Directive::Run {
+            self.apply_shutdown(event_loop, directive);
+            return;
+        }
         let now = Instant::now();
         for kind in [WindowKind::Popup, WindowKind::Settings] {
             let should_run = {
@@ -562,6 +814,12 @@ impl<A: App> Runner<A> {
 
     /// Reconcile desired state with OS windows.
     fn reconcile(&mut self, event_loop: &ActiveEventLoop) {
+        shutdown::ordinary_work(self.shutdown.is_some(), || {
+            self.reconcile_running(event_loop);
+        });
+    }
+
+    fn reconcile_running(&mut self, event_loop: &ActiveEventLoop) {
         let Some(app) = self.app.as_mut() else {
             return;
         };
@@ -569,7 +827,7 @@ impl<A: App> Runner<A> {
         let request = app.take_popup_activation();
         let previous = std::mem::replace(&mut self.last, desired);
         if desired.exit {
-            event_loop.exit();
+            self.begin_shutdown(event_loop);
             return;
         }
         let now = Instant::now();
@@ -607,6 +865,16 @@ impl<A: App> Runner<A> {
                 policy,
             );
         }
+        let context = self
+            .app
+            .as_ref()
+            .filter(|app| app.wants_desktop_context())
+            .and_then(|_| self.collect_desktop_context(event_loop));
+        if let Some(app) = self.app.as_mut() {
+            if deliver_desktop_context(app, || context) {
+                self.popup.deadline.at(Instant::now());
+            }
+        }
     }
 
     /// Show or hide the popup window.
@@ -614,9 +882,11 @@ impl<A: App> Runner<A> {
         if self.per_show {
             if open {
                 let host = self.create_host(event_loop, WindowKind::Popup, true)?;
+                self.popup.native_input.reset();
                 self.popup.host = Some(host);
             } else {
                 self.popup.host = None;
+                self.popup.native_input.reset();
             }
         } else if let Some(host) = self.popup.host.as_mut() {
             if open {
@@ -646,46 +916,211 @@ impl<A: App> Runner<A> {
             if needs_host {
                 let host = self.create_host(event_loop, WindowKind::Settings, true)?;
                 if let Some(slot) = self.settings.as_mut() {
+                    slot.native_input.reset();
                     slot.host = Some(host);
                 }
             }
-        } else if let Some(slot) = self.settings.as_mut() {
-            slot.host = None;
-            slot.deadline.clear();
+        } else {
+            self.settings_geometry(geometry::Lifecycle::Close);
+            if let Some(slot) = self.settings.as_mut() {
+                slot.host = None;
+                slot.native_input.reset();
+                slot.deadline.clear();
+            }
         }
         Ok(())
     }
+
+    fn window_geometry_event(&mut self, kind: WindowKind, event: &WindowEvent) {
+        if kind == WindowKind::Settings
+            && matches!(
+                event,
+                WindowEvent::CloseRequested
+                    | WindowEvent::Resized(_)
+                    | WindowEvent::Moved(_)
+                    | WindowEvent::ScaleFactorChanged { .. }
+            )
+        {
+            self.settings_geometry(geometry::Lifecycle::Changed);
+        }
+        if let Some(app) = self.app.as_mut() {
+            notify_desktop_geometry(app, DesktopGeometrySignal::Window(kind, event));
+        }
+    }
+
+    fn settings_geometry(&mut self, lifecycle: geometry::Lifecycle) {
+        let window = self
+            .settings
+            .as_ref()
+            .and_then(|slot| slot.host.as_ref())
+            .map(|host| &*host.window);
+        self.geometry
+            .handle(lifecycle, window, !self.per_show, |message| {
+                eprintln!("{message}");
+            });
+    }
+
+    fn collect_desktop_context(
+        &self,
+        event_loop: &ActiveEventLoop,
+    ) -> Option<crate::placement::DesktopContext> {
+        let host = self.popup.host.as_ref()?;
+        let physical = host.window.inner_size();
+        let current_scale = host.window.scale_factor();
+        let monitors: Vec<_> = event_loop
+            .available_monitors()
+            .map(|monitor| (monitor_rect(&monitor), monitor.scale_factor()))
+            .collect();
+        Some(desktop_context_from_snapshot(
+            (physical.width, physical.height),
+            current_scale,
+            &monitors,
+            query_cursor(event_loop),
+            host.window.current_monitor().as_ref().map(monitor_rect),
+            event_loop.primary_monitor().as_ref().map(monitor_rect),
+            !self.per_show,
+        ))
+    }
+}
+
+/// Build placement context from one native snapshot, predicting the physical size
+/// after a move to the destination monitor without querying the desktop again.
+fn desktop_context_from_snapshot(
+    current_physical: (u32, u32),
+    current_scale: f64,
+    raw_monitors: &[(crate::placement::Rect, f64)],
+    cursor: Option<(i32, i32)>,
+    current_monitor: Option<crate::placement::Rect>,
+    primary_monitor: Option<crate::placement::Rect>,
+    supports_global_position: bool,
+) -> crate::placement::DesktopContext {
+    let monitors: Vec<_> = raw_monitors.iter().map(|(rect, _)| *rect).collect();
+    let destination =
+        crate::placement::destination_monitor(cursor, &monitors, current_monitor, primary_monitor);
+    // Without a matching destination scale, preserve the known physical size.
+    let destination_scale = raw_monitors
+        .iter()
+        .find(|(rect, _)| Some(*rect) == destination)
+        .map_or(current_scale, |(_, scale)| *scale);
+    let popup_physical_size = crate::placement::predicted_physical_size(
+        current_physical,
+        current_scale,
+        destination_scale,
+    );
+    crate::placement::DesktopContext {
+        monitors,
+        cursor,
+        current_monitor,
+        primary_monitor,
+        popup_physical_size,
+        supports_global_position,
+    }
+}
+
+/// Deliver exactly one requested native snapshot after host reconciliation.
+/// The collector is lazy: an identical Config or an already-open raise does no query.
+pub fn deliver_desktop_context(
+    app: &mut impl App,
+    collect: impl FnOnce() -> Option<crate::placement::DesktopContext>,
+) -> bool {
+    if !app.wants_desktop_context() {
+        return false;
+    }
+    let Some(context) = collect() else {
+        return false;
+    };
+    app.provide_desktop_context(context);
+    true
+}
+
+/// Native signals that may make missing monitor geometry available.
+#[derive(Clone, Copy)]
+pub enum DesktopGeometrySignal<'a> {
+    Resumed,
+    Window(WindowKind, &'a WindowEvent),
+}
+
+/// Wake only unresolved placement; ordinary frames, Config and Raise do not retry.
+pub fn notify_desktop_geometry(app: &mut impl App, signal: DesktopGeometrySignal<'_>) -> bool {
+    let relevant = match signal {
+        DesktopGeometrySignal::Resumed => true,
+        DesktopGeometrySignal::Window(kind, event) => {
+            kind == WindowKind::Popup
+                && matches!(
+                    event,
+                    WindowEvent::Moved(_)
+                        | WindowEvent::Resized(_)
+                        | WindowEvent::ScaleFactorChanged { .. }
+                )
+        }
+    };
+    if relevant {
+        app.desktop_geometry_changed();
+        app.wants_desktop_context()
+    } else {
+        false
+    }
+}
+
+fn monitor_rect(monitor: &winit::monitor::MonitorHandle) -> crate::placement::Rect {
+    let position = monitor.position();
+    let size = monitor.size();
+    crate::placement::Rect {
+        x: position.x,
+        y: position.y,
+        w: i32::try_from(size.width).unwrap_or(i32::MAX),
+        h: i32::try_from(size.height).unwrap_or(i32::MAX),
+    }
+}
+
+fn query_cursor(event_loop: &ActiveEventLoop) -> Option<(i32, i32)> {
+    if window::is_wayland(event_loop) {
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
+        let mut point = POINT::default();
+        // SAFETY: the event-loop thread owns this valid, writable POINT.
+        #[allow(unsafe_code)]
+        if unsafe { GetCursorPos(&raw mut point) }.is_ok() {
+            return Some((point.x, point.y));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use winit::platform::x11::ActiveEventLoopExtX11 as _;
+        use x11rb::{connection::Connection as _, protocol::xproto::ConnectionExt as _};
+        if event_loop.is_x11() {
+            let (connection, _) = x11rb::connect(None).ok()?;
+            // A separate connection may default to a different X screen. The
+            // pointer belongs to the root whose same_screen response is true.
+            for screen in &connection.setup().roots {
+                let pointer = connection.query_pointer(screen.root).ok()?.reply().ok()?;
+                if pointer.same_screen {
+                    return Some((i32::from(pointer.root_x), i32::from(pointer.root_y)));
+                }
+            }
+        }
+    }
+    None
 }
 
 impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.settings_geometry(geometry::Lifecycle::Exit);
+    }
+
     /// Handle resumed event.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.app.is_some() {
-            return;
-        }
-        if let Err(e) = self.start(event_loop) {
-            self.fail(event_loop, e);
-        }
+        shutdown::ordinary_work(self.shutdown.is_some(), || self.resumed_running(event_loop));
     }
 
     /// Handle wake and repaint events.
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        let now = Instant::now();
-        match event {
-            UserEvent::Wake => {
-                self.popup.deadline.at(now);
-                if let Some(slot) = self.settings.as_mut() {
-                    slot.deadline.at(now);
-                }
-            }
-            UserEvent::Repaint { kind, delay, pass } => {
-                if let Some(slot) = self.slot_mut(kind) {
-                    let current = slot.ctx.cumulative_pass_nr_for(ViewportId::ROOT);
-                    slot.deadline.request(now, delay, pass, current);
-                }
-            }
-        }
-        self.set_flow(event_loop);
+        shutdown::ordinary_work(self.shutdown.is_some(), || {
+            self.user_event_running(event_loop, &event);
+        });
     }
 
     /// Handle window events.
@@ -695,34 +1130,68 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Dispatch owns acknowledgment-before-lookup ordering, including after
+        // the complete hosts have been removed from their slots.
+        let dispatch = shutdown::window_event(
+            &mut self.shutdown,
+            self.popup.host.as_ref(),
+            self.settings.as_ref().and_then(|slot| slot.host.as_ref()),
+            window_id,
+            &event,
+            Instant::now(),
+            |host| host.window.id(),
+        );
+        let kind = match dispatch {
+            shutdown::WindowDispatch::Normal(kind) => kind,
+            shutdown::WindowDispatch::Shutdown(directive) => {
+                self.apply_shutdown(event_loop, directive);
+                return;
+            }
+        };
         let now = Instant::now();
         let close = matches!(event, WindowEvent::CloseRequested);
-        let kind = if let Some(host) = self.popup.host.as_ref() {
-            if host.window.id() == window_id {
-                Some(WindowKind::Popup)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let kind = kind.or_else(|| {
-            if let Some(slot) = self.settings.as_ref() {
-                if let Some(host) = slot.host.as_ref() {
-                    if host.window.id() == window_id {
-                        return Some(WindowKind::Settings);
-                    }
-                }
-            }
-            None
-        });
         if let Some(kind) = kind {
-            if let Some(slot) = self.slot_mut(kind) {
+            self.window_geometry_event(kind, &event);
+            let preserve_super = self
+                .app
+                .as_ref()
+                .is_some_and(|app| app.preserve_native_super(kind));
+            let app = self.app.as_ref();
+            let slot = match kind {
+                WindowKind::Popup => Some(&mut self.popup),
+                WindowKind::Settings => self.settings.as_mut(),
+            };
+            if let Some(slot) = slot {
                 if let Some(host) = slot.host.as_mut() {
                     if close {
                         host.info.events.push(ViewportEvent::Close);
                     }
+                    let start = host.state.egui_input_mut().events.len();
+                    if preserve_super {
+                        slot.native_input.observe(&event, slot.ctx.os().is_mac());
+                    }
                     let response = host.state.on_window_event(&host.window, &event);
+                    if preserve_super {
+                        let input = host.state.egui_input_mut();
+                        let override_key = app.and_then(|app| {
+                            let WindowEvent::KeyboardInput {
+                                event,
+                                is_synthetic: false,
+                                ..
+                            } = &event
+                            else {
+                                return None;
+                            };
+                            slot.native_input.clipboard_override(
+                                app,
+                                kind,
+                                &event.logical_key,
+                                event.state.is_pressed(),
+                                &input.events[start..],
+                            )
+                        });
+                        slot.native_input.finish(input, start, override_key);
+                    }
                     if response.repaint || close {
                         slot.deadline.at(now);
                     }
@@ -750,6 +1219,579 @@ mod zoom_tests {
                 !ctx.options(|options| options.zoom_with_keyboard),
                 "{kind:?}: keyboard zoom must be off before the first pass"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_input_tests {
+    use super::*;
+    use winit::keyboard::ModifiersState;
+
+    fn key(pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::J,
+            physical_key: Some(egui::Key::J),
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn native_input_patches_key_before_text_and_preserves_batched_snapshots() {
+        for is_mac in [false, true] {
+            let mut adapter = NativeInput::default();
+            let mut input = RawInput::default();
+            adapter.observe(
+                &WindowEvent::ModifiersChanged(ModifiersState::SUPER.into()),
+                is_mac,
+            );
+            input.events.extend([
+                key(true, egui::Modifiers::NONE),
+                egui::Event::Text("j".into()),
+            ]);
+            adapter.finish(&mut input, 0, None);
+            adapter.observe(
+                &WindowEvent::ModifiersChanged(ModifiersState::empty().into()),
+                is_mac,
+            );
+            let start = input.events.len();
+            input.events.push(key(false, egui::Modifiers::NONE));
+            adapter.finish(&mut input, start, None);
+            assert_eq!(input.events.len(), 2, "shortcut text must not reach search");
+            assert!(
+                matches!(input.events[0], egui::Event::Key { pressed:true, modifiers, .. } if modifiers.mac_cmd && modifiers.command == is_mac && !modifiers.ctrl)
+            );
+            assert!(
+                matches!(input.events[1], egui::Event::Key { pressed:false, modifiers, .. } if modifiers == egui::Modifiers::NONE)
+            );
+        }
+    }
+
+    fn shortcut_app() -> (crate::app::PopupApp, Context) {
+        let (app, ctx, _) = shortcut_app_with_keys(
+            &serde_json::json!({"navigate_down":"super+j", "end":"ctrl+c", "home":"ctrl+x", "page_down":"ctrl+v"}),
+            false,
+        );
+        (app, ctx)
+    }
+
+    fn shortcut_app_with_keys(
+        keys: &serde_json::Value,
+        permanent: bool,
+    ) -> (
+        crate::app::PopupApp,
+        Context,
+        std::sync::mpsc::Receiver<crate::ipc_bridge::UiCmd>,
+    ) {
+        use crate::app::{AppParts, PopupApp};
+        use crate::ipc_bridge::{UiCmd, UiEvent};
+        use serde_json::json;
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<UiCmd>();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut app = PopupApp::new(AppParts {
+            profile: std::path::PathBuf::from("native-input-fixture"),
+            cmds: cmd_tx,
+            events: event_rx,
+            tray: Box::new(Vec::new),
+            hold: None,
+            open: true,
+            status_period: Duration::from_secs(3600),
+            trace: None,
+            allow_foreground: Box::new(|| {}),
+        });
+        event_tx
+            .send(UiEvent::Config(json!({"config":{"popup":{"keys":keys}}})))
+            .expect("config");
+        app.vm_mut().set_clips((1..=3).map(|n| serde_json::from_value(json!({
+            "id":uuid::Uuid::from_u128(n), "created_ms":1, "source_os":"linux", "preview":"row", "pinned":false,
+            "rev":{"wall_ms":1,"dev":"fixture"}
+        })).expect("clip")).collect());
+        if permanent {
+            event_tx
+                .send(UiEvent::PermGroups(
+                    json!({"groups":[{"name":"Work","system":false,"count":3}]}),
+                ))
+                .expect("groups");
+            event_tx.send(UiEvent::Permanents(json!({"permanents":(1..=3).map(|n| json!({
+                "id":uuid::Uuid::from_u128(1000+n), "group":"Work", "name":format!("row {n}"), "kind":"Paste", "body":"row body", "hotkey":null, "js":null, "rev":{"wall_ms":1,"dev":"fixture","ctr":0}
+            })).collect::<Vec<_>>()}))).expect("permanents");
+        }
+        let ctx = new_context();
+        frame(&mut app, &ctx, RawInput::default());
+        if permanent {
+            app.config().lock().expect("config").perm_source = Some(0);
+            app.vm_mut().selected = 2;
+            frame(&mut app, &ctx, RawInput::default());
+        }
+        let _ = cmd_rx.try_iter().collect::<Vec<_>>();
+        (app, ctx, cmd_rx)
+    }
+
+    fn frame(app: &mut crate::app::PopupApp, ctx: &Context, input: RawInput) {
+        let mut output = ctx.run_ui(input, |ui| {
+            app.logic(ui.ctx(), WindowKind::Popup);
+            app.ui(ui, WindowKind::Popup);
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn native_input_super_batch_dispatches_once_without_search_text() {
+        let (mut app, ctx) = shortcut_app();
+        let mut adapter = NativeInput::default();
+        adapter.observe(
+            &WindowEvent::ModifiersChanged(ModifiersState::SUPER.into()),
+            false,
+        );
+        let mut input = RawInput {
+            events: vec![
+                key(true, egui::Modifiers::NONE),
+                egui::Event::Text("j".into()),
+            ],
+            ..RawInput::default()
+        };
+        adapter.finish(&mut input, 0, None);
+        adapter.observe(
+            &WindowEvent::ModifiersChanged(ModifiersState::empty().into()),
+            false,
+        );
+        let start = input.events.len();
+        input.events.extend([
+            key(false, egui::Modifiers::NONE),
+            egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+        ]);
+        adapter.finish(&mut input, start, None);
+        frame(&mut app, &ctx, input);
+        assert_eq!(
+            app.vm().selected,
+            1,
+            "one native shortcut must dispatch exactly once"
+        );
+        assert!(
+            app.vm().query.is_empty(),
+            "shortcut must not fall back to search text"
+        );
+    }
+
+    #[test]
+    fn native_input_clipboard_overrides_preserve_text_editing() {
+        let (mut app, ctx) = shortcut_app();
+        let mut adapter = NativeInput::default();
+        adapter.observe(
+            &WindowEvent::ModifiersChanged(ModifiersState::CONTROL.into()),
+            false,
+        );
+        // Clipboard translation remains text editing when the search field owns focus.
+        let native_v = winit::keyboard::Key::Character("v".into());
+        assert!(ctx.text_edit_focused());
+        assert_eq!(
+            adapter.clipboard_override(&app, WindowKind::Popup, &native_v, true, &[]),
+            Some(egui::Key::V)
+        );
+        let mut paste = RawInput {
+            events: vec![egui::Event::Paste("needle".into())],
+            ..RawInput::default()
+        };
+        adapter.finish(&mut paste, 0, Some(egui::Key::V));
+        frame(&mut app, &ctx, paste);
+        assert_eq!(app.vm().query, "needle");
+        app.vm_mut().query.clear();
+        ctx.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+        });
+        frame(&mut app, &ctx, RawInput::default());
+        assert!(!ctx.text_edit_focused());
+        for (name, translated, selected) in [
+            ("c", egui::Event::Copy, 2),
+            ("x", egui::Event::Cut, 0),
+            ("v", egui::Event::Paste("must not enter search".into()), 2),
+        ] {
+            let native = winit::keyboard::Key::Character(name.into());
+            let override_key =
+                adapter.clipboard_override(&app, WindowKind::Popup, &native, true, &[]);
+            assert!(
+                override_key.is_some(),
+                "configured {name} must survive native clipboard translation"
+            );
+            let mut input = RawInput {
+                events: vec![translated],
+                ..RawInput::default()
+            };
+            adapter.finish(&mut input, 0, override_key);
+            assert_eq!(
+                input.events.len(),
+                2,
+                "preserve clipboard input until actual frame focus is known"
+            );
+            frame(&mut app, &ctx, input);
+            assert_eq!(app.vm().selected, selected);
+            assert_eq!(app.vm().query, "");
+        }
+    }
+
+    #[test]
+    fn native_input_clipboard_focus_changes_in_same_batch() {
+        let (mut app, ctx) = shortcut_app();
+        let search_id = ctx
+            .memory(egui::Memory::focused)
+            .expect("search owns focus");
+        let search = ctx
+            .read_response(search_id)
+            .expect("actual search widget")
+            .rect;
+        ctx.memory_mut(|memory| memory.surrender_focus(search_id));
+        frame(&mut app, &ctx, RawInput::default());
+        assert!(!ctx.text_edit_focused());
+        let mut adapter = NativeInput::default();
+        adapter.observe(
+            &WindowEvent::ModifiersChanged(ModifiersState::CONTROL.into()),
+            false,
+        );
+        let click = |pos| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        let native_v = winit::keyboard::Key::Character("v".into());
+        let override_key =
+            adapter.clipboard_override(&app, WindowKind::Popup, &native_v, true, &[]);
+        let mut input = RawInput {
+            events: click(search.center()),
+            ..RawInput::default()
+        };
+        let start = input.events.len();
+        input.events.push(egui::Event::Paste("needle".into()));
+        adapter.finish(&mut input, start, override_key);
+        frame(&mut app, &ctx, input);
+        assert!(
+            ctx.text_edit_focused(),
+            "actual search click at {search:?} must focus text editor"
+        );
+        assert_eq!(
+            app.vm().query,
+            "needle",
+            "same-batch search click must retain native paste"
+        );
+        assert_eq!(
+            app.vm().selected,
+            0,
+            "paste into search must not also navigate the list"
+        );
+        app.vm_mut().query.clear();
+        frame(&mut app, &ctx, RawInput::default());
+        assert!(ctx.text_edit_focused());
+        let mut rows = ctx
+            .interactive_rects_last_pass()
+            .into_iter()
+            .filter(|rect| rect.top() > search.bottom() && rect.height() <= 25.0)
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        let row = rows.get(1).expect("actual second history row");
+        let native_c = winit::keyboard::Key::Character("c".into());
+        let override_key =
+            adapter.clipboard_override(&app, WindowKind::Popup, &native_c, true, &[]);
+        let mut input = RawInput {
+            events: click(row.center()),
+            ..RawInput::default()
+        };
+        let start = input.events.len();
+        input.events.push(egui::Event::Copy);
+        adapter.finish(&mut input, start, override_key);
+        frame(&mut app, &ctx, input);
+        assert!(!ctx.text_edit_focused());
+        assert_eq!(
+            app.vm().selected,
+            2,
+            "same-batch list click must honor configured copy chord"
+        );
+        assert_eq!(app.vm().query, "");
+    }
+
+    fn alt_shortcut_control(permanent: bool, fallback: bool) {
+        use crate::ipc_bridge::UiCmd;
+
+        let (chord, text, effective) = if fallback {
+            ("alt+o", "ø", egui::Key::O)
+        } else {
+            ("alt+j", "j", egui::Key::J)
+        };
+        let (mut app, ctx, commands) =
+            shortcut_app_with_keys(&serde_json::json!({"navigate_down":chord}), permanent);
+        assert!(ctx.text_edit_focused());
+        let mut adapter = NativeInput::default();
+        adapter.observe(
+            &WindowEvent::ModifiersChanged(ModifiersState::ALT.into()),
+            fallback,
+        );
+        let native = winit::keyboard::Key::Character(text.into());
+        let mut input = RawInput {
+            // Pinned egui-winit emits logical.or(physical), then printable Text.
+            events: vec![
+                egui::Event::Key {
+                    key: effective,
+                    physical_key: Some(effective),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::ALT,
+                },
+                egui::Event::Text(text.into()),
+            ],
+            ..RawInput::default()
+        };
+        let owned =
+            adapter.clipboard_override(&app, WindowKind::Popup, &native, true, &input.events);
+        adapter.finish(&mut input, 0, owned);
+        adapter.observe(
+            &WindowEvent::ModifiersChanged(ModifiersState::empty().into()),
+            fallback,
+        );
+        let start = input.events.len();
+        input.events.extend([
+            egui::Event::Key {
+                key: effective,
+                physical_key: Some(effective),
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+        ]);
+        adapter.finish(&mut input, start, None);
+        frame(&mut app, &ctx, input);
+        assert_eq!(
+            app.vm().query,
+            "",
+            "configured {chord} must not type its native {text} text"
+        );
+        if permanent {
+            assert_eq!(app.config().lock().expect("config").perm_vm.selected, 1);
+            assert_eq!(
+                app.vm().selected,
+                2,
+                "permanent navigation must preserve hidden history"
+            );
+            assert_eq!(app.vm().clips().len(), 3);
+        } else {
+            assert_eq!(app.vm().selected, 1, "one key press must navigate once");
+        }
+        frame(
+            &mut app,
+            &ctx,
+            RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..RawInput::default()
+            },
+        );
+        assert!(!app.desired().popup_open);
+        app.logic(&ctx, WindowKind::Popup);
+        std::thread::sleep(Duration::from_millis(170));
+        app.logic(&ctx, WindowKind::Popup);
+        let picked = commands.try_iter().collect::<Vec<_>>();
+        if permanent {
+            assert_eq!(
+                picked,
+                vec![UiCmd::ExecPermanent(uuid::Uuid::from_u128(1002))]
+            );
+        } else {
+            assert!(
+                matches!(picked.as_slice(),[UiCmd::PasteClipTo(id,..)] if *id == uuid::Uuid::from_u128(2)),
+                "{picked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_input_alt_shortcut_history_pick_uses_unchanged_query() {
+        alt_shortcut_control(false, false);
+    }
+
+    #[test]
+    fn native_input_alt_shortcut_permanent_pick_preserves_hidden_history() {
+        alt_shortcut_control(true, false);
+    }
+
+    #[test]
+    fn native_input_alt_physical_fallback_history_pick_uses_unchanged_query() {
+        alt_shortcut_control(false, true);
+    }
+
+    #[test]
+    fn native_input_alt_physical_fallback_permanent_pick_preserves_hidden_history() {
+        alt_shortcut_control(true, true);
+    }
+
+    #[test]
+    fn native_input_alt_ownership_uses_logical_priority_over_physical() {
+        for (chord, expected_query, expected_selected) in [("alt+o", "j", 0), ("alt+j", "", 1)] {
+            let (mut app, ctx, _) =
+                shortcut_app_with_keys(&serde_json::json!({"navigate_down":chord}), false);
+            let mut adapter = NativeInput::default();
+            adapter.observe(
+                &WindowEvent::ModifiersChanged(ModifiersState::ALT.into()),
+                false,
+            );
+            // A recognized logical J wins over physical O in pinned egui-winit.
+            let mut input = RawInput {
+                events: vec![
+                    egui::Event::Key {
+                        key: egui::Key::J,
+                        physical_key: Some(egui::Key::O),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::ALT,
+                    },
+                    egui::Event::Text("j".into()),
+                ],
+                ..RawInput::default()
+            };
+            let owned = adapter.clipboard_override(
+                &app,
+                WindowKind::Popup,
+                &winit::keyboard::Key::Character("j".into()),
+                true,
+                &input.events,
+            );
+            adapter.finish(&mut input, 0, owned);
+            frame(&mut app, &ctx, input);
+            assert_eq!(app.vm().query, expected_query, "{chord}");
+            assert_eq!(app.vm().selected, expected_selected, "{chord}");
+        }
+    }
+
+    #[test]
+    fn native_input_alt_shortcut_preserves_other_native_text_in_batch() {
+        let (mut app, ctx, _) =
+            shortcut_app_with_keys(&serde_json::json!({"navigate_down":"alt+o"}), false);
+        let mut adapter = NativeInput::default();
+        adapter.observe(
+            &WindowEvent::ModifiersChanged(ModifiersState::ALT.into()),
+            false,
+        );
+        let mut input = RawInput {
+            events: vec![
+                egui::Event::Text("before".into()),
+                egui::Event::Key {
+                    key: egui::Key::O,
+                    physical_key: Some(egui::Key::O),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::ALT,
+                },
+                egui::Event::Text("ø".into()),
+            ],
+            ..RawInput::default()
+        };
+        let owned = adapter.clipboard_override(
+            &app,
+            WindowKind::Popup,
+            &winit::keyboard::Key::Character("ø".into()),
+            true,
+            &input.events[1..],
+        );
+        adapter.finish(&mut input, 1, owned);
+        let start = input.events.len();
+        input.events.push(egui::Event::Text("after".into()));
+        adapter.finish(&mut input, start, None);
+        frame(&mut app, &ctx, input);
+        assert_eq!(
+            app.vm().query,
+            "beforeafter",
+            "only the owned native key's appended text may be suppressed"
+        );
+    }
+
+    #[test]
+    fn native_input_unmatched_alt_and_option_text_remains_editable() {
+        for (is_mac, text) in [(false, "j"), (true, "ø")] {
+            let (mut app, ctx) = shortcut_app();
+            let mut adapter = NativeInput::default();
+            adapter.observe(
+                &WindowEvent::ModifiersChanged(ModifiersState::ALT.into()),
+                is_mac,
+            );
+            let native = winit::keyboard::Key::Character(text.into());
+            let effective = if is_mac { egui::Key::O } else { egui::Key::J };
+            let translated_key = egui::Event::Key {
+                key: effective,
+                physical_key: Some(effective),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT,
+            };
+            let owned = adapter.clipboard_override(
+                &app,
+                WindowKind::Popup,
+                &native,
+                true,
+                std::slice::from_ref(&translated_key),
+            );
+            assert_eq!(owned, None, "unbound Alt/Option is ordinary text input");
+            let mut input = RawInput {
+                events: vec![translated_key, egui::Event::Text(text.into())],
+                ..RawInput::default()
+            };
+            adapter.finish(&mut input, 0, owned);
+            frame(&mut app, &ctx, input);
+            assert_eq!(app.vm().query, text);
+            assert!(app.desired().popup_open);
+        }
+    }
+
+    #[test]
+    fn native_input_ctrl_focus_and_host_reset_do_not_invent_super() {
+        for is_mac in [false, true] {
+            let mut adapter = NativeInput::default();
+            adapter.observe(
+                &WindowEvent::ModifiersChanged(ModifiersState::CONTROL.into()),
+                is_mac,
+            );
+            let mut input = RawInput {
+                events: vec![key(true, egui::Modifiers::NONE)],
+                ..RawInput::default()
+            };
+            adapter.finish(&mut input, 0, None);
+            assert!(
+                matches!(input.events[0], egui::Event::Key { modifiers, .. } if modifiers.ctrl && !modifiers.mac_cmd && modifiers.command != is_mac)
+            );
+            for event in [WindowEvent::Focused(false), WindowEvent::Destroyed] {
+                adapter.observe(
+                    &WindowEvent::ModifiersChanged(
+                        (ModifiersState::SUPER | ModifiersState::ALT | ModifiersState::SHIFT)
+                            .into(),
+                    ),
+                    is_mac,
+                );
+                adapter.observe(&event, is_mac);
+                assert_eq!(adapter.modifiers, egui::Modifiers::NONE);
+            }
+            adapter.observe(
+                &WindowEvent::ModifiersChanged(ModifiersState::SUPER.into()),
+                is_mac,
+            );
+            adapter.reset();
+            assert_eq!(adapter.modifiers, egui::Modifiers::NONE);
         }
     }
 }

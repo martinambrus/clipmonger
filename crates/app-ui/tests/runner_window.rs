@@ -1101,3 +1101,125 @@ fn activation_helper_no_visibility_calls_on_supported() {
     );
     assert_eq!(fake.focus_calls.get(), 1);
 }
+
+struct SetupWindow {
+    native: Fake,
+    configured: Cell<bool>,
+    stages: RefCell<Vec<&'static str>>,
+}
+
+impl OsWindow for SetupWindow {
+    fn is_visible(&self) -> Option<bool> {
+        self.native.is_visible()
+    }
+    fn set_visible(&self, visible: bool) {
+        if visible {
+            assert!(self.configured.get(), "show before host setup");
+        }
+        self.stages
+            .borrow_mut()
+            .push(if visible { "show" } else { "hide" });
+        self.native.set_visible(visible);
+    }
+    fn is_minimized(&self) -> Option<bool> {
+        self.native.is_minimized()
+    }
+    fn has_focus(&self) -> bool {
+        false
+    }
+    fn focus_window(&self) {
+        panic!("creation must not add focus activation");
+    }
+}
+
+#[test]
+fn settings_native_creation_stays_hidden_through_setup_then_uses_visibility_show() {
+    use clipmonger_app_ui::runner::{geometry::NormalizedRestore, window::prepare_host};
+    let ctx = Context::default();
+    ctx.set_zoom_factor(1.6);
+    let mut raw = egui::RawInput::default();
+    raw.viewports
+        .get_mut(&egui::ViewportId::ROOT)
+        .unwrap()
+        .native_pixels_per_point = Some(1.5);
+    let mut output = ctx.run_ui(raw, |_| {});
+    output.textures_delta.clear();
+    assert!((ctx.pixels_per_point() - 2.4).abs() < 0.001);
+    for requested_visible in [false, true] {
+        let restore = NormalizedRestore {
+            logical_size: [960.0, 680.0],
+            physical_position: Some([-1800, -150]),
+        };
+        let prepared = prepare_host(
+            &ctx,
+            settings_builder("Settings", [960.0, 680.0]).with_visible(requested_visible),
+            SETTINGS_CLASS,
+            Some(&restore),
+        );
+        let window = SetupWindow {
+            native: Fake::new(prepared.attributes.visible),
+            configured: Cell::new(false),
+            stages: RefCell::new(vec!["create"]),
+        };
+        let ((), mut visibility) = prepared
+            .finish_setup(&window, |builder| {
+                assert!(
+                    !window.native.on_screen(),
+                    "native creation showed before geometry/setup"
+                );
+                assert_eq!(
+                    prepared
+                        .attributes
+                        .inner_size
+                        .unwrap()
+                        .to_physical::<u32>(1.5),
+                    winit::dpi::PhysicalSize::new(1440, 1020)
+                );
+                assert_eq!(
+                    prepared.attributes.position,
+                    Some(Position::Physical(winit::dpi::PhysicalPosition::new(
+                        -1800, -150
+                    )))
+                );
+                assert_eq!(builder.visible, Some(false));
+                assert!(
+                    builder.inner_size.is_none() && builder.position.is_none(),
+                    "post-create setup must not rescale geometry"
+                );
+                window.stages.borrow_mut().push("post-create setup");
+                window.configured.set(true);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(visibility.flag(), requested_visible);
+        if requested_visible {
+            assert_eq!(
+                *window.stages.borrow(),
+                ["create", "post-create setup", "show"]
+            );
+            assert_eq!(window.native.calls(), [true]);
+            visibility.show(&window);
+            assert_eq!(
+                window.native.calls(),
+                [true],
+                "already shown host needs no extra show"
+            );
+        } else {
+            assert_eq!(*window.stages.borrow(), ["create", "post-create setup"]);
+            assert_none_visible(&window);
+        }
+        let failed = SetupWindow {
+            native: Fake::new(prepared.attributes.visible),
+            configured: Cell::new(false),
+            stages: RefCell::new(vec!["create"]),
+        };
+        let result = prepared.finish_setup(&failed, |_| Err::<(), _>("setup failed"));
+        assert!(result.is_err());
+        assert_none_visible(&failed);
+    }
+}
+
+fn assert_none_visible(window: &SetupWindow) {
+    assert!(!window.native.on_screen());
+    assert_eq!(window.native.calls(), NO_CALLS);
+}
