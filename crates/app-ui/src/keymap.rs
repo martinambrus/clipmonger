@@ -161,6 +161,11 @@ impl Keymap {
         Ok(map)
     }
 
+    /// Whether this exact chord has a binding, without resolving its action.
+    pub(crate) fn has_binding(&self, event: &KeyEvent) -> bool {
+        self.bindings.contains_key(&event.chord())
+    }
+
     /// Resolve an event to its action, falling back to typing.
     #[must_use]
     pub fn action_for(&self, event: &KeyEvent) -> Option<Action> {

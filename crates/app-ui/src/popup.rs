@@ -50,6 +50,31 @@ pub fn preview_kind(clip: &Clip) -> &'static str {
     }
 }
 
+/// Display-only truncation for history and Current Clipboard previews.
+///
+/// `width` is a Unicode scalar count from `popup.preview_width`. The total
+/// visible budget includes the deterministic ellipsis `…`. Width 1 is valid and
+/// yields `…` when truncation is needed. Invalid zero (reachable via manual
+/// TOML edit or `CLIPMONGER_POPUP_PREVIEW_WIDTH=0` env override despite
+/// validation requiring ≥1) is clamped to 1 for safe display without panic.
+/// Huge widths do not preallocate huge capacity: short previews are returned
+/// verbatim without allocating `width` bytes, and truncation only collects the
+/// needed `width-1` scalars. Never slices UTF-8 by byte offsets.
+#[must_use]
+pub fn display_preview(preview: &str, width: u32) -> String {
+    let effective = if width == 0 { 1 } else { width as usize };
+    let count = preview.chars().count();
+    if count <= effective {
+        return preview.to_string();
+    }
+    if effective == 1 {
+        return "…".to_string();
+    }
+    let mut out: String = preview.chars().take(effective - 1).collect();
+    out.push('…');
+    out
+}
+
 /// Whether a special key reaches the view-model while the search field is
 /// being edited: navigation and commit keys forward, text-editing keys stay
 /// with the field (Delete there edits text, never soft-deletes a clip).
@@ -182,6 +207,17 @@ impl PopupVm {
         Ok(())
     }
 
+    /// Test exact native shortcut ownership before egui's clipboard translation.
+    pub(crate) fn has_binding(&self, event: &keymap::KeyEvent) -> bool {
+        self.keymap.has_binding(event)
+    }
+
+    /// Resolve a key event to its action via the current keymap.
+    #[must_use]
+    pub fn action_for(&self, event: &keymap::KeyEvent) -> Option<keymap::Action> {
+        self.keymap.action_for(event)
+    }
+
     /// Mark monitoring paused or running for the status line.
     pub fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
@@ -265,7 +301,7 @@ impl PopupVm {
     }
 
     /// Clamp the selection into the visible rows.
-    fn clamp_selection(&mut self) {
+    pub(crate) fn clamp_selection(&mut self) {
         let len = self.visible().len();
         if len == 0 {
             self.selected = 0;
@@ -300,6 +336,11 @@ impl PopupVm {
         let Some(action) = self.keymap.action_for(&event) else {
             return VmEffect::None;
         };
+        self.on_action(action)
+    }
+
+    /// Apply an already resolved action to the history list.
+    pub fn on_action(&mut self, action: keymap::Action) -> VmEffect {
         match action {
             keymap::Action::NavigateUp => {
                 self.move_selection(-1);
@@ -355,5 +396,63 @@ impl PopupVm {
             keymap::Action::GroupTab(n) => VmEffect::GroupTab(n),
             keymap::Action::Edit | keymap::Action::None => VmEffect::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod display_preview_tests {
+    use super::display_preview;
+
+    #[test]
+    fn empty_and_short_preserved() {
+        assert_eq!(display_preview("", 5), "");
+        assert_eq!(display_preview("hi", 80), "hi");
+        assert_eq!(display_preview("abc", 3), "abc");
+    }
+
+    #[test]
+    fn width_one_ellipsis() {
+        assert_eq!(display_preview("abcdef", 1), "…");
+        assert_eq!(display_preview("a", 1), "a");
+        assert_eq!(display_preview("", 1), "");
+    }
+
+    #[test]
+    fn truncates_with_ellipsis_budget() {
+        assert_eq!(display_preview("abcdefghij", 5), "abcd…");
+        assert_eq!(display_preview("abcdefghij", 5).chars().count(), 5);
+    }
+
+    #[test]
+    fn multibyte_scalar() {
+        let preview = "🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀";
+        assert_eq!(display_preview(preview, 5), "🦀🦀🦀🦀…");
+        assert_eq!(display_preview(preview, 5).chars().count(), 5);
+    }
+
+    #[test]
+    fn zero_safe() {
+        // invalid zero treated as 1
+        assert_eq!(display_preview("abcdef", 0), "…");
+        assert_eq!(display_preview("", 0), "");
+        assert_eq!(display_preview("a", 0), "a");
+    }
+
+    #[test]
+    fn huge_width_no_huge_alloc() {
+        let short = "abc";
+        // huge width should return verbatim without allocating huge capacity
+        assert_eq!(display_preview(short, 1_000_000), "abc");
+        let long = "x".repeat(200);
+        assert_eq!(display_preview(&long, 1_000_000), long);
+    }
+
+    #[test]
+    fn does_not_slice_bytes() {
+        let s = "a🦀b";
+        // ensure truncation respects char boundaries, not bytes
+        let out = display_preview(s, 2);
+        assert_eq!(out, "a…");
+        assert_eq!(out.chars().count(), 2);
     }
 }

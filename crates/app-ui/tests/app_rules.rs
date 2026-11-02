@@ -29,7 +29,7 @@ use clipmonger_app_ui::ipc_bridge::{UiCmd, UiEvent};
 use clipmonger_app_ui::runner::{App, Desired, WindowKind};
 use clipmonger_app_ui::shell::Context as PasteContext;
 use clipmonger_app_ui::tray_logic::TrayAction;
-use clipmonger_app_ui::{placement, strings};
+use clipmonger_app_ui::{config_model, placement, strings};
 use clipmonger_core::model::Clip;
 use clipmonger_ipc::proto::methods::ShowPopupEvent;
 use serde_json::{json, Value};
@@ -89,6 +89,7 @@ struct Pass {
     /// Every text the pass painted (empty for a hidden pass).
     texts: Vec<String>,
     fills: Vec<egui::Color32>,
+    bounds: Vec<(String, egui::Rect, egui::Rect)>,
 }
 
 impl Pass {
@@ -327,7 +328,10 @@ impl Rig {
         if visible {
             raw.screen_rect = Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(480.0, 360.0),
+                match kind {
+                    WindowKind::Popup => egui::vec2(480.0, 360.0),
+                    WindowKind::Settings => egui::vec2(960.0, 680.0) / win.ctx.zoom_factor(),
+                },
             ));
             raw.events = std::mem::take(&mut win.events);
             let mut runs = 0;
@@ -346,7 +350,9 @@ impl Rig {
             textures_delta.clear();
             let mut texts = Vec::new();
             let mut fills = Vec::new();
+            let mut bounds = Vec::new();
             for clipped in &shapes {
+                settings_text_bounds(&clipped.shape, clipped.clip_rect, &mut bounds);
                 collect_text(&clipped.shape, &mut texts);
                 collect_fills(&clipped.shape, &mut fills);
             }
@@ -357,6 +363,7 @@ impl Rig {
                     .unwrap_or_default(),
                 texts,
                 fills,
+                bounds,
             }
         } else {
             let mut output = win.ctx.run_logic(&raw, |ctx| app.logic(ctx, kind));
@@ -367,6 +374,7 @@ impl Rig {
                     .unwrap_or_default(),
                 texts: Vec::new(),
                 fills: Vec::new(),
+                bounds: Vec::new(),
             }
         }
     }
@@ -1253,6 +1261,13 @@ fn rule_paste_done_does_nothing() {
 #[test]
 fn rule_replies_fill_the_settings_state() {
     let mut rig = Rig::closed();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    assert_eq!(
+        rig.cmds(),
+        settings_commands(),
+        "opening Settings queues four commands"
+    );
     rig.push(UiEvent::Caps(json!({"clipboard": "ok"})));
     rig.push(UiEvent::LogsTail(vec![
         "one".to_string(),
@@ -1283,6 +1298,9 @@ fn rule_replies_fill_the_settings_state() {
 #[test]
 fn rule_bookkeeping_events_update_state_and_ask_for_refreshes() {
     let mut rig = Rig::closed();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    let _ = rig.cmds();
     rig.push(UiEvent::BackupDone("/tmp/b.zip".to_string()));
     rig.tick();
     assert_eq!(
@@ -2558,8 +2576,11 @@ fn rule_error_while_settings_is_open_goes_to_settings() {
 
 // rule 12: an Error while an Apply is pending goes to the Settings error line
 #[test]
-fn rule_error_with_a_pending_apply_goes_to_settings() {
+fn rule_error_with_a_pending_apply_goes_to_settings_when_open() {
     let mut rig = Rig::closed();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    let _ = rig.cmds();
     rig.app.config().lock().expect("settings").pending_apply =
         vec!["popup.hotkey".to_string(), "history.max_items".to_string()];
     rig.push(UiEvent::Error("refused".to_string()));
@@ -2571,6 +2592,31 @@ fn rule_error_with_a_pending_apply_goes_to_settings() {
     );
     assert_eq!(rig.error(), None);
     assert_none(&rig.trace(), "rig.trace()");
+}
+
+#[test]
+fn rule_error_with_pending_apply_when_closed_goes_to_shell() {
+    let mut rig = Rig::closed();
+    rig.app.config().lock().expect("settings").pending_apply = vec!["popup.hotkey".to_string()];
+    rig.push(UiEvent::Error("closed pending".to_string()));
+    rig.tick();
+    assert_eq!(
+        rig.config_error(),
+        "",
+        "closed Error must not fill Settings even with pending_apply"
+    );
+    assert_eq!(
+        rig.error().as_deref(),
+        Some("closed pending"),
+        "closed Error routes to shell"
+    );
+    assert_eq!(
+        rig.app.config().lock().expect("settings").pending_apply,
+        vec!["popup.hotkey".to_string()],
+        "closed Error must not clear pending_apply (only open clears)"
+    );
+    assert_none(&rig.trace(), "closed Error does not open popup");
+    assert!(!rig.is_open(), "closed Error must not force popup open");
 }
 
 // rule 12: otherwise the Error is the popup error line
@@ -3022,112 +3068,242 @@ fn rule_wake_toggle_pause_clears_the_pause_deadline() {
 // 15. Centering
 // ---------------------------------------------------------------------------
 
-/// The centre of a monitor for the popup, as `placement` computes it.
-fn centre_of(width: u16, height: u16) -> egui::Pos2 {
-    let monitor = placement::monitor_rect_from_size(Some((u32::from(width), u32::from(height))));
-    let (x, y) = placement::place(
-        placement::Placement::Center,
-        (0, 0),
-        &[monitor],
-        placement::POPUP_DEFAULT,
-    );
-    egui::pos2(
-        f32::from(i16::try_from(x).expect("a sane x")),
-        f32::from(i16::try_from(y).expect("a sane y")),
-    )
+fn desktop(cursor: Option<(i32, i32)>) -> placement::DesktopContext {
+    let monitor = placement::Rect {
+        x: -1920,
+        y: -200,
+        w: 1920,
+        h: 1080,
+    };
+    placement::DesktopContext {
+        monitors: vec![
+            monitor,
+            placement::Rect {
+                x: 0,
+                y: 100,
+                w: 2560,
+                h: 1440,
+            },
+        ],
+        cursor,
+        current_monitor: Some(monitor),
+        primary_monitor: None,
+        popup_physical_size: (720, 540),
+        supports_global_position: true,
+    }
 }
 
-fn monitor_of(width: u16, height: u16) -> egui::Vec2 {
-    egui::vec2(f32::from(width), f32::from(height))
+fn deliver(rig: &mut Rig, context: placement::DesktopContext) {
+    assert!(clipmonger_app_ui::runner::deliver_desktop_context(
+        &mut rig.app,
+        || Some(context)
+    ));
 }
 
-// rule 15: the first Popup pass with a monitor size yields exactly one OuterPosition, the
-// centre per placement; later passes none
 #[test]
-fn rule_center_first_pass_with_a_monitor_size_moves_the_popup_once() {
+fn rule_placement_waits_for_native_context_despite_monitor_size() {
     for visible in [false, true] {
-        for open in [false, true] {
-            let mut rig = Rig::with(Setup::new(open));
-            rig.monitor(Some(monitor_of(1920, 1080)));
-            let first = if visible { rig.show() } else { rig.tick() };
-            assert_eq!(
-                first.positions(),
-                vec![centre_of(1920, 1080)],
-                "visible = {visible}, open = {open}"
-            );
-            for pass in [rig.tick(), rig.show(), rig.tick(), rig.show()] {
-                assert!(
-                    pass.positions().is_empty(),
-                    "later passes send none (visible = {visible}, open = {open})"
-                );
-            }
-        }
+        let mut rig = Rig::opened();
+        rig.monitor(Some(egui::vec2(1920.0, 1080.0)));
+        let pass = if visible { rig.show() } else { rig.tick() };
+        assert_none(&pass.positions(), "placement commands");
+        assert!(rig.app.wants_desktop_context());
+        deliver(&mut rig, desktop(Some((-1700, 100))));
+        assert_eq!(rig.tick().positions(), vec![egui::pos2(-1320.0, 70.0)]);
+        assert!(!rig.app.wants_desktop_context());
+        assert_none(&rig.tick().positions(), "placement commands");
     }
 }
 
-// rule 15: the position follows the monitor that was reported
 #[test]
-fn rule_center_follows_the_reported_monitor_size() {
-    for (width, height) in [
-        (1366, 768),
-        (2560, 1440),
-        (800, 600),
-        (1920, 1200),
-        (3840, 2160),
+fn rule_placement_mode_changes_with_unchanged_desktop_and_identical_config_is_idle() {
+    let mut rig = Rig::opened();
+    let context = desktop(Some((-1700, 100)));
+    for (mode, expected) in [
+        ("center", egui::pos2(-1320.0, 70.0)),
+        ("cursor", egui::pos2(-1700.0, 100.0)),
+        ("center", egui::pos2(-1320.0, 70.0)),
     ] {
-        let mut rig = Rig::closed();
-        rig.monitor(Some(monitor_of(width, height)));
-        let pass = rig.tick();
+        rig.push(config_reply(&json!({"popup": {"placement": mode}})));
+        rig.tick();
+        deliver(&mut rig, context.clone());
+        assert_eq!(rig.tick().positions(), vec![expected]);
+        rig.push(config_reply(&json!({"popup": {"placement": mode}})));
+        assert_none(&rig.tick().positions(), "placement commands");
+        assert!(!clipmonger_app_ui::runner::deliver_desktop_context(
+            &mut rig.app,
+            || panic!("identical Config queried native desktop")
+        ));
+    }
+}
+
+#[test]
+fn rule_placement_reopens_with_fresh_cursor_but_already_open_raise_does_not_jump() {
+    let mut rig = Rig::closed();
+    rig.push(config_reply(&json!({"popup": {"placement": "cursor"}})));
+    rig.tick();
+    assert!(!clipmonger_app_ui::runner::deliver_desktop_context(
+        &mut rig.app,
+        || panic!("closed Config queried desktop")
+    ));
+    for cursor in [(-1700, 100), (300, 400)] {
+        rig.tray(&[TrayAction::OpenPopup]);
+        assert_none(&rig.tick().positions(), "placement commands");
+        deliver(&mut rig, desktop(Some(cursor)));
         assert_eq!(
-            pass.positions(),
-            vec![centre_of(width, height)],
-            "{width}x{height}"
+            rig.tick().positions(),
+            vec![egui::pos2(
+                f32::from(i16::try_from(cursor.0).unwrap()),
+                f32::from(i16::try_from(cursor.1).unwrap())
+            )]
         );
+        rig.push(request());
+        assert_none(&rig.tick().positions(), "placement commands");
+        assert!(!clipmonger_app_ui::runner::deliver_desktop_context(
+            &mut rig.app,
+            || panic!("open raise queried desktop")
+        ));
+        rig.tray(&[TrayAction::Toggle]);
+        rig.tick();
+        assert!(!rig.app.desired().popup_open);
     }
-    assert_ne!(centre_of(1366, 768), centre_of(2560, 1440));
 }
 
-// rule 15: without a monitor size there is no command, until one is known
 #[test]
-fn rule_center_without_a_monitor_size_sends_nothing_until_it_is_known() {
-    let mut rig = Rig::closed();
+fn rule_placement_uses_actual_physical_size_and_converts_os_dpi_and_font_zoom_once() {
+    let mut rig = Rig::opened();
+    rig.popup.info.native_pixels_per_point = Some(1.5);
+    rig.push(config_reply(
+        &json!({"popup": {"placement": "cursor"}, "ui": {"theme": {"font_scale": 1.6}}}),
+    ));
+    rig.show();
+    rig.show(); // egui applies the pending zoom at the next pass.
+    deliver(&mut rig, desktop(Some((-1700, 100))));
+    let position = rig.show().positions()[0];
+    let physical = winit::dpi::PhysicalPosition::new(
+        position.x * rig.popup.ctx.pixels_per_point(),
+        position.y * rig.popup.ctx.pixels_per_point(),
+    );
+    assert!((rig.popup.ctx.pixels_per_point() - 2.4).abs() < 0.001);
+    assert!((physical.x + 1700.0).abs() < 0.001);
+    assert!((physical.y - 100.0).abs() < 0.001);
+}
+
+#[test]
+fn rule_placement_unknown_platform_fallback_and_wayland_emit_no_synthetic_position() {
+    let mut rig = Rig::opened();
+    deliver(&mut rig, desktop(None));
+    assert_eq!(rig.tick().positions(), vec![egui::pos2(-1320.0, 70.0)]);
+    for wayland in [false, true] {
+        rig.tray(&[TrayAction::Toggle]);
+        rig.tick();
+        rig.tray(&[TrayAction::OpenPopup]);
+        rig.tick();
+        let mut context = desktop(Some((-1700, 100)));
+        if wayland {
+            context.supports_global_position = false;
+        } else {
+            context.monitors.clear();
+            context.current_monitor = None;
+        }
+        deliver(&mut rig, context);
+        assert_none(&rig.tick().positions(), "placement commands");
+    }
+    rig.settings.info.monitor_size = Some(egui::vec2(1920.0, 1080.0));
+    assert_none(&rig.tick_settings().positions(), "placement commands");
+}
+
+fn placement_is_idle(rig: &mut Rig) {
+    assert_none(&rig.tick().positions(), "idle placement");
+    assert!(!clipmonger_app_ui::runner::deliver_desktop_context(
+        &mut rig.app,
+        || panic!("idle pass queried desktop")
+    ));
+}
+
+#[test]
+fn rule_placement_recovers_missing_monitors_on_native_geometry_signal_without_polling() {
+    use clipmonger_app_ui::runner::{notify_desktop_geometry, DesktopGeometrySignal};
+    use winit::{
+        dpi::{PhysicalPosition, PhysicalSize},
+        event::WindowEvent,
+    };
+    for signal in 0..3 {
+        let mut rig = Rig::opened();
+        rig.push(config_reply(&json!({"popup": {"placement": "cursor"}})));
+        rig.tick();
+        let mut missing = desktop(Some((-1700, 100)));
+        missing.monitors.clear();
+        missing.current_monitor = None;
+        if signal == 1 {
+            missing.monitors.push(placement::Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            });
+        }
+        deliver(&mut rig, missing);
+        for _ in 0..3 {
+            placement_is_idle(&mut rig);
+        }
+        rig.push(config_reply(&json!({"popup": {"placement": "cursor"}})));
+        placement_is_idle(&mut rig);
+        rig.push(request());
+        placement_is_idle(&mut rig);
+        assert!(!notify_desktop_geometry(
+            &mut rig.app,
+            DesktopGeometrySignal::Window(WindowKind::Popup, &WindowEvent::RedrawRequested)
+        ));
+        assert!(!notify_desktop_geometry(
+            &mut rig.app,
+            DesktopGeometrySignal::Window(
+                WindowKind::Settings,
+                &WindowEvent::Resized(PhysicalSize::new(960, 680))
+            )
+        ));
+        placement_is_idle(&mut rig);
+        let moved = WindowEvent::Moved(PhysicalPosition::new(-1800, 0));
+        let resized = WindowEvent::Resized(PhysicalSize::new(720, 540));
+        let useful = match signal {
+            0 => DesktopGeometrySignal::Window(WindowKind::Popup, &moved),
+            1 => DesktopGeometrySignal::Window(WindowKind::Popup, &resized),
+            _ => DesktopGeometrySignal::Resumed,
+        };
+        assert!(notify_desktop_geometry(&mut rig.app, useful));
+        assert!(rig.app.desired().popup_open, "recover within the same open");
+        deliver(&mut rig, desktop(Some((300, 400))));
+        assert_eq!(rig.tick().positions(), vec![egui::pos2(300.0, 400.0)]);
+        assert!(!notify_desktop_geometry(
+            &mut rig.app,
+            DesktopGeometrySignal::Resumed
+        ));
+        placement_is_idle(&mut rig);
+    }
+}
+
+#[test]
+fn rule_placement_wayland_has_no_retry_after_geometry_or_resume() {
+    use clipmonger_app_ui::runner::{notify_desktop_geometry, DesktopGeometrySignal};
+    let mut rig = Rig::opened();
+    let mut unsupported = desktop(None);
+    unsupported.supports_global_position = false;
+    unsupported.monitors.clear();
+    deliver(&mut rig, unsupported);
     for _ in 0..3 {
-        assert_none(&rig.tick().positions(), "rig.tick().positions()");
-        assert_none(&rig.show().positions(), "rig.show().positions()");
+        assert!(!notify_desktop_geometry(
+            &mut rig.app,
+            DesktopGeometrySignal::Resumed
+        ));
+        assert!(!notify_desktop_geometry(
+            &mut rig.app,
+            DesktopGeometrySignal::Window(
+                WindowKind::Popup,
+                &winit::event::WindowEvent::Moved(winit::dpi::PhysicalPosition::new(0, 0))
+            )
+        ));
+        placement_is_idle(&mut rig);
     }
-    rig.monitor(Some(monitor_of(1280, 720)));
-    assert_eq!(rig.tick().positions(), vec![centre_of(1280, 720)]);
-    assert_none(&rig.tick().positions(), "rig.tick().positions()");
-}
-
-// rule 15: the centre is sent once even when the monitor size changes later
-#[test]
-fn rule_center_happens_once() {
-    let mut rig = Rig::closed();
-    rig.monitor(Some(monitor_of(1280, 720)));
-    assert_eq!(rig.tick().positions().len(), 1);
-    rig.monitor(Some(monitor_of(2560, 1440)));
-    assert_none(&rig.tick().positions(), "rig.tick().positions()");
-    rig.monitor(None);
-    rig.monitor(Some(monitor_of(1280, 720)));
-    assert_none(&rig.tick().positions(), "rig.tick().positions()");
-}
-
-// rule 15: only the Popup window is centred
-#[test]
-fn rule_center_settings_passes_do_not_move_anything() {
-    let mut rig = Rig::closed();
-    rig.settings.info.monitor_size = Some(monitor_of(1920, 1080));
-    assert_none(
-        &rig.tick_settings().positions(),
-        "rig.tick_settings().positions()",
-    );
-    assert_none(
-        &rig.show_settings().positions(),
-        "rig.show_settings().positions()",
-    );
-    rig.monitor(Some(monitor_of(1920, 1080)));
-    assert_eq!(rig.tick().positions(), vec![centre_of(1920, 1080)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -3351,15 +3527,27 @@ fn fix_x4_capped_queue_requests_one_follow_up_without_losing_order() {
     }
     rig.tick();
     assert_eq!(
-        rig.app.config().lock().expect("settings").error,
-        format!("queued {}", DRAIN_CAP - 1)
+        rig.error().as_deref(),
+        Some(format!("queued {}", DRAIN_CAP - 1).as_str()),
+        "closed ConfigError routes to shell"
+    );
+    assert_eq!(
+        rig.config_error(),
+        "",
+        "closed ConfigError must not fill Settings"
     );
     let requests = rig.requests();
     assert_eq!(requests.iter().filter(|r| r.delay.is_zero()).count(), 1);
     rig.tick();
     assert_eq!(
-        rig.app.config().lock().expect("settings").error,
-        format!("queued {}", DRAIN_CAP + 2)
+        rig.error().as_deref(),
+        Some(format!("queued {}", DRAIN_CAP + 2).as_str()),
+        "second batch routes to shell"
+    );
+    assert_eq!(
+        rig.config_error(),
+        "",
+        "closed ConfigError still not in Settings"
     );
     assert!(rig.requests().iter().all(|r| !r.delay.is_zero()));
     for _ in 0..DRAIN_CAP {
@@ -3426,6 +3614,496 @@ fn fix_fc3_closing_settings_clears_old_messages_before_reopening() {
             assert!(!rig.show_settings().painted(&old));
         }
     }
+}
+
+#[test]
+fn fix_fc3_closed_settings_drops_late_replies_after_pending_apply() {
+    for visible in [false, true] {
+        let mut rig = Rig::closed();
+        rig.tray(&[TrayAction::OpenConfig]);
+        rig.tick();
+        let _ = rig.cmds();
+        {
+            let mut config = rig.app.config().lock().expect("settings");
+            config.pending_apply = vec!["popup.hotkey".to_string()];
+            config.error = "pending".to_string();
+        }
+        rig.close_request(WindowKind::Settings);
+        rig.pass(WindowKind::Settings, visible);
+        assert!(!rig.desired().settings_open);
+        assert_eq!(rig.app.config().lock().expect("settings").error, "");
+        assert!(
+            rig.app
+                .config()
+                .lock()
+                .expect("settings")
+                .pending_apply
+                .is_empty(),
+            "close clears pending_apply"
+        );
+        rig.push(UiEvent::BackupDone("/tmp/late.zip".to_string()));
+        rig.tick();
+        assert_eq!(
+            rig.config_error(),
+            "",
+            "late BackupDone must not fill closed Settings"
+        );
+        assert_eq!(rig.cmds(), vec![]);
+        rig.push(UiEvent::RestoreDone);
+        rig.tick();
+        assert_eq!(
+            rig.config_error(),
+            "",
+            "late RestoreDone must not fill closed Settings"
+        );
+        assert_eq!(
+            rig.cmds(),
+            vec![UiCmd::ListHistory],
+            "restore still refreshes history"
+        );
+        rig.push(UiEvent::ConfigError("late config error".to_string()));
+        rig.tick();
+        assert_eq!(
+            rig.config_error(),
+            "",
+            "late ConfigError must not fill closed Settings"
+        );
+        assert_eq!(
+            rig.error().as_deref(),
+            Some("late config error"),
+            "late ConfigError routes to shell"
+        );
+        rig.push(UiEvent::Error("late error".to_string()));
+        rig.tick();
+        assert_eq!(
+            rig.config_error(),
+            "",
+            "late Error must not fill closed Settings"
+        );
+        assert_eq!(rig.error().as_deref(), Some("late error"));
+        assert!(
+            rig.app
+                .config()
+                .lock()
+                .expect("settings")
+                .pending_apply
+                .is_empty(),
+            "late error must not leave pending_apply"
+        );
+        rig.tray(&[TrayAction::OpenConfig]);
+        rig.tick();
+        let painted = rig.show_settings().texts.join(" ");
+        assert!(
+            !painted.contains("late"),
+            "reopening must not replay dropped late messages"
+        );
+        assert!(
+            !painted.contains("pending"),
+            "reopening must not replay pending text"
+        );
+    }
+}
+
+#[test]
+fn r1_legacy_groups_renders_once_in_general_and_excluded_from_permanent_clips() {
+    let mut rig = Rig::closed();
+    // Prepare a doc that contains the legacy key and other history keys so rows exist
+    let snapshot = serde_json::json!({
+        "config": {
+            "history": {"max_items": 100},
+            "popup": {"hotkey": "ctrl+alt+h"},
+            "permanents": {"groups": ["Work"]},
+            "monitor": {"formats": ["text/plain"]}
+        }
+    });
+    rig.push(UiEvent::Config(snapshot));
+    rig.tick();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    let _ = rig.cmds();
+    // History tab should not contain legacy row
+    {
+        rig.app.config().lock().expect("settings").tab = "History".to_string();
+        let pass = rig.show_settings();
+        let hits = pass
+            .texts
+            .iter()
+            .filter(|t| *t == strings::text("config.permanents_groups"))
+            .count();
+        assert_eq!(hits, 0, "History tab must not show legacy groups");
+    }
+    // General tab must show legacy row exactly once
+    {
+        rig.app.config().lock().expect("settings").tab = "General".to_string();
+        rig.app.config().lock().expect("settings").filter.clear();
+        let pass = rig.show_settings();
+        let hits = pass
+            .texts
+            .iter()
+            .filter(|t| *t == strings::text("config.permanents_groups"))
+            .count();
+        assert_eq!(
+            hits, 1,
+            "General must show legacy row once: {:?}",
+            pass.texts
+        );
+    }
+    // PermanentClips tab must exclude legacy row
+    {
+        rig.app.config().lock().expect("settings").tab = "PermanentClips".to_string();
+        rig.app.config().lock().expect("settings").filter.clear();
+        let pass = rig.show_settings();
+        let hits = pass
+            .texts
+            .iter()
+            .filter(|t| *t == strings::text("config.permanents_groups"))
+            .count();
+        assert_eq!(
+            hits, 0,
+            "PermanentClips must not show legacy row: {:?}",
+            pass.texts
+        );
+    }
+    // Filtered rendering: General with filter "groups" still shows once
+    {
+        rig.app.config().lock().expect("settings").tab = "General".to_string();
+        rig.app.config().lock().expect("settings").filter = "groups".to_string();
+        let pass = rig.show_settings();
+        let hits = pass
+            .texts
+            .iter()
+            .filter(|t| *t == strings::text("config.permanents_groups"))
+            .count();
+        assert_eq!(
+            hits, 1,
+            "General filtered 'groups' must show legacy row once"
+        );
+    }
+    // Filtered rendering: PermanentClips with filter "groups" still excludes
+    {
+        rig.app.config().lock().expect("settings").tab = "PermanentClips".to_string();
+        rig.app.config().lock().expect("settings").filter = "groups".to_string();
+        let pass = rig.show_settings();
+        let hits = pass
+            .texts
+            .iter()
+            .filter(|t| *t == strings::text("config.permanents_groups"))
+            .count();
+        assert_eq!(
+            hits, 0,
+            "PermanentClips filtered 'groups' must not show legacy row"
+        );
+    }
+}
+
+#[test]
+fn r1_visible_rows_still_partition_the_legacy_config_key() {
+    let tabs = [
+        config_model::Tab::History,
+        config_model::Tab::Popup,
+        config_model::Tab::Advanced,
+        config_model::Tab::PermanentClips,
+        config_model::Tab::Privacy,
+        config_model::Tab::Tray,
+        config_model::Tab::Startup,
+        config_model::Tab::General,
+    ];
+    assert_eq!(
+        tabs.iter()
+            .map(|tab| config_model::visible_rows(*tab).len())
+            .sum::<usize>(),
+        config_model::ROWS.len()
+    );
+    let keys = |tab| {
+        config_model::visible_rows(tab)
+            .into_iter()
+            .map(|i| config_model::ROWS[i].key)
+            .collect::<Vec<_>>()
+    };
+    assert!(keys(config_model::Tab::General).contains(&"permanents.groups"));
+    assert!(!keys(config_model::Tab::PermanentClips).contains(&"permanents.groups"));
+}
+
+#[test]
+fn r1_db_group_button_sends_immediately_without_applying_legacy_config() {
+    let mut rig = Rig::closed();
+    rig.push(UiEvent::Config(
+        json!({"config": {"permanents": {"groups": ["Work"]}}}),
+    ));
+    rig.tick();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    let _ = rig.cmds();
+    // The DB manager must send immediately, independently of staged config.
+    {
+        let mut cfg = rig.app.config().lock().expect("settings");
+        cfg.tab = "PermanentClips".to_string();
+        cfg.filter.clear();
+        cfg.perm_group_new = "NewGroup".to_string();
+        cfg.doc
+            .as_mut()
+            .expect("doc")
+            .stage("permanents.groups", json!(["LegacyOnly"]))
+            .expect("stage legacy groups");
+    }
+    let size = egui::vec2(960.0, 680.0);
+    settings_frame(&mut rig, size, 1.0, Vec::new());
+    click_settings_button(&mut rig, size, 1.0, strings::text("perm.new_group"));
+    assert!(matches!(rig.cmds().as_slice(), [UiCmd::PermGroupCreate(name)] if name == "NewGroup"));
+    assert!(rig
+        .app
+        .config()
+        .lock()
+        .expect("settings")
+        .doc
+        .as_ref()
+        .expect("doc")
+        .is_dirty("permanents.groups"));
+}
+
+/// Native logical dimensions become physical pixels through OS scale, then
+/// egui points through OS scale times the app's settled font zoom.
+fn settings_frame(
+    rig: &mut Rig,
+    native_size: egui::Vec2,
+    os_scale: f32,
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    let physical_size = native_size * os_scale;
+    let pixels_per_point = os_scale * rig.settings.ctx.zoom_factor();
+    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, physical_size / pixels_per_point);
+    let mut info = rig.settings.info.clone();
+    info.native_pixels_per_point = Some(os_scale);
+    let mut output = rig.settings.ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(viewport),
+            viewports: std::iter::once((egui::ViewportId::ROOT, info)).collect(),
+            events,
+            ..egui::RawInput::default()
+        },
+        |ui| {
+            rig.app.logic(ui.ctx(), WindowKind::Settings);
+            rig.app.ui(ui, WindowKind::Settings);
+        },
+    );
+    output.textures_delta.clear();
+    output
+}
+
+fn settings_text_bounds(
+    shape: &egui::Shape,
+    clip: egui::Rect,
+    out: &mut Vec<(String, egui::Rect, egui::Rect)>,
+) {
+    match shape {
+        egui::Shape::Text(text) => out.push((
+            text.galley.text().to_string(),
+            egui::Rect::from_min_size(text.pos, text.galley.size()),
+            clip,
+        )),
+        egui::Shape::Vec(shapes) => {
+            for shape in shapes {
+                settings_text_bounds(shape, clip, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Locate painted text, hover it, then inspect egui's actual widget response.
+/// This also fails for disabled, clipped, or occluded controls.
+fn settings_button(
+    rig: &mut Rig,
+    native_size: egui::Vec2,
+    os_scale: f32,
+    label: &str,
+) -> egui::Response {
+    let output = settings_frame(rig, native_size, os_scale, Vec::new());
+    let mut texts = Vec::new();
+    for shape in &output.shapes {
+        settings_text_bounds(&shape.shape, shape.clip_rect, &mut texts);
+    }
+    let (_, text, clip) = texts
+        .iter()
+        .find(|(text, _, _)| text == label)
+        .unwrap_or_else(|| panic!("missing button text {label:?}; painted {texts:?}"));
+    let viewport = rig.settings.ctx.viewport_rect();
+    assert!(
+        viewport.contains_rect(*text),
+        "{label:?} text {text:?} outside viewport {viewport:?}"
+    );
+    assert!(
+        clip.contains_rect(*text),
+        "{label:?} text {text:?} outside clip {clip:?}"
+    );
+    settings_frame(
+        rig,
+        native_size,
+        os_scale,
+        vec![egui::Event::PointerMoved(text.center())],
+    );
+    let hovered = rig
+        .settings
+        .ctx
+        .interaction_snapshot(|s| s.hovered.iter().copied().collect::<Vec<_>>());
+    let response = hovered
+        .into_iter()
+        .filter_map(|id| rig.settings.ctx.read_response(id))
+        .find(|r| r.sense.senses_click() && r.rect.contains_rect(*text))
+        .unwrap_or_else(|| panic!("no actual clickable response for {label:?} at {text:?}"));
+    assert!(response.enabled(), "{label:?} must be enabled");
+    assert!(
+        viewport.contains_rect(response.rect),
+        "{label:?} widget {:?} outside viewport {viewport:?}",
+        response.rect
+    );
+    assert!(
+        clip.contains_rect(response.rect),
+        "{label:?} widget {:?} outside clip {clip:?}",
+        response.rect
+    );
+    println!("control {label:?}: widget={:?} text={text:?} clip={clip:?} viewport={viewport:?} enabled={}", response.rect, response.enabled());
+    response
+}
+
+fn click_settings_button(rig: &mut Rig, size: egui::Vec2, os_scale: f32, label: &str) {
+    let response = settings_button(rig, size, os_scale, label);
+    let pos = response.rect.center();
+    for pressed in [true, false] {
+        settings_frame(
+            rig,
+            size,
+            os_scale,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+    }
+    assert_eq!(
+        rig.settings.ctx.interaction_snapshot(|s| s.clicked),
+        Some(response.id),
+        "must click {label:?}"
+    );
+}
+
+fn settings_layout_controls(font_scale: f32, native_height: f32) {
+    let mut rig = Rig::closed();
+    rig.push(UiEvent::Config(json!({"config": {
+        "history": {"max_items": 100, "max_age_days": 30},
+        "popup": {"hotkey": "ctrl+alt+h", "preview_width": 400},
+        "monitor": {"formats": ["text/plain"], "max_bytes": 1000},
+        "permanents": {"groups": ["Work"]},
+        "privacy": {"strict": false}, "tray": {"enabled": true},
+        "autostart": {"enabled": false},
+        "ui": {"theme": {"mode": "dark", "font_scale": font_scale}}
+    }})));
+    rig.tick();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    rig.push(UiEvent::Permanents(json!({"permanents": [permanent_json(1, "Work", "ClipOne"), permanent_json(2, "Work", "ClipTwo")]})));
+    rig.push(UiEvent::PermGroups(
+        json!({"groups": [{"name": "Work", "system": false, "count": 2}]}),
+    ));
+    rig.tick();
+    let size = egui::vec2(960.0, native_height);
+    for _ in 0..3 {
+        settings_frame(&mut rig, egui::vec2(960.0, 680.0), 1.0, Vec::new());
+    }
+    settings_frame(&mut rig, size, 1.0, Vec::new());
+    assert!((rig.settings.ctx.zoom_factor() - font_scale).abs() < 1e-6);
+    assert!((rig.settings.ctx.pixels_per_point() - font_scale).abs() < 1e-6);
+    let expected_viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size / font_scale);
+    assert_eq!(
+        rig.settings.ctx.input(egui::InputState::viewport_rect),
+        expected_viewport
+    );
+    assert_eq!(
+        rig.settings.ctx.viewport_rect(),
+        egui::emath::GuiRounding::round_ui(expected_viewport)
+    );
+    let _ = rig.cmds();
+    for (tab, draft) in [
+        ("History", false),
+        ("PermanentClips", false),
+        ("PermanentClips", true),
+    ] {
+        {
+            let mut cfg = rig.app.config().lock().expect("settings");
+            cfg.tab = tab.to_string();
+            if draft {
+                cfg.perm_vm.begin_new();
+            }
+            let doc = cfg.doc.as_mut().expect("doc");
+            assert_eq!(doc.get("history.max_items"), Some(&json!(100)));
+            doc.stage("history.max_items", json!(999))
+                .expect("dirty edit");
+        }
+        // Resize the same dirty editor from the default native dimensions.
+        if native_height < 680.0 {
+            settings_frame(&mut rig, egui::vec2(960.0, 680.0), 1.0, Vec::new());
+        }
+        settings_frame(&mut rig, size, 1.0, Vec::new());
+        println!("case native=960x{native_height} os=1 font={font_scale} tab={tab} draft={draft}");
+        // Both controls must be enabled and fully visible before activation.
+        settings_button(&mut rig, size, 1.0, strings::text("config.apply"));
+        settings_button(&mut rig, size, 1.0, strings::text("config.revert"));
+        click_settings_button(&mut rig, size, 1.0, strings::text("config.apply"));
+        assert!(
+            matches!(rig.cmds().as_slice(), [UiCmd::ConfigSet(key, value), UiCmd::ConfigGet] if key == "history.max_items" && value == &json!(999))
+        );
+        assert_eq!(
+            rig.app.config().lock().expect("settings").pending_apply,
+            ["history.max_items"]
+        );
+        click_settings_button(&mut rig, size, 1.0, strings::text("config.revert"));
+        assert!(
+            rig.cmds().is_empty(),
+            "Revert must not send config or DB commands"
+        );
+        let cfg = rig.app.config().lock().expect("settings");
+        assert_eq!(
+            cfg.doc.as_ref().expect("doc").dirty_keys(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            cfg.doc.as_ref().expect("doc").get("history.max_items"),
+            Some(&json!(100))
+        );
+        assert_eq!(
+            cfg.perm_vm.draft.is_some(),
+            draft,
+            "config actions preserve permanent draft"
+        );
+        assert_eq!(cfg.perm_vm.permanents.len(), 2);
+    }
+}
+
+#[test]
+fn l1_settings_apply_revert_visible_at_native_size() {
+    settings_layout_controls(1.0, 680.0);
+}
+#[test]
+fn l1_settings_native_130() {
+    settings_layout_controls(1.3, 680.0);
+}
+#[test]
+fn l1_settings_native_160() {
+    settings_layout_controls(1.6, 680.0);
+}
+#[test]
+fn l1_settings_short_100() {
+    settings_layout_controls(1.0, 400.0);
+}
+#[test]
+fn l1_settings_short_130() {
+    settings_layout_controls(1.3, 400.0);
+}
+#[test]
+fn l1_settings_short_160() {
+    settings_layout_controls(1.6, 400.0);
 }
 
 #[test]
@@ -3655,4 +4333,433 @@ fn rule_raise_tray_show_while_open_preserves_and_activates() {
         rig.app.take_popup_activation(),
         "tray show must request activation"
     );
+}
+
+fn active_list_rig(permanent: bool, count: u128) -> Rig {
+    let mut rig = Rig::opened();
+    rig.push(history(
+        &(1..=count)
+            .map(|n| clip(n, &format!("History row {n}")))
+            .collect::<Vec<_>>(),
+    ));
+    rig.push(UiEvent::Permanents(json!({"permanents": (1..=count).map(|n| permanent_json(1000+n, "Work", &format!("Permanent row {n}"))).collect::<Vec<_>>()})));
+    rig.push(UiEvent::PermGroups(
+        json!({"groups": [{"name":"Work", "system":false,"count":count}]}),
+    ));
+    rig.tick();
+    rig.app.config().lock().expect("config").perm_source = permanent.then_some(0);
+    rig.show();
+    rig.show();
+    let _ = rig.cmds();
+    rig
+}
+
+fn popup_widget(rig: &mut Rig, label: &str) -> egui::Response {
+    let pass = rig.show();
+    let (_, text, clip) = pass
+        .bounds
+        .iter()
+        .rev()
+        .find(|(text, _, _)| text == label)
+        .unwrap_or_else(|| panic!("missing {label:?}: {:?}", pass.texts));
+    let text = *text;
+    let clip = *clip;
+    assert!(
+        clip.contains_rect(text),
+        "{label:?} text {text:?} outside scroll clip {clip:?}"
+    );
+    assert!(rig.popup.ctx.viewport_rect().contains_rect(text));
+    rig.input(egui::Event::PointerMoved(text.center()));
+    rig.show();
+    let hovered = rig
+        .popup
+        .ctx
+        .interaction_snapshot(|s| s.hovered.iter().copied().collect::<Vec<_>>());
+    let responses: Vec<_> = hovered
+        .into_iter()
+        .filter_map(|id| rig.popup.ctx.read_response(id))
+        .collect();
+    let response = responses
+        .iter()
+        .find(|r| r.sense.senses_click() && r.rect.contains(text.center()))
+        .unwrap_or_else(|| panic!("actual row widget {label} text={text:?} hovered={responses:?}"))
+        .clone();
+    assert!(response.enabled());
+    assert!(
+        clip.contains_rect(response.rect),
+        "widget {:?} outside {clip:?}",
+        response.rect
+    );
+    assert!(rig.popup.ctx.viewport_rect().contains_rect(response.rect));
+    println!("{label}: widget={:?} clip={clip:?}", response.rect);
+    response
+}
+
+fn click_popup_widget(rig: &mut Rig, label: &str) {
+    let response = popup_widget(rig, label);
+    for pressed in [true, false] {
+        rig.input(egui::Event::PointerButton {
+            pos: response.rect.center(),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        rig.show();
+    }
+    assert_eq!(
+        rig.popup.ctx.interaction_snapshot(|s| s.clicked),
+        Some(response.id)
+    );
+}
+
+fn finish_popup_pick(rig: &mut Rig) {
+    assert!(!rig.is_open(), "pick must close popup before execution");
+    rig.tick();
+    thread::sleep(Duration::from_millis(170));
+    rig.tick();
+}
+
+#[test]
+fn active_list_permanent_navigation_and_history_actions_are_isolated() {
+    let mut rig = active_list_rig(true, 3);
+    rig.app.vm_mut().selected = 1;
+    for key in [egui::Key::ArrowDown, egui::Key::End] {
+        rig.key(key);
+        rig.show();
+    }
+    assert_eq!(rig.app.config().lock().expect("config").perm_vm.selected, 2);
+    for (key, modifiers) in [
+        (egui::Key::Delete, egui::Modifiers::NONE),
+        (egui::Key::P, egui::Modifiers::CTRL),
+        (egui::Key::E, egui::Modifiers::CTRL),
+    ] {
+        rig.input(key_event(key, true, modifiers));
+        rig.show();
+    }
+    assert_eq!(rig.app.vm().selected, 1);
+    assert_eq!(rig.app.vm().clips().len(), 3);
+    assert_eq!(rig.cmds(), vec![]);
+    // Move the pointer off the list so focused-row activation cannot consume Enter.
+    rig.popup.ctx.memory_mut(|m| {
+        if let Some(id) = m.focused() {
+            m.surrender_focus(id);
+        }
+    });
+    rig.key(egui::Key::Enter);
+    rig.show();
+    finish_popup_pick(&mut rig);
+    assert_eq!(rig.cmds(), vec![UiCmd::ExecPermanent(id(1003))]);
+}
+
+fn filtered_permanent_pick(mouse: bool) {
+    let mut rig = active_list_rig(true, 2);
+    rig.app.vm_mut().query = "row 2".into();
+    rig.app.vm_mut().selected = 1;
+    rig.show();
+    rig.show();
+    if mouse {
+        click_popup_widget(&mut rig, "Permanent row 2");
+    } else {
+        rig.key(egui::Key::Enter);
+        rig.show();
+    }
+    finish_popup_pick(&mut rig);
+    assert_eq!(rig.cmds(), vec![UiCmd::ExecPermanent(id(1002))]);
+    assert_eq!(rig.app.vm().selected, 1);
+}
+
+#[test]
+fn active_list_filtered_keyboard_activation() {
+    filtered_permanent_pick(false);
+}
+
+#[test]
+fn active_list_filtered_mouse_activation() {
+    filtered_permanent_pick(true);
+}
+
+#[test]
+fn active_list_empty_activation() {
+    let mut rig = active_list_rig(true, 2);
+    rig.app.vm_mut().query = "no matches".into();
+    rig.key(egui::Key::Enter);
+    rig.show();
+    assert_eq!(rig.cmds(), vec![]);
+}
+
+#[test]
+fn active_list_configured_chords_use_each_event_modifiers() {
+    let mut rig = active_list_rig(true, 4);
+    rig.push(config_reply(&json!({"popup":{"keys":{"navigate_down":"ctrl+j", "end":"shift+end", "home":"F21", "page_down":"F22", "page_up":"F23", "paste":"F24"}}})));
+    rig.tick();
+    let _ = rig.cmds();
+    for (key, modifiers, selected) in [
+        (egui::Key::J, egui::Modifiers::CTRL, 1),
+        (egui::Key::End, egui::Modifiers::SHIFT, 3),
+        (egui::Key::F21, egui::Modifiers::NONE, 0),
+        (egui::Key::F22, egui::Modifiers::NONE, 3),
+        (egui::Key::F23, egui::Modifiers::NONE, 0),
+    ] {
+        rig.input(key_event(key, true, modifiers));
+        rig.input(key_event(key, false, egui::Modifiers::NONE));
+        rig.input(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        rig.show();
+        assert_eq!(
+            rig.app.config().lock().expect("config").perm_vm.selected,
+            selected,
+            "{key:?}"
+        );
+    }
+    rig.key(egui::Key::F24);
+    rig.show();
+    finish_popup_pick(&mut rig);
+    assert_eq!(rig.cmds(), vec![UiCmd::ExecPermanent(id(1001))]);
+}
+
+fn scroll_controls(permanent: bool) {
+    let mut rig = active_list_rig(permanent, 60);
+    let prefix = if permanent { "Permanent" } else { "History" };
+    for (key, row) in [
+        (egui::Key::End, 60),
+        (egui::Key::Home, 1),
+        (egui::Key::PageDown, 11),
+    ] {
+        rig.key(key);
+        rig.show();
+        rig.show();
+        println!(
+            "key={key:?} history selected={} permanent selected={}",
+            rig.app.vm().selected,
+            rig.app.config().lock().expect("config").perm_vm.selected
+        );
+        popup_widget(&mut rig, &format!("{prefix} row {row}"));
+    }
+    rig.key(egui::Key::End);
+    rig.show();
+    rig.show();
+    let selected = popup_widget(&mut rig, &format!("{prefix} row 60"));
+    // A real wheel event scrolls away from the selected row.
+    rig.input(egui::Event::PointerMoved(selected.rect.center()));
+    rig.input(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        source: egui::MouseWheelSource::Unknown,
+        phase: egui::TouchPhase::Move,
+        delta: egui::vec2(0.0, 450.0),
+        modifiers: egui::Modifiers::NONE,
+    });
+    rig.show();
+    for _ in 0..20 {
+        rig.show();
+    }
+    let pass = rig.show();
+    assert!(
+        !pass
+            .bounds
+            .iter()
+            .any(|(text, rect, clip)| text == &format!("{prefix} row 60")
+                && clip.intersects(*rect)),
+        "idle must not undo wheel scrolling"
+    );
+    rig.key(egui::Key::End);
+    rig.show();
+    rig.show();
+    popup_widget(&mut rig, &format!("{prefix} row 60"));
+    rig.key(egui::Key::Enter);
+    rig.show();
+    finish_popup_pick(&mut rig);
+    let commands = rig.cmds();
+    if permanent {
+        assert_eq!(commands, vec![UiCmd::ExecPermanent(id(1060))]);
+    } else {
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd, UiCmd::PasteClipTo(picked, ..) if *picked == id(60))),
+            "{commands:?}"
+        );
+    }
+}
+
+#[test]
+fn active_list_history_scroll_reveals_and_preserves_wheel() {
+    scroll_controls(false);
+}
+
+#[test]
+fn active_list_permanent_scroll_reveals_and_preserves_wheel() {
+    scroll_controls(true);
+}
+
+#[test]
+fn active_list_settings_reply_preserves_unfiltered_selection() {
+    let mut rig = active_list_rig(true, 3);
+    rig.app.vm_mut().query = "no popup matches".into();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    rig.app.config().lock().expect("config").perm_vm.selected = 2;
+    rig.push(UiEvent::Permanents(json!({"permanents": (1..=3).map(|n| permanent_json(1000+n,"Work", &format!("Permanent row {n}"))).collect::<Vec<_>>()})));
+    rig.push(UiEvent::PermGroups(
+        json!({"groups":[{"name":"Work","system":false,"count":3}]}),
+    ));
+    rig.tick_settings();
+    assert_eq!(
+        rig.app
+            .config()
+            .lock()
+            .expect("config")
+            .perm_vm
+            .activate_selected(),
+        Some(id(1003))
+    );
+    rig.show();
+    assert_eq!(
+        rig.app
+            .config()
+            .lock()
+            .expect("config")
+            .perm_vm
+            .activate_selected(),
+        Some(id(1003)),
+        "passive popup repaint must preserve the Settings selection"
+    );
+}
+
+#[test]
+fn active_list_search_editing_and_focused_widget_activation_stay_separate() {
+    let mut rig = active_list_rig(true, 3);
+    rig.app.vm_mut().selected = 2;
+    rig.app.config().lock().expect("config").perm_vm.selected = 2;
+    rig.input(egui::Event::Text("row 2".into()));
+    rig.show();
+    rig.show();
+    assert_eq!(rig.app.vm().query, "row 2");
+    assert_eq!(
+        rig.app.vm().selected,
+        2,
+        "searching permanents leaves hidden history alone"
+    );
+    assert_eq!(rig.app.config().lock().expect("config").perm_vm.selected, 0);
+    rig.key(egui::Key::Delete);
+    rig.show();
+    assert!(
+        rig.cmds().is_empty(),
+        "editing Delete must not remove hidden history"
+    );
+    let button = popup_widget(&mut rig, strings::text("config.open_config"));
+    button.request_focus();
+    rig.key(egui::Key::Enter);
+    rig.show();
+    assert!(rig.desired().settings_open);
+    assert!(rig.is_open(), "focused button must not additionally paste");
+    assert!(!rig
+        .cmds()
+        .iter()
+        .any(|c| matches!(c, UiCmd::ExecPermanent(_) | UiCmd::PasteClipTo(..))));
+}
+
+#[test]
+fn active_list_source_switch_and_replaced_pending_rows_settle() {
+    let mut rig = active_list_rig(false, 60);
+    rig.key(egui::Key::End);
+    rig.show();
+    // Replace the row that has an outstanding reveal before it can paint.
+    rig.push(history(&[clip(99, "Replacement")]));
+    rig.show();
+    rig.show();
+    popup_widget(&mut rig, "Replacement");
+    rig.input(key_event(egui::Key::Num1, true, egui::Modifiers::ALT));
+    rig.show();
+    rig.show();
+    popup_widget(&mut rig, "Permanent row 1");
+    rig.key(egui::Key::End);
+    rig.show();
+    // Same-sized permanent replacement changes ID, then an empty result clears it.
+    rig.push(UiEvent::Permanents(json!({"permanents":(1..=60).map(|n| permanent_json(2000+n,"Work", &format!("Replacement permanent {n}"))).collect::<Vec<_>>()})));
+    rig.show();
+    rig.show();
+    popup_widget(&mut rig, "Replacement permanent 60");
+    rig.push(UiEvent::Permanents(json!({"permanents":[]})));
+    rig.input(egui::Event::PointerGone);
+    for _ in 0..20 {
+        rig.show();
+    }
+    let _ = rig.requests();
+    for _ in 0..3 {
+        rig.show();
+    }
+    assert!(
+        !rig.requests().iter().any(|r| r.delay == Duration::ZERO),
+        "stale pending row must not request perpetual repaint"
+    );
+    rig.key(egui::Key::Enter);
+    rig.show();
+    assert!(rig.is_open());
+    assert_eq!(rig.cmds(), vec![]);
+}
+
+#[test]
+fn active_list_return_to_history_clamps_only_when_displayed() {
+    let mut rig = active_list_rig(true, 3);
+    rig.app.vm_mut().selected = 2;
+    rig.input(egui::Event::Text("row 1".into()));
+    rig.show();
+    rig.show();
+    assert_eq!(rig.app.vm().selected, 2);
+    click_popup_widget(&mut rig, strings::text("perm.tab_history"));
+    rig.show();
+    assert_eq!(rig.app.vm().selected, 0);
+    popup_widget(&mut rig, "History row 1");
+    // A focused source tab retains its own Enter/Space behavior; release it to pick.
+    rig.popup.ctx.memory_mut(|m| {
+        if let Some(id) = m.focused() {
+            m.surrender_focus(id);
+        }
+    });
+    rig.key(egui::Key::Enter);
+    rig.show();
+    finish_popup_pick(&mut rig);
+    assert!(rig
+        .cmds()
+        .iter()
+        .any(|cmd| matches!(cmd, UiCmd::PasteClipTo(picked, ..) if *picked == id(1))));
+}
+
+fn query_edit_then_navigation_pick(permanent: bool) {
+    let mut rig = active_list_rig(permanent, 3);
+    if permanent {
+        rig.app.vm_mut().selected = 2;
+    }
+    rig.input(egui::Event::Text("row".into()));
+    rig.key(egui::Key::ArrowDown);
+    rig.show();
+    assert_eq!(rig.app.vm().query, "row");
+    if permanent {
+        assert_eq!(rig.app.config().lock().expect("config").perm_vm.selected, 1);
+        assert_eq!(rig.app.vm().selected, 2);
+    } else {
+        assert_eq!(rig.app.vm().selected, 1);
+    }
+    // Enter is in the following frame, after the query was already reconciled.
+    rig.key(egui::Key::Enter);
+    rig.show();
+    finish_popup_pick(&mut rig);
+    let commands = rig.cmds();
+    if permanent {
+        assert_eq!(commands, vec![UiCmd::ExecPermanent(id(1002))]);
+    } else {
+        assert!(
+            matches!(commands.as_slice(), [UiCmd::PasteClipTo(picked,..)] if *picked == id(2)),
+            "{commands:?}"
+        );
+    }
+}
+
+#[test]
+fn active_list_query_edit_then_history_navigation_keeps_the_picked_row() {
+    query_edit_then_navigation_pick(false);
+}
+
+#[test]
+fn active_list_query_edit_then_permanent_navigation_keeps_the_picked_row() {
+    query_edit_then_navigation_pick(true);
 }
