@@ -56,26 +56,40 @@ pub fn build_cf_html(fragment_html: &str) -> Vec<u8> {
 ///
 /// Returns [`HtmlError`] on empty/garbage input, bad offsets, or truncation.
 pub fn parse_cf_html(bytes: &[u8]) -> Result<String, HtmlError> {
+    cf_html_fragment(bytes).map(str::to_string)
+}
+
+/// Borrow the validated fragment so transfer can check its normalized byte
+/// length before copying it. The public owned parser keeps its old behavior.
+pub(crate) fn cf_html_fragment(bytes: &[u8]) -> Result<&str, HtmlError> {
     let text = std::str::from_utf8(bytes).map_err(|_| HtmlError::NotUtf8)?;
+    let range = cf_html_fragment_range(text, bytes.len())?;
+    std::str::from_utf8(&bytes[range]).map_err(|_| HtmlError::BadFragment)
+}
+
+/// Validate offsets using a header-only borrow. Native transfer bounds that
+/// header before inspecting offsets or copying the normalized fragment.
+pub(crate) fn cf_html_fragment_range(
+    text: &str,
+    native_len: usize,
+) -> Result<std::ops::Range<usize>, HtmlError> {
     if text.is_empty() {
         return Err(HtmlError::MissingField("header"));
     }
     let start_fragment = required_offset(text, "StartFragment")?;
     let end_fragment = required_offset(text, "EndFragment")?;
-    if start_fragment > end_fragment || end_fragment > bytes.len() {
+    if start_fragment > end_fragment || end_fragment > native_len {
         return Err(HtmlError::BadRange);
     }
     if let (Some(start_html), Some(end_html)) = (
         optional_offset(text, "StartHTML")?,
         optional_offset(text, "EndHTML")?,
     ) {
-        if start_html > end_html || end_html > bytes.len() {
+        if start_html > end_html || end_html > native_len {
             return Err(HtmlError::BadRange);
         }
     }
-    let fragment = std::str::from_utf8(&bytes[start_fragment..end_fragment])
-        .map_err(|_| HtmlError::BadFragment)?;
-    Ok(fragment.to_string())
+    Ok(start_fragment..end_fragment)
 }
 
 /// Format the `CF_HTML` header with fixed-width offsets.

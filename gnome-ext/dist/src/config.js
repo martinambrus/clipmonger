@@ -7,7 +7,7 @@ export function defaultConfig() {
     return {
         monitor: { formats: [...DEFAULT_FORMATS], max_bytes: DEFAULT_MAX_BYTES, ignores: [], poll_ms: DEFAULT_POLL_MS },
         popup: { hotkey: DEFAULT_POPUP_HOTKEY },
-        privacy: { denylist: [] },
+        privacy: { denylist: [], strict: false },
     };
 }
 function isObj(v) { return typeof v === 'object' && v !== null && !Array.isArray(v); }
@@ -34,6 +34,8 @@ export function mergeConfig(partial) {
         out.popup.hotkey = pop.hotkey;
     if (typeof cfg.hotkey === 'string' && cfg.hotkey)
         out.popup.hotkey = cfg.hotkey;
+    if (typeof priv.strict === 'boolean')
+        out.privacy.strict = priv.strict;
     out.privacy.denylist = strArr(priv.denylist ?? cfg.denylist, out.privacy.denylist);
     return out;
 }

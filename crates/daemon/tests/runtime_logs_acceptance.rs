@@ -219,7 +219,7 @@ fn runtime_api_and_failed_ingestion_observe_actual_production_behavior() {
     );
     assert!(!monitor_lines.join("\n").contains("MONITOR_SECRET_EXCLUDED"));
     // A real managed blob-directory obstruction reaches Store::insert_clip.
-    // No injected log message, mock Store, changed acceptance assertion or #76 fix.
+    // No injected log message, mock Store or broader #76 fix.
     fs::remove_dir(dir.join("blobs")).unwrap();
     fs::write(dir.join("blobs"), "obstructed").unwrap();
     let secret = "PAYLOAD_SECRET_EXCLUDED";
@@ -237,20 +237,22 @@ fn runtime_api_and_failed_ingestion_observe_actual_production_behavior() {
     assert!(failures[0]["code"].as_str().is_some());
     assert!(!after.join("\n").contains(secret));
     assert!(!after.join("\n").contains(dir.to_str().unwrap()));
-    // Preserve checked capture refusal and existing blob.put successful envelope.
+    // Both checked paths report the real storage failure.
     let mut second_payload = payload.clone();
     second_payload.push(b'2');
     let mut third_payload = payload.clone();
     third_payload.push(b'3');
-    let report = state
+    let report_error = state
         .handle(
             "capture.report",
             &json!({"event":{"sensitive":false},"payloads":{"text/plain":b64(&second_payload)}}),
         )
-        .unwrap();
-    assert_eq!(report["accepted"], false);
-    let blob = state.handle("blob.put",&json!({"clip":"secret-job-excluded","mime":"text/plain","seq":0,"eof":true,"data_b64":b64(&third_payload)})).unwrap();
-    assert_eq!(blob, json!({"ok":true}));
+        .expect_err("capture report must surface storage failure");
+    assert_eq!(report_error.code, "backend");
+    let blob_error = state
+        .handle("blob.put", &json!({"clip":"secret-job-excluded","mime":"text/plain","seq":0,"eof":true,"data_b64":b64(&third_payload)}))
+        .expect_err("blob EOF must surface storage failure");
+    assert_eq!(blob_error.code, "backend");
     let after = lines(&state, &json!({"source":"daemon","lines":1000}));
     let failures = after
         .iter()
