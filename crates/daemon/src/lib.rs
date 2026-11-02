@@ -16,7 +16,75 @@ use clipmonger_ipc::proto::IpcError;
 use clipmonger_platform::types::{BackendCaps, Level, PasteStrategy};
 use serde_json::Value;
 
+pub mod autostart;
 pub mod capture;
+
+struct ConfigStage {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl ConfigStage {
+    fn create(target: &Path, bytes: &[u8]) -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        match fs::symlink_metadata(target) {
+            Ok(meta) if !meta.file_type().is_file() => {
+                return Err(std::io::Error::other("invalid config target"))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let parent = target
+            .parent()
+            .ok_or_else(|| std::io::Error::other("missing profile"))?;
+        for _ in 0..32 {
+            let path = parent.join(format!(
+                ".config.toml.stage-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let stage = Self {
+                        path,
+                        committed: false,
+                    };
+                    let written = (|| -> std::io::Result<()> {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                        }
+                        file.write_all(bytes)?;
+                        file.sync_all()
+                    })();
+                    drop(file);
+                    written?;
+                    return Ok(stage);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "stage names exhausted",
+        ))
+    }
+}
+impl Drop for ConfigStage {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
 
 fn daemon_runtime_emit(
     sev: clipmonger_core::runtime_log::Severity,
@@ -1718,6 +1786,8 @@ pub struct DaemonState {
     blob_buf: Mutex<HashMap<(String, String), BlobAsm>>,
     /// Latest `hotkey.conflict` note surfaced in caps notes.
     hotkey_conflict_note: Mutex<Option<String>>,
+    /// Daemon-owned autostart service (single init, retained for explicit apply).
+    autostart: Mutex<Option<autostart::AutostartService>>,
     /// Popup trigger path: event hub, UI launcher, debounce state.
     popup: Mutex<popup::PopupTrigger>,
     /// Dual-backend merge window state (seg-06 S8, W-F5: 2000 ms).
@@ -1758,6 +1828,7 @@ impl DaemonState {
             publication_hook: Mutex::new(None),
             blob_buf: Mutex::new(HashMap::new()),
             hotkey_conflict_note: Mutex::new(None),
+            autostart: Mutex::new(None),
             popup: Mutex::new(popup::PopupTrigger::default()),
             #[cfg(all(unix, feature = "backend-wayland"))]
             merger: Mutex::new(clipmonger_backend_wayland::merge::Merger::new(2000)),
@@ -1781,6 +1852,90 @@ impl DaemonState {
         self.config
             .lock()
             .map_or_else(|_| String::new(), |config| config.popup.hotkey.clone())
+    }
+
+    /// Install one immutable autostart service before serving requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service lock fails or a service is already installed.
+    pub fn set_autostart_service(
+        &self,
+        service: autostart::AutostartService,
+    ) -> Result<(), clipmonger_platform::types::Error> {
+        let mut slot = self.autostart.lock().map_err(|_| {
+            clipmonger_platform::types::Error::Internal("autostart lock failed".into())
+        })?;
+        if slot.is_some() {
+            return Err(clipmonger_platform::types::Error::Internal(
+                "autostart already installed".into(),
+            ));
+        }
+        *slot = Some(service);
+        Ok(())
+    }
+
+    fn autostart_service(
+        &self,
+    ) -> Result<autostart::AutostartService, clipmonger_platform::types::Error> {
+        self.autostart
+            .lock()
+            .map_err(|_| {
+                clipmonger_platform::types::Error::Internal("autostart lock failed".into())
+            })?
+            .clone()
+            .ok_or_else(|| {
+                clipmonger_platform::types::Error::Unavailable("autostart unavailable".into())
+            })
+    }
+
+    /// Apply the installed service’s startup setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service cannot be accessed or its operation fails.
+    pub async fn apply_autostart_startup(
+        &self,
+        enabled: bool,
+    ) -> Result<autostart::StartupOutcome, clipmonger_platform::types::Error> {
+        self.autostart_service()?.apply_startup(enabled).await
+    }
+
+    /// Apply an explicit setting through the installed service.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service cannot be accessed or its operation fails.
+    pub async fn apply_autostart_explicit(
+        &self,
+        enabled: bool,
+    ) -> Result<autostart::ExplicitOutcome, clipmonger_platform::types::Error> {
+        self.autostart_service()?.apply_explicit(enabled).await
+    }
+
+    /// Query the installed service for the actual autostart state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service cannot be accessed or its query fails.
+    pub async fn query_autostart(&self) -> Result<bool, clipmonger_platform::types::Error> {
+        self.autostart_service()?.query().await
+    }
+
+    #[cfg(test)]
+    pub fn autostart_is_portable(&self) -> bool {
+        self.autostart.lock().is_ok_and(|s| {
+            s.as_ref()
+                .is_some_and(autostart::AutostartService::is_portable)
+        })
+    }
+
+    #[cfg(test)]
+    pub fn autostart_is_available(&self) -> bool {
+        self.autostart.lock().is_ok_and(|s| {
+            s.as_ref()
+                .is_some_and(autostart::AutostartService::is_available)
+        })
     }
 
     /// Stored config as JSON (full document).
@@ -2710,6 +2865,13 @@ impl DaemonState {
         serde_json::json!({"config": cursor.clone()})
     }
 
+    fn apply_autostart_sync(
+        &self,
+        enabled: bool,
+    ) -> Result<autostart::ExplicitOutcome, clipmonger_platform::types::Error> {
+        self.autostart_service()?.apply_explicit_sync(enabled)
+    }
+
     /// Dispatch `config.set`: apply one dotted key and persist
     /// `<profile>/config.toml`.
     fn handle_config_set(&self, params: &Value) -> Result<Value, IpcError> {
@@ -2732,20 +2894,59 @@ impl DaemonState {
             .and_then(Value::as_str)
             .ok_or_else(|| IpcError::new("backend", "config.set: key required".to_string()))?;
         let value = params.get("value").cloned().unwrap_or(Value::Null);
-        let candidate = {
-            let current = self
-                .config
-                .lock()
-                .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?
-                .clone();
-            let mut candidate = current;
-            apply_config_key(&mut candidate, key, &value)
-                .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
-            candidate
-        };
-        candidate
-            .save(&profile.join("config.toml"))
+        if key == "autostart" || key.starts_with("autostart.enabled.") {
+            return Err(IpcError::new(
+                "backend",
+                "config.set: invalid autostart key".into(),
+            ));
+        }
+        if key == "autostart.enabled" && !value.is_boolean() {
+            return Err(IpcError::new(
+                "backend",
+                "config.set: autostart.enabled requires a boolean".into(),
+            ));
+        }
+        let current = self
+            .config
+            .lock()
+            .map_err(|_| IpcError::new("internal", "config state poisoned".into()))?
+            .clone();
+        let old_enabled = current.autostart.enabled;
+        let mut candidate = current;
+        apply_config_key(&mut candidate, key, &value)
             .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
+        if key == "autostart.enabled" {
+            let text = candidate
+                .to_toml()
+                .map_err(|_| IpcError::new("backend", "config.set: serialization failed".into()))?;
+            let target = profile.join("config.toml");
+            let mut stage = ConfigStage::create(&target, text.as_bytes())
+                .map_err(|_| IpcError::new("backend", "config.set: staging failed".into()))?;
+            if let Err(error) = self.apply_autostart_sync(candidate.autostart.enabled) {
+                return Err(IpcError::new(
+                    runtime_platform_class(&error),
+                    "config.set: autostart was not applied; OS state may have changed".into(),
+                ));
+            }
+            if fs::rename(&stage.path, &target).is_err() {
+                let _ = self.apply_autostart_sync(old_enabled);
+                return Err(IpcError::new(
+                    "backend",
+                    "config.set: commit failed; OS state may differ".into(),
+                ));
+            }
+            stage.committed = true;
+        } else {
+            if candidate.autostart.enabled != old_enabled {
+                return Err(IpcError::new(
+                    "backend",
+                    "config.set: invalid autostart change".into(),
+                ));
+            }
+            candidate
+                .save(&profile.join("config.toml"))
+                .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
+        }
         self.publish_config(candidate);
         Ok(serde_json::json!({"ok": true}))
     }
@@ -2802,13 +3003,24 @@ impl DaemonState {
         } else {
             None
         };
-        let result = self.install_prepared_restore(prepared);
-        if result.is_ok() {
-            if let Some(cfg) = candidate {
-                self.publish_config(cfg);
+        let result = self.install_prepared_restore(prepared)?;
+        if let Some(cfg) = candidate {
+            let enabled = cfg.autostart.enabled;
+            self.publish_config(cfg);
+            let warning = match self.autostart_service() {
+                Ok(service) if service.is_portable() => Some("portable"),
+                Ok(service) if !service.is_available() => Some("unavailable"),
+                Ok(service) => service
+                    .apply_explicit_sync(enabled)
+                    .err()
+                    .map(|_| "apply_failed"),
+                Err(_) => Some("unavailable"),
+            };
+            if let Some(code) = warning {
+                return Ok(serde_json::json!({"ok": true, "autostart_warning": {"code": code}}));
             }
         }
-        result
+        Ok(result)
     }
 
     fn install_prepared_restore(

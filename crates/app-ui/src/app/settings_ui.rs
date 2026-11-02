@@ -7,6 +7,9 @@ use serde_json::Value;
 
 use crate::{config_model, ipc_bridge, permanents, strings};
 
+pub(crate) const DEFAULT_DARK: bool = true;
+pub(crate) const DEFAULT_FONT_SCALE: f32 = 1.0;
+
 /// State of the Settings window, shared with the popup (theme, permanents).
 pub struct ConfigWindowState {
     pub doc: Option<config_model::ConfigDoc>,
@@ -24,6 +27,8 @@ pub struct ConfigWindowState {
     pub dark: bool,
     pub font_scale: f32,
     pub pending_apply: Vec<String>,
+    pub restore_pending: bool,
+    pub(crate) restore_notice: Option<String>,
     pub perm_vm: permanents::PermanentsVm,
     pub perm_source: Option<usize>,
     pub perm_group_new: String,
@@ -57,9 +62,11 @@ impl ConfigWindowState {
             log_lines: Vec::new(),
             log_source: "audit".to_string(),
             log_error: String::new(),
-            dark: true,
-            font_scale: 1.0,
+            dark: DEFAULT_DARK,
+            font_scale: DEFAULT_FONT_SCALE,
             pending_apply: Vec::new(),
+            restore_pending: false,
+            restore_notice: None,
             perm_vm: permanents::PermanentsVm::new(),
             perm_source: None,
             perm_group_new: String::new(),
@@ -111,6 +118,9 @@ pub fn render_config_viewport(
         let _ = cmds.send(cmd);
     };
     egui::CentralPanel::default().show(ui, |ui| {
+        if config.restore_pending {
+            ui.disable();
+        }
         ui.add(
             egui::TextEdit::singleline(&mut config.filter)
                 .hint_text(strings::text("config.filter_hint")),
@@ -152,7 +162,13 @@ pub fn render_config_viewport(
             if ui.button(strings::text("config.backup_create")).clicked() {
                 do_backup = true;
             }
-            if ui.button(strings::text("config.backup_restore")).clicked() {
+            if ui
+                .add_enabled(
+                    !config.restore_pending,
+                    egui::Button::new(strings::text("config.backup_restore")),
+                )
+                .clicked()
+            {
                 do_restore = true;
             }
         } else if config.tab == "about" {
@@ -460,14 +476,15 @@ pub fn render_config_viewport(
     for cmd in perm_send {
         send(cmd);
     }
-    if theme_changed {
+    if theme_changed && !config.restore_pending && !do_restore {
         let mode = if config.dark { "dark" } else { "light" };
         send(ipc_bridge::UiCmd::ConfigSet(
             "ui.theme".to_string(),
             serde_json::json!({ "mode": mode, "font_scale": config.font_scale }),
         ));
     }
-    for (key, value) in stage_edits {
+    let accept_edits = !config.restore_pending && !do_restore;
+    for (key, value) in stage_edits.into_iter().filter(|_| accept_edits) {
         if let Some(doc) = &mut config.doc {
             match doc.stage(&key, value) {
                 Ok(()) => config.error.clear(),
@@ -481,7 +498,12 @@ pub fn render_config_viewport(
     if do_backup {
         send(ipc_bridge::UiCmd::BackupCreate(config.backup_path.clone()));
     }
-    if do_restore {
+    if do_restore && !config.restore_pending {
+        config.restore_pending = true;
+        config.restore_notice = None;
+        config.pending_apply.clear();
+        config.edits.clear();
+        config.doc = None;
         send(ipc_bridge::UiCmd::BackupRestore(config.backup_path.clone()));
     }
     if do_logs {
@@ -495,13 +517,13 @@ pub fn render_config_viewport(
             });
         }
     }
-    if do_revert {
+    if do_revert && !config.restore_pending {
         if let Some(doc) = &mut config.doc {
             doc.revert();
         }
         config.edits.clear();
     }
-    if do_apply {
+    if do_apply && !config.restore_pending {
         if let Some(doc) = config.doc.as_ref() {
             let pending = doc.dirty_keys();
             let plan = doc.apply_plan();

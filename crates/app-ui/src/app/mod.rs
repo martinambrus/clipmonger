@@ -17,7 +17,7 @@ use serde_json::Value;
 pub use settings_ui::{render_config_viewport, ConfigWindowState};
 pub use trace::{Trace, TraceEvent};
 
-use crate::ipc_bridge::{UiCmd, UiEvent};
+use crate::ipc_bridge::{self, UiCmd, UiEvent};
 use crate::runner::{self, WindowKind};
 use crate::shell::{Effect, Event, Millis, Shell};
 use crate::tray_logic::TrayAction;
@@ -316,6 +316,17 @@ impl PopupApp {
         }
     }
 
+    fn restore_error_message(&self, message: &str) -> String {
+        self.config
+            .lock()
+            .ok()
+            .and_then(|config| config.restore_notice.clone())
+            .map_or_else(
+                || message.to_owned(),
+                |notice| format!("{notice} {message}"),
+            )
+    }
+
     /// Handle one bridge event: update the view-model and the Settings state as
     /// the old shell did, and hand the events the shell has rules for to
     /// `feed(Event::Bridge(..))`.
@@ -431,13 +442,49 @@ impl PopupApp {
                     }
                 }
             }
-            UiEvent::RestoreDone => {
-                if self.shell.desired().settings_open {
-                    if let Ok(mut config) = self.config.lock() {
-                        config.error = strings::text("config.restore_done").to_string();
+            UiEvent::RestoreDone { warning } => {
+                let mut message = strings::text("config.restore_done").to_string();
+                if let Some(ref warning) = warning {
+                    let id = match warning {
+                        ipc_bridge::RestoreWarning::ApplyFailed => "config.restore_warning_apply",
+                        ipc_bridge::RestoreWarning::Unavailable => {
+                            "config.restore_warning_unavailable"
+                        }
+                        ipc_bridge::RestoreWarning::Portable => "config.restore_warning_portable",
+                        ipc_bridge::RestoreWarning::Unknown => "config.restore_warning_unknown",
+                    };
+                    message.push(' ');
+                    message.push_str(strings::text(id));
+                }
+                if let Ok(mut config) = self.config.lock() {
+                    config.restore_notice = warning.map(|_| message.clone());
+                    if self.shell.desired().settings_open {
+                        config.error.clone_from(&message);
                     }
                 }
+                if !self.shell.desired().settings_open {
+                    self.feed(Event::Bridge(UiEvent::Error(message)));
+                }
                 self.send(UiCmd::ListHistory);
+                self.send(UiCmd::ConfigGetAfterRestore);
+            }
+            UiEvent::RestoreFailed(message) => {
+                self.on_bridge(UiEvent::ConfigError(message));
+                self.send(UiCmd::ConfigGetAfterRestore);
+            }
+            UiEvent::RestoredConfigError(message) => {
+                if let Ok(mut config) = self.config.lock() {
+                    config.restore_pending = false;
+                }
+                self.on_bridge(UiEvent::ConfigError(message));
+            }
+            UiEvent::RestoredConfig(body) => {
+                if let Ok(mut config) = self.config.lock() {
+                    config.restore_pending = false;
+                    config.dark = settings_ui::DEFAULT_DARK;
+                    config.font_scale = settings_ui::DEFAULT_FONT_SCALE;
+                }
+                self.on_bridge(UiEvent::Config(body));
             }
             UiEvent::LogsTail {
                 source,
@@ -459,6 +506,7 @@ impl PopupApp {
                 }
             }
             UiEvent::ConfigError(message) => {
+                let message = self.restore_error_message(&message);
                 if self.shell.desired().settings_open {
                     if let Ok(mut config) = self.config.lock() {
                         config.error = message;
@@ -489,6 +537,13 @@ impl PopupApp {
                 }
             }
             UiEvent::Config(body) => {
+                if self
+                    .config
+                    .lock()
+                    .is_ok_and(|config| config.restore_pending)
+                {
+                    return;
+                }
                 let doc = config_model::ConfigDoc::from_snapshot(&body);
                 let width = doc
                     .get("popup.preview_width")
@@ -519,6 +574,7 @@ impl PopupApp {
                 self.feed(Event::Bridge(UiEvent::Config(body)));
             }
             UiEvent::Error(message) => {
+                let message = self.restore_error_message(&message);
                 let settings_open = self.shell.desired().settings_open;
                 let routed = self.config.lock().is_ok_and(|mut config| {
                     let routed = settings_open;

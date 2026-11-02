@@ -218,7 +218,27 @@ fn logs_tail_serves_last_n_audit_lines_with_cap() {
 // survive set -> save -> load -> get, including the extra-map rows.
 #[test]
 fn config_all_rows_persist_across_reload() {
+    struct Adapter;
+    impl clipmonger_daemon::autostart::AutostartAdapter for Adapter {
+        fn enable(&self) -> clipmonger_platform::types::Result<()> {
+            Ok(())
+        }
+        fn disable(&self) -> clipmonger_platform::types::Result<()> {
+            Ok(())
+        }
+        fn is_enabled(&self) -> clipmonger_platform::types::Result<bool> {
+            Ok(false)
+        }
+    }
     let (dir, state) = fresh_state("config25");
+    state
+        .set_autostart_service(
+            clipmonger_daemon::autostart::AutostartService::with_adapter(
+                std::sync::Arc::new(Adapter),
+                false,
+            ),
+        )
+        .unwrap();
     let cases: &[(&str, Value)] = &[
         ("monitor.formats", json!(["text/plain"])),
         ("monitor.max_bytes", json!(1024)),

@@ -95,7 +95,7 @@ fn backup_bridge_success_events_carry_daemon_replies() {
         .recv_timeout(Duration::from_secs(2))
         .expect("restore event");
     assert!(
-        matches!(ev, UiEvent::RestoreDone),
+        matches!(ev, UiEvent::RestoreDone { warning: None }),
         "backup.restore ok must yield RestoreDone, got {ev:?}"
     );
 
@@ -228,4 +228,30 @@ fn ui_owned_initialization_status_enters_actual_bridge_reply() {
         matches!(event,UiEvent::LogsTail {source,lines,sink_error:Some(error)} if source=="ui" && lines.len()==2 && error=="runtime_log.refused_logs_directory")
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn restore_warning_codes_and_malformed_payload_remain_successes() {
+    use ipc_bridge::RestoreWarning;
+    struct Reply(Value);
+    impl ipc_bridge::Transport for Reply {
+        fn call(&mut self, _: &str, _: &Value) -> Result<Value, clipmonger_ipc::proto::IpcError> {
+            Ok(self.0.clone())
+        }
+    }
+    for (warning, expected) in [
+        (json!({"code":"apply_failed"}), RestoreWarning::ApplyFailed),
+        (json!({"code":"unavailable"}), RestoreWarning::Unavailable),
+        (json!({"code":"portable"}), RestoreWarning::Portable),
+        (json!({"code":"future"}), RestoreWarning::Unknown),
+        (json!(null), RestoreWarning::Unknown),
+    ] {
+        let (tx, rx) = ipc_bridge::Bridge::spawn(Box::new(Reply(
+            json!({"ok":true,"autostart_warning":warning}),
+        )));
+        tx.send(UiCmd::BackupRestore("backup.zip".into())).unwrap();
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), UiEvent::RestoreDone { warning: Some(actual) } if actual == expected)
+        );
+    }
 }

@@ -185,6 +185,21 @@ pub struct BackupRestoreParams {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupRestoreResult {
     pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autostart_warning: Option<AutostartWarning>,
+}
+/// The saved setting could not be applied after restoring the profile.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutostartWarning {
+    pub code: AutostartWarningCode,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutostartWarningCode {
+    /// Applying may have partially changed the OS state.
+    ApplyFailed,
+    Unavailable,
+    Portable,
 }
 /// Log tail request for `logs.tail`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
