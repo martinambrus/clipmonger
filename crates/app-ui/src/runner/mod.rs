@@ -6,15 +6,13 @@
 pub mod geometry;
 pub mod render;
 pub mod sched;
+mod shutdown;
 pub mod window;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui::{
-    ClippedPrimitive, Color32, Context, RawInput, ViewportBuilder, ViewportEvent, ViewportId,
-    ViewportInfo,
-};
+use egui::{ClippedPrimitive, Color32, Context, RawInput, ViewportEvent, ViewportId, ViewportInfo};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
@@ -139,6 +137,7 @@ pub enum RunError {
     EventLoop(winit::error::EventLoopError),
     Window(winit::error::OsError),
     Surface(softbuffer::SoftBufferError),
+    Teardown(String),
 }
 
 impl std::fmt::Display for RunError {
@@ -147,6 +146,7 @@ impl std::fmt::Display for RunError {
             Self::EventLoop(e) => write!(f, "event loop: {e}"),
             Self::Window(e) => write!(f, "window: {e}"),
             Self::Surface(e) => write!(f, "surface: {e}"),
+            Self::Teardown(m) => write!(f, "teardown: {m}"),
         }
     }
 }
@@ -183,10 +183,8 @@ pub fn run<A: App + 'static>(
         .map_err(RunError::EventLoop)?;
     let proxy = event_loop.create_proxy();
     let mut runner = Runner::new(config, proxy, Box::new(make_app));
-    event_loop
-        .run_app(&mut runner)
-        .map_err(RunError::EventLoop)?;
-    runner.error.map_or(Ok(()), Err)
+    let loop_result = event_loop.run_app(&mut runner).map_err(RunError::EventLoop);
+    shutdown::finish(runner.error, loop_result)
 }
 
 /// The OS window of a slot and everything bound to it.
@@ -197,50 +195,6 @@ struct Host {
     present_error_logged: bool,
     info: ViewportInfo,
     visibility: Visibility,
-}
-
-impl Host {
-    #[allow(clippy::cast_possible_truncation)]
-    fn new(
-        event_loop: &ActiveEventLoop,
-        surface_context: &softbuffer::Context<OwnedDisplayHandle>,
-        ctx: &Context,
-        builder: &ViewportBuilder,
-        class: &str,
-        restore: Option<&geometry::NormalizedRestore>,
-    ) -> Result<Self, RunError> {
-        let prepared = window::prepare_host(ctx, builder.clone(), class, restore);
-        let window = Arc::new(
-            event_loop
-                .create_window(prepared.attributes.clone())
-                .map_err(RunError::Window)?,
-        );
-        let ((state, presenter, info), visibility) =
-            prepared.finish_setup(&*window, |builder| {
-                egui_winit::apply_viewport_builder_to_window(ctx, &window, builder);
-                let state = egui_winit::State::new(
-                    ctx.clone(),
-                    ViewportId::ROOT,
-                    &*window,
-                    Some(window.scale_factor() as f32),
-                    window.theme(),
-                    None,
-                );
-                let presenter = render::Presenter::new(surface_context, Arc::clone(&window))
-                    .map_err(RunError::Surface)?;
-                let mut info = ViewportInfo::default();
-                egui_winit::update_viewport_info(&mut info, ctx, &window, true);
-                Ok::<_, RunError>((state, presenter, info))
-            })?;
-        Ok(Self {
-            window,
-            state,
-            presenter,
-            present_error_logged: false,
-            info,
-            visibility,
-        })
-    }
 }
 
 impl Host {
@@ -461,6 +415,8 @@ struct Runner<A: App> {
     pending_activation: window::Activation,
     error: Option<RunError>,
     geometry: geometry::GeometryState,
+    shutdown: Option<shutdown::Shutdown>,
+    orphan_pending: std::collections::HashSet<WindowId>,
 }
 
 impl<A: App> Runner<A> {
@@ -486,6 +442,8 @@ impl<A: App> Runner<A> {
             pending_activation: window::Activation::new(),
             error: None,
             geometry,
+            shutdown: None,
+            orphan_pending: std::collections::HashSet::new(),
         }
     }
 
@@ -496,15 +454,94 @@ impl<A: App> Runner<A> {
         }
     }
 
-    /// Remember the error and leave the event loop.
+    fn resumed_running(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(app) = self.app.as_mut() {
+            if notify_desktop_geometry(app, DesktopGeometrySignal::Resumed) {
+                self.popup.deadline.at(Instant::now());
+                self.set_flow(event_loop);
+            }
+            return;
+        }
+        if let Err(e) = self.start(event_loop) {
+            self.fail(event_loop, e);
+        }
+    }
+
+    fn user_event_running(&mut self, event_loop: &ActiveEventLoop, event: &UserEvent) {
+        let now = Instant::now();
+        match *event {
+            UserEvent::Wake => {
+                self.popup.deadline.at(now);
+                if let Some(slot) = self.settings.as_mut() {
+                    slot.deadline.at(now);
+                }
+            }
+            UserEvent::Repaint { kind, delay, pass } => {
+                if let Some(slot) = self.slot_mut(kind) {
+                    let current = slot.ctx.cumulative_pass_nr_for(ViewportId::ROOT);
+                    slot.deadline.request(now, delay, pass, current);
+                }
+            }
+        }
+        self.set_flow(event_loop);
+    }
+
+    /// Save geometry and release complete hosts through the shared transition.
+    fn begin_shutdown(&mut self, event_loop: &ActiveEventLoop) {
+        let geometry = &mut self.geometry;
+        let global_position = !self.per_show;
+        let directive = shutdown::begin(
+            &mut self.shutdown,
+            &mut self.popup.host,
+            self.settings.as_mut().map(|slot| &mut slot.host),
+            &mut self.orphan_pending,
+            Instant::now(),
+            |host| {
+                geometry.handle(
+                    geometry::Lifecycle::Exit,
+                    host.map(|host: &Host| &*host.window),
+                    global_position,
+                    |message| eprintln!("{message}"),
+                );
+            },
+            |host| host.window.id(),
+        );
+        self.popup.native_input.reset();
+        self.popup.deadline.clear();
+        if let Some(slot) = self.settings.as_mut() {
+            slot.native_input.reset();
+            slot.deadline.clear();
+        }
+        self.apply_shutdown(event_loop, directive);
+    }
+
+    /// Apply a terminal decision without dropping the permanent shutdown guard.
+    fn apply_shutdown(&mut self, event_loop: &ActiveEventLoop, directive: shutdown::Directive) {
+        shutdown::record_timeout(directive, &mut self.error, |pending| {
+            RunError::Teardown(format!(
+                "teardown timed out with {pending} pending after {:?}",
+                shutdown::TEARDOWN_TIMEOUT
+            ))
+        });
+        match directive {
+            shutdown::Directive::Run => {}
+            shutdown::Directive::WaitUntil(deadline) => {
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+            }
+            shutdown::Directive::Exit | shutdown::Directive::TimedOut(_) => event_loop.exit(),
+        }
+    }
+
+    /// Remember the first error and enter shutdown drain.
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: RunError) {
-        self.error = Some(error);
-        event_loop.exit();
+        shutdown::record_error(&mut self.error, error);
+        self.begin_shutdown(event_loop);
     }
 
     /// Create the OS window for a slot.
+    #[allow(clippy::cast_possible_truncation)]
     fn create_host(
-        &self,
+        &mut self,
         event_loop: &ActiveEventLoop,
         kind: WindowKind,
         visible: bool,
@@ -562,14 +599,49 @@ impl<A: App> Runner<A> {
         } else {
             None
         };
-        Host::new(
-            event_loop,
-            surface_context,
-            ctx,
-            &builder,
-            class,
-            restore.as_ref(),
-        )
+        // Explicit window creation to capture WindowId if Presenter fails.
+        let prepared = window::prepare_host(ctx, builder.clone(), class, restore.as_ref());
+        let window = Arc::new(
+            event_loop
+                .create_window(prepared.attributes.clone())
+                .map_err(RunError::Window)?,
+        );
+        let window_id = window.id();
+        let host_res = (|| {
+            let ((state, presenter, info), visibility) = prepared.finish_setup(&*window, |b| {
+                egui_winit::apply_viewport_builder_to_window(ctx, &window, b);
+                let state = egui_winit::State::new(
+                    ctx.clone(),
+                    ViewportId::ROOT,
+                    &*window,
+                    Some(window.scale_factor() as f32),
+                    window.theme(),
+                    None,
+                );
+                let presenter = render::Presenter::new(surface_context, Arc::clone(&window))
+                    .map_err(RunError::Surface)?;
+                let mut info = ViewportInfo::default();
+                egui_winit::update_viewport_info(&mut info, ctx, &window, true);
+                Ok::<_, RunError>((state, presenter, info))
+            })?;
+            Ok::<_, RunError>(Host {
+                window,
+                state,
+                presenter,
+                present_error_logged: false,
+                info,
+                visibility,
+            })
+        })();
+        match host_res {
+            Ok(host) => Ok(host),
+            Err(e) => {
+                // Window was created and will be dropped here, posting Destroy.
+                // Track its id so shutdown drain can account for it if needed.
+                self.orphan_pending.insert(window_id);
+                Err(e)
+            }
+        }
     }
 
     /// Initialize the runner on first resume.
@@ -597,6 +669,12 @@ impl<A: App> Runner<A> {
 
     /// Update the event loop control flow from deadlines.
     fn set_flow(&self, event_loop: &ActiveEventLoop) {
+        if let Some(shutdown) = &self.shutdown {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                shutdown.deadline(),
+            ));
+            return;
+        }
         let deadlines = [
             self.popup.deadline.next(),
             self.settings.as_ref().and_then(|s| s.deadline.next()),
@@ -606,6 +684,11 @@ impl<A: App> Runner<A> {
 
     /// Run due passes and reconcile.
     fn tick(&mut self, event_loop: &ActiveEventLoop) {
+        let directive = shutdown::poll(&mut self.shutdown, Instant::now());
+        if directive != shutdown::Directive::Run {
+            self.apply_shutdown(event_loop, directive);
+            return;
+        }
         let now = Instant::now();
         for kind in [WindowKind::Popup, WindowKind::Settings] {
             let should_run = {
@@ -729,6 +812,12 @@ impl<A: App> Runner<A> {
 
     /// Reconcile desired state with OS windows.
     fn reconcile(&mut self, event_loop: &ActiveEventLoop) {
+        shutdown::ordinary_work(self.shutdown.is_some(), || {
+            self.reconcile_running(event_loop);
+        });
+    }
+
+    fn reconcile_running(&mut self, event_loop: &ActiveEventLoop) {
         let Some(app) = self.app.as_mut() else {
             return;
         };
@@ -736,8 +825,7 @@ impl<A: App> Runner<A> {
         let request = app.take_popup_activation();
         let previous = std::mem::replace(&mut self.last, desired);
         if desired.exit {
-            self.settings_geometry(geometry::Lifecycle::Exit);
-            event_loop.exit();
+            self.begin_shutdown(event_loop);
             return;
         }
         let now = Instant::now();
@@ -990,36 +1078,14 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
 
     /// Handle resumed event.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(app) = self.app.as_mut() {
-            if notify_desktop_geometry(app, DesktopGeometrySignal::Resumed) {
-                self.popup.deadline.at(Instant::now());
-                self.set_flow(event_loop);
-            }
-            return;
-        }
-        if let Err(e) = self.start(event_loop) {
-            self.fail(event_loop, e);
-        }
+        shutdown::ordinary_work(self.shutdown.is_some(), || self.resumed_running(event_loop));
     }
 
     /// Handle wake and repaint events.
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        let now = Instant::now();
-        match event {
-            UserEvent::Wake => {
-                self.popup.deadline.at(now);
-                if let Some(slot) = self.settings.as_mut() {
-                    slot.deadline.at(now);
-                }
-            }
-            UserEvent::Repaint { kind, delay, pass } => {
-                if let Some(slot) = self.slot_mut(kind) {
-                    let current = slot.ctx.cumulative_pass_nr_for(ViewportId::ROOT);
-                    slot.deadline.request(now, delay, pass, current);
-                }
-            }
-        }
-        self.set_flow(event_loop);
+        shutdown::ordinary_work(self.shutdown.is_some(), || {
+            self.user_event_running(event_loop, &event);
+        });
     }
 
     /// Handle window events.
@@ -1029,27 +1095,26 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Dispatch owns acknowledgment-before-lookup ordering, including after
+        // the complete hosts have been removed from their slots.
+        let dispatch = shutdown::window_event(
+            &mut self.shutdown,
+            self.popup.host.as_ref(),
+            self.settings.as_ref().and_then(|slot| slot.host.as_ref()),
+            window_id,
+            &event,
+            Instant::now(),
+            |host| host.window.id(),
+        );
+        let kind = match dispatch {
+            shutdown::WindowDispatch::Normal(kind) => kind,
+            shutdown::WindowDispatch::Shutdown(directive) => {
+                self.apply_shutdown(event_loop, directive);
+                return;
+            }
+        };
         let now = Instant::now();
         let close = matches!(event, WindowEvent::CloseRequested);
-        let kind = if let Some(host) = self.popup.host.as_ref() {
-            if host.window.id() == window_id {
-                Some(WindowKind::Popup)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let kind = kind.or_else(|| {
-            if let Some(slot) = self.settings.as_ref() {
-                if let Some(host) = slot.host.as_ref() {
-                    if host.window.id() == window_id {
-                        return Some(WindowKind::Settings);
-                    }
-                }
-            }
-            None
-        });
         if let Some(kind) = kind {
             self.window_geometry_event(kind, &event);
             let preserve_super = self

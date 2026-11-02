@@ -16,6 +16,5 @@ serde_json.workspace = true
 wl-clipboard-rs.workspace = true
 wayland-client.workspace = true
 
-[lints.clippy]
-all = "warn"
-pedantic = "warn"
+[lints]
+workspace = true

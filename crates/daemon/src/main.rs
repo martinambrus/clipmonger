@@ -254,7 +254,7 @@ fn setup_windows_backend(
         std::thread::spawn(move || admin_consent_loop(&profile, &state, &shutdown));
     }
 
-    if let Some(mut monitor) = monitor {
+    if let Some(monitor) = monitor {
         let state = Arc::clone(state);
         let transfer = Arc::clone(&transfer);
         let formats: Vec<String> = config.monitor.formats.clone();
@@ -263,48 +263,53 @@ fn setup_windows_backend(
         let shutdown = Arc::clone(shutdown);
         std::thread::spawn(move || {
             let poll_timeout = std::time::Duration::from_millis(poll_ms.clamp(50, 5000));
-            while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                let events = match monitor.poll(poll_timeout) {
-                    Ok(events) => events,
-                    Err(e) => {
-                        eprintln!("daemon: monitor poll failed: {e}");
-                        break;
-                    }
-                };
-                for event in &events {
-                    if event.sensitive {
-                        state.ingest_capture("windows", true, &[]);
-                        continue;
-                    }
-                    let mut payloads = Vec::new();
-                    let mut seen = std::collections::HashSet::new();
-                    for offer in &event.offers {
-                        if !wanted_format(&offer.mime, &formats) {
+            clipmonger_daemon::capture::run(
+                monitor,
+                poll_timeout,
+                &shutdown,
+                || {
+                    let mut monitor = WinMonitor::new()?;
+                    monitor.subscribe(&[SubscribeKind::Clipboard])?;
+                    Ok(monitor)
+                },
+                |events| {
+                    for event in events {
+                        if event.sensitive {
+                            state.ingest_capture("windows", true, &[]);
                             continue;
                         }
-                        if !seen.insert(offer.mime.clone()) {
-                            continue;
-                        }
-                        match transfer.read(&offer.mime, max_bytes) {
-                            Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
-                            Err(e) => {
-                                eprintln!("daemon: payload read skipped ({}): {e}", offer.mime);
-                                let _ = std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open("C:\\Temp\\monitor.log")
-                                    .and_then(|mut f| {
-                                        use std::io::Write;
-                                        writeln!(f, "read skipped {}: {}", offer.mime, e)
-                                    });
+                        let mut payloads = Vec::new();
+                        let mut seen = std::collections::HashSet::new();
+                        for offer in &event.offers {
+                            if !wanted_format(&offer.mime, &formats) {
+                                continue;
+                            }
+                            if !seen.insert(offer.mime.clone()) {
+                                continue;
+                            }
+                            match transfer.read(&offer.mime, max_bytes) {
+                                Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
+                                Err(e) => {
+                                    eprintln!("daemon: payload read skipped ({}): {e}", offer.mime);
+                                    let _ = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open("C:\\Temp\\monitor.log")
+                                        .and_then(|mut f| {
+                                            use std::io::Write;
+                                            writeln!(f, "read skipped {}: {}", offer.mime, e)
+                                        });
+                                }
                             }
                         }
+                        if !payloads.is_empty() {
+                            state.ingest_capture("windows", false, &payloads);
+                        }
                     }
-                    if !payloads.is_empty() {
-                        state.ingest_capture("windows", false, &payloads);
-                    }
-                }
-            }
+                },
+                std::thread::sleep,
+                |line| eprintln!("daemon: windows {line}"),
+            );
         });
     }
 }
@@ -473,20 +478,18 @@ fn setup_x11_backend(
     let mut denylist = config.monitor.ignores.clone();
     denylist.extend(config.privacy.denylist.iter().cloned());
     let mut monitor_ok = transfer.is_some();
-    let monitor = match X11Monitor::connect(
-        None,
-        MonitorOpts {
-            capture_primary: config.monitor.capture_primary,
-            debounce_ms: config.monitor.primary_debounce_ms,
-            denylist,
-            max_bytes: config.monitor.max_bytes,
-        },
-    ) {
+    let monitor_opts = MonitorOpts {
+        capture_primary: config.monitor.capture_primary,
+        debounce_ms: config.monitor.primary_debounce_ms,
+        denylist,
+        max_bytes: config.monitor.max_bytes,
+    };
+    let mut kinds = vec![SubscribeKind::Clipboard];
+    if config.monitor.capture_primary {
+        kinds.push(SubscribeKind::Primary);
+    }
+    let monitor = match X11Monitor::connect(None, monitor_opts.clone()) {
         Ok(mut monitor) => {
-            let mut kinds = vec![SubscribeKind::Clipboard];
-            if config.monitor.capture_primary {
-                kinds.push(SubscribeKind::Primary);
-            }
             if monitor.subscribe(&kinds).is_err() {
                 monitor_ok = false;
             }
@@ -542,7 +545,7 @@ fn setup_x11_backend(
     }
     state.register_backend("x11", caps);
 
-    if let (Some(mut monitor), Some(transfer)) = (monitor, transfer) {
+    if let (Some(monitor), Some(transfer)) = (monitor, transfer) {
         let state = Arc::clone(state);
         let formats: Vec<String> = config.monitor.formats.clone();
         let max_bytes = config.monitor.max_bytes;
@@ -550,48 +553,53 @@ fn setup_x11_backend(
         let shutdown = Arc::clone(shutdown);
         std::thread::spawn(move || {
             let poll_timeout = std::time::Duration::from_millis(poll_ms.clamp(50, 5000));
-            while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                let events = match monitor.poll(poll_timeout) {
-                    Ok(events) => events,
-                    Err(e) => {
-                        eprintln!("daemon: monitor poll failed: {e}");
-                        break;
-                    }
-                };
-                for event in &events {
-                    if event.sensitive {
-                        state.ingest_capture("x11", true, &[]);
-                        continue;
-                    }
-                    let mut payloads = Vec::new();
-                    let mut seen = std::collections::HashSet::new();
-                    for offer in &event.offers {
-                        if !wanted_format(&offer.mime, &formats) {
+            clipmonger_daemon::capture::run(
+                monitor,
+                poll_timeout,
+                &shutdown,
+                || {
+                    let mut monitor = X11Monitor::connect(None, monitor_opts.clone())?;
+                    monitor.subscribe(&kinds)?;
+                    Ok(monitor)
+                },
+                |events| {
+                    for event in events {
+                        if event.sensitive {
+                            state.ingest_capture("x11", true, &[]);
                             continue;
                         }
-                        if !seen.insert(offer.mime.clone()) {
-                            continue;
-                        }
-                        match transfer.read(&offer.mime, max_bytes) {
-                            Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
-                            Err(e) => {
-                                eprintln!("daemon: payload read skipped ({}): {e}", offer.mime);
-                                let _ = std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open("C:\\Temp\\monitor.log")
-                                    .and_then(|mut f| {
-                                        use std::io::Write;
-                                        writeln!(f, "read skipped {}: {}", offer.mime, e)
-                                    });
+                        let mut payloads = Vec::new();
+                        let mut seen = std::collections::HashSet::new();
+                        for offer in &event.offers {
+                            if !wanted_format(&offer.mime, &formats) {
+                                continue;
+                            }
+                            if !seen.insert(offer.mime.clone()) {
+                                continue;
+                            }
+                            match transfer.read(&offer.mime, max_bytes) {
+                                Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
+                                Err(e) => {
+                                    eprintln!("daemon: payload read skipped ({}): {e}", offer.mime);
+                                    let _ = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open("C:\\Temp\\monitor.log")
+                                        .and_then(|mut f| {
+                                            use std::io::Write;
+                                            writeln!(f, "read skipped {}: {}", offer.mime, e)
+                                        });
+                                }
                             }
                         }
+                        if !payloads.is_empty() {
+                            state.ingest_capture("x11", false, &payloads);
+                        }
                     }
-                    if !payloads.is_empty() {
-                        state.ingest_capture("x11", false, &payloads);
-                    }
-                }
-            }
+                },
+                std::thread::sleep,
+                |line| eprintln!("daemon: x11 {line}"),
+            );
         });
     }
 
@@ -659,18 +667,19 @@ fn setup_wayland_backend(
     };
 
     let mut monitor_ok = transfer.is_some();
-    let monitor = match WlMonitor::connect(WlMonitorOpts {
+    let monitor_opts = WlMonitorOpts {
         primary: capture_primary,
         debounce_ms: config.monitor.primary_debounce_ms,
         // No core config knob (core is frozen); W-F6 fixes min_len 3.
         min_len: 3,
         capture_primary,
-    }) {
+    };
+    let mut kinds = vec![clipmonger_platform::types::SubscribeKind::Clipboard];
+    if capture_primary {
+        kinds.push(clipmonger_platform::types::SubscribeKind::Primary);
+    }
+    let monitor = match WlMonitor::connect(monitor_opts) {
         Ok(mut monitor) => {
-            let mut kinds = vec![clipmonger_platform::types::SubscribeKind::Clipboard];
-            if capture_primary {
-                kinds.push(clipmonger_platform::types::SubscribeKind::Primary);
-            }
             if monitor.subscribe(&kinds).is_err() {
                 monitor_ok = false;
             }
@@ -691,7 +700,7 @@ fn setup_wayland_backend(
     }
     state.register_backend("wayland", caps);
 
-    if let (Some(mut monitor), Some(transfer)) = (monitor, transfer) {
+    if let (Some(monitor), Some(transfer)) = (monitor, transfer) {
         let state = Arc::clone(state);
         let formats: Vec<String> = config.monitor.formats.clone();
         let max_bytes = config.monitor.max_bytes;
@@ -699,43 +708,48 @@ fn setup_wayland_backend(
         let shutdown = Arc::clone(shutdown);
         std::thread::spawn(move || {
             let poll_timeout = std::time::Duration::from_millis(poll_ms.clamp(50, 5000));
-            while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                let events = match monitor.poll(poll_timeout) {
-                    Ok(events) => events,
-                    Err(e) => {
-                        eprintln!("daemon: wayland monitor poll failed: {e}");
-                        break;
-                    }
-                };
-                for event in &events {
-                    if event.sensitive {
-                        state.ingest_capture("wayland", true, &[]);
-                        continue;
-                    }
-                    let mut payloads = Vec::new();
-                    let mut seen = std::collections::HashSet::new();
-                    for offer in &event.offers {
-                        if !wanted_format(&offer.mime, &formats) {
+            clipmonger_daemon::capture::run(
+                monitor,
+                poll_timeout,
+                &shutdown,
+                || {
+                    let mut monitor = WlMonitor::connect(monitor_opts)?;
+                    monitor.subscribe(&kinds)?;
+                    Ok(monitor)
+                },
+                |events| {
+                    for event in events {
+                        if event.sensitive {
+                            state.ingest_capture("wayland", true, &[]);
                             continue;
                         }
-                        if !seen.insert(offer.mime.clone()) {
-                            continue;
-                        }
-                        match transfer.read(&offer.mime, max_bytes) {
-                            Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
-                            Err(e) => {
-                                eprintln!(
-                                    "daemon: wayland payload read skipped ({}): {e}",
-                                    offer.mime
-                                );
+                        let mut payloads = Vec::new();
+                        let mut seen = std::collections::HashSet::new();
+                        for offer in &event.offers {
+                            if !wanted_format(&offer.mime, &formats) {
+                                continue;
+                            }
+                            if !seen.insert(offer.mime.clone()) {
+                                continue;
+                            }
+                            match transfer.read(&offer.mime, max_bytes) {
+                                Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
+                                Err(e) => {
+                                    eprintln!(
+                                        "daemon: wayland payload read skipped ({}): {e}",
+                                        offer.mime
+                                    );
+                                }
                             }
                         }
+                        if !payloads.is_empty() {
+                            state.ingest_capture("wayland", false, &payloads);
+                        }
                     }
-                    if !payloads.is_empty() {
-                        state.ingest_capture("wayland", false, &payloads);
-                    }
-                }
-            }
+                },
+                std::thread::sleep,
+                |line| eprintln!("daemon: wayland {line}"),
+            );
         });
     }
 

@@ -58,6 +58,7 @@ impl Drop for Fixture {
 #[test]
 fn actual_candidate_open_failure_keeps_same_daemon_usable() {
     let fixture = Fixture::new();
+    archive_config(&fixture);
     fs::write(fixture.path.join("config.toml"), b"# retained config\n").unwrap();
     *fixture.state.restore_hook.lock().unwrap() = Some(Box::new(|prepared| {
         Connection::open(prepared.incoming().join("clipstore.sqlite3"))
@@ -85,6 +86,7 @@ fn actual_candidate_open_failure_keeps_same_daemon_usable() {
 #[test]
 fn actual_old_reopen_failure_reports_unavailable_and_retains_recovery() {
     let fixture = Fixture::new();
+    archive_config(&fixture);
     let profile = fixture.path.clone();
     *fixture.state.restore_hook.lock().unwrap() = Some(Box::new(move |prepared| {
         // Real primary rename failure followed by real old-DB open refusal.
@@ -111,6 +113,10 @@ fn actual_old_reopen_failure_reports_unavailable_and_retains_recovery() {
         .query_row("SELECT preview FROM clips", [], |row| row.get(0))
         .unwrap();
     assert_eq!(preview, "original");
+    assert_eq!(
+        fs::read(fixture.path.join("config.toml")).unwrap(),
+        b"# original config\n"
+    );
     for (method, params) in [
         ("history.list", json!({})),
         ("history.get", json!({"clip":"missing"})),
@@ -161,6 +167,7 @@ fn busy_checkpoint_preserves_live_store_and_moves_nothing() {
 #[test]
 fn concurrent_restore_backup_and_config_writers_wait_for_whole_transaction() {
     let fixture = Fixture::new();
+    archive_config(&fixture);
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     *fixture.state.restore_hook.lock().unwrap() = Some(Box::new(move |_| {
@@ -209,12 +216,21 @@ fn concurrent_restore_backup_and_config_writers_wait_for_whole_transaction() {
             worker.join().unwrap().unwrap();
         }
     });
+    let live = fixture
+        .state
+        .handle("config.get", &json!({"key":"history.max_items"}))
+        .unwrap()["config"]
+        .as_u64()
+        .unwrap();
+    // Either serialized writer can finish last once the first restore releases
+    // the gate. Disk and live state must describe that same final writer.
+    assert!([1, 17].contains(&live));
     assert_eq!(
-        fixture
-            .state
-            .handle("config.get", &json!({"key":"history.max_items"}))
-            .unwrap()["config"],
-        17
+        clipmonger_core::Config::load(&fixture.path.join("config.toml"))
+            .unwrap()
+            .history
+            .max_items,
+        live
     );
     assert!(fixture.path.join("concurrent.zip").exists());
 }
@@ -222,6 +238,7 @@ fn concurrent_restore_backup_and_config_writers_wait_for_whole_transaction() {
 #[test]
 fn capture_waits_for_cutover_before_taking_retention_config_snapshot() {
     let fixture = Fixture::new();
+    archive_config(&fixture);
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     *fixture.state.restore_hook.lock().unwrap() = Some(Box::new(move |_| {
@@ -240,9 +257,6 @@ fn capture_waits_for_cutover_before_taking_retention_config_snapshot() {
             )
         });
         capture_started.wait();
-        // Simulates the next checkpoint's config publication while the restore
-        // owns the gate; a waiting capture must snapshot this value afterwards.
-        fixture.state.config.lock().unwrap().history.max_items = 1;
         assert!(fixture.state.profile_op.try_lock().is_err());
         release_tx.send(()).unwrap();
         restore.join().unwrap().unwrap();
@@ -257,4 +271,176 @@ fn capture_waits_for_cutover_before_taking_retention_config_snapshot() {
             .len(),
         1
     );
+}
+
+const RAW_CONFIG: &[u8] = b"# restored comment\nconfig_version = 99\nfuture = 'retained'\n[history]\nmax_items = 1\nfuture_limit = 42\n[popup]\nunicode_limit = 23\ndelivery_dwell_ms = 45\ndelivery = 'unicode_inject'\nrestore_clipboard = false\n";
+fn archive_config(fixture: &Fixture) {
+    fs::write(fixture.path.join("config.toml"), RAW_CONFIG).unwrap();
+    fixture
+        .state
+        .handle("backup.create", &json!({"dest":fixture.archive}))
+        .unwrap();
+    fs::write(fixture.path.join("config.toml"), b"# original config\n").unwrap();
+}
+#[test]
+fn config_restore_publishes_same_daemon_settings_caps_and_preserves_unknown() {
+    use clipmonger_platform::types::{BackendCaps, Level, PasteCaps, PasteStrategy};
+    let fixture = Fixture::new();
+    archive_config(&fixture);
+    fixture.state.register_backend(
+        "windows",
+        BackendCaps {
+            monitor: Level::Full,
+            transfer: Level::Full,
+            hotkey: Level::Full,
+            paste: PasteCaps {
+                level: Level::Full,
+                strategy: PasteStrategy::UnicodeInject,
+                reason: String::new(),
+            },
+            tray: Level::Full,
+            autostart: false,
+            primary_selection: false,
+            notes: Vec::new(),
+        },
+    );
+    fixture.restore().unwrap();
+    assert_eq!(
+        fs::read(fixture.path.join("config.toml")).unwrap(),
+        RAW_CONFIG
+    );
+    assert_eq!(
+        fixture
+            .state
+            .handle("config.get", &json!({"key":"history.max_items"}))
+            .unwrap()["config"],
+        1
+    );
+    assert_eq!(
+        fixture.state.paste_budget(),
+        (23, 45, clipmonger_core::PasteDelivery::UnicodeInject, false)
+    );
+    assert_eq!(
+        fixture.state.caps.snapshot()["backends"]["windows"]["paste"]["strategy"],
+        "unicode_inject"
+    );
+    assert!(fixture.state.ingest_capture(
+        "test",
+        false,
+        &[("text/plain".into(), b"new retention".to_vec())]
+    ));
+    assert_eq!(fixture.texts(), ["new retention"]);
+    fixture
+        .state
+        .handle(
+            "config.set",
+            &json!({"key":"popup.unicode_limit", "value":31}),
+        )
+        .unwrap();
+    let saved = clipmonger_core::Config::load(&fixture.path.join("config.toml")).unwrap();
+    assert_eq!(saved.extra["future"].as_str(), Some("retained"));
+    assert_eq!(saved.history.extra["future_limit"].as_integer(), Some(42));
+    assert_eq!(saved.popup.unicode_limit, 31);
+    assert_eq!(fixture.state.paste_budget().0, 31);
+}
+#[test]
+fn legacy_zip4_keeps_existing_live_config_and_fresh_absence() {
+    for existing in [false, true] {
+        let fixture = Fixture::new();
+        let mut config = clipmonger_core::Config::default();
+        config.history.max_items = 67;
+        config.popup.unicode_limit = 91;
+        config.popup.restore_clipboard = false;
+        fixture.state.set_config(config);
+        if existing {
+            fs::write(fixture.path.join("config.toml"), RAW_CONFIG).unwrap();
+        }
+        let before = fixture.state.config_json();
+        let budget = fixture.state.paste_budget();
+        let zip = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../core/tests/fixtures/backup-zip4.zip");
+        fixture
+            .state
+            .handle("backup.restore", &json!({"src": zip}))
+            .unwrap();
+        assert_eq!(fixture.state.config_json(), before);
+        assert_eq!(fixture.state.paste_budget(), budget);
+        if existing {
+            assert_eq!(
+                fs::read(fixture.path.join("config.toml")).unwrap(),
+                RAW_CONFIG
+            );
+        } else {
+            assert!(!fixture.path.join("config.toml").exists());
+        }
+        assert_ne!(fixture.texts(), Vec::<String>::new());
+    }
+}
+#[test]
+fn paste_snapshot_is_wholly_old_or_new_during_actual_restore_publication() {
+    let fixture = Fixture::new();
+    archive_config(&fixture);
+    fixture.state.set_paste_limits(71, 83);
+    let old = fixture.state.paste_budget();
+    let new = (23, 45, clipmonger_core::PasteDelivery::UnicodeInject, false);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *fixture.state.publication_hook.lock().unwrap() = Some(Box::new(move || {
+        entered_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    }));
+    thread::scope(|scope| {
+        let restore = scope.spawn(|| fixture.restore());
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // The real writer has replaced Config but has not published the paste
+        // tuple. The actual helper must return one complete generation.
+        assert_eq!(
+            fixture.state.config_json()["popup"]["delivery"],
+            "unicode_inject"
+        );
+        let (writer_started_tx, writer_started_rx) = mpsc::channel();
+        let (writer_done_tx, writer_done_rx) = mpsc::channel();
+        let state = &fixture.state;
+        let writer = scope.spawn(move || {
+            writer_started_tx.send(()).unwrap();
+            let result = state.handle("config.set", &json!({"key":"history.max_items","value":17}));
+            writer_done_tx.send(()).unwrap();
+            result
+        });
+        writer_started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert!(fixture.state.profile_op.try_lock().is_err());
+        assert!(matches!(
+            writer_done_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let observed = fixture.state.paste_budget();
+        assert!(
+            observed == old || observed == new,
+            "mixed paste settings: {observed:?}"
+        );
+        release_tx.send(()).unwrap();
+        restore.join().unwrap().unwrap();
+        writer.join().unwrap().unwrap();
+    });
+    assert_eq!(fixture.state.paste_budget(), new);
+}
+#[test]
+fn unsafe_destination_config_is_rejected_without_closing_live_store() {
+    let fixture = Fixture::new();
+    archive_config(&fixture);
+    fs::remove_file(fixture.path.join("config.toml")).unwrap();
+    fs::create_dir(fixture.path.join("config.toml")).unwrap();
+    *fixture.state.restore_hook.lock().unwrap() = Some(Box::new(|_| {
+        panic!("Store was closed before config preflight")
+    }));
+    assert!(fixture.restore().is_err());
+    assert_eq!(fixture.texts(), ["original"]);
+    assert!(fixture.state.restore_hook.lock().unwrap().is_some());
+    assert!(fixture.state.ingest_capture(
+        "test",
+        false,
+        &[("text/plain".into(), b"still usable".to_vec())]
+    ));
 }

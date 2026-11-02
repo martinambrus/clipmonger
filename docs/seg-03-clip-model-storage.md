@@ -208,12 +208,8 @@ MUST NOT be promised in v1.
   | plugins.enabled | bool | true | Plugins | v2 (ADR-001) |
   | plugins.<id>.enabled | bool (managed in UI) | true | Plugins | v2 (ADR-001) |
   | run.confirm_policy | enum | permanent-only | Permanents | v2 (macros) |
-- Backup/restore ZIP (F-602): `manifest.toml` + `config.toml` +
-  `clipstore.sqlite3` (via backup API) + `blobs/` + schema versions.
-  Restore is TRANSACTIONAL (review finding 31): unpack to a TEMP profile
-  → validate manifest/schema/checksums/size caps → reject path
-  traversal/symlinks/overlarge entries → run DB validation → atomic swap
-  with rollback. NEVER overwrite the only good profile pre-validation.
+- Backup/restore ZIP (F-602): `manifest.toml` + `clipstore.sqlite3` (via backup API) + `blobs/` + schema versions and optional raw `config.toml` (exact UTF-8 bytes with `config_bytes`/`config_sha256`; missing file omits entry/fields, never reserialize env-overridden live config).
+  Legacy/no-config archives preserve existing destination `config.toml` and live config (fresh destination stays absent); never infer deletion from omission. Restore is TRANSACTIONAL (review finding 31): destination-local owned stage → validate present config digest/length/UTF-8/TOML plus manifest/schema/checksums/size caps → reject path traversal/symlinks/overlarge entries → run DB validation → atomic swap with rollback on reported errors and retained recovery directory. Some backend monitor/formats/poll/hotkey values snapshot at daemon start and require restart after config restore (documented limit, no backend hot reload). NEVER overwrite the only good profile pre-validation.
 
 ## 7. Macros (v2 design, frozen now so core needs no refactor)
 
@@ -263,7 +259,7 @@ MUST NOT be promised in v1.
   (verify rusqlite-bundled FTS5 at implementation; LIKE fallback).
   Display previews render from payload at query time (any width).
 - Decode guards (review finding 36): images/native payloads enforce
-  max dimension 8192 px, max 64 MP, per-decode timeout; violations →
+  max 64 MP (width and bottom-up height capped at 65535 px by the bitmap decoder, top-down height bound only by 64 MP, so wide multi-monitor screenshots fit), per-decode timeout; violations →
   `TooLarge`/`Unsupported` stub, never OOM. Parser fuzz vectors in T-305.
 - Primary selection (review H-11): `capture_primary` DEFAULTS OFF
   (selection-churn spam protection); when on: 500 ms debounce + min

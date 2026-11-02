@@ -17,7 +17,7 @@ use crate::types::{
 #[derive(Debug, Default)]
 pub struct FakeMonitor {
     /// Queued event batches, one per `poll`.
-    script: VecDeque<Vec<CaptureEvent>>,
+    script: VecDeque<Result<Vec<CaptureEvent>>>,
     /// Last subscribed kinds.
     pub kinds: Vec<SubscribeKind>,
 }
@@ -26,6 +26,12 @@ impl FakeMonitor {
     /// Build from a poll-by-poll script.
     #[must_use]
     pub fn new(script: Vec<Vec<CaptureEvent>>) -> Self {
+        Self::with_results(script.into_iter().map(Ok).collect())
+    }
+
+    /// Build from batches and failures, one result per poll.
+    #[must_use]
+    pub fn with_results(script: Vec<Result<Vec<CaptureEvent>>>) -> Self {
         Self {
             script: script.into(),
             kinds: Vec::new(),
@@ -42,7 +48,7 @@ impl ClipboardMonitor for FakeMonitor {
     }
 
     fn poll(&mut self, _timeout: Duration) -> Result<Vec<CaptureEvent>> {
-        Ok(self.script.pop_front().unwrap_or_default())
+        self.script.pop_front().unwrap_or_else(|| Ok(Vec::new()))
     }
 }
 
