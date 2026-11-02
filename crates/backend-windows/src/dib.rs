@@ -6,7 +6,7 @@ use std::io::Cursor;
 
 use image::codecs::bmp::BmpDecoder;
 use image::codecs::png::{PngDecoder, PngEncoder};
-use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder as _, RgbaImage};
+use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder as _, Limits, RgbaImage};
 
 /// Decode guards (seg-03 §8): bigger images are refused before decoding.
 const MAX_PIXELS: u64 = 64_000_000;
@@ -22,20 +22,22 @@ pub const MAX_DIB_BYTES: u64 = MAX_PIXELS * 4 + 64 * 1024;
 /// Returns a message when the DIB cannot be decoded, is over the decode
 /// guard, or the PNG cannot be encoded.
 pub fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>, String> {
-    let decoder = BmpDecoder::new_without_file_header(Cursor::new(dib))
-        .map_err(|e| format!("bitmap decode failed: {e}"))?;
-    check_size(decoder.dimensions())?;
-    let mut rgba = DynamicImage::from_decoder(decoder)
-        .map_err(|e| format!("bitmap decode failed: {e}"))?
-        .to_rgba8();
-    // Some apps publish 32-bit bitmaps whose alpha bytes are all zero; keep
-    // those opaque instead of storing an invisible image.
-    if rgba.pixels().all(|p| p.0[3] == 0) {
-        for p in rgba.pixels_mut() {
-            p.0[3] = u8::MAX;
-        }
-    }
-    encode_png(&rgba)
+    dib_to_png_classified(dib).map_err(|error| match error {
+        DibDecodeError::Limit(message) | DibDecodeError::Unsupported(message) => message,
+    })
+}
+
+/// Decoder allocation budget at the 64M-pixel guard's worst-case 16-bit
+/// RGBA (8 bytes per pixel), plus header slack. This is a best-effort decoder
+/// budget, not an aggregate cap on conversion and DIB output allocations.
+const PNG_MAX_ALLOC: u64 = MAX_PIXELS * 8 + 64 * 1024;
+
+fn png_decoder(png: &[u8], max_alloc: u64) -> image::ImageResult<PngDecoder<Cursor<&[u8]>>> {
+    let mut limits = Limits::default();
+    limits.max_image_width = None;
+    limits.max_image_height = None;
+    limits.max_alloc = Some(max_alloc);
+    PngDecoder::with_limits(Cursor::new(png), limits)
 }
 
 /// Decode a PNG and build a `CF_DIB`: a 40-byte `BITMAPINFOHEADER`
@@ -46,8 +48,7 @@ pub fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>, String> {
 /// Returns a message when the PNG cannot be decoded or is over the decode
 /// guard.
 pub fn png_to_dib(png: &[u8]) -> Result<Vec<u8>, String> {
-    let decoder =
-        PngDecoder::new(Cursor::new(png)).map_err(|e| format!("PNG decode failed: {e}"))?;
+    let decoder = png_decoder(png, PNG_MAX_ALLOC).map_err(|e| format!("PNG decode failed: {e}"))?;
     check_size(decoder.dimensions())?;
     let rgba = DynamicImage::from_decoder(decoder)
         .map_err(|e| format!("PNG decode failed: {e}"))?
@@ -84,6 +85,29 @@ fn check_size((width, height): (u32, u32)) -> Result<(), String> {
         return Err(format!("image {width}x{height} is over the decode limit"));
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum DibDecodeError {
+    Limit(String),
+    Unsupported(String),
+}
+
+pub(crate) fn dib_to_png_classified(dib: &[u8]) -> Result<Vec<u8>, DibDecodeError> {
+    let decoder = BmpDecoder::new_without_file_header(Cursor::new(dib))
+        .map_err(|e| DibDecodeError::Unsupported(format!("bitmap decode failed: {e}")))?;
+    check_size(decoder.dimensions()).map_err(DibDecodeError::Limit)?;
+    let mut rgba = DynamicImage::from_decoder(decoder)
+        .map_err(|e| DibDecodeError::Unsupported(format!("bitmap decode failed: {e}")))?
+        .to_rgba8();
+    // Some apps publish 32-bit bitmaps whose alpha bytes are all zero; keep
+    // those opaque instead of storing an invisible image.
+    if rgba.pixels().all(|p| p.0[3] == 0) {
+        for p in rgba.pixels_mut() {
+            p.0[3] = u8::MAX;
+        }
+    }
+    encode_png(&rgba).map_err(DibDecodeError::Unsupported)
 }
 
 fn encode_png(rgba: &RgbaImage) -> Result<Vec<u8>, String> {
@@ -260,8 +284,120 @@ mod tests {
     }
 
     #[test]
+    fn native_dib_larger_than_normalized_cap_can_compress_below_it() {
+        let image = RgbaImage::from_pixel(128, 128, image::Rgba([20, 40, 60, 255]));
+        let dib = png_to_dib(&encode_png(&image).unwrap()).unwrap();
+        let cap = 4096;
+        assert!(dib.len() > cap);
+        assert!((dib.len() as u64) < MAX_DIB_BYTES);
+        let png = dib_to_png(&dib).unwrap();
+        assert!(png.len() < cap);
+        assert_eq!(image::load_from_memory(&png).unwrap().to_rgba8(), image);
+    }
+
+    #[test]
     fn garbage_is_an_error() {
         assert!(dib_to_png(b"not a bitmap").is_err());
         assert!(png_to_dib(b"not a png").is_err());
+    }
+
+    #[test]
+    fn png_decoder_rejects_insufficient_construction_budget() {
+        let expected = sample();
+        let png = encode_png(&expected).unwrap();
+        assert!(png.len() < 1024, "allocation control must stay small");
+        let Err(error) = png_decoder(&png, 11) else {
+            panic!("construction accepted less than one output row");
+        };
+        assert!(
+            matches!(error, image::ImageError::Limits(ref limit)
+                if limit.kind() == image::error::LimitErrorKind::InsufficientMemory),
+            "expected decoder allocation limit, got {error}"
+        );
+        let decoder = png_decoder(&png, PNG_MAX_ALLOC).unwrap();
+        assert_eq!(decoder.dimensions(), (3, 2));
+        let rgba = DynamicImage::from_decoder(decoder).unwrap().to_rgba8();
+        assert_eq!(rgba, expected);
+        assert_eq!(png_to_dib(&png).unwrap().len(), 40 + 3 * 2 * 4);
+    }
+
+    #[test]
+    fn png_synthetic_oversize_header_refuses_without_huge_alloc() {
+        let png = hex(
+            "89504e470d0a1a0a0000000d4948445200001f4100001f410806000000226f156f0000000b49444154789c63600000020001500087e39c4a0000000049454e44ae426082",
+        );
+        let before = png.len();
+        assert!(before < 1024, "synthetic header must stay small");
+        let err = png_to_dib(&png).unwrap_err();
+        assert!(err.contains("decode limit"), "{err}");
+    }
+
+    #[test]
+    fn dib_guard_with_limits_accepts_wide_images() {
+        assert!(check_size((9000, 1)).is_ok());
+        const { assert!(PNG_MAX_ALLOC >= 9000 * 4) };
+    }
+
+    #[test]
+    fn typed_dib_dimension_guard_under_raw_cap_is_too_large_before_decode() {
+        // Header alone, no pixel allocation: 5213x12277 and 8000x8001 exceed 64MP but stay under MAX_DIB_BYTES
+        let dib = header_only(5213, 12277);
+        assert!((dib.len() as u64) < MAX_DIB_BYTES);
+        assert!(matches!(
+            dib_to_png_classified(&dib),
+            Err(DibDecodeError::Limit(msg)) if msg.contains("decode limit")
+        ));
+        assert!(dib_to_png(&dib).unwrap_err().contains("decode limit"));
+        let dib2 = header_only(8000, 8001);
+        assert!((dib2.len() as u64) < MAX_DIB_BYTES);
+        assert!(matches!(
+            dib_to_png_classified(&dib2),
+            Err(DibDecodeError::Limit(_))
+        ));
+        // Synthetic PNG oversize header also maps to Limit without huge alloc
+        let png = hex(
+            "89504e470d0a1a0a0000000d4948445200001f4100001f410806000000226f156f0000000b49444154789c63600000020001500087e39c4a0000000049454e44ae426082",
+        );
+        assert!(png.len() < 1024);
+        assert!(matches!(
+            dib_to_png_classified(&header_only(9000, 8000)),
+            Err(DibDecodeError::Limit(_))
+        ));
+    }
+
+    #[test]
+    fn typed_malformed_dib_remains_unsupported_not_limit() {
+        // Garbage and truncated DIBs should be Unsupported, not Limit
+        assert!(matches!(
+            dib_to_png_classified(b"not a bitmap"),
+            Err(DibDecodeError::Unsupported(_))
+        ));
+        assert!(matches!(
+            dib_to_png_classified(&header_only(10, 10)[..20]),
+            Err(DibDecodeError::Unsupported(_))
+        ));
+        assert!(dib_to_png(b"not a bitmap")
+            .unwrap_err()
+            .contains("bitmap decode"));
+    }
+
+    #[test]
+    fn typed_small_and_wide_images_roundtrip_under_guard() {
+        let small = sample();
+        let png = encode_png(&small).unwrap();
+        let dib = png_to_dib(&png).unwrap();
+        assert!(matches!(dib_to_png_classified(&dib), Ok(_)));
+        let back = dib_to_png(&dib).unwrap();
+        assert_eq!(image::load_from_memory(&back).unwrap().to_rgba8(), small);
+
+        let wide = RgbaImage::from_fn(9000, 1, |x, _| {
+            image::Rgba([u8::try_from(x % 256).unwrap(), 120, 200, 255])
+        });
+        let png = encode_png(&wide).unwrap();
+        let dib = png_to_dib(&png).unwrap();
+        assert_eq!(i32::from_le_bytes(dib[4..8].try_into().unwrap()), 9000);
+        assert!(matches!(dib_to_png_classified(&dib), Ok(_)));
+        let back = dib_to_png(&dib).unwrap();
+        assert_eq!(image::load_from_memory(&back).unwrap().to_rgba8(), wide);
     }
 }

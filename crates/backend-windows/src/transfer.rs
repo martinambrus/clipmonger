@@ -7,6 +7,107 @@
 use clipmonger_platform::traits::ClipboardTransfer;
 use clipmonger_platform::types::{Affinity, Error, PayloadMap, Result};
 
+// Decode incrementally: UTF-16 can expand in UTF-8, so a native size
+// preflight alone is insufficient to bound the normalized text allocation.
+#[cfg(any(windows, test))]
+fn decode_unicode_bounded(raw: &[u8], max_bytes: u64) -> Result<Vec<u8>> {
+    let units = raw
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|unit| *unit != 0);
+    let mut out = Vec::new();
+    for character in char::decode_utf16(units) {
+        let character = character.unwrap_or(char::REPLACEMENT_CHARACTER);
+        let mut encoded = [0; 4];
+        let encoded = character.encode_utf8(&mut encoded).as_bytes();
+        if (out.len() as u64).saturating_add(encoded.len() as u64) > max_bytes {
+            return Err(Error::TooLarge("clipboard text over cap".to_string()));
+        }
+        out.extend_from_slice(encoded);
+    }
+    Ok(out)
+}
+
+#[cfg(any(windows, test))]
+fn html_payload_bounded(raw: &[u8], max_bytes: u64) -> Result<Vec<u8>> {
+    const MAX_HEADER_BYTES: usize = 64 * 1024;
+    let prefix = &raw[..raw.len().min(MAX_HEADER_BYTES)];
+    let header = match std::str::from_utf8(prefix) {
+        Ok(header) => header,
+        // A bounded prefix can end within a body code point. Offsets in the
+        // preceding complete header remain readable without copying it.
+        Err(error) => std::str::from_utf8(&prefix[..error.valid_up_to()])
+            .map_err(|_| Error::Internal("HTML header UTF-8 boundary".to_string()))?,
+    };
+    let mut fragment = match crate::html::cf_html_fragment_range(header, raw.len()) {
+        Ok(range) => &raw[range],
+        Err(_) => raw, // Keep the existing malformed-CF_HTML raw fallback.
+    };
+    if fragment.len() as u64 > max_bytes {
+        return Err(Error::TooLarge(
+            "clipboard HTML fragment over cap".to_string(),
+        ));
+    }
+    if std::str::from_utf8(fragment).is_err() {
+        fragment = raw;
+        if fragment.len() as u64 > max_bytes {
+            return Err(Error::TooLarge(
+                "clipboard malformed HTML over cap".to_string(),
+            ));
+        }
+    }
+    Ok(fragment.to_vec())
+}
+
+#[cfg(any(windows, test))]
+fn read_text_candidates(mut read: impl FnMut(u32) -> Result<Vec<u8>>) -> Result<Vec<u8>> {
+    for id in [13, 1, 7] {
+        // CF_UNICODETEXT, CF_TEXT, CF_OEMTEXT
+        match read(id) {
+            Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
+            Err(error @ Error::TooLarge(_)) => return Err(error),
+            _ => {}
+        }
+    }
+    Err(Error::Unavailable("text/plain not available".to_string()))
+}
+
+// The callback checks native availability and reads only within the raw DIB
+// cap. The PNG cap applies after conversion, not to the raw bitmap.
+#[cfg(any(windows, test))]
+fn read_dib_candidates(
+    ids: [u32; 2],
+    max_bytes: u64,
+    mut read: impl FnMut(u32) -> Option<Result<Vec<u8>>>,
+) -> Result<Vec<u8>> {
+    let mut failure = Error::Unavailable("image/png not available".to_string());
+    for id in ids {
+        let dib = match read(id) {
+            None => continue,
+            Some(Ok(bytes)) => bytes,
+            Some(Err(error @ Error::TooLarge(_))) => return Err(error),
+            Some(Err(error)) => {
+                failure = error;
+                continue;
+            }
+        };
+        match crate::dib::dib_to_png_classified(&dib) {
+            Ok(png) => {
+                if png.len() as u64 > max_bytes {
+                    return Err(Error::TooLarge(format!(
+                        "clipboard payload {} bytes over cap {max_bytes}",
+                        png.len()
+                    )));
+                }
+                return Ok(png);
+            }
+            Err(crate::dib::DibDecodeError::Limit(msg)) => return Err(Error::TooLarge(msg)),
+            Err(crate::dib::DibDecodeError::Unsupported(msg)) => failure = Error::Unsupported(msg),
+        }
+    }
+    Err(failure)
+}
+
 /// Direct-OS clipboard transfer (seg-04 S2).
 pub struct WinTransfer;
 
@@ -220,35 +321,29 @@ pub(crate) mod imp {
                 _ => {}
             }
         }
-        let mut failure = Error::Unavailable("image/png not available".to_string());
-        for id in [CF_DIBV5, CF_DIB] {
+        super::read_dib_candidates([CF_DIBV5, CF_DIB], max_bytes, |id| {
             if !raw::is_format_avail(id) {
-                continue;
+                return None;
             }
             // Checked before reading: a bitmap can be hundreds of MB.
             if raw::size(id).is_some_and(|n| n.get() as u64 > crate::dib::MAX_DIB_BYTES) {
-                return Err(Error::TooLarge(
+                return Some(Err(Error::TooLarge(
                     "clipboard bitmap over the decode limit".to_string(),
-                ));
+                )));
             }
-            let mut dib = Vec::new();
-            if let Err(e) = raw::get_vec(id, &mut dib) {
-                failure = clip_error("read bitmap", e);
-                continue;
-            }
-            match crate::dib::dib_to_png(&dib) {
-                Ok(png) => {
-                    check_cap(png.len(), max_bytes)?;
-                    return Ok(png);
-                }
-                Err(e) => failure = Error::Unsupported(e),
-            }
-        }
-        Err(failure)
+            // Raw DIB size is limited by the 64 MP native allocation guard,
+            // never by the normalized PNG cap: a larger DIB may compress well.
+            Some(read_native_bounded(id, crate::dib::MAX_DIB_BYTES))
+        })
     }
 
     /// `text/uri-list` from the `CF_HDROP` file list.
     pub(crate) fn read_uri_list(max_bytes: u64) -> Result<Vec<u8>> {
+        // DROPFILES header plus UTF-16 paths; guard before path-vector copies.
+        let native_cap = max_bytes.saturating_mul(2).saturating_add(20);
+        let len = raw::size(CF_HDROP)
+            .ok_or_else(|| Error::Unavailable("file list has no data".to_string()))?;
+        check_cap(len.get(), native_cap)?;
         let mut paths = Vec::new();
         raw::get_file_list(&mut paths).map_err(|e| clip_error("read file list", e))?;
         if paths.is_empty() {
@@ -305,24 +400,27 @@ pub(crate) mod imp {
         })
     }
 
+    /// Check native size while borrowed; copy only after the cap passes.
+    /// Every caller holds with_open's exclusive clipboard session.
+    pub(crate) fn read_native_bounded(id: u32, max_raw_bytes: u64) -> Result<Vec<u8>> {
+        crate::sys::with_clipboard_bytes(id, |bytes| {
+            check_cap(bytes.len(), max_raw_bytes)?;
+            Ok(bytes.to_vec())
+        })
+    }
+
     pub(crate) fn read_one(id: u32, mime: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        if mime == "text/html" {
-            raw::get_html(id, &mut out).map_err(|e| clip_error("read html", e))?;
-            if let Ok(fragment) = crate::html::parse_cf_html(&out) {
-                out = fragment.into_bytes();
-            }
-        } else if mime == "text/plain" {
-            if id == CF_TEXT || id == CF_OEMTEXT {
-                raw::get_vec(id, &mut out).map_err(|e| clip_error("read text", e))?;
-            } else {
-                raw::get_string(&mut out).map_err(|e| clip_error("read text", e))?;
-            }
-        } else {
-            raw::get_vec(id, &mut out).map_err(|e| clip_error("read", e))?;
+        if mime == "text/plain" && id == CF_UNICODETEXT {
+            return crate::sys::with_clipboard_bytes(id, |bytes| {
+                super::decode_unicode_bounded(bytes, max_bytes)
+            });
         }
-        check_cap(out.len(), max_bytes)?;
-        Ok(out)
+        if mime == "text/html" {
+            return crate::sys::with_clipboard_bytes(id, |bytes| {
+                super::html_payload_bounded(bytes, max_bytes)
+            });
+        }
+        read_native_bounded(id, max_bytes)
     }
 
     pub(crate) fn write_one(id: u32, mime: &str, bytes: &[u8]) -> Result<()> {
@@ -383,14 +481,7 @@ impl ClipboardTransfer for WinTransfer {
         {
             imp::with_open("read", || {
                 if mime == "text/plain" || mime == "text/plain;charset=utf-8" {
-                    for cand in [imp::CF_UNICODETEXT, imp::CF_TEXT, imp::CF_OEMTEXT] {
-                        if let Ok(bytes) = imp::read_one(cand, "text/plain", max_bytes) {
-                            if !bytes.is_empty() {
-                                return Ok(bytes);
-                            }
-                        }
-                    }
-                    return Err(Error::Unavailable("text/plain not available".to_string()));
+                    return read_text_candidates(|id| imp::read_one(id, "text/plain", max_bytes));
                 }
                 if mime == "image/png" {
                     return imp::read_png(max_bytes);
@@ -424,5 +515,136 @@ impl ClipboardTransfer for WinTransfer {
         {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+
+    #[test]
+    fn typed_text_oversize_is_not_lost_to_unavailable_or_ansi_fallback() {
+        let mut calls = Vec::new();
+        let result = read_text_candidates(|id| {
+            calls.push(id);
+            Err(Error::TooLarge("synthetic".to_string()))
+        });
+        assert!(matches!(result, Err(Error::TooLarge(_))));
+        assert_eq!(calls, [13]);
+    }
+
+    #[test]
+    fn html_native_envelope_larger_than_cap_keeps_small_valid_fragment() {
+        let raw = crate::html::build_cf_html("hello");
+        assert!(raw.len() > 5);
+        assert_eq!(html_payload_bounded(&raw, 5).unwrap(), b"hello");
+        assert!(matches!(
+            html_payload_bounded(&raw, 4),
+            Err(Error::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn unicode_expansion_respects_normalized_cap() {
+        let raw = [0xac, 0x20, 0, 0]; // EURO SIGN: 2 native bytes, 3 UTF-8 bytes
+        assert!(matches!(
+            decode_unicode_bounded(&raw, 2),
+            Err(Error::TooLarge(_))
+        ));
+        assert_eq!(decode_unicode_bounded(&raw, 3).unwrap(), "€".as_bytes());
+        assert_eq!(decode_unicode_bounded(&[65, 0, 0, 0], 1).unwrap(), b"A");
+    }
+
+    #[test]
+    fn dib_dimension_guard_maps_to_too_large_not_unsupported() {
+        let dib = dib_header(5213, 12277);
+        assert!((dib.len() as u64) < crate::dib::MAX_DIB_BYTES);
+        let classified = crate::dib::dib_to_png_classified(&dib);
+        assert!(matches!(
+            classified,
+            Err(crate::dib::DibDecodeError::Limit(_))
+        ));
+        let mapped = read_dib_candidates([17, 8], 1024, |id| (id == 17).then(|| Ok(dib.clone())));
+        assert!(matches!(mapped, Err(Error::TooLarge(_))));
+
+        let garbage = b"not a bitmap";
+        let mapped2 =
+            read_dib_candidates([17, 8], 1024, |id| (id == 17).then(|| Ok(garbage.to_vec())));
+        assert!(matches!(mapped2, Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn dib_too_large_does_not_fallback_to_next_format() {
+        let over = dib_header(8000, 8001);
+        let fallback = solid_dib(1, 1);
+        let mut calls = Vec::new();
+        let result = read_dib_candidates([17, 8], 1024, |id| {
+            calls.push(id);
+            Some(Ok(if id == 17 {
+                over.clone()
+            } else {
+                fallback.clone()
+            }))
+        });
+        assert!(matches!(result, Err(Error::TooLarge(_))));
+        assert_eq!(calls, [17], "must not read fallback after TooLarge");
+    }
+
+    fn dib_header(width: i32, height: i32) -> Vec<u8> {
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40_u32.to_le_bytes());
+        dib.extend_from_slice(&width.to_le_bytes());
+        dib.extend_from_slice(&height.to_le_bytes());
+        dib.extend_from_slice(&1_u16.to_le_bytes());
+        dib.extend_from_slice(&32_u16.to_le_bytes());
+        dib.extend_from_slice(&[0; 24]);
+        dib
+    }
+
+    fn solid_dib(width: i32, height: i32) -> Vec<u8> {
+        let mut dib = dib_header(width, height);
+        for _ in 0..width * height {
+            dib.extend_from_slice(&[10, 20, 30, 255]);
+        }
+        dib
+    }
+
+    #[test]
+    fn malformed_dib_falls_back_to_valid_wide_dib() {
+        let wide = solid_dib(9000, 1);
+        let mut calls = Vec::new();
+        let png = read_dib_candidates([17, 8], 100_000, |id| {
+            calls.push(id);
+            Some(Ok(if id == 17 {
+                b"not a bitmap".to_vec()
+            } else {
+                wide.clone()
+            }))
+        })
+        .unwrap();
+        assert_eq!(calls, [17, 8]);
+        let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (9000, 1));
+        assert_eq!(decoded.get_pixel(8999, 0).0, [30, 20, 10, 255]);
+    }
+
+    #[test]
+    fn raw_dib_above_png_cap_is_accepted_when_encoded_png_fits() {
+        let dib = solid_dib(128, 128);
+        let cap = 4096;
+        assert!(dib.len() > cap);
+        assert!((dib.len() as u64) < crate::dib::MAX_DIB_BYTES);
+        let png = read_dib_candidates([17, 8], cap as u64, |id| {
+            (id == 17).then(|| Ok(dib.clone()))
+        })
+        .unwrap();
+        assert!(png.len() < cap);
+        let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (128, 128));
+        assert_eq!(decoded.get_pixel(0, 0).0, [30, 20, 10, 255]);
+        assert!(matches!(
+            read_dib_candidates([17, 8], 1, |id| { (id == 17).then(|| Ok(dib.clone())) }),
+            Err(Error::TooLarge(_))
+        ));
     }
 }

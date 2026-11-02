@@ -225,11 +225,23 @@ pub(crate) fn send_selection_notify(
 }
 
 /// Read one property value, deleting it (the INCR ACK).
-fn take_property(conn: &RustConnection, win: Window, property: Atom) -> Result<(Atom, Vec<u8>)> {
-    let reply = xproto::get_property(conn, true, win, property, 0u32, 0, u32::MAX)
+fn take_property(
+    conn: &RustConnection,
+    win: Window,
+    property: Atom,
+    max_bytes: u64,
+) -> Result<(Atom, Vec<u8>)> {
+    // X11 counts 4-byte units. Request only enough for cap+1 (rounded
+    // up), then inspect bytes_after before any concatenation or payload copy.
+    let units = u32::try_from(max_bytes.saturating_add(4) / 4).unwrap_or(u32::MAX);
+    let reply = xproto::get_property(conn, true, win, property, 0u32, 0, units)
         .map_err(|e| Error::Io(format!("x11 get_property failed: {e}")))?
         .reply()
         .map_err(|e| Error::Io(format!("x11 get_property reply failed: {e}")))?;
+    if reply.bytes_after != 0 || reply.value.len() as u64 > max_bytes {
+        let _ = xproto::delete_property(conn, win, property);
+        return Err(Error::TooLarge("X11 property over cap".to_string()));
+    }
     Ok((reply.type_, reply.value))
 }
 
@@ -291,11 +303,14 @@ pub(crate) fn convert_read(
                 if notify.property == 0 {
                     return Err(Error::Denied("owner refused the conversion".to_string()));
                 }
-                let (actual, value) = take_property(conn, requestor, property)?;
+                let (actual, value) = take_property(conn, requestor, property, max_bytes.max(4))?;
                 if actual == incr_atom(conn) {
                     return incr_receive(
                         conn, requestor, property, &value, max_bytes, deadline, serve,
                     );
+                }
+                if value.len() as u64 > max_bytes {
+                    return Err(Error::TooLarge("X11 selection over cap".to_string()));
                 }
                 return Ok((actual, value));
             }
@@ -327,7 +342,8 @@ fn incr_receive(
     serve: &mut dyn FnMut(&x11rb14::protocol::xproto::SelectionRequestEvent),
 ) -> Result<(Atom, Vec<u8>)> {
     let mut size_bytes = [0u8; 4];
-    size_bytes.copy_from_slice(&announce[0..announce.len().min(4)]);
+    let size_len = announce.len().min(4);
+    size_bytes[..size_len].copy_from_slice(&announce[..size_len]);
     let total = u64::from(u32::from_ne_bytes(size_bytes));
     if total > max_bytes {
         let _ = xproto::delete_property(conn, requestor, property);
@@ -351,7 +367,12 @@ fn incr_receive(
                     && event.atom == property
                     && event.state == xproto::Property::NEW_VALUE =>
             {
-                let (kind, chunk) = take_property(conn, requestor, property)?;
+                let (kind, chunk) = take_property(
+                    conn,
+                    requestor,
+                    property,
+                    max_bytes.saturating_sub(buf.len() as u64),
+                )?;
                 if chunk.is_empty() {
                     return Ok((kind, buf));
                 }
