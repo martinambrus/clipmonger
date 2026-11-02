@@ -6,7 +6,7 @@ use std::io::Cursor;
 
 use image::codecs::bmp::BmpDecoder;
 use image::codecs::png::{PngDecoder, PngEncoder};
-use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder as _, RgbaImage};
+use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder as _, Limits, RgbaImage};
 
 /// Decode guards (seg-03 §8): bigger images are refused before decoding.
 const MAX_PIXELS: u64 = 64_000_000;
@@ -38,6 +38,22 @@ pub fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>, String> {
     encode_png(&rgba)
 }
 
+/// Decoder allocation budget at the 64M-pixel guard's worst-case 16-bit
+/// RGBA (8 bytes per pixel), plus header slack. This is a best-effort decoder
+/// budget, not an aggregate cap on conversion and DIB output allocations.
+const PNG_MAX_ALLOC: u64 = MAX_PIXELS * 8 + 64 * 1024;
+
+// The production construction seam takes a finite byte budget so the actual
+// decoder's allocation rejection can also be exercised with a small image.
+fn png_decoder(png: &[u8], max_alloc: u64) -> image::ImageResult<PngDecoder<Cursor<&[u8]>>> {
+    let mut limits = Limits::default();
+    // Keep wide ordinary images valid; the separate pixel guard still applies.
+    limits.max_image_width = None;
+    limits.max_image_height = None;
+    limits.max_alloc = Some(max_alloc);
+    PngDecoder::with_limits(Cursor::new(png), limits)
+}
+
 /// Decode a PNG and build a `CF_DIB`: a 40-byte `BITMAPINFOHEADER`
 /// (32 bpp, `BI_RGB`, bottom-up rows) followed by BGRA pixels.
 ///
@@ -46,8 +62,7 @@ pub fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>, String> {
 /// Returns a message when the PNG cannot be decoded or is over the decode
 /// guard.
 pub fn png_to_dib(png: &[u8]) -> Result<Vec<u8>, String> {
-    let decoder =
-        PngDecoder::new(Cursor::new(png)).map_err(|e| format!("PNG decode failed: {e}"))?;
+    let decoder = png_decoder(png, PNG_MAX_ALLOC).map_err(|e| format!("PNG decode failed: {e}"))?;
     check_size(decoder.dimensions())?;
     let rgba = DynamicImage::from_decoder(decoder)
         .map_err(|e| format!("PNG decode failed: {e}"))?
@@ -263,5 +278,44 @@ mod tests {
     fn garbage_is_an_error() {
         assert!(dib_to_png(b"not a bitmap").is_err());
         assert!(png_to_dib(b"not a png").is_err());
+    }
+
+    #[test]
+    fn png_decoder_rejects_insufficient_construction_budget() {
+        let expected = sample();
+        let png = encode_png(&expected).unwrap();
+        assert!(png.len() < 1024, "allocation control must stay small");
+        // png 0.18 reserves an expanded output row during read_info, inside
+        // PngDecoder construction. The 3-pixel RGBA8 row needs 12 bytes.
+        let Err(error) = png_decoder(&png, 11) else {
+            panic!("construction accepted less than one output row");
+        };
+        assert!(
+            matches!(error, image::ImageError::Limits(ref limit)
+                if limit.kind() == image::error::LimitErrorKind::InsufficientMemory),
+            "expected decoder allocation limit, got {error}"
+        );
+        let decoder = png_decoder(&png, PNG_MAX_ALLOC).unwrap();
+        assert_eq!(decoder.dimensions(), (3, 2));
+        let rgba = DynamicImage::from_decoder(decoder).unwrap().to_rgba8();
+        assert_eq!(rgba, expected);
+        assert_eq!(png_to_dib(&png).unwrap().len(), 40 + 3 * 2 * 4);
+    }
+
+    #[test]
+    fn png_synthetic_oversize_header_refuses_without_huge_alloc() {
+        let png = hex(
+            "89504e470d0a1a0a0000000d4948445200001f4100001f410806000000226f156f0000000b49444154789c63600000020001500087e39c4a0000000049454e44ae426082",
+        );
+        let before = png.len();
+        assert!(before < 1024, "synthetic header must stay small");
+        let err = png_to_dib(&png).unwrap_err();
+        assert!(err.contains("decode limit"), "{err}");
+    }
+
+    #[test]
+    fn dib_guard_with_limits_accepts_wide_images() {
+        assert!(check_size((9000, 1)).is_ok());
+        const { assert!(PNG_MAX_ALLOC >= 9000 * 4) };
     }
 }
