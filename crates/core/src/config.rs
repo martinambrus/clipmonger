@@ -225,6 +225,26 @@ pub struct PrivacyConfig {
     pub extra: BTreeMap<String, toml::Value>,
 }
 
+/// `[autostart]` section (autostart.enabled, General tab, v1, default false).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutostartConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Unknown keys preserved for forward compatibility.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for AutostartConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
 /// `[windows]` section (Windows-only, ignored elsewhere).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowsConfig {
@@ -263,6 +283,8 @@ pub struct Config {
     #[serde(default)]
     pub privacy: PrivacyConfig,
     #[serde(default)]
+    pub autostart: AutostartConfig,
+    #[serde(default)]
     pub windows: WindowsConfig,
     /// Unknown root-level keys preserved for forward compatibility.
     #[serde(flatten)]
@@ -284,6 +306,7 @@ impl Default for Config {
             history: HistoryConfig::default(),
             popup: PopupConfig::default(),
             privacy: PrivacyConfig::default(),
+            autostart: AutostartConfig::default(),
             windows: WindowsConfig::default(),
             extra: BTreeMap::new(),
             warned_newer_version: false,
@@ -435,6 +458,11 @@ impl Config {
         }
         if let Some(v) = env_list("CLIPMONGER_PRIVACY_DENYLIST") {
             self.privacy.denylist = v;
+        }
+        if let Some(v) = env_str("CLIPMONGER_AUTOSTART_ENABLED") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.autostart.enabled = b;
+            }
         }
     }
 

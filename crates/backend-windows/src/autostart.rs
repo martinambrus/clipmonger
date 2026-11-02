@@ -3,7 +3,7 @@
 //! Portable mode skips autostart entirely (no registry writes, `is_enabled`
 //! is always false). The elevated helper is never registered here.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clipmonger_platform::traits::AutostartManager;
 use clipmonger_platform::types::{Affinity, Error, Result};
@@ -12,6 +12,8 @@ use clipmonger_platform::types::{Affinity, Error, Result};
 pub struct WinAutostart {
     #[cfg_attr(not(windows), allow(dead_code))]
     exe: PathBuf,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    profile_dir: Option<PathBuf>,
     portable: bool,
 }
 
@@ -19,7 +21,46 @@ impl WinAutostart {
     /// Create for `exe` (daemon binary); `portable` disables all registry I/O.
     #[must_use]
     pub fn new(exe: PathBuf, portable: bool) -> Self {
-        Self { exe, portable }
+        Self {
+            exe,
+            profile_dir: None,
+            portable,
+        }
+    }
+
+    /// Create a profile-aware manager for the sibling UI `clipmonger[.exe]`
+    /// and an absolute `profile_dir`. Validates both paths fallibly (rejects
+    /// NUL, quote, control characters) without touching the registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Unavailable` when either path is unrepresentable as a Windows
+    /// command-line argument.
+    pub fn with_profile(
+        ui_exe: PathBuf,
+        profile_dir: PathBuf,
+        portable: bool,
+    ) -> Result<Self> {
+        crate::autostart_logic::run_value_with_profile(&ui_exe, &profile_dir, true)?;
+        Ok(Self {
+            exe: ui_exe,
+            profile_dir: Some(profile_dir),
+            portable,
+        })
+    }
+
+    /// Fallible variant accepting borrowed paths for testing parity.
+    pub fn try_with_profile(
+        ui_exe: &Path,
+        profile_dir: &Path,
+        portable: bool,
+    ) -> Result<Self> {
+        crate::autostart_logic::run_value_with_profile(ui_exe, profile_dir, true)?;
+        Ok(Self {
+            exe: ui_exe.to_path_buf(),
+            profile_dir: Some(profile_dir.to_path_buf()),
+            portable,
+        })
     }
 }
 
@@ -55,7 +96,11 @@ impl AutostartManager for WinAutostart {
         }
         #[cfg(windows)]
         {
-            let command = crate::autostart_logic::run_value(&self.exe, true);
+            let command = if let Some(profile) = &self.profile_dir {
+                crate::autostart_logic::run_value_with_profile(&self.exe, profile, true)?
+            } else {
+                crate::autostart_logic::run_value(&self.exe, true)
+            };
             crate::sys::run_value_set(&command)
                 .map_err(|e| Error::Io(format!("autostart enable failed: {e}")))
         }
@@ -92,5 +137,66 @@ impl AutostartManager for WinAutostart {
         {
             Err(unavailable())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn legacy_constructor_retained() {
+        let m = WinAutostart::new(Path::new("/usr/bin/clipmonger-daemon").to_path_buf(), false);
+        assert!(m.profile_dir.is_none());
+    }
+
+    #[test]
+    fn profile_constructor_validates() {
+        let ok = WinAutostart::with_profile(
+            Path::new("C:\\clipmonger.exe").to_path_buf(),
+            Path::new("C:\\profiles\\work").to_path_buf(),
+            false,
+        );
+        assert!(ok.is_ok());
+        let bad = WinAutostart::with_profile(
+            Path::new("C:\\bad\"exe.exe").to_path_buf(),
+            Path::new("C:\\profiles\\work").to_path_buf(),
+            false,
+        );
+        assert!(bad.is_err());
+        let bad_profile = WinAutostart::with_profile(
+            Path::new("C:\\clipmonger.exe").to_path_buf(),
+            Path::new("C:\\bad\x01profile").to_path_buf(),
+            false,
+        );
+        assert!(bad_profile.is_err());
+    }
+
+    #[test]
+    fn portable_skips_enable_disable_query() {
+        let mut m = WinAutostart::new(Path::new("C:\\clipmonger.exe").to_path_buf(), true);
+        assert!(m.enable().is_ok());
+        assert!(m.disable().is_ok());
+        assert_eq!(m.is_enabled().unwrap(), false);
+        let mut mp = WinAutostart::with_profile(
+            Path::new("C:\\clipmonger.exe").to_path_buf(),
+            Path::new("C:\\profiles\\work").to_path_buf(),
+            true,
+        )
+        .unwrap();
+        assert!(mp.enable().is_ok());
+        assert!(mp.disable().is_ok());
+        assert_eq!(mp.is_enabled().unwrap(), false);
+    }
+
+    #[test]
+    fn no_malformed_registration_on_invalid_profile() {
+        let bad = WinAutostart::with_profile(
+            Path::new("C:\\clipmonger.exe").to_path_buf(),
+            Path::new("C:\\bad\"path").to_path_buf(),
+            false,
+        );
+        assert!(bad.is_err(), "should not create manager with malformed profile");
     }
 }
