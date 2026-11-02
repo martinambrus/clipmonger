@@ -401,9 +401,23 @@ impl PopupApp {
                 }
                 self.send(UiCmd::ListHistory);
             }
-            UiEvent::LogsTail(lines) => {
+            UiEvent::LogsTail {
+                source,
+                lines,
+                sink_error,
+            } => {
                 if let Ok(mut config) = self.config.lock() {
-                    config.log_lines = lines;
+                    if config.log_source == source {
+                        config.log_lines = lines;
+                        config.log_error = sink_error.unwrap_or_default();
+                    }
+                }
+            }
+            UiEvent::LogsTailError { source, message } => {
+                if let Ok(mut config) = self.config.lock() {
+                    if config.log_source == source {
+                        config.log_error = message;
+                    }
                 }
             }
             UiEvent::ConfigError(message) => {

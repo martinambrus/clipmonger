@@ -103,6 +103,11 @@ impl DaemonState {
             if let Ok(token) = self.mint_gesture_token_with(target, at_ms, draw) {
                 Some(token)
             } else {
+                crate::daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "popup.gesture_failed",
+                    &[("class", "entropy_unavailable")],
+                );
                 eprintln!("daemon: gesture entropy unavailable");
                 None
             }
@@ -151,6 +156,11 @@ impl DaemonState {
         };
         if let Some(launch) = launcher {
             if !launch() {
+                crate::daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "popup.spawn_failed",
+                    &[("class", "launcher_unavailable")],
+                );
                 eprintln!("daemon: could not start the UI for the popup");
             }
         }

@@ -90,6 +90,7 @@ const ENTRIES: &[(&str, &str)] = &[
     ("config.restore_done", "Backup restored."),
     ("config.logs_title", "Logs"),
     ("config.logs_refresh", "Refresh logs"),
+    ("config.logs_source", "Source"),
     ("config.about_version", "Version"),
     ("config.accesskit_note", "Screen reader support: not available in this build. Keyboard operation is fully supported."),
     ("config.caps_title", "Capabilities"),

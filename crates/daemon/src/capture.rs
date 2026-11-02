@@ -39,6 +39,11 @@ pub fn run<M: ClipboardMonitor>(
         match result {
             Ok(events) => {
                 if failing {
+                    crate::daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Info,
+                        "capture.monitor_recovered",
+                        &[("operation", "monitor_poll")],
+                    );
                     log("monitor poll recovered");
                 }
                 failing = false;
@@ -52,6 +57,14 @@ pub fn run<M: ClipboardMonitor>(
                     monitor = None;
                 }
                 if !failing {
+                    crate::daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "capture.monitor_failed",
+                        &[
+                            ("operation", "monitor_poll"),
+                            ("class", crate::runtime_platform_class(&e)),
+                        ],
+                    );
                     log(&format!("monitor poll failed: {e}"));
                 }
                 failing = true;

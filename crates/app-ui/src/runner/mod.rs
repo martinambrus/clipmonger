@@ -113,6 +113,18 @@ pub enum RunError {
     Surface(softbuffer::SoftBufferError),
 }
 
+impl RunError {
+    /// Stable diagnostic class; excludes OS text and window/profile identifiers.
+    #[must_use]
+    pub fn runtime_class(&self) -> &'static str {
+        match self {
+            Self::EventLoop(_) => "event_loop",
+            Self::Window(_) => "window",
+            Self::Surface(_) => "surface",
+        }
+    }
+}
+
 impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -225,6 +237,12 @@ impl Host {
         {
             if !self.present_error_logged {
                 self.present_error_logged = true;
+                let _ = clipmonger_core::runtime_log::global_emit(
+                    clipmonger_core::runtime_log::Role::Ui,
+                    clipmonger_core::runtime_log::Severity::Error,
+                    "present.failed",
+                    &[("class", "surface")],
+                );
                 eprintln!("cannot present a frame: {error}");
             }
         }

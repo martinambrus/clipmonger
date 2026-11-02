@@ -1254,10 +1254,11 @@ fn rule_paste_done_does_nothing() {
 fn rule_replies_fill_the_settings_state() {
     let mut rig = Rig::closed();
     rig.push(UiEvent::Caps(json!({"clipboard": "ok"})));
-    rig.push(UiEvent::LogsTail(vec![
-        "one".to_string(),
-        "two".to_string(),
-    ]));
+    rig.push(UiEvent::LogsTail {
+        source: "audit".into(),
+        lines: vec!["one".into(), "two".into()],
+        sink_error: None,
+    });
     rig.push(UiEvent::ConfigError("bad config".to_string()));
     rig.push(UiEvent::PermGroups(
         json!({"groups": [{"name": "Work", "system": false, "count": 1}]}),
@@ -3655,4 +3656,102 @@ fn rule_raise_tray_show_while_open_preserves_and_activates() {
         rig.app.take_popup_activation(),
         "tray show must request activation"
     );
+}
+
+#[test]
+fn runtime_log_reducer_keeps_selection_errors_and_readable_lines() {
+    let mut rig = Rig::closed();
+    {
+        let mut config = rig.app.config().lock().unwrap();
+        assert_eq!(config.log_source, "audit");
+        config.log_lines = vec!["old audit".into()];
+        config.select_log_source("daemon");
+        assert_eq!(config.log_lines, Vec::<String>::new());
+    }
+    rig.push(UiEvent::LogsTail {
+        source: "audit".into(),
+        lines: vec!["late audit".into()],
+        sink_error: None,
+    });
+    rig.tick();
+    assert!(
+        rig.app.config().lock().unwrap().log_lines.is_empty(),
+        "late reply cannot populate selected daemon stream"
+    );
+    rig.push(UiEvent::LogsTail {
+        source: "daemon".into(),
+        lines: vec!["readable daemon".into()],
+        sink_error: Some("runtime_log.refused_file".into()),
+    });
+    rig.tick();
+    {
+        let config = rig.app.config().lock().unwrap();
+        assert_eq!(config.log_lines, ["readable daemon"]);
+        assert_eq!(config.log_error, "runtime_log.refused_file");
+    }
+    rig.app.config().lock().unwrap().tab = "about".into();
+    let painted = rig.show_settings();
+    assert!(painted.painted("daemon: runtime_log.refused_file"));
+    assert!(
+        painted.painted("readable daemon"),
+        "sink failure does not hide readable lines"
+    );
+    rig.push(UiEvent::LogsTailError {
+        source: "ui".into(),
+        message: "late other error".into(),
+    });
+    rig.tick();
+    assert_eq!(
+        rig.app.config().lock().unwrap().log_error,
+        "runtime_log.refused_file"
+    );
+    rig.push(UiEvent::LogsTailError {
+        source: "daemon".into(),
+        message: "read failed".into(),
+    });
+    rig.tick();
+    {
+        let config = rig.app.config().lock().unwrap();
+        assert_eq!(config.log_lines, ["readable daemon"]);
+        assert_eq!(config.log_error, "read failed");
+    }
+    rig.push(UiEvent::LogsTail {
+        source: "daemon".into(),
+        lines: vec!["healthy".into()],
+        sink_error: None,
+    });
+    rig.tick();
+    assert_eq!(rig.app.config().lock().unwrap().log_error, "");
+    rig.app.config().lock().unwrap().select_log_source("ui");
+    assert_eq!(
+        rig.app.config().lock().unwrap().log_lines,
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn ui_own_sink_failure_is_painted_without_daemon_connectivity() {
+    use clipmonger_core::runtime_log::{self, Role};
+    let dir = std::env::temp_dir().join(format!(
+        "cm-runtime-ui-reducer-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("logs"), "obstruction").unwrap();
+    assert!(runtime_log::init_global(&dir, Role::Ui).is_err());
+    let mut rig = Rig::closed();
+    {
+        let mut config = rig.app.config().lock().unwrap();
+        config.tab = "about".into();
+        config.select_log_source("ui");
+        config.log_lines = vec!["last readable UI line".into()];
+    }
+    let pass = rig.show_settings();
+    assert!(pass.painted("ui sink: runtime_log.refused_logs_directory"));
+    assert!(pass.painted("last readable UI line"));
+    std::fs::remove_dir_all(dir).unwrap();
 }

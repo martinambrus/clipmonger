@@ -19,6 +19,8 @@ pub struct ConfigWindowState {
     pub profile: PathBuf,
     pub backup_path: String,
     pub log_lines: Vec<String>,
+    pub log_source: String,
+    pub log_error: String,
     pub dark: bool,
     pub font_scale: f32,
     pub pending_apply: Vec<String>,
@@ -29,6 +31,15 @@ pub struct ConfigWindowState {
 }
 
 impl ConfigWindowState {
+    /// Switch streams without displaying replies from the previous selection.
+    pub fn select_log_source(&mut self, source: &str) {
+        if matches!(source, "audit" | "daemon" | "ui") && self.log_source != source {
+            self.log_source = source.to_string();
+            self.log_lines.clear();
+            self.log_error.clear();
+        }
+    }
+
     /// Fresh state for the profile.
     #[must_use]
     pub fn new(profile: PathBuf) -> Self {
@@ -44,6 +55,8 @@ impl ConfigWindowState {
             profile,
             backup_path,
             log_lines: Vec::new(),
+            log_source: "audit".to_string(),
+            log_error: String::new(),
             dark: true,
             font_scale: 1.0,
             pending_apply: Vec::new(),
@@ -136,8 +149,34 @@ pub fn render_config_viewport(
             ui.label(strings::text("config.caps_title"));
             ui.label(&config.caps_text);
             ui.label(strings::text("config.logs_title"));
-            if ui.button(strings::text("config.logs_refresh")).clicked() {
-                do_logs = true;
+            ui.horizontal(|ui| {
+                ui.label(strings::text("config.logs_source"));
+                for src in ["audit", "daemon", "ui"] {
+                    let selected = config.log_source == src;
+                    if ui.selectable_label(selected, src).clicked() && !selected {
+                        config.select_log_source(src);
+                        do_logs = true;
+                    }
+                }
+                if ui.button(strings::text("config.logs_refresh")).clicked() {
+                    do_logs = true;
+                }
+            });
+            if config.log_source == "ui" {
+                if let Some(error) = clipmonger_core::runtime_log::global_status(
+                    clipmonger_core::runtime_log::Role::Ui,
+                ) {
+                    ui.label(format!("ui sink: {error}"));
+                }
+            }
+            if !config.log_error.is_empty() {
+                ui.label(format!("{}: {}", config.log_source, config.log_error));
+            } else if !config.log_lines.is_empty() {
+                ui.label(format!(
+                    "{} ({} lines)",
+                    config.log_source,
+                    config.log_lines.len()
+                ));
             }
             for line in &config.log_lines {
                 ui.label(line);
@@ -406,7 +445,15 @@ pub fn render_config_viewport(
         send(ipc_bridge::UiCmd::BackupRestore(config.backup_path.clone()));
     }
     if do_logs {
-        send(ipc_bridge::UiCmd::LogsTail(100));
+        let src = config.log_source.clone();
+        if src == "audit" {
+            send(ipc_bridge::UiCmd::LogsTail(100));
+        } else {
+            send(ipc_bridge::UiCmd::LogsTailSource {
+                lines: 100,
+                source: src,
+            });
+        }
     }
     if do_revert {
         if let Some(doc) = &mut config.doc {
