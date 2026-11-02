@@ -7,6 +7,7 @@ pub mod error;
 pub mod hash;
 pub mod model;
 pub mod policy;
+pub mod runtime_log;
 pub mod store;
 
 pub use config::{AppPaths, Config, PasteDelivery};

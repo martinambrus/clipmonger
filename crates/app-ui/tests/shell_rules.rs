@@ -2157,7 +2157,11 @@ fn ignored_events() -> Vec<(&'static str, Event)> {
         ("RestoreDone", bridge(UiEvent::RestoreDone)),
         (
             "LogsTail",
-            bridge(UiEvent::LogsTail(vec!["line".to_string()])),
+            bridge(UiEvent::LogsTail {
+                source: "audit".into(),
+                lines: vec!["line".to_string()],
+                sink_error: None,
+            }),
         ),
         (
             "ConfigError",

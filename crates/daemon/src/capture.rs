@@ -66,8 +66,20 @@ pub fn subscribed<M: ClipboardMonitor>(
     factory: impl FnOnce() -> Result<M>,
     kinds: &[clipmonger_platform::types::SubscribeKind],
 ) -> Result<M> {
-    let mut monitor = factory()?;
-    monitor.subscribe(kinds)?;
+    let mut monitor = factory().inspect_err(|error| {
+        crate::daemon_runtime_emit(
+            clipmonger_core::runtime_log::Severity::Warn,
+            "capture.monitor_init_failed",
+            &[("class", crate::runtime_platform_class(error))],
+        );
+    })?;
+    monitor.subscribe(kinds).inspect_err(|error| {
+        crate::daemon_runtime_emit(
+            clipmonger_core::runtime_log::Severity::Warn,
+            "capture.subscribe_failed",
+            &[("class", crate::runtime_platform_class(error))],
+        );
+    })?;
     Ok(monitor)
 }
 
@@ -124,6 +136,11 @@ pub fn run_opt<M: ClipboardMonitor>(
         match result {
             Ok(events) => {
                 if failing {
+                    crate::daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Info,
+                        "capture.monitor_recovered",
+                        &[("operation", "monitor_poll")],
+                    );
                     log("monitor poll recovered");
                 }
                 if degraded {
@@ -144,6 +161,14 @@ pub fn run_opt<M: ClipboardMonitor>(
                     monitor = None;
                 }
                 if !failing {
+                    crate::daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "capture.monitor_failed",
+                        &[
+                            ("operation", "monitor_poll"),
+                            ("class", crate::runtime_platform_class(&e)),
+                        ],
+                    );
                     log(&format!("monitor poll failed: {e}"));
                 }
                 failing = true;
