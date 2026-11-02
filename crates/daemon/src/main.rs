@@ -954,10 +954,27 @@ fn run_helper_job(job: &clipmonger_backend_windows::helper::Job) -> Result<(), S
     Ok(())
 }
 
-#[tokio::main]
-#[allow(clippy::too_many_lines)]
-async fn main() {
+fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|s| s.as_str()) == Some("__thumbnail-decode") {
+        if args.len() != 1 {
+            eprintln!("thumbnail-decode: unexpected args");
+            std::process::exit(2);
+        }
+        std::process::exit(clipmonger_daemon::thumbnail::run_thumbnail_child());
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("daemon: runtime build failed: {e}");
+            std::process::exit(1);
+        });
+    rt.block_on(async_main(args));
+}
+
+#[allow(clippy::too_many_lines)]
+async fn async_main(args: Vec<String>) {
     #[cfg(all(windows, feature = "backend-windows"))]
     if args.iter().any(|a| a == "__elevated-persistent") {
         let profile = profile_arg(&args);

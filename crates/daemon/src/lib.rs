@@ -17,6 +17,7 @@ use clipmonger_platform::types::{BackendCaps, Level, PasteStrategy};
 use serde_json::Value;
 
 pub mod capture;
+pub mod thumbnail;
 
 fn daemon_runtime_emit(
     sev: clipmonger_core::runtime_log::Severity,

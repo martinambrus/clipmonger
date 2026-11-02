@@ -679,6 +679,7 @@ dependencies = [
  "clipmonger-ipc",
  "clipmonger-platform",
  "futures-util",
+ "image",
  "rusqlite",
  "serde",
  "serde_json",

@@ -91,6 +91,19 @@ pub enum InsertOutcome {
     Stubbed(Uuid),
 }
 
+/// Bounded single-MIME payload snapshot (P4 Task 20 Part 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadSnapshot {
+    /// Clip identity (v7 UUID).
+    pub clip_id: Uuid,
+    /// Stored content hash (hex SHA-256, local dedupe only).
+    pub content_hash: String,
+    /// Canonical MIME of the selected payload (exact match).
+    pub mime: String,
+    /// Raw payload bytes (bounded by caller cap).
+    pub data: Vec<u8>,
+}
+
 /// Result of [`Store::gc_blobs`].
 #[derive(Debug, Clone)]
 pub struct GcReport {
@@ -856,6 +869,141 @@ fn safe_blob_read(blobs: &Path, key: &str, expect_sha: &str) -> Result<Vec<u8>, 
         .read_to_end(&mut buf)
         .map_err(CoreError::Io)?;
     if n as u64 != size {
+        return Err(CoreError::Corrupt {
+            message: "external blob size mismatch".to_string(),
+        });
+    }
+    let mut h = Sha256::new();
+    h.update(&buf);
+    if hex_of(&h.finalize()) != expect_sha {
+        return Err(CoreError::Corrupt {
+            message: "external blob failed verification".to_string(),
+        });
+    }
+    Ok(buf)
+}
+
+fn capped_read<R: std::io::Read>(mut reader: R, cap: usize) -> Result<Vec<u8>, CoreError> {
+    let cap_plus_one = cap.checked_add(1).ok_or_else(|| CoreError::Backend {
+        backend: "store".to_string(),
+        kind: BackendKind::Internal,
+        message: "cap overflow".to_string(),
+    })?;
+    let mut buf = Vec::new();
+    let n = reader
+        .take(cap_plus_one as u64)
+        .read_to_end(&mut buf)
+        .map_err(CoreError::Io)?;
+    if n > cap {
+        return Err(CoreError::TooLarge {
+            message: format!("read {n} > cap {cap}"),
+        });
+    }
+    Ok(buf)
+}
+
+fn safe_blob_read_capped(
+    blobs: &Path,
+    key: &str,
+    expect_sha: &str,
+    cap: usize,
+) -> Result<Vec<u8>, CoreError> {
+    let (prefix, size) = parse_blob_key(key).ok_or_else(|| CoreError::Corrupt {
+        message: "invalid blob key".to_string(),
+    })?;
+    let _ = prefix;
+    let cap_u64 = u64::try_from(cap).map_err(|_| CoreError::Backend {
+        backend: "store".to_string(),
+        kind: BackendKind::Internal,
+        message: "cap overflow u64".to_string(),
+    })?;
+    if size > cap_u64 {
+        return Err(CoreError::TooLarge {
+            message: format!("blob size {size} > cap {cap}"),
+        });
+    }
+    let path = safe_blob_path(blobs, key)?;
+    // Open the leaf itself without following a final symlink/reparse point. The
+    // subsequent checks apply to this handle, not to an earlier pathname check.
+    // Ancestor replacement remains the pre-existing blobs-root boundary.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NONBLOCK: i32 = 0x800;
+        const O_NOFOLLOW: i32 = 0x20000;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK | O_NOFOLLOW)
+            .open(&path)
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+    };
+    #[cfg(not(any(
+        windows,
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
+    let file: std::io::Result<fs::File> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "safe blob leaf open unsupported on this platform",
+    ));
+    let file = file.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::Unsupported {
+            CoreError::Unsupported {
+                message: "safe blob leaf open unsupported on this platform".to_string(),
+            }
+        } else {
+            CoreError::Corrupt {
+                message: "missing or unsafe external blob".to_string(),
+            }
+        }
+    })?;
+    let meta = file.metadata().map_err(CoreError::Io)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(CoreError::Corrupt {
+                message: "blob reparse point".to_string(),
+            });
+        }
+    }
+    if !meta.is_file() {
+        return Err(CoreError::Corrupt {
+            message: "blob not a regular file".to_string(),
+        });
+    }
+    let file_len = meta.len();
+    if file_len != size {
+        return Err(CoreError::Corrupt {
+            message: "external blob size mismatch".to_string(),
+        });
+    }
+    if file_len > cap_u64 {
+        return Err(CoreError::TooLarge {
+            message: format!("blob file {file_len} > cap {cap}"),
+        });
+    }
+    let buf = capped_read(file, cap)?;
+    if buf.len() as u64 != size {
+        if buf.len() as u64 > cap_u64 {
+            return Err(CoreError::TooLarge {
+                message: "external blob exceeds cap on read".to_string(),
+            });
+        }
         return Err(CoreError::Corrupt {
             message: "external blob size mismatch".to_string(),
         });
@@ -1910,6 +2058,214 @@ impl Store {
         let out = load_payload_rows(&self.blobs, rows)?;
         clip.formats = out.iter().map(|(m, _)| m.clone()).collect();
         Ok(Some((clip.clone(), out)))
+    }
+
+    /// Bounded single-MIME payload snapshot (P4 Task 20 Part 1).
+    ///
+    /// Direct UUID + exact MIME query with caller cap. Returns `None` for
+    /// absent, soft-deleted, missing MIME, or metadata-only (stub) clips.
+    /// Errors honestly for corrupt rows or I/O. Enforces cap with checked
+    /// `usize`/`u64` arithmetic before materializing inline SQLite BLOB or
+    /// allocating external bytes. SQL does not pull unbounded inline BLOB then
+    /// check Rust length: metadata + conditional bounded selection within the
+    /// coherent SQLite read transaction. Reuses `safe_blob_read` containment/hash/size
+    /// protections via `safe_blob_read_capped`. External preflight checks
+    /// recorded bytes vs cap, and actual file read uses `cap+1` to handle
+    /// growth, never bypassing cap on tampered `recorded_len`. Holds the
+    /// same store lock and a read transaction, no aux connection or
+    /// `get_clip` full-payload scan, preserving restore/publication semantics.
+    ///
+    /// Inline payloads are available on all targets. Opening an external
+    /// payload is supported on Windows and Linux x86_64/aarch64; on other
+    /// targets it returns [`CoreError::Unsupported`] after earlier metadata,
+    /// cap and pathname checks, which may themselves return another error.
+    pub fn get_payload(
+        &self,
+        id: Uuid,
+        mime: &str,
+        cap: usize,
+    ) -> Result<Option<PayloadSnapshot>, CoreError> {
+        self.get_payload_with_interleave(id, mime, cap, || {})
+    }
+
+    // The callback lets the in-module control interleave a second real connection
+    // after the first read. Production always supplies a no-op.
+    fn get_payload_with_interleave<F: FnOnce()>(
+        &self,
+        id: Uuid,
+        mime: &str,
+        cap: usize,
+        interleave: F,
+    ) -> Result<Option<PayloadSnapshot>, CoreError> {
+        let _cap_plus_one = cap.checked_add(1).ok_or_else(|| CoreError::Backend {
+            backend: "store".to_string(),
+            kind: BackendKind::Internal,
+            message: "cap overflow".to_string(),
+        })?;
+        let cap_u64 = u64::try_from(cap).map_err(|_| CoreError::Backend {
+            backend: "store".to_string(),
+            kind: BackendKind::Internal,
+            message: "cap overflow u64".to_string(),
+        })?;
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|e| db_err(&e))?;
+        let mut stmt = tx
+            .prepare("SELECT content_hash, removed FROM clips WHERE id=?1")
+            .map_err(|e| db_err(&e))?;
+        let mut rows = stmt
+            .query_map(params![id.to_string()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(|e| db_err(&e))?;
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        let (content_hash, removed) = row.map_err(|e| db_err(&e))?;
+        drop(rows);
+        drop(stmt);
+        if removed != 0 {
+            return Ok(None);
+        }
+        interleave();
+        let mut stmt = tx
+            .prepare(
+                "SELECT p.external, length(p.data), p.blob_key, b.sha256, b.bytes, typeof(p.data)                  FROM clip_payloads p LEFT JOIN clip_blobs b ON b.blob_key=p.blob_key                  WHERE p.clip_id=?1 AND p.mime=?2",
+            )
+            .map_err(|e| db_err(&e))?;
+        let mut rows = stmt
+            .query_map(params![id.to_string(), mime], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| db_err(&e))?;
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        let (external, len_opt, blob_key_opt, sha_opt, bytes_opt, data_type) =
+            row.map_err(|_| CoreError::Corrupt {
+                message: "invalid payload types".to_string(),
+            })?;
+        drop(rows);
+        drop(stmt);
+        match external {
+            0 => {
+                if blob_key_opt.is_some() {
+                    return Err(CoreError::Corrupt {
+                        message: "inline payload has blob_key".to_string(),
+                    });
+                }
+                // The established reader maps SQL NULL inline payloads to empty bytes.
+                if data_type == "null" {
+                    return Ok(Some(PayloadSnapshot {
+                        clip_id: id,
+                        mime: mime.to_string(),
+                        content_hash,
+                        data: Vec::new(),
+                    }));
+                }
+                if data_type != "blob" {
+                    return Err(CoreError::Corrupt {
+                        message: "invalid inline data".to_string(),
+                    });
+                }
+                let len_i64 = len_opt.ok_or_else(|| CoreError::Corrupt {
+                    message: "inline payload missing data".to_string(),
+                })?;
+                if len_i64 < 0 {
+                    return Err(CoreError::Corrupt {
+                        message: "invalid inline length".to_string(),
+                    });
+                }
+                let len_u64 = len_i64 as u64;
+                if len_u64 > cap_u64 {
+                    return Err(CoreError::TooLarge {
+                        message: format!("inline payload {len_u64} > cap {cap}"),
+                    });
+                }
+                let cap_i64 = i64::try_from(cap_u64).unwrap_or(i64::MAX);
+                let mut stmt = tx
+                    .prepare("SELECT data FROM clip_payloads WHERE clip_id=?1 AND mime=?2 AND length(data) <= ?3")
+                    .map_err(|e| db_err(&e))?;
+                let mut rows = stmt
+                    .query_map(params![id.to_string(), mime, cap_i64], |r| {
+                        r.get::<_, Vec<u8>>(0)
+                    })
+                    .map_err(|e| db_err(&e))?;
+                let Some(data_row) = rows.next() else {
+                    return Err(CoreError::TooLarge {
+                        message: "inline payload exceeds cap on re-check".to_string(),
+                    });
+                };
+                let data = data_row.map_err(|_| CoreError::Corrupt {
+                    message: "invalid inline data".to_string(),
+                })?;
+                if data.len() as u64 != len_u64 {
+                    return Err(CoreError::Corrupt {
+                        message: "inline length mismatch".to_string(),
+                    });
+                }
+                if data.len() > cap {
+                    return Err(CoreError::TooLarge {
+                        message: "inline data exceeds cap after fetch".to_string(),
+                    });
+                }
+                Ok(Some(PayloadSnapshot {
+                    clip_id: id,
+                    mime: mime.to_string(),
+                    content_hash,
+                    data,
+                }))
+            }
+            1 => {
+                if data_type != "null" {
+                    return Err(CoreError::Corrupt {
+                        message: "external payload has inline data".to_string(),
+                    });
+                }
+                let blob_key = blob_key_opt.ok_or_else(|| CoreError::Corrupt {
+                    message: "missing external blob_key".to_string(),
+                })?;
+                let sha = sha_opt.ok_or_else(|| CoreError::Corrupt {
+                    message: "missing external sha".to_string(),
+                })?;
+                let bytes_i64 = bytes_opt.ok_or_else(|| CoreError::Corrupt {
+                    message: "missing external bytes".to_string(),
+                })?;
+                validate_blob_metadata(&blob_key, &sha, bytes_i64)?;
+                if bytes_i64 < 0 {
+                    return Err(CoreError::Corrupt {
+                        message: "invalid blob bytes".to_string(),
+                    });
+                }
+                let bytes_u64 = bytes_i64 as u64;
+                if bytes_u64 > cap_u64 {
+                    return Err(CoreError::TooLarge {
+                        message: format!("external payload {bytes_u64} > cap {cap}"),
+                    });
+                }
+                let data = safe_blob_read_capped(&self.blobs, &blob_key, &sha, cap)?;
+                if data.len() as u64 != bytes_u64 {
+                    return Err(CoreError::Corrupt {
+                        message: "external bytes length mismatch".to_string(),
+                    });
+                }
+                Ok(Some(PayloadSnapshot {
+                    clip_id: id,
+                    mime: mime.to_string(),
+                    content_hash,
+                    data,
+                }))
+            }
+            _ => Err(CoreError::Corrupt {
+                message: "invalid external flag".to_string(),
+            }),
+        }
     }
 
     /// Create a Paste permanent, minting its v7 id and implicit group.
@@ -3308,6 +3664,74 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Barrier;
     use uuid::Uuid;
+
+    #[test]
+    fn bounded_read_counts_consumed_bytes() {
+        struct ReadSpy {
+            inner: std::io::Cursor<Vec<u8>>,
+            consumed: usize,
+        }
+        impl std::io::Read for ReadSpy {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = std::io::Read::read(&mut self.inner, buf)?;
+                self.consumed += n;
+                Ok(n)
+            }
+        }
+        let cap = 16;
+        let mut spy = ReadSpy {
+            inner: std::io::Cursor::new(vec![0xaa; cap + 8]),
+            consumed: 0,
+        };
+        assert!(matches!(
+            super::capped_read(&mut spy, cap),
+            Err(crate::CoreError::TooLarge { .. })
+        ));
+        assert!(spy.consumed <= cap + 1, "consumed {} bytes", spy.consumed);
+        assert_eq!(spy.consumed, cap + 1);
+        assert!(matches!(
+            super::capped_read(std::io::Cursor::new(Vec::<u8>::new()), usize::MAX),
+            Err(crate::CoreError::Backend { .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_snapshot_keeps_sqlite_view_across_other_connection_commit() {
+        let profile = unique_dir("payload-view");
+        let store = super::Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let mut clip = sample_clip(id, "view", "view", 7);
+        clip.content_hash = "old-hash".to_string();
+        let mime = "text/plain;charset=utf-8";
+        store.insert_clip(&clip, &text_payloads("old!")).unwrap();
+        let mut writer = rusqlite::Connection::open(db_path(&profile)).unwrap();
+        let old = store
+            .get_payload_with_interleave(id, mime, 4, || {
+                let tx = writer.transaction().unwrap();
+                tx.execute(
+                    "UPDATE clips SET content_hash=?1 WHERE id=?2",
+                    rusqlite::params!["new-hash", id.to_string()],
+                )
+                .unwrap();
+                tx.execute(
+                    "UPDATE clip_payloads SET data=?1 WHERE clip_id=?2 AND mime=?3",
+                    rusqlite::params![b"new!".as_slice(), id.to_string(), mime],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (old.content_hash.as_str(), old.data.as_slice()),
+            ("old-hash", b"old!".as_slice())
+        );
+        let new = store.get_payload(id, mime, 4).unwrap().unwrap();
+        assert_eq!(
+            (new.content_hash.as_str(), new.data.as_slice()),
+            ("new-hash", b"new!".as_slice())
+        );
+    }
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
