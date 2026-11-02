@@ -15,6 +15,18 @@ use std::sync::Mutex;
 use clipmonger_platform::traits::ClipboardTransfer;
 use clipmonger_platform::types::{Affinity, Error, PayloadMap, Result};
 
+fn read_bounded(reader: impl std::io::Read, max_bytes: u64) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|error| Error::Unavailable(format!("wayland read body: {error}")))?;
+    if out.len() as u64 > max_bytes {
+        return Err(Error::TooLarge("wayland payload over cap".to_string()));
+    }
+    Ok(out)
+}
+
 /// Wayland clipboard transfer.
 pub struct WlTransfer {
     /// `offer:<n>` counter bumped on every own write.
@@ -83,23 +95,13 @@ impl ClipboardTransfer for WlTransfer {
     }
 
     fn read(&self, mime: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        let (mut reader, _actual) = wl_clipboard_rs::paste::get_contents(
+        let (reader, _actual) = wl_clipboard_rs::paste::get_contents(
             wl_clipboard_rs::paste::ClipboardType::Regular,
             wl_clipboard_rs::paste::Seat::Unspecified,
             wl_clipboard_rs::paste::MimeType::Specific(mime),
         )
         .map_err(|e| Error::Unavailable(format!("wayland read({mime}): {e}")))?;
-        let mut out = Vec::new();
-        reader
-            .read_to_end(&mut out)
-            .map_err(|e| Error::Unavailable(format!("wayland read body({mime}): {e}")))?;
-        if out.len() as u64 > max_bytes {
-            return Err(Error::TooLarge(format!(
-                "wayland read({mime}): {} bytes over cap {max_bytes}",
-                out.len()
-            )));
-        }
-        Ok(out)
+        read_bounded(reader, max_bytes)
     }
 
     fn write(&self, payload: &PayloadMap) -> Result<()> {
@@ -111,5 +113,40 @@ impl ClipboardTransfer for WlTransfer {
             .lock()
             .ok()
             .and_then(|serial| (*serial > 0).then(|| format!("offer:{serial}")))
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct FiniteOversize<'a> {
+        remaining: usize,
+        read_bytes: &'a Cell<usize>,
+    }
+    impl std::io::Read for FiniteOversize<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            let n = out.len().min(self.remaining);
+            out[..n].fill(1);
+            self.remaining -= n;
+            self.read_bytes.set(self.read_bytes.get() + n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn stream_stops_at_cap_plus_one_and_returns_typed_oversize() {
+        let read = Cell::new(0);
+        let reader = FiniteOversize {
+            remaining: 12,
+            read_bytes: &read,
+        };
+        assert!(matches!(read_bounded(reader, 4), Err(Error::TooLarge(_))));
+        assert_eq!(read.get(), 5);
+        assert_eq!(read_bounded(&b"abcd"[..], 4).unwrap(), b"abcd");
     }
 }

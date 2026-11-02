@@ -1756,18 +1756,37 @@ impl Store {
         clip: &Clip,
         payloads: &[(String, Vec<u8>)],
     ) -> Result<InsertOutcome, CoreError> {
+        self.insert_clip_inner(clip, payloads, false)
+    }
+
+    /// Insert a new metadata-only capture, refusing an existing ID.
+    ///
+    /// # Errors
+    /// Returns an error if the ID exists, the store is read-only, or a write fails.
+    pub fn insert_metadata_capture(&self, clip: &Clip) -> Result<InsertOutcome, CoreError> {
+        self.insert_clip_inner(clip, &[], true)
+    }
+
+    fn insert_clip_inner(
+        &self,
+        clip: &Clip,
+        payloads: &[(String, Vec<u8>)],
+        insert_only: bool,
+    ) -> Result<InsertOutcome, CoreError> {
         if self.read_only {
             return Err(readonly_err());
         }
         let incoming = content_hash(payloads);
-        if let Some(hit) = self.dedupe_hit(&incoming, &clip.id)? {
-            self.lock()
-                .execute(
-                    "UPDATE clips SET last_used_ms=?1 WHERE id=?2",
-                    params![clip.last_used_ms, hit.to_string()],
-                )
-                .map_err(|e| db_err(&e))?;
-            return Ok(InsertOutcome::MovedToTop(hit));
+        if !payloads.is_empty() {
+            if let Some(hit) = self.dedupe_hit(&incoming, &clip.id)? {
+                self.lock()
+                    .execute(
+                        "UPDATE clips SET last_used_ms=?1 WHERE id=?2",
+                        params![clip.last_used_ms, hit.to_string()],
+                    )
+                    .map_err(|e| db_err(&e))?;
+                return Ok(InsertOutcome::MovedToTop(hit));
+            }
         }
         let mut ext: Vec<(String, String, String)> = Vec::with_capacity(payloads.len());
         for (mime, bytes) in payloads {
@@ -1781,7 +1800,7 @@ impl Store {
         }
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(|e| db_err(&e))?;
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT INTO clips(id, created_ms, source_app, source_os, pinned, removed, \
             preview, search_text, bytes_total, content_hash, rev_ms, rev_dev, rev_ctr, \
             last_used_ms, origin_dev, origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
@@ -1789,14 +1808,22 @@ impl Store {
             source_os=excluded.source_os, pinned=excluded.pinned, removed=excluded.removed, preview=excluded.preview, \
             search_text=excluded.search_text, bytes_total=excluded.bytes_total, content_hash=excluded.content_hash, \
             rev_ms=excluded.rev_ms, rev_dev=excluded.rev_dev, rev_ctr=excluded.rev_ctr, \
-            last_used_ms=excluded.last_used_ms, origin_dev=excluded.origin_dev, origin=excluded.origin",
+            last_used_ms=excluded.last_used_ms, origin_dev=excluded.origin_dev, origin=excluded.origin WHERE ?17",
             params![
                 clip.id.to_string(), clip.created_ms, clip.source_app, clip.source_os,
                 i64::from(clip.pinned), i64::from(clip.removed), clip.preview, clip.search_text,
                 i64_from_u64(clip.bytes_total)?, clip.content_hash, clip.rev.wall_ms, clip.rev.dev,
-                i64_from_u64(clip.rev.ctr)?, clip.last_used_ms, clip.origin_dev, clip.origin,
+                i64_from_u64(clip.rev.ctr)?, clip.last_used_ms, clip.origin_dev, clip.origin, !insert_only,
             ],
         ).map_err(|e| db_err(&e))?;
+        // Distinct metadata captures must never overwrite an existing row,
+        // even if their OS-random IDs collide. General upserts retain their
+        // existing behavior. Refuse before DELETE/payload/FTS writes.
+        if inserted == 0 {
+            return Err(CoreError::Unsupported {
+                message: "metadata-only capture ID already exists".to_string(),
+            });
+        }
         tx.execute(
             "DELETE FROM clip_payloads WHERE clip_id=?1",
             params![clip.id.to_string()],

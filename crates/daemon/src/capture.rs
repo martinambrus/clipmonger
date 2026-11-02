@@ -6,6 +6,22 @@ use std::time::Duration;
 use clipmonger_platform::traits::ClipboardMonitor;
 use clipmonger_platform::types::{CaptureEvent, Error, Result};
 
+/// Match the configured canonical MIME, retaining charset variants.
+#[must_use]
+pub fn wanted_format(mime: &str, formats: &[String]) -> bool {
+    formats.iter().any(|format| {
+        format == mime
+            || (mime == "text/plain" && format == "text/plain;charset=utf-8")
+            || (format == "text/plain" && mime == "text/plain;charset=utf-8")
+    })
+}
+
+/// Whether an offer is ordinary plain text under strict privacy.
+#[must_use]
+pub fn plain_text(mime: &str) -> bool {
+    mime.split(';').next().map(str::trim) == Some("text/plain")
+}
+
 /// Poll a session monitor until shutdown and deliver each batch to capture.
 /// Errors retry with 100 ms exponential backoff capped at two seconds. Log
 /// once per failure streak and again on recovery; any successful poll resets

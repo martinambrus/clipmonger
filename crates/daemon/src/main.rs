@@ -182,23 +182,6 @@ fn write_token(profile: &Path) -> Result<String, String> {
     Ok(token)
 }
 
-/// Whether a config format entry selects `mime`.
-///
-/// Config uses canonical names (`text/plain;charset=utf-8` and `text/plain`
-/// both); transfer offers use the short form.
-#[cfg(any(
-    all(windows, feature = "backend-windows"),
-    all(unix, feature = "backend-x11"),
-    all(unix, feature = "backend-wayland")
-))]
-fn wanted_format(mime: &str, formats: &[String]) -> bool {
-    formats.iter().any(|format| {
-        format == mime
-            || (mime == "text/plain" && format == "text/plain;charset=utf-8")
-            || (format == "text/plain" && mime == "text/plain;charset=utf-8")
-    })
-}
-
 /// Construct the live Windows backend: typed caps, monitor thread (real
 /// payloads via transfer honoring opt-out + privacy counter), the popup
 /// chord thread, and the admin-window consent watcher.
@@ -211,7 +194,7 @@ fn setup_windows_backend(
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     use clipmonger_backend_windows::{caps as backend_caps, WinAutostart, WinMonitor, WinTransfer};
-    use clipmonger_platform::traits::{AutostartManager, ClipboardTransfer};
+    use clipmonger_platform::traits::AutostartManager;
     use clipmonger_platform::types::SubscribeKind;
 
     let transfer = Arc::new(WinTransfer::new());
@@ -258,8 +241,6 @@ fn setup_windows_backend(
     {
         let state = Arc::clone(state);
         let transfer = Arc::clone(&transfer);
-        let formats: Vec<String> = config.monitor.formats.clone();
-        let max_bytes = config.monitor.max_bytes;
         let poll_ms = config.monitor.poll_ms;
         let shutdown = Arc::clone(shutdown);
         std::thread::spawn(move || {
@@ -278,40 +259,18 @@ fn setup_windows_backend(
                 },
                 |events| {
                     for event in events {
-                        if event.sensitive {
-                            state.ingest_capture("windows", true, &[]);
-                            continue;
-                        }
-                        let mut payloads = Vec::new();
-                        let mut seen = std::collections::HashSet::new();
-                        for offer in &event.offers {
-                            if !wanted_format(&offer.mime, &formats) {
-                                continue;
-                            }
-                            if !seen.insert(offer.mime.clone()) {
-                                continue;
-                            }
-                            match transfer.read(&offer.mime, max_bytes) {
-                                Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
-                                Err(e) => {
-                                    let _ = clipmonger_core::runtime_log::global_emit(
-                                        clipmonger_core::runtime_log::Role::Daemon,
-                                        clipmonger_core::runtime_log::Severity::Warn,
-                                        "capture.read_skipped",
-                                        &[
-                                            ("operation", "capture_read"),
-                                            (
-                                                "class",
-                                                clipmonger_daemon::runtime_platform_class(&e),
-                                            ),
-                                        ],
-                                    );
-                                    eprintln!("daemon: payload read skipped ({}): {e}", offer.mime);
-                                }
-                            }
-                        }
-                        if !payloads.is_empty() {
-                            state.ingest_capture("windows", false, &payloads);
+                        if let Err(error) =
+                            state.capture_event("windows", event, transfer.as_ref(), |line| {
+                                eprintln!("daemon: windows {line}");
+                            })
+                        {
+                            let _ = clipmonger_core::runtime_log::global_emit(
+                                clipmonger_core::runtime_log::Role::Daemon,
+                                clipmonger_core::runtime_log::Severity::Error,
+                                "capture.unavailable",
+                                &[("operation", "capture"), ("class", "unavailable")],
+                            );
+                            eprintln!("daemon: windows capture unavailable: {error}");
                         }
                     }
                 },
@@ -459,7 +418,7 @@ fn setup_x11_backend(
     use clipmonger_backend_x11::{
         caps as backend_caps, MonitorOpts, X11Autostart, X11Hotkeys, X11Monitor, X11Transfer,
     };
-    use clipmonger_platform::traits::{AutostartManager, ClipboardTransfer};
+    use clipmonger_platform::traits::AutostartManager;
     use clipmonger_platform::types::SubscribeKind;
 
     let transfer = match X11Transfer::connect(None) {
@@ -518,8 +477,6 @@ fn setup_x11_backend(
     {
         let state = Arc::clone(state);
         let transfer = transfer.clone();
-        let formats: Vec<String> = config.monitor.formats.clone();
-        let max_bytes = config.monitor.max_bytes;
         let poll_ms = config.monitor.poll_ms;
         let shutdown = Arc::clone(shutdown);
         let monitor_opts_clone = monitor_opts.clone();
@@ -550,40 +507,18 @@ fn setup_x11_backend(
                         return;
                     };
                     for event in events {
-                        if event.sensitive {
-                            state.ingest_capture("x11", true, &[]);
-                            continue;
-                        }
-                        let mut payloads = Vec::new();
-                        let mut seen = std::collections::HashSet::new();
-                        for offer in &event.offers {
-                            if !wanted_format(&offer.mime, &formats) {
-                                continue;
-                            }
-                            if !seen.insert(offer.mime.clone()) {
-                                continue;
-                            }
-                            match transfer.read(&offer.mime, max_bytes) {
-                                Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
-                                Err(e) => {
-                                    let _ = clipmonger_core::runtime_log::global_emit(
-                                        clipmonger_core::runtime_log::Role::Daemon,
-                                        clipmonger_core::runtime_log::Severity::Warn,
-                                        "capture.read_skipped",
-                                        &[
-                                            ("operation", "capture_read"),
-                                            (
-                                                "class",
-                                                clipmonger_daemon::runtime_platform_class(&e),
-                                            ),
-                                        ],
-                                    );
-                                    eprintln!("daemon: payload read skipped ({}): {e}", offer.mime);
-                                }
-                            }
-                        }
-                        if !payloads.is_empty() {
-                            state.ingest_capture("x11", false, &payloads);
+                        if let Err(error) =
+                            state.capture_event("x11", event, transfer.as_ref(), |line| {
+                                eprintln!("daemon: x11 {line}");
+                            })
+                        {
+                            let _ = clipmonger_core::runtime_log::global_emit(
+                                clipmonger_core::runtime_log::Role::Daemon,
+                                clipmonger_core::runtime_log::Severity::Error,
+                                "capture.unavailable",
+                                &[("operation", "capture"), ("class", "unavailable")],
+                            );
+                            eprintln!("daemon: x11 capture unavailable: {error}");
                         }
                     }
                 },
@@ -654,7 +589,6 @@ fn setup_wayland_backend(
     use clipmonger_backend_wayland::{
         caps as backend_caps, probe_current, WlMonitor, WlMonitorOpts, WlTransfer,
     };
-    use clipmonger_platform::traits::ClipboardTransfer;
 
     let capture_primary = config.monitor.capture_primary;
     let probe = probe_current();
@@ -696,8 +630,6 @@ fn setup_wayland_backend(
 
     {
         let state = Arc::clone(state);
-        let formats: Vec<String> = config.monitor.formats.clone();
-        let max_bytes = config.monitor.max_bytes;
         let poll_ms = config.monitor.poll_ms;
         let shutdown = Arc::clone(shutdown);
         let transfer_opt = transfer.clone();
@@ -727,43 +659,18 @@ fn setup_wayland_backend(
                         return;
                     };
                     for event in events {
-                        if event.sensitive {
-                            state.ingest_capture("wayland", true, &[]);
-                            continue;
-                        }
-                        let mut payloads = Vec::new();
-                        let mut seen = std::collections::HashSet::new();
-                        for offer in &event.offers {
-                            if !wanted_format(&offer.mime, &formats) {
-                                continue;
-                            }
-                            if !seen.insert(offer.mime.clone()) {
-                                continue;
-                            }
-                            match transfer.read(&offer.mime, max_bytes) {
-                                Ok(bytes) => payloads.push((offer.mime.clone(), bytes)),
-                                Err(e) => {
-                                    let _ = clipmonger_core::runtime_log::global_emit(
-                                        clipmonger_core::runtime_log::Role::Daemon,
-                                        clipmonger_core::runtime_log::Severity::Warn,
-                                        "capture.read_skipped",
-                                        &[
-                                            ("operation", "capture_read"),
-                                            (
-                                                "class",
-                                                clipmonger_daemon::runtime_platform_class(&e),
-                                            ),
-                                        ],
-                                    );
-                                    eprintln!(
-                                        "daemon: wayland payload read skipped ({}): {e}",
-                                        offer.mime
-                                    );
-                                }
-                            }
-                        }
-                        if !payloads.is_empty() {
-                            state.ingest_capture("wayland", false, &payloads);
+                        if let Err(error) =
+                            state.capture_event("wayland", event, transfer.as_ref(), |line| {
+                                eprintln!("daemon: wayland {line}");
+                            })
+                        {
+                            let _ = clipmonger_core::runtime_log::global_emit(
+                                clipmonger_core::runtime_log::Role::Daemon,
+                                clipmonger_core::runtime_log::Severity::Error,
+                                "capture.unavailable",
+                                &[("operation", "capture"), ("class", "unavailable")],
+                            );
+                            eprintln!("daemon: wayland capture unavailable: {error}");
                         }
                     }
                 },

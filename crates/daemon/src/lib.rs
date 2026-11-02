@@ -45,6 +45,17 @@ pub fn runtime_platform_class(error: &clipmonger_platform::types::Error) -> &'st
         Error::Internal(_) => "internal",
     }
 }
+fn log_capture_read_skipped(error: &clipmonger_platform::types::Error) {
+    daemon_runtime_emit(
+        clipmonger_core::runtime_log::Severity::Warn,
+        "capture.read_skipped",
+        &[
+            ("operation", "capture_read"),
+            ("class", runtime_platform_class(error)),
+        ],
+    );
+}
+
 fn runtime_origin(origin: &str) -> &'static str {
     match origin {
         "windows" => "windows",
@@ -882,6 +893,339 @@ fn new_id(index: u64) -> String {
 /// fills the row metadata.
 fn fnv_hex(bytes: &[u8]) -> String {
     format!("{:016x}", clipmonger_core::hash::fnv1a64(bytes))
+}
+
+/// Bounded wanted-format metadata for one oversized capture observation.
+#[derive(Debug, Clone)]
+pub struct OversizeEntry {
+    /// Canonical MIME selected by the capture policy.
+    pub mime: String,
+    /// Actual normalized byte count when known; native/decoder errors use None.
+    pub bytes_hint: Option<u64>,
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 && bytes.is_multiple_of(1024 * 1024) {
+        format!("{} MiB", bytes / (1024 * 1024))
+    } else if bytes >= 1024 && bytes.is_multiple_of(1024) {
+        format!("{} KiB", bytes / 1024)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+// Bound metadata before cloning any producer-controlled names or vectors.
+const MAX_CAPTURE_FORMATS: usize = 32;
+const MAX_CAPTURE_MIME_BYTES: usize = 128;
+
+fn valid_capture_mime(mime: &str) -> bool {
+    !mime.is_empty()
+        && mime.len() <= MAX_CAPTURE_MIME_BYTES
+        && mime.contains('/')
+        && mime
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+}
+
+fn stub_preview(entries: &[OversizeEntry], max_bytes: u64) -> String {
+    let details = entries
+        .iter()
+        .take(3)
+        .map(|entry| match entry.bytes_hint {
+            Some(bytes) => format!("{} ({bytes} B)", entry.mime),
+            None => format!("{} (size unknown)", entry.mime),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Too large — not saved ({} limit): {details}",
+        format_bytes(max_bytes)
+    )
+    .chars()
+    .take(200)
+    .collect()
+}
+
+fn store_stub(
+    store: &Store,
+    origin: &str,
+    entries: &[OversizeEntry],
+    max_bytes: u64,
+    now: i64,
+    mut random: impl FnMut() -> Result<u64, clipmonger_core::entropy::Error>,
+) -> Result<(), IpcError> {
+    // Existing OS entropy is fallible on every platform. No timestamp, /proc
+    // or counter fallback: failure must happen before any Store write.
+    let high = random().map_err(|error| IpcError::new("unavailable", error.to_string()))?;
+    let low = random().map_err(|error| IpcError::new("unavailable", error.to_string()))?;
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&high.to_be_bytes());
+    bytes[8..].copy_from_slice(&low.to_be_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let id = uuid::Uuid::from_bytes(bytes);
+    let preview = stub_preview(entries, max_bytes);
+    // The same bounded label is searchable; formats are reconstructed from
+    // payload rows by Store, so a true stub has formats=[], including in IPC.
+    let clip_json = serde_json::json!({
+        "id": id,
+        "created_ms": now,
+        "source_os": origin,
+        "pinned": false,
+        "removed": false,
+        "preview": preview,
+        "search_text": format!("{preview}\ntoo large"),
+        "formats": [],
+        "bytes_total": 0,
+        "content_hash": fnv_hex(preview.as_bytes()),
+        "rev": {"wall_ms": now, "dev": "daemon", "ctr": 0},
+        "last_used_ms": now,
+        "origin_dev": "daemon",
+        "origin": origin,
+    });
+    let clip = serde_json::from_value(clip_json)
+        .map_err(|error| IpcError::new("internal", format!("stub build failed: {error}")))?;
+    store
+        .insert_metadata_capture(&clip)
+        .map_err(|error| IpcError::new(error.code(), error.to_string()))?;
+    Ok(())
+}
+
+fn with_pasteable_payloads<T>(
+    payloads: &[(String, Vec<u8>)],
+    deliver: impl FnOnce() -> Result<T, IpcError>,
+) -> Result<T, IpcError> {
+    if payloads.is_empty() {
+        return Err(IpcError::new(
+            "unavailable",
+            "paste.execute: clip has no pasteable payload (too large)".to_string(),
+        ));
+    }
+    deliver()
+}
+
+struct CaptureReportMetadata<'a> {
+    source_app: Option<&'a str>,
+    offers: &'a [Value],
+    truncated: &'a [Value],
+    payloads: &'a Value,
+    mimes: Vec<&'a str>,
+}
+
+fn invalid_report_metadata() -> IpcError {
+    IpcError::new(
+        "backend",
+        "capture.report: invalid bounded metadata".to_string(),
+    )
+}
+
+fn bounded_report_array(value: Option<&Value>) -> Result<&[Value], IpcError> {
+    match value {
+        None => Ok(&[]),
+        Some(Value::Array(items)) if items.len() <= MAX_CAPTURE_FORMATS => Ok(items),
+        _ => Err(invalid_report_metadata()),
+    }
+}
+
+fn read_report_metadata(params: &Value) -> Result<CaptureReportMetadata<'_>, IpcError> {
+    let event = params.get("event").unwrap_or(&Value::Null);
+    let source_app = match event.get("source_app") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(app)) if app.len() <= 256 && !app.chars().any(char::is_control) => {
+            Some(app.as_str())
+        }
+        _ => return Err(invalid_report_metadata()),
+    };
+    let offers = bounded_report_array(event.get("offers"))?;
+    let truncated =
+        bounded_report_array(event.get("truncated").or_else(|| params.get("truncated")))?;
+    let payloads = params
+        .get("payloads")
+        .or_else(|| event.get("payloads"))
+        .unwrap_or(&Value::Null);
+    match payloads {
+        Value::Object(map) if map.len() <= MAX_CAPTURE_FORMATS => {}
+        Value::Array(items) if items.len() <= MAX_CAPTURE_FORMATS => {}
+        Value::Null => {}
+        _ => return Err(invalid_report_metadata()),
+    }
+    // All three containers are bounded before constructing this borrowed list.
+    let mut mimes = Vec::new();
+    let mut add = |mime| -> Result<(), IpcError> {
+        if !valid_capture_mime(mime) {
+            return Err(invalid_report_metadata());
+        }
+        mimes.push(mime);
+        Ok(())
+    };
+    for offer in offers {
+        add(offer
+            .get("mime")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid_report_metadata)?)?;
+        if let Some(size) = offer.get("bytes_hint") {
+            // GNOME's existing JS-number contract cannot represent larger exact integers.
+            if !size.is_null()
+                && size
+                    .as_u64()
+                    .is_none_or(|bytes| bytes > 9_007_199_254_740_991)
+            {
+                return Err(invalid_report_metadata());
+            }
+        }
+    }
+    for value in truncated {
+        add(value.as_str().ok_or_else(invalid_report_metadata)?)?;
+    }
+    match payloads {
+        Value::Object(map) => {
+            for mime in map.keys() {
+                add(mime)?;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                add(item
+                    .get("mime")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_report_metadata)?)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(CaptureReportMetadata {
+        source_app,
+        offers,
+        truncated,
+        payloads,
+        mimes,
+    })
+}
+
+fn wanted_capture_mime(mime: &str, cfg: &clipmonger_core::Config) -> bool {
+    capture::wanted_format(mime, &cfg.monitor.formats)
+        && (!cfg.privacy.strict || capture::plain_text(mime))
+}
+
+fn report_source_ignored(app: Option<&str>, cfg: &clipmonger_core::Config) -> bool {
+    app.is_some_and(|app| {
+        let normalized = app.trim().to_ascii_lowercase();
+        let normalized = normalized.trim_end_matches(".desktop");
+        cfg.privacy
+            .denylist
+            .iter()
+            .chain(&cfg.monitor.ignores)
+            .any(|entry| {
+                entry
+                    .trim()
+                    .to_ascii_lowercase()
+                    .trim_end_matches(".desktop")
+                    == normalized
+            })
+    })
+}
+
+fn report_oversize_entries(
+    meta: &CaptureReportMetadata<'_>,
+    cfg: &clipmonger_core::Config,
+) -> Result<Vec<OversizeEntry>, IpcError> {
+    let mut entries: Vec<OversizeEntry> = Vec::new();
+    for value in meta.truncated {
+        let mime = value.as_str().ok_or_else(invalid_report_metadata)?;
+        if !wanted_capture_mime(mime, cfg) || entries.iter().any(|entry| entry.mime == mime) {
+            continue;
+        }
+        let bytes_hint = meta
+            .offers
+            .iter()
+            .filter(|offer| offer.get("mime").and_then(Value::as_str) == Some(mime))
+            .filter_map(|offer| offer.get("bytes_hint").and_then(Value::as_u64))
+            .max()
+            .filter(|bytes| clipmonger_core::policy::needs_stub(*bytes, cfg.monitor.max_bytes));
+        entries.push(OversizeEntry {
+            mime: mime.to_string(),
+            bytes_hint,
+        });
+    }
+    for offer in meta.offers {
+        let mime = offer
+            .get("mime")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid_report_metadata)?;
+        let hint = offer.get("bytes_hint").and_then(Value::as_u64);
+        if wanted_capture_mime(mime, cfg)
+            && hint.is_some_and(|bytes| {
+                clipmonger_core::policy::needs_stub(bytes, cfg.monitor.max_bytes)
+            })
+            && !entries.iter().any(|entry| entry.mime == mime)
+        {
+            if entries.len() == MAX_CAPTURE_FORMATS {
+                return Err(invalid_report_metadata());
+            }
+            entries.push(OversizeEntry {
+                mime: mime.to_string(),
+                bytes_hint: hint,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn decode_report_payloads(
+    value: &Value,
+    cfg: &clipmonger_core::Config,
+) -> Result<Vec<(String, Vec<u8>)>, IpcError> {
+    let mut payloads: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut decode = |mime: &str, encoded: Option<&str>| -> Result<(), IpcError> {
+        if !wanted_capture_mime(mime, cfg) || payloads.iter().any(|(previous, _)| previous == mime)
+        {
+            return Ok(());
+        }
+        let encoded = encoded.ok_or_else(invalid_report_metadata)?;
+        if encoded.len() as u64
+            > cfg
+                .monitor
+                .max_bytes
+                .saturating_add(2)
+                .saturating_div(3)
+                .saturating_mul(4)
+        {
+            return Err(IpcError::new(
+                "backend",
+                "capture.report: inline payload exceeds cap".to_string(),
+            ));
+        }
+        let bytes = b64_decode(encoded).ok_or_else(invalid_report_metadata)?;
+        if bytes.len() as u64 > cfg.monitor.max_bytes {
+            return Err(invalid_report_metadata());
+        }
+        payloads.push((mime.to_string(), bytes));
+        Ok(())
+    };
+    match value {
+        Value::Object(map) => {
+            for (mime, encoded) in map {
+                decode(mime, encoded.as_str())?;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                let mime = item
+                    .get("mime")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_report_metadata)?;
+                decode(
+                    mime,
+                    item.get("inline_b64")
+                        .or_else(|| item.get("data_b64"))
+                        .or_else(|| item.get("b64"))
+                        .and_then(Value::as_str),
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(payloads)
 }
 
 /// Decode standard padded base64; `None` on any malformed input.
@@ -1744,6 +2088,9 @@ impl DaemonState {
         sensitive: bool,
         payloads: &[(String, Vec<u8>)],
     ) -> Result<bool, IpcError> {
+        if sensitive {
+            return self.record_capture_privacy_skip();
+        }
         let gate = self
             .profile_op
             .lock()
@@ -1788,6 +2135,7 @@ impl DaemonState {
                     ("code", &failure.code),
                 ],
             );
+            return Err(IpcError::new("backend", "capture store failed".to_string()));
         }
         if stored {
             match store.enforce_retention(&limits) {
@@ -1820,6 +2168,219 @@ impl DaemonState {
         Ok(stored)
     }
 
+    /// Store a bounded wanted oversize observation, obeying current capture policy.
+    pub fn ingest_oversize(&self, origin: &str, entries: &[OversizeEntry]) -> bool {
+        match self.ingest_oversize_checked(origin, entries) {
+            Ok(stored) => stored,
+            Err(error) => {
+                eprintln!("daemon: oversize capture unavailable: {error}");
+                false
+            }
+        }
+    }
+
+    fn record_capture_privacy_skip(&self) -> Result<bool, IpcError> {
+        self.with_store(|store| {
+            store
+                .record_privacy_skip()
+                .map_err(|error| IpcError::new(error.code(), error.to_string()))
+        })?;
+        Ok(false)
+    }
+
+    /// Actual lazy-read capture adapter shared by Windows, X11 and Wayland.
+    /// Sensitive/strict/pause checks precede payload reads and metadata copies;
+    /// known oversize hints preflight the whole observation before any read.
+    ///
+    /// # Errors
+    /// Returns policy/store errors; ordinary transfer errors are reported to `log`.
+    pub fn capture_event<T: clipmonger_platform::traits::ClipboardTransfer>(
+        &self,
+        origin: &str,
+        event: &clipmonger_platform::types::CaptureEvent,
+        transfer: &T,
+        mut log: impl FnMut(&str),
+    ) -> Result<bool, IpcError> {
+        if event.sensitive {
+            return self.record_capture_privacy_skip();
+        }
+        let cfg = self
+            .config
+            .lock()
+            .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?
+            .clone();
+        if self.capture_paused()? {
+            return Ok(false);
+        }
+        if cfg.privacy.strict
+            && event.offers.iter().any(|offer| {
+                capture::wanted_format(&offer.mime, &cfg.monitor.formats)
+                    && !capture::plain_text(&offer.mime)
+            })
+            && !event.offers.iter().any(|offer| {
+                capture::wanted_format(&offer.mime, &cfg.monitor.formats)
+                    && capture::plain_text(&offer.mime)
+            })
+        {
+            return self.record_capture_privacy_skip();
+        }
+        if event.offers.len() > MAX_CAPTURE_FORMATS {
+            return Err(IpcError::new(
+                "backend",
+                "too many capture formats".to_string(),
+            ));
+        }
+        let mut wanted: Vec<OversizeEntry> = Vec::new();
+        for offer in &event.offers {
+            if !valid_capture_mime(&offer.mime)
+                || !capture::wanted_format(&offer.mime, &cfg.monitor.formats)
+                || (cfg.privacy.strict && !capture::plain_text(&offer.mime))
+            {
+                continue;
+            }
+            if let Some(entry) = wanted.iter_mut().find(|entry| entry.mime == offer.mime) {
+                entry.bytes_hint = entry.bytes_hint.max(offer.bytes_hint);
+            } else {
+                wanted.push(OversizeEntry {
+                    mime: offer.mime.clone(),
+                    bytes_hint: offer.bytes_hint,
+                });
+            }
+        }
+        let known_oversize: Vec<_> = wanted
+            .iter()
+            .filter(|entry| {
+                entry.bytes_hint.is_some_and(|bytes| {
+                    clipmonger_core::policy::needs_stub(bytes, cfg.monitor.max_bytes)
+                })
+            })
+            .cloned()
+            .collect();
+        if !known_oversize.is_empty() {
+            return self.ingest_oversize_checked(origin, &known_oversize);
+        }
+        let mut payloads = Vec::new();
+        for entry in wanted {
+            match transfer.read(&entry.mime, cfg.monitor.max_bytes) {
+                Ok(bytes) => {
+                    if clipmonger_core::policy::needs_stub(
+                        bytes.len() as u64,
+                        cfg.monitor.max_bytes,
+                    ) {
+                        return self.ingest_oversize_checked(
+                            origin,
+                            &[OversizeEntry {
+                                mime: entry.mime,
+                                bytes_hint: Some(bytes.len() as u64),
+                            }],
+                        );
+                    }
+                    payloads.push((entry.mime, bytes));
+                }
+                Err(error) => {
+                    log_capture_read_skipped(&error);
+                    if matches!(error, clipmonger_platform::types::Error::TooLarge(_)) {
+                        // A native or decoder guard does not establish the final size.
+                        return self.ingest_oversize_checked(
+                            origin,
+                            &[OversizeEntry {
+                                mime: entry.mime,
+                                bytes_hint: None,
+                            }],
+                        );
+                    }
+                    log(&format!("payload read skipped ({}): {error}", entry.mime));
+                }
+            }
+        }
+        if payloads.is_empty() {
+            return Ok(false);
+        }
+        self.ingest_capture_checked(origin, false, &payloads)
+    }
+
+    fn ingest_oversize_checked(
+        &self,
+        origin: &str,
+        entries: &[OversizeEntry],
+    ) -> Result<bool, IpcError> {
+        self.ingest_oversize_with(
+            origin,
+            entries,
+            now_ms(),
+            clipmonger_core::entropy::random_u64,
+        )
+    }
+
+    fn ingest_oversize_with(
+        &self,
+        origin: &str,
+        entries: &[OversizeEntry],
+        now: i64,
+        random: impl FnMut() -> Result<u64, clipmonger_core::entropy::Error>,
+    ) -> Result<bool, IpcError> {
+        let gate = self
+            .profile_op
+            .lock()
+            .map_err(|_| IpcError::new("internal", "profile op poisoned".to_string()))?;
+        let cfg = self
+            .config
+            .lock()
+            .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?
+            .clone();
+        if self.capture_paused()? {
+            return Ok(false);
+        }
+        if cfg.privacy.strict
+            && entries.iter().any(|entry| {
+                capture::wanted_format(&entry.mime, &cfg.monitor.formats)
+                    && !capture::plain_text(&entry.mime)
+            })
+            && !entries.iter().any(|entry| {
+                capture::wanted_format(&entry.mime, &cfg.monitor.formats)
+                    && capture::plain_text(&entry.mime)
+            })
+        {
+            return self.record_capture_privacy_skip();
+        }
+        if entries.len() > MAX_CAPTURE_FORMATS || origin.len() > 16 || !origin.is_ascii() {
+            return Err(IpcError::new(
+                "backend",
+                "invalid oversize metadata".to_string(),
+            ));
+        }
+        let mut bounded: Vec<OversizeEntry> = Vec::new();
+        for entry in entries {
+            if !valid_capture_mime(&entry.mime)
+                || !capture::wanted_format(&entry.mime, &cfg.monitor.formats)
+                || (cfg.privacy.strict && !capture::plain_text(&entry.mime))
+            {
+                continue;
+            }
+            if let Some(previous) = bounded
+                .iter_mut()
+                .find(|previous| previous.mime == entry.mime)
+            {
+                previous.bytes_hint = previous.bytes_hint.max(entry.bytes_hint);
+            } else {
+                bounded.push(entry.clone());
+            }
+        }
+        if bounded.is_empty() {
+            return Ok(false);
+        }
+        let store_opt = self.store_read()?;
+        let store = store_opt
+            .as_ref()
+            .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?;
+        drop(gate);
+        store_stub(store, origin, &bounded, cfg.monitor.max_bytes, now, random)?;
+        store
+            .enforce_retention(&retention_limits(&cfg))
+            .map_err(|error| IpcError::new(error.code(), error.to_string()))?;
+        Ok(true)
+    }
+
     /// Find a stored clip id by its string form without naming the id type.
     fn find_clip(&self, id: &str) -> Result<Option<clipmonger_core::model::Clip>, IpcError> {
         self.with_store(|store| {
@@ -1828,6 +2389,13 @@ impl DaemonState {
                 .map_err(|error| IpcError::new(error.code(), error.to_string()))?;
             Ok(clips.into_iter().find(|clip| clip.id.to_string() == id))
         })
+    }
+
+    fn capture_paused(&self) -> Result<bool, IpcError> {
+        self.monitoring_paused
+            .lock()
+            .map(|flag| *flag)
+            .map_err(|_| IpcError::new("internal", "monitor flag poisoned".to_string()))
     }
 
     /// Whether the monitor is currently paused.
@@ -1980,58 +2548,49 @@ impl DaemonState {
         Ok(serde_json::json!({"ok": true, "monitoring_paused": paused}))
     }
 
-    /// Dispatch `capture.report`: decode `{event, payloads:{mime: base64}}`
-    /// and store the real payloads via `ingest_capture` (G-F3). Sensitive
-    /// events only bump the privacy counter through the same path.
+    /// Dispatch GNOME's existing capture.report contract. Decide the entire
+    /// capture from bounded metadata before decoding any ordinary payload.
     fn handle_capture(&self, params: &Value) -> Result<Value, IpcError> {
-        let event = params.get("event").cloned().unwrap_or(Value::Null);
-        let sensitive = event
-            .get("sensitive")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if sensitive {
-            self.ingest_capture_checked("gnome", true, &[])?;
+        let event = params.get("event").unwrap_or(&Value::Null);
+        match event.get("sensitive") {
+            Some(Value::Bool(true)) => {
+                self.record_capture_privacy_skip()?;
+                return Ok(serde_json::json!({"accepted": false}));
+            }
+            None | Some(Value::Bool(false)) => {}
+            _ => return Err(invalid_report_metadata()),
+        }
+        let cfg = self
+            .config
+            .lock()
+            .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?
+            .clone();
+        if self.capture_paused()? {
             return Ok(serde_json::json!({"accepted": false}));
         }
-        let payloads_value = params
-            .get("payloads")
-            .or_else(|| event.get("payloads"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        let mut payloads: Vec<(String, Vec<u8>)> = Vec::new();
-        match &payloads_value {
-            Value::Object(map) => {
-                let mut mimes: Vec<&String> = map.keys().collect();
-                mimes.sort();
-                for mime in mimes {
-                    let Some(encoded) = map.get(mime).and_then(Value::as_str) else {
-                        return Ok(serde_json::json!({"accepted": false}));
-                    };
-                    let Some(bytes) = b64_decode(encoded) else {
-                        return Ok(serde_json::json!({"accepted": false}));
-                    };
-                    payloads.push((mime.clone(), bytes));
-                }
-            }
-            Value::Array(items) => {
-                for item in items {
-                    let (Some(mime), Some(encoded)) = (
-                        item.get("mime").and_then(Value::as_str),
-                        item.get("inline_b64")
-                            .or_else(|| item.get("data_b64"))
-                            .or_else(|| item.get("b64"))
-                            .and_then(Value::as_str),
-                    ) else {
-                        continue;
-                    };
-                    let Some(bytes) = b64_decode(encoded) else {
-                        return Ok(serde_json::json!({"accepted": false}));
-                    };
-                    payloads.push((mime.to_string(), bytes));
-                }
-            }
-            _ => {}
+        let meta = read_report_metadata(params)?;
+        if report_source_ignored(meta.source_app, &cfg) {
+            return Ok(serde_json::json!({"accepted": false}));
         }
+        if cfg.privacy.strict
+            && meta
+                .mimes
+                .iter()
+                .any(|mime| capture::wanted_format(mime, &cfg.monitor.formats))
+            && !meta
+                .mimes
+                .iter()
+                .any(|mime| wanted_capture_mime(mime, &cfg))
+        {
+            self.record_capture_privacy_skip()?;
+            return Ok(serde_json::json!({"accepted": false}));
+        }
+        let oversize = report_oversize_entries(&meta, &cfg)?;
+        if !oversize.is_empty() {
+            let accepted = self.ingest_oversize_checked("gnome", &oversize)?;
+            return Ok(serde_json::json!({"accepted": accepted}));
+        }
+        let payloads = decode_report_payloads(meta.payloads, &cfg)?;
         if payloads.is_empty() {
             return Ok(serde_json::json!({"accepted": false}));
         }
@@ -2122,7 +2681,12 @@ impl DaemonState {
                     ));
                 }
             }
-            self.ingest_capture_checked("gnome", false, &[(mime, data)])?;
+            if !self.ingest_capture_checked("gnome", false, &[(mime, data)])? {
+                return Err(IpcError::new(
+                    "backend",
+                    "blob.put: capture was not stored".to_string(),
+                ));
+            }
         }
         Ok(serde_json::json!({"ok": true}))
     }
@@ -2562,13 +3126,24 @@ impl DaemonState {
     /// a fresh single-use gesture token (`gesture` param). Generic IPC
     /// callers cannot mint tokens, so tokenless elevated requests are
     /// refused without ever spawning.
+    fn paste_payloads(
+        &self,
+        clip: clipmonger_platform::types::ClipRef,
+        payloads: &[(String, Vec<u8>)],
+        params: &Value,
+    ) -> Result<Value, IpcError> {
+        with_pasteable_payloads(payloads, || {
+            self.paste_payloads_nonempty(clip, payloads, params)
+        })
+    }
+
     // `self` is only used by the Windows arm; other backends are stateless.
     #[allow(clippy::unused_self)]
     #[expect(
         clippy::too_many_lines,
         reason = "keep paste transaction and its error logging together"
     )]
-    fn paste_payloads(
+    fn paste_payloads_nonempty(
         &self,
         clip: clipmonger_platform::types::ClipRef,
         payloads: &[(String, Vec<u8>)],
@@ -3824,3 +4399,142 @@ mod tests {
 #[cfg(test)]
 #[path = "restore_tests.rs"]
 mod restore_tests;
+
+#[cfg(test)]
+mod oversize_source_controls {
+    use super::*;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn state() -> (PathBuf, DaemonState) {
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cm-task71-private-{}-{stamp}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        let store = Store::open(&path).unwrap();
+        let mut cfg = clipmonger_core::Config::default();
+        cfg.monitor.max_bytes = 4;
+        (path, DaemonState::with_config(store, cfg))
+    }
+
+    fn entry(mime: &str) -> [OversizeEntry; 1] {
+        [OversizeEntry {
+            mime: mime.to_string(),
+            bytes_hint: Some(5),
+        }]
+    }
+
+    #[test]
+    fn same_millisecond_uses_entropy_and_collision_refuses_without_overwrite() {
+        let (_path, state) = state();
+        let now = 1234;
+        let mut first = [1, 2].into_iter();
+        assert!(state
+            .ingest_oversize_with("windows", &entry("image/png"), now, || Ok(first
+                .next()
+                .expect("two entropy draws")))
+            .unwrap());
+        let original = state
+            .handle("history.list", &serde_json::json!({}))
+            .unwrap()["clips"][0]
+            .clone();
+        let mut collision = [1, 2].into_iter();
+        let error = state
+            .ingest_oversize_with("windows", &entry("text/html"), now, || {
+                Ok(collision.next().expect("two entropy draws"))
+            })
+            .expect_err("colliding stub ID must not overwrite");
+        assert!(error.message.contains("ID already exists"));
+        assert_eq!(
+            state
+                .handle("history.list", &serde_json::json!({}))
+                .unwrap()["clips"],
+            serde_json::json!([original])
+        );
+        let mut second = [3, 4].into_iter();
+        assert!(state
+            .ingest_oversize_with("windows", &entry("text/html"), now, || Ok(second
+                .next()
+                .expect("two entropy draws")))
+            .unwrap());
+        let rows = state
+            .handle("history.list", &serde_json::json!({}))
+            .unwrap();
+        let rows = rows["clips"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["created_ms"], rows[1]["created_ms"]);
+        assert_ne!(rows[0]["id"], rows[1]["id"]);
+    }
+
+    #[test]
+    fn entropy_failure_on_either_draw_has_no_store_write() {
+        for fail_at in [0, 1] {
+            let (path, state) = state();
+            let draws = Cell::new(0);
+            let error = state
+                .ingest_oversize_with("windows", &entry("image/png"), 1234, || {
+                    let at = draws.get();
+                    draws.set(at + 1);
+                    if at == fail_at {
+                        Err(clipmonger_core::entropy::Error::UNSUPPORTED)
+                    } else {
+                        Ok(1)
+                    }
+                })
+                .expect_err("entropy failure must propagate");
+            assert_eq!(error.code, "unavailable");
+            assert_eq!(
+                state
+                    .handle("history.list", &serde_json::json!({}))
+                    .unwrap()["clips"]
+                    .as_array()
+                    .unwrap()
+                    .as_slice(),
+                [] as [serde_json::Value; 0]
+            );
+            let conn = rusqlite::Connection::open(path.join("clipstore.sqlite3")).unwrap();
+            for table in ["clips", "clip_payloads", "clip_blobs", "clips_fts"] {
+                assert_eq!(
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stored_stub_payload_reader_refuses_before_delivery_closure() {
+        let (path, state) = state();
+        assert!(state
+            .ingest_oversize_checked("windows", &entry("image/png"))
+            .unwrap());
+        let store = Store::open(&path).unwrap();
+        let clip = store.list_history(1, 0, false).unwrap().pop().unwrap();
+        let (_, payloads) = store.get_clip(clip.id).unwrap().unwrap();
+        let called = Cell::new(false);
+        let error = with_pasteable_payloads(&payloads, || {
+            called.set(true);
+            Ok(())
+        })
+        .expect_err("actual shared paste gate refuses an empty stored clip");
+        assert!(error.message.contains("no pasteable payload"));
+        assert!(!called.get());
+        state
+            .paste_payloads(
+                clipmonger_platform::types::ClipRef(clip.id),
+                &payloads,
+                &Value::Null,
+            )
+            .expect_err("production paste entry refuses on every feature set");
+    }
+}
