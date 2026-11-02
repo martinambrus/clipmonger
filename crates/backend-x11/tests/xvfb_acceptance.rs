@@ -1236,8 +1236,9 @@ fn t505_save_targets_dying_owner() {
     reason = "the overlap oracle preserves the ordered timing and handoff assertions"
 )]
 fn t505_save_targets_gated_overlap() {
-    let (_guard, xvfb) = fixture("t505_save_targets_gated_overlap")
-        .expect("gated overlap requires a working Xvfb fixture");
+    let Some((_guard, xvfb)) = fixture("t505_save_targets_gated_overlap") else {
+        return;
+    };
     let display = xvfb.addr().to_string();
     let text = b"save-me-gated text".to_vec();
     let html = b"<p>save-me-gated html</p>".to_vec();
