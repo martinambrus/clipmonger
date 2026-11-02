@@ -26,6 +26,8 @@ export default class ClipmongerExtension extends Extension {
             const cfg = mergeConfig(result);
             diff.denylist = [...cfg.privacy.denylist, ...prefDenylist, ...cfg.monitor.ignores];
             diff.maxBytes = cfg.monitor.max_bytes;
+            diff.formats = cfg.monitor.formats;
+            diff.strict = cfg.privacy.strict;
             this.capture?.setPollMs(cfg.monitor.poll_ms);
             hotkeys.registerPopup(cfg.popup.hotkey);
         };

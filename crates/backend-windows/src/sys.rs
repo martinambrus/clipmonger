@@ -56,6 +56,76 @@ fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+// The clipboard handles use kernel32 global-memory APIs. Declare this tiny
+// boundary locally instead of enabling a new windows-sys feature/dependency.
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "GlobalSize"]
+    fn clipboard_global_size(handle: HANDLE) -> usize;
+    #[link_name = "GlobalLock"]
+    fn clipboard_global_lock(handle: HANDLE) -> *mut c_void;
+    #[link_name = "GlobalUnlock"]
+    fn clipboard_global_unlock(handle: HANDLE) -> i32;
+}
+
+#[cfg(windows)]
+struct ClipboardDataLock(HANDLE);
+
+#[cfg(windows)]
+impl Drop for ClipboardDataLock {
+    fn drop(&mut self) {
+        // Safety: the guard owns exactly one successful GlobalLock and the
+        // clipboard remains exclusively open until this guard is dropped.
+        unsafe {
+            clipboard_global_unlock(self.0);
+        }
+    }
+}
+
+/// Inspect native bytes without first copying the entire clipboard handle.
+/// The caller must hold the exclusive clipboard session from `with_open` for
+/// the whole call. The callback cannot retain the borrowed memory. No handle
+/// is freed: the clipboard owns it, and the lock guard only unlocks it.
+#[cfg(windows)]
+pub(crate) fn with_clipboard_bytes<T>(
+    id: u32,
+    inspect: impl FnOnce(&[u8]) -> clipmonger_platform::types::Result<T>,
+) -> clipmonger_platform::types::Result<T> {
+    use clipmonger_platform::types::Error;
+    // Safety: all callers run inside transfer::imp::with_open, which keeps
+    // the clipboard exclusively open while this handle is inspected.
+    let handle = unsafe { windows_sys::Win32::System::DataExchange::GetClipboardData(id) };
+    if handle.is_null() {
+        return Err(Error::Unavailable(
+            "clipboard format has no data".to_string(),
+        ));
+    }
+    // Safety: handle was returned by GetClipboardData for a byte-backed format.
+    let len = unsafe { clipboard_global_size(handle) };
+    if len == 0 {
+        return inspect(&[]);
+    }
+    if isize::try_from(len).is_err() {
+        return Err(Error::TooLarge(
+            "native clipboard handle over addressable limit".to_string(),
+        ));
+    }
+    // Safety: the byte-backed clipboard handle is valid and remains owned by
+    // the clipboard. The matching unlock is owned by the RAII guard below.
+    let ptr = unsafe { clipboard_global_lock(handle) };
+    if ptr.is_null() {
+        return Err(Error::Io(format!(
+            "clipboard data lock failed: {}",
+            last_error()
+        )));
+    }
+    let _lock = ClipboardDataLock(handle);
+    // Safety: GlobalLock exposes len initialized native bytes, len fits
+    // isize, and the lock/session outlive this non-escaping borrowed slice.
+    inspect(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) })
+}
+
 // ---------------------------------------------------------------------------
 // Clipboard session owner
 // ---------------------------------------------------------------------------

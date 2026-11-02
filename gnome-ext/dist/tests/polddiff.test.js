@@ -46,7 +46,10 @@ test('oversize format skipped, others reported with truncated list', () => {
         assert.deepEqual(decision.truncated, ['image/png']);
     }
     const allBig = new PollDiff({ maxBytes: 1 });
-    assert.deepEqual(allBig.decide({ offers: text('toolong'), nowMs: 0 }), { kind: 'Ignore', reason: 'oversize' });
+    const allBigDecision = allBig.decide({ offers: text('toolong'), nowMs: 0 });
+    assert.equal(allBigDecision.kind, 'Report');
+    if (allBigDecision.kind === 'Report')
+        assert.deepEqual(allBigDecision.truncated, ['text/plain']);
 });
 test('self-write suppressed within TTL (one-shot), real copy after TTL kept', () => {
     const d = new PollDiff();

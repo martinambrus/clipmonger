@@ -3,7 +3,8 @@
 import St from 'gi://St';
 import GLib from 'gi://GLib?version=2.0';
 import { PollDiff, type OfferInput } from './polddiff.js';
-import { base64Encode, captureReportRequest, blobPutRequests, newClipId, CHUNK_RAW_BYTES, type CaptureEvent } from './codec.js';
+import { captureReportRequest, newClipId } from './codec.js';
+import { emitCaptureReport } from './report.js';
 import type { IpcClient } from './ipc.js';
 
 export class CaptureRelay {
@@ -48,8 +49,21 @@ export class CaptureRelay {
           else done(null);
         } catch { done(null); }
       });
+      // Privacy signals precede source-app queries and all ordinary reads.
+      const privacy = this.diff.preflight(mimes);
+      if (privacy?.kind === 'Sensitive') {
+        await this.ipc.request(captureReportRequest(this.ipc.nextId(), {
+          clip: newClipId(), origin: 'Clipboard', source_app: null,
+          sensitive: true, offers: [],
+        }));
+        this.ipc.relay.recordSuccess();
+        return;
+      }
+      const focusedAppId: string | null = (globalThis as any).global?.display?.get_focus_window?.()?.get_gtk_application_id?.() ?? null;
+      if (this.diff.preflight(mimes, focusedAppId)) { this.ipc.relay.recordSuccess(); return; }
       const offers: OfferInput[] = [];
       for (const mime of mimes) {
+        if (!this.diff.wants(mime)) continue;
         if (mime.startsWith('text/plain') || mime === 'UTF8_STRING') {
           // get_text may answer via callback or via a returned promise,
           // depending on Shell version; a callback that never fires must
@@ -72,15 +86,10 @@ export class CaptureRelay {
           offers.push({ mime, sizeHint: 0 });
         }
       }
-      // VERIFY: focused app id via global.display.get_focus_window()
-      // ?.get_gtk_application_id() / Shell.WindowTracker — exact call per version.
-      const focusedAppId: string | null = (globalThis as any).global?.display?.get_focus_window?.()?.get_gtk_application_id?.() ?? null;
-      const hint = offers.find((o) => o.mime === 'x-kde-passwordManagerHint');
-      void hint;
       const decision = this.diff.decide({ offers, focusedAppId, nowMs: Date.now() });
       if (decision.kind === 'Report') {
         console.log(`clipmonger: capture report (${decision.offers.length} offers, app=${focusedAppId ?? '?'})`);
-        await this.emitReport(decision.offers, decision.truncated, focusedAppId);
+        await emitCaptureReport(this.ipc.nextId, (frame) => this.ipc.request(frame), decision.offers, decision.truncated, focusedAppId, decision.truncatedOffers);
       }
       this.ipc.relay.recordSuccess();
     } catch (e) {
@@ -89,21 +98,4 @@ export class CaptureRelay {
     } finally { this.diff.setReading(false); }
   }
 
-  private async emitReport(offers: Array<{ mime: string; bytes_hint: number; bytes?: Uint8Array }>, truncated: string[], sourceApp: string | null): Promise<void> {
-    const clip = newClipId();
-    const payloads: Record<string, string> = {};
-    const eventOffers: CaptureEvent['offers'] = [];
-    for (const offer of offers) {
-      const bytes = offer.bytes;
-      if (bytes && bytes.length > CHUNK_RAW_BYTES) {
-        for (const frame of blobPutRequests(this.ipc.nextId, clip, offer.mime, bytes)) await this.ipc.request(frame);
-        eventOffers.push({ mime: offer.mime, bytes_hint: bytes.length, blob: true });
-      } else if (bytes) {
-        payloads[offer.mime] = base64Encode(bytes);
-        eventOffers.push({ mime: offer.mime, bytes_hint: bytes.length, inline_b64: payloads[offer.mime] });
-      } else eventOffers.push({ mime: offer.mime, bytes_hint: offer.bytes_hint });
-    }
-    const event: CaptureEvent = { clip, origin: 'Clipboard', source_app: sourceApp, sensitive: false, offers: eventOffers, truncated };
-    await this.ipc.request(captureReportRequest(this.ipc.nextId(), event, payloads));
-  }
 }
