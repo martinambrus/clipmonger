@@ -259,7 +259,7 @@ MUST NOT be promised in v1.
   (verify rusqlite-bundled FTS5 at implementation; LIKE fallback).
   Display previews render from payload at query time (any width).
 - Decode guards (review finding 36): images/native payloads enforce
-  max dimension 8192 px, max 64 MP, per-decode timeout; violations →
+  max 64 MP (width and bottom-up height capped at 65535 px by the bitmap decoder, top-down height bound only by 64 MP, so wide multi-monitor screenshots fit), per-decode timeout; violations →
   `TooLarge`/`Unsupported` stub, never OOM. Parser fuzz vectors in T-305.
 - Primary selection (review H-11): `capture_primary` DEFAULTS OFF
   (selection-churn spam protection); when on: 500 ms debounce + min

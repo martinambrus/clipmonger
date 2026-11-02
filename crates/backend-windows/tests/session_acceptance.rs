@@ -123,15 +123,71 @@ fn t405_transfer_roundtrip() {
     }
 }
 
-/// T-402 session opt-out: a raw `CanIncludeInClipboardHistory=0` format
-/// write is not expressible through `ClipboardTransfer::write(PayloadMap)`.
-/// Opt-out itself is covered by the pure matrix (wincore optout unit tests).
+/// T-402 session opt-out: raw history DWORD zero marks every observed
+/// event sensitive; DWORD one permits capture with a text/plain offer.
+/// Report the clipboard block length to expose any allocation padding.
 #[test]
 fn t402_session_optout() {
-    println!(
-        "SKIP t402_session_optout: raw CanIncludeInClipboardHistory=0 format write \
-         is not expressible via ClipboardTransfer::write; opt-out covered by pure matrix (T-402)"
-    );
+    use clipmonger_backend_windows::optout::HISTORY_OPT_OUT;
+    const T: &str = "t402_session_optout";
+    let mut mon = match WinMonitor::new() {
+        Ok(m) => m,
+        Err(e) => {
+            println!("SKIP {T}: monitor unavailable in session: {e}");
+            return;
+        }
+    };
+    guard!(mon.subscribe(&[SubscribeKind::Clipboard]), T);
+    let t = WinTransfer::new();
+    let saved = guard!(save_user_text(&t), T);
+    let id = clipboard_win::raw::register_format(HISTORY_OPT_OUT).expect("history format");
+
+    for (value, sensitive) in [(0_u32, true), (1_u32, false)] {
+        let marker = unique_marker("t402");
+        guard!(
+            t.write(&[
+                ("text/plain".to_string(), marker.into_bytes()),
+                (
+                    format!("x-os/{HISTORY_OPT_OUT}"),
+                    value.to_le_bytes().to_vec()
+                ),
+            ]),
+            T
+        );
+        let raw = raw_format(id.get()).expect("history marker missing after write");
+        println!(
+            "{T}: {HISTORY_OPT_OUT}={value}, raw byte length {}",
+            raw.len()
+        );
+
+        let mut events = Vec::new();
+        for _ in 0..10 {
+            events.extend(guard!(mon.poll(Duration::from_millis(500)), T));
+            if !events.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !events.is_empty(),
+            "{T}: no event for history DWORD {value}"
+        );
+        for event in events {
+            assert_eq!(
+                event.sensitive, sensitive,
+                "{T}: wrong sensitivity for history DWORD {value}"
+            );
+            if !sensitive {
+                assert!(
+                    event.offers.iter().any(|offer| offer.mime == "text/plain"),
+                    "{T}: history DWORD one must offer text/plain"
+                );
+            }
+        }
+    }
+
+    if let Some(orig) = saved {
+        let _ = t.write(&[("text/plain".to_string(), orig)]);
+    }
 }
 
 /// T-406 hotkeys: register/unregister round-trip plus duplicate-chord
