@@ -569,7 +569,111 @@ impl Server {
 }
 
 #[cfg(any(unix, windows))]
-type SharedWriter<S> = Arc<tokio::sync::Mutex<tokio::io::WriteHalf<S>>>;
+struct SharedWriterInner<S> {
+    slot: tokio::sync::Mutex<Option<tokio::io::WriteHalf<S>>>,
+    closed: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(any(unix, windows))]
+struct SharedWriter<S> {
+    inner: Arc<SharedWriterInner<S>>,
+}
+
+#[cfg(any(unix, windows))]
+impl<S> Clone for SharedWriter<S> {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl<S> SharedWriter<S> {
+    fn new(half: tokio::io::WriteHalf<S>) -> Self {
+        let (closed, _) = tokio::sync::watch::channel(false);
+        Self {
+            inner: Arc::new(SharedWriterInner {
+                slot: tokio::sync::Mutex::new(Some(half)),
+                closed,
+            }),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        *self.inner.closed.borrow()
+    }
+
+    fn trigger_close(&self) {
+        self.inner.closed.send_replace(true);
+    }
+
+    async fn wait_closed(&self) {
+        let mut closed = self.inner.closed.subscribe();
+        while !*closed.borrow_and_update() {
+            if closed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    async fn write_bytes(&self, bytes: &[u8]) -> Result<(), ()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt as _;
+        if self.is_closed() {
+            return Err(());
+        }
+        let mut guard = tokio::select! {
+            biased;
+            _ = self.wait_closed() => return Err(()),
+            g = self.inner.slot.lock() => g,
+        };
+        if self.is_closed() {
+            return Err(());
+        }
+        let Some(half) = guard.as_mut() else {
+            return Err(());
+        };
+        let res = tokio::select! {
+            biased;
+            _ = self.wait_closed() => return Err(()),
+            r = half.write_all(bytes) => r,
+        };
+        match res {
+            Ok(()) => {
+                let flush_res = tokio::select! {
+                    biased;
+                    _ = self.wait_closed() => return Err(()),
+                    r = half.flush() => r,
+                };
+                match flush_res {
+                    Ok(()) => {
+                        if self.is_closed() {
+                            Err(())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    Err(_) => {
+                        self.trigger_close();
+                        Err(())
+                    }
+                }
+            }
+            Err(_) => {
+                self.trigger_close();
+                Err(())
+            }
+        }
+    }
+
+    async fn close_and_take(&self) {
+        self.trigger_close();
+        let mut guard = self.inner.slot.lock().await;
+        guard.take();
+    }
+}
+
 #[cfg(any(unix, windows))]
 type SharedCancels = Arc<Mutex<HashSet<String>>>;
 
@@ -661,15 +765,24 @@ async fn serve_conn<S>(
     let lifecycle = options.lifecycle;
     let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(read_half);
-    let writer: SharedWriter<S> = Arc::new(tokio::sync::Mutex::new(write_half));
+    let writer = SharedWriter::new(write_half);
     let Some(Ok(hello)) = next_frame(&mut reader).await else {
+        writer.trigger_close();
+        writer.close_and_take().await;
         return;
     };
     if hello.kind != FrameKind::Req || hello.method.as_deref() != Some("hello") {
+        writer.trigger_close();
+        writer.close_and_take().await;
         return;
     }
-    answer_hello(&writer, &hello, &token).await;
+    let hello_ok = matches!(answer_hello(&writer, &hello, &token).await, Ok(ReplyDelivery::Original));
     if !hello_token_ok(&hello, &token) {
+        writer.close_and_take().await;
+        return;
+    }
+    if !hello_ok {
+        writer.close_and_take().await;
         return;
     }
     let client = hello
@@ -694,6 +807,7 @@ async fn serve_conn<S>(
         hub.as_ref().map(|hub| (hub, peer_pid, &mut subscription)),
     )
     .await;
+    writer.close_and_take().await;
     if let (Some(hub), Some((id, task))) = (&hub, subscription) {
         task.abort();
         hub.unsubscribe(id);
@@ -715,14 +829,27 @@ async fn serve_requests<S, R>(
     handler: Handler,
     mut events: Option<(&EventHub, Option<u32>, &mut Option<Subscription>)>,
 ) where
-    S: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     R: tokio::io::AsyncRead + Unpin,
 {
     let cancelled: SharedCancels = Arc::new(Mutex::new(HashSet::new()));
-    while let Some(frame) = next_frame(reader).await {
+    loop {
+        let frame_opt = tokio::select! {
+            biased;
+            _ = writer.wait_closed() => {
+                break;
+            }
+            f = next_frame(reader) => f,
+        };
+        let Some(frame) = frame_opt else {
+            break;
+        };
         let env = match frame {
             Ok(env) => env,
-            Err(e) if e.code == "oversize" => return,
+            Err(e) if e.code == "oversize" => {
+                writer.trigger_close();
+                break;
+            }
             Err(_) => continue,
         };
         match env.kind {
@@ -732,13 +859,26 @@ async fn serve_requests<S, R>(
                 }
             }
             FrameKind::Req => match (env.method.as_deref(), events.as_mut()) {
-                (Some("hello"), _) => answer_hello(writer, &env, token).await,
-                (Some("events.subscribe"), Some((hub, peer_pid, slot))) => {
-                    subscribe(writer, hub, &env, *peer_pid, slot).await;
+                (Some("hello"), _) => {
+                    if answer_hello(writer, &env, token).await.is_err() {
+                        break;
+                    }
                 }
-                _ => dispatch((*writer).clone(), cancelled.clone(), handler.clone(), env),
+                (Some("events.subscribe"), Some((hub, peer_pid, slot))) => {
+                    if subscribe(writer, hub, &env, *peer_pid, slot).await.is_err() {
+                        break;
+                    }
+                }
+                _ => dispatch(writer.clone(), cancelled.clone(), handler.clone(), env),
             },
             FrameKind::Res | FrameKind::Event => {}
+        }
+    }
+    writer.trigger_close();
+    if let Some((hub, _, slot)) = events {
+        if let Some((id, task)) = slot.take() {
+            task.abort();
+            hub.unsubscribe(id);
         }
     }
 }
@@ -752,16 +892,16 @@ async fn subscribe<S>(
     req: &Envelope,
     peer_pid: Option<u32>,
     slot: &mut Option<Subscription>,
-) where
-    S: tokio::io::AsyncWrite + Unpin + Send + 'static,
+ ) -> Result<(), ()>
+ where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     if slot.is_some() {
         let error = IpcError::new(
             "already_subscribed",
             "this connection is already subscribed".to_string(),
         );
-        send_res(writer, &req.id, None, Some(error)).await;
-        return;
+        return send_res(writer, &req.id, None, Some(error)).await.map(|_| ());
     }
     let params = req.params.clone().unwrap_or(Value::Null);
     let topics: Vec<String> = params
@@ -778,11 +918,23 @@ async fn subscribe<S>(
     match hub.subscribe(topics, peer_pid, params) {
         Ok((id, wake)) => {
             let ok = serde_json::json!({"ok": true});
-            send_res(writer, &req.id, Some(ok), None).await;
-            let task = tokio::spawn(write_events(Arc::clone(writer), hub.clone(), id, wake));
-            *slot = Some((id, task));
+            match send_res(writer, &req.id, Some(ok), None).await {
+                Ok(ReplyDelivery::Original) => {
+                    let task = tokio::spawn(write_events(writer.clone(), hub.clone(), id, wake));
+                    *slot = Some((id, task));
+                    Ok(())
+                }
+                Ok(ReplyDelivery::Fallback) => {
+                    hub.unsubscribe(id);
+                    Ok(())
+                }
+                Err(()) => {
+                    hub.unsubscribe(id);
+                    Err(())
+                }
+            }
         }
-        Err(error) => send_res(writer, &req.id, None, Some(error)).await,
+        Err(error) => send_res(writer, &req.id, None, Some(error)).await.map(|_| ()),
     }
 }
 
@@ -794,18 +946,21 @@ async fn write_events<S>(
     id: u64,
     wake: Arc<tokio::sync::Notify>,
 ) where
-    S: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    use tokio::io::AsyncWriteExt as _;
     loop {
-        wake.notified().await;
-        for env in hub.drain(id) {
-            let Ok(bytes) = encode_line(&env) else {
-                continue;
-            };
-            let mut guard = writer.lock().await;
-            if guard.write_all(&bytes).await.is_err() {
-                return;
+        tokio::select! {
+            biased;
+            _ = writer.wait_closed() => return,
+            _ = wake.notified() => {
+                for env in hub.drain(id) {
+                    let Ok(bytes) = encode_line(&env) else {
+                        continue;
+                    };
+                    if writer.write_bytes(&bytes).await.is_err() {
+                        return;
+                    }
+                }
             }
         }
     }
@@ -822,16 +977,16 @@ fn hello_token_ok(hello: &Envelope, token: &str) -> bool {
 }
 
 #[cfg(any(unix, windows))]
-async fn answer_hello<S>(writer: &SharedWriter<S>, hello: &Envelope, token: &str)
+async fn answer_hello<S>(writer: &SharedWriter<S>, hello: &Envelope, token: &str) -> Result<ReplyDelivery, ()>
 where
-    S: tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     if hello_token_ok(hello, token) {
         let welcome = serde_json::json!({
             "chosen": 1,
             "daemon_version": env!("CARGO_PKG_VERSION"),
         });
-        send_res(writer, &hello.id, Some(welcome), None).await;
+        send_res(writer, &hello.id, Some(welcome), None).await
     } else {
         let denied = IpcError {
             code: "auth_failed".to_string(),
@@ -839,36 +994,36 @@ where
             retryable: false,
             backend: None,
         };
-        send_res(writer, &hello.id, None, Some(denied)).await;
+        send_res(writer, &hello.id, None, Some(denied)).await
     }
 }
 
 #[cfg(any(unix, windows))]
 fn dispatch<S>(writer: SharedWriter<S>, cancelled: SharedCancels, handler: Handler, req: Envelope)
 where
-    S: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         let id = req.id.clone();
         let method = req.method.clone().unwrap_or_default();
         let params = req.params.clone().unwrap_or(Value::Null);
         if is_cancelled(&cancelled, &id) {
-            send_res(&writer, &id, None, Some(cancelled_error())).await;
+            let _ = send_res(&writer, &id, None, Some(cancelled_error())).await;
             return;
         }
         let outcome = tokio::task::spawn_blocking(move || handler(method, params)).await;
         if is_cancelled(&cancelled, &id) {
-            send_res(&writer, &id, None, Some(cancelled_error())).await;
+            let _ = send_res(&writer, &id, None, Some(cancelled_error())).await;
             return;
         }
-        match outcome {
+        let _ = match outcome {
             Ok(Ok(value)) => send_res(&writer, &id, Some(value), None).await,
             Ok(Err(error)) => send_res(&writer, &id, None, Some(error)).await,
             Err(_) => {
                 let failed = IpcError::new("internal", "handler task failed".to_string());
-                send_res(&writer, &id, None, Some(failed)).await;
+                send_res(&writer, &id, None, Some(failed)).await
             }
-        }
+        };
     });
 }
 
@@ -886,16 +1041,22 @@ fn cancelled_error() -> IpcError {
 }
 
 #[cfg(any(unix, windows))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplyDelivery {
+    Original,
+    Fallback,
+}
+
+#[cfg(any(unix, windows))]
 async fn send_res<S>(
     writer: &SharedWriter<S>,
     id: &str,
     result: Option<Value>,
     error: Option<IpcError>,
-) where
-    S: tokio::io::AsyncWrite + Unpin,
+) -> Result<ReplyDelivery, ()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use tokio::io::AsyncWriteExt as _;
-
     let env = Envelope {
         v: IPC_VERSION.to_string(),
         id: id.to_string(),
@@ -906,11 +1067,40 @@ async fn send_res<S>(
         error,
         seq: None,
     };
-    let Ok(bytes) = encode_line(&env) else {
-        return;
-    };
-    let mut guard = writer.lock().await;
-    let _ = guard.write_all(&bytes).await;
+    match encode_line(&env) {
+        Ok(bytes) => {
+            if writer.write_bytes(&bytes).await.is_ok() {
+                Ok(ReplyDelivery::Original)
+            } else {
+                Err(())
+            }
+        }
+        Err(_) => {
+            let fallback = Envelope {
+                v: IPC_VERSION.to_string(),
+                id: id.to_string(),
+                kind: FrameKind::Res,
+                method: None,
+                params: None,
+                result: None,
+                error: Some(IpcError::new(
+                    "oversize",
+                    "response exceeds frame limit".to_string(),
+                )),
+                seq: None,
+            };
+            match encode_line(&fallback) {
+                Ok(fb_bytes) => {
+                    writer.write_bytes(&fb_bytes).await?;
+                    Ok(ReplyDelivery::Fallback)
+                }
+                Err(_) => {
+                    writer.trigger_close();
+                    Err(())
+                }
+            }
+        }
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -1034,5 +1224,99 @@ mod tests {
         drop(guard);
         drop(server);
         let _ = std::fs::remove_file(&sock);
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod reply_close_tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+    use tokio::time::timeout;
+
+    // Deterministic write failure while retaining an actual asynchronous read side.
+    struct FailWrite(tokio::io::DuplexStream);
+    impl AsyncRead for FailWrite {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+    impl AsyncWrite for FailWrite {
+        fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "fixture")))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> { Poll::Ready(Ok(())) }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> { Poll::Ready(Ok(())) }
+    }
+
+    #[tokio::test]
+    async fn failed_hello_write_emits_no_lifecycle() {
+        let (server, mut client) = tokio::io::duplex(4096);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&events);
+        let options = ServeOptions { lifecycle: Some(Arc::new(move |e| seen.lock().unwrap().push(e))), ..ServeOptions::default() };
+        let handler: Handler = Arc::new(|_, _| Ok(Value::Null));
+        let task = tokio::spawn(serve_conn(FailWrite(server), "tok".into(), handler, options, None));
+        let hello = Envelope { v: IPC_VERSION.into(), id: "h".into(), kind: FrameKind::Req, method: Some("hello".into()), params: Some(serde_json::json!({"token":"tok", "client":"c"})), result: None, error: None, seq: None };
+        let welcome = Envelope { v: IPC_VERSION.into(), id: hello.id.clone(), kind: FrameKind::Res, method: None, params: None, result: Some(serde_json::json!({"chosen": 1, "daemon_version": env!("CARGO_PKG_VERSION")})), error: None, seq: None };
+        assert!(encode_line(&welcome).is_ok());
+        client.write_all(&encode_line(&hello).unwrap()).await.unwrap();
+        timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_subscribe_write_removes_subscriber() {
+        let (server, _client) = tokio::io::duplex(4096);
+        let (_read, write) = tokio::io::split(FailWrite(server));
+        let writer = SharedWriter::new(write);
+        let hub = EventHub::new(vec![TopicRule { topic: "foo".into(), exclusive: true }]);
+        let req = Envelope { v: IPC_VERSION.into(), id: "s".into(), kind: FrameKind::Req, method: Some("events.subscribe".into()), params: Some(serde_json::json!({"topics":["foo"]})), result: None, error: None, seq: None };
+        let mut subscription = None;
+        assert!(encode_line(&req).is_ok());
+        let ack = Envelope { v: IPC_VERSION.into(), id: req.id.clone(), kind: FrameKind::Res, method: None, params: None, result: Some(serde_json::json!({"ok": true})), error: None, seq: None };
+        assert!(encode_line(&ack).is_ok());
+        assert!(subscribe(&writer, &hub, &req, None, &mut subscription).await.is_err());
+        assert!(hub.subscribers("foo").is_empty());
+        assert!(subscription.is_none());
+        writer.close_and_take().await;
+    }
+
+    #[tokio::test]
+    async fn close_releases_blocked_writer_and_waiter_and_drops_both_halves() {
+        let (server, mut client) = tokio::io::duplex(1);
+        let (read, write) = tokio::io::split(server);
+        let writer = SharedWriter::new(write);
+        let first = writer.clone();
+        let writing = tokio::spawn(async move { first.write_bytes(&vec![7; 65536]).await });
+        // Reading one byte proves the write acquired the slot and exceeded its buffer.
+        let mut byte = [0; 1];
+        timeout(Duration::from_secs(5), client.read_exact(&mut byte)).await.unwrap().unwrap();
+        // Hold the slot until this task has queued for it, independently of scheduler timing.
+        let second = writer.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiting = tokio::spawn(async move {
+            let mut operation = Box::pin(second.write_bytes(b"wait"));
+            let mut started = Some(started_tx);
+            std::future::poll_fn(|cx| match operation.as_mut().poll(cx) {
+                Poll::Pending => {
+                    if let Some(tx) = started.take() { let _ = tx.send(()); }
+                    Poll::Pending
+                }
+                ready => ready,
+            }).await
+        });
+        timeout(Duration::from_secs(5), started_rx).await.unwrap().unwrap();
+        writer.trigger_close();
+        timeout(Duration::from_secs(5), writer.close_and_take()).await.unwrap();
+        assert!(timeout(Duration::from_secs(5), writing).await.unwrap().unwrap().is_err());
+        assert!(timeout(Duration::from_secs(5), waiting).await.unwrap().unwrap().is_err());
+        drop(read);
+        let mut remaining = Vec::new();
+        timeout(Duration::from_secs(5), client.read_to_end(&mut remaining)).await.unwrap().unwrap();
+        // The retained SharedWriter clones cannot keep the underlying stream alive.
+        assert!(writer.is_closed());
     }
 }
