@@ -17,7 +17,6 @@ use clipmonger_app_ui::{app, foreground, ipc_bridge, lifecycle, placement, push,
 use clipmonger_app_ui::{linux_tray, tray_logic};
 use clipmonger_core::config::Config;
 use clipmonger_ipc::client::Client;
-use clipmonger_ipc::framing;
 use clipmonger_ipc::proto::IpcError;
 use serde_json::Value;
 
@@ -129,36 +128,10 @@ fn hand_over_to_running_ui(profile: &Path) {
     }
 }
 
-/// Read the profile token file.
-fn read_token(profile: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(profile.join("token")).ok()?;
-    let trimmed = text.trim().to_string();
-    if trimmed.is_empty() {
-        Option::None
-    } else {
-        Some(trimmed)
-    }
-}
-
-/// Resolve the daemon socket from rendezvous or the path helper.
-fn socket_for(profile: &Path) -> PathBuf {
-    if let Ok(text) = std::fs::read_to_string(profile.join("rendezvous.json")) {
-        if let Ok(body) = serde_json::from_str::<Value>(&text) {
-            if let Some(socket) = body.get("socket").and_then(Value::as_str) {
-                return PathBuf::from(socket);
-            }
-        }
-    }
-    let runtime =
-        std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
-    framing::socket_path_for(profile, &runtime)
-}
-
 /// Try one IPC connect for the profile.
 fn try_connect(profile: &Path) -> Option<Client> {
-    let socket = socket_for(profile);
-    let token = read_token(profile)?;
-    Client::connect(&socket, &token).ok()
+    let connection = clipmonger_app_ui::profile_connection::resolve(profile).ok()?;
+    Client::connect(&connection.endpoint, &connection.token).ok()
 }
 
 /// Daemon binary next to the running shell binary.
