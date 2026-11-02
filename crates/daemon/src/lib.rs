@@ -18,6 +18,54 @@ use serde_json::Value;
 
 pub mod capture;
 
+fn daemon_runtime_emit(
+    sev: clipmonger_core::runtime_log::Severity,
+    event: &str,
+    fields: &[(&str, &str)],
+) {
+    let _ = clipmonger_core::runtime_log::global_emit(
+        clipmonger_core::runtime_log::Role::Daemon,
+        sev,
+        event,
+        fields,
+    );
+}
+
+/// Classify before formatting; backend messages can contain user-controlled text.
+#[must_use]
+pub fn runtime_platform_class(error: &clipmonger_platform::types::Error) -> &'static str {
+    use clipmonger_platform::types::Error;
+    match error {
+        Error::Unavailable(_) => "unavailable",
+        Error::Denied(_) => "denied",
+        Error::Timeout(_) => "timeout",
+        Error::TooLarge(_) => "too_large",
+        Error::Unsupported(_) => "unsupported",
+        Error::Io(_) => "io",
+        Error::Internal(_) => "internal",
+    }
+}
+fn log_capture_read_skipped(error: &clipmonger_platform::types::Error) {
+    daemon_runtime_emit(
+        clipmonger_core::runtime_log::Severity::Warn,
+        "capture.read_skipped",
+        &[
+            ("operation", "capture_read"),
+            ("class", runtime_platform_class(error)),
+        ],
+    );
+}
+
+fn runtime_origin(origin: &str) -> &'static str {
+    match origin {
+        "windows" => "windows",
+        "x11" => "x11",
+        "wayland" => "wayland",
+        "gnome" => "gnome",
+        _ => "other",
+    }
+}
+
 /// Protocol tag written to the rendezvous file.
 pub const PROTOCOL: &str = "ipc/v1";
 pub mod popup;
@@ -668,6 +716,14 @@ impl CapsAggregator {
         }
     }
 
+    fn update_backend(&self, name: &str, update: impl FnOnce(&mut BackendCaps)) {
+        if let Ok(mut backends) = self.backends.lock() {
+            if let Some(caps) = backends.get_mut(name) {
+                update(caps);
+            }
+        }
+    }
+
     /// Flip the GNOME extension link state.
     pub fn set_extension_connected(&self, connected: bool) {
         if let Ok(mut flag) = self.extension_connected.lock() {
@@ -1010,9 +1066,9 @@ fn read_report_metadata(params: &Value) -> Result<CaptureReportMetadata<'_>, Ipc
         if let Some(size) = offer.get("bytes_hint") {
             // GNOME's existing JS-number contract cannot represent larger exact integers.
             if !size.is_null()
-                && !size
+                && size
                     .as_u64()
-                    .is_some_and(|bytes| bytes <= 9_007_199_254_740_991)
+                    .is_none_or(|bytes| bytes > 9_007_199_254_740_991)
             {
                 return Err(invalid_report_metadata());
             }
@@ -1413,6 +1469,19 @@ enum StoreDecision {
     Failed,
 }
 
+struct StoreFailure {
+    class: &'static str,
+    code: String,
+}
+impl StoreFailure {
+    fn fixed(class: &'static str) -> Self {
+        Self {
+            class,
+            code: class.into(),
+        }
+    }
+}
+
 /// Store real monitor payloads: sensitive events only bump `privacy_skips`,
 /// everything else becomes a clip row. `origin` names the capture backend
 /// (`windows`, `x11`, ...); `id_seed` feeds id generation.
@@ -1422,7 +1491,7 @@ fn store_payloads(
     sensitive: bool,
     payloads: &[(String, Vec<u8>)],
     id_seed: u64,
-) -> (StoreDecision, Option<String>) {
+) -> (StoreDecision, Option<StoreFailure>) {
     if sensitive {
         let _ = store.record_privacy_skip();
         return (StoreDecision::Sensitive, None);
@@ -1430,7 +1499,7 @@ fn store_payloads(
     if payloads.is_empty() {
         return (
             StoreDecision::Failed,
-            Some("no readable payload".to_string()),
+            Some(StoreFailure::fixed("no_payload")),
         );
     }
     let now = now_ms();
@@ -1466,16 +1535,22 @@ fn store_payloads(
     });
     let clip: clipmonger_core::model::Clip = match serde_json::from_value(clip_json) {
         Ok(clip) => clip,
-        Err(e) => {
+        Err(_) => {
             return (
                 StoreDecision::Failed,
-                Some(format!("clip build failed: {e}")),
+                Some(StoreFailure::fixed("clip_build")),
             );
         }
     };
     match store.insert_clip(&clip, payloads) {
         Ok(_) => (StoreDecision::Stored, None),
-        Err(e) => (StoreDecision::Failed, Some(format!("store failed: {e}"))),
+        Err(e) => (
+            StoreDecision::Failed,
+            Some(StoreFailure {
+                class: clipmonger_core::runtime_log::core_class(&e),
+                code: clipmonger_core::runtime_log::core_code(&e),
+            }),
+        ),
     }
 }
 
@@ -1887,6 +1962,38 @@ impl DaemonState {
         self.caps.register_backend(name, caps);
     }
 
+    /// Refresh only capture availability; concurrent hotkey, helper and
+    /// configured paste capabilities remain intact.
+    pub fn set_monitor_available(&self, name: &str, available: bool) {
+        const NOTE: &str = "monitor Degraded: session clipboard unavailable";
+        self.caps.update_backend(name, |caps| {
+            caps.monitor = if available {
+                Level::Full
+            } else {
+                Level::Degraded
+            };
+            caps.notes.retain(|note| note != NOTE);
+            if !available {
+                caps.notes.push(NOTE.to_string());
+            }
+        });
+    }
+
+    /// Publish the popup registration result without replacing other caps.
+    pub fn set_hotkey_status(&self, name: &str, status: &popup::ChordStatus) {
+        self.caps.update_backend(name, |caps| {
+            caps.notes
+                .retain(|note| !note.starts_with("hotkey Degraded:"));
+            match status {
+                popup::ChordStatus::Held => caps.hotkey = Level::Full,
+                popup::ChordStatus::Refused(why) => {
+                    caps.hotkey = Level::Degraded;
+                    caps.notes.push(format!("hotkey Degraded: {why}"));
+                }
+            }
+        });
+    }
+
     /// Override the paste delivery budget from config.
     pub fn set_paste_limits(&self, unicode_limit: u64, dwell_ms: u64) {
         if let Ok(mut limits) = self.paste_limits.lock() {
@@ -1964,6 +2071,11 @@ impl DaemonState {
         match self.ingest_capture_checked(origin, sensitive, payloads) {
             Ok(stored) => stored,
             Err(error) => {
+                daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Error,
+                    "capture.unavailable",
+                    &[("operation", "capture"), ("class", "unavailable")],
+                );
                 eprintln!("daemon: capture unavailable: {error}");
                 false
             }
@@ -2009,21 +2121,48 @@ impl DaemonState {
             }
         }
         let seed = u64::try_from(now_ms().max(0)).unwrap_or_default();
-        let stored = match store_payloads(store, origin, sensitive, payloads, seed) {
-            (StoreDecision::Stored, _) => true,
-            (StoreDecision::Sensitive, _) => false,
-            (StoreDecision::Failed, detail) => {
-                return Err(IpcError::new(
-                    "backend",
-                    detail.unwrap_or_else(|| "capture store failed".to_string()),
-                ))
-            }
-        };
+        let (decision, reason) = store_payloads(store, origin, sensitive, payloads, seed);
+        let stored = matches!(decision, StoreDecision::Stored);
+        if matches!(decision, StoreDecision::Failed) {
+            let failure = reason.unwrap_or_else(|| StoreFailure::fixed("store_failed"));
+            daemon_runtime_emit(
+                clipmonger_core::runtime_log::Severity::Error,
+                "capture.store_failed",
+                &[
+                    ("operation", "store_insert"),
+                    ("origin", runtime_origin(origin)),
+                    ("class", failure.class),
+                    ("code", &failure.code),
+                ],
+            );
+            return Err(IpcError::new("backend", "capture store failed".to_string()));
+        }
         if stored {
             match store.enforce_retention(&limits) {
                 Ok(0) => {}
-                Ok(purged) => eprintln!("daemon: retention purged {purged} clips"),
-                Err(e) => eprintln!("daemon: retention failed: {e}"),
+                Ok(purged) => {
+                    daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Info,
+                        "retention.purged",
+                        &[
+                            ("count", &purged.to_string()),
+                            ("origin", runtime_origin(origin)),
+                        ],
+                    );
+                    eprintln!("daemon: retention purged {purged} clips");
+                }
+                Err(e) => {
+                    daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "retention.failed",
+                        &[
+                            ("operation", "retention"),
+                            ("class", clipmonger_core::runtime_log::core_class(&e)),
+                            ("code", &clipmonger_core::runtime_log::core_code(&e)),
+                        ],
+                    );
+                    eprintln!("daemon: retention failed: {e}");
+                }
             }
         }
         Ok(stored)
@@ -2138,18 +2277,20 @@ impl DaemonState {
                     }
                     payloads.push((entry.mime, bytes));
                 }
-                Err(clipmonger_platform::types::Error::TooLarge(_)) => {
-                    // A decoder/native guard need not imply >monitor.max_bytes.
-                    // The actual final size is unknown, irrespective of a hint.
-                    return self.ingest_oversize_checked(
-                        origin,
-                        &[OversizeEntry {
-                            mime: entry.mime,
-                            bytes_hint: None,
-                        }],
-                    );
+                Err(error) => {
+                    log_capture_read_skipped(&error);
+                    if matches!(error, clipmonger_platform::types::Error::TooLarge(_)) {
+                        // A native or decoder guard does not establish the final size.
+                        return self.ingest_oversize_checked(
+                            origin,
+                            &[OversizeEntry {
+                                mime: entry.mime,
+                                bytes_hint: None,
+                            }],
+                        );
+                    }
+                    log(&format!("payload read skipped ({}): {error}", entry.mime));
                 }
-                Err(error) => log(&format!("payload read skipped ({}): {error}", entry.mime)),
             }
         }
         if payloads.is_empty() {
@@ -2710,34 +2851,91 @@ impl DaemonState {
     }
 
     /// Dispatch `logs.tail`: the last `lines` of `<profile>/audit.log`,
-    /// capped at 1000. A missing log is an empty Ok; only audit lines
-    /// are ever returned, never clipboard payload bytes.
+    /// capped at 1000. Omitted/audit source preserves the audit contract;
+    /// daemon/ui select fixed bounded active runtime files, never backups.
     fn handle_logs_tail(&self, params: &Value) -> Result<Value, IpcError> {
         let want = params
             .get("lines")
             .and_then(Value::as_u64)
             .unwrap_or(100)
             .min(1000) as usize;
-        let path = self
-            .profile_dir
-            .lock()
-            .map_or_else(|_| PathBuf::new(), |dir| dir.join("audit.log"));
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(serde_json::json!({"lines": []}));
+        if params.get("source").is_some() && params.get("source").and_then(Value::as_str).is_none()
+        {
+            return Err(IpcError::new(
+                "invalid_params",
+                "logs.tail: source must be a string".to_string(),
+            ));
+        }
+        let source = params.get("source").and_then(Value::as_str);
+        match source {
+            None | Some("audit") => {
+                let path = self
+                    .profile_dir
+                    .lock()
+                    .map_or_else(|_| PathBuf::new(), |dir| dir.join("audit.log"));
+                let text = match fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(serde_json::json!({"lines": []}));
+                    }
+                    Err(e) => {
+                        return Err(IpcError::new(
+                            "backend",
+                            format!("logs.tail: cannot read audit log: {e}"),
+                        ));
+                    }
+                };
+                let all: Vec<&str> = text.lines().collect();
+                let start = all.len().saturating_sub(want);
+                let lines: Vec<&str> = all[start..].to_vec();
+                Ok(serde_json::json!({"lines": lines}))
             }
-            Err(e) => {
-                return Err(IpcError::new(
-                    "backend",
-                    format!("logs.tail: cannot read audit log: {e}"),
-                ));
+            Some("daemon" | "ui") => {
+                let role = if source == Some("daemon") {
+                    clipmonger_core::runtime_log::Role::Daemon
+                } else {
+                    clipmonger_core::runtime_log::Role::Ui
+                };
+                let profile = self
+                    .profile_dir
+                    .lock()
+                    .map_err(|_| IpcError::new("internal", "profile state poisoned".to_string()))?
+                    .clone();
+                if profile.as_os_str().is_empty() {
+                    return Err(IpcError::new(
+                        "unavailable",
+                        "logs.tail: no profile dir".to_string(),
+                    ));
+                }
+                match clipmonger_core::runtime_log::global_tail(&profile, role, want) {
+                    Ok(lines) => {
+                        if let Some(err) = (role == clipmonger_core::runtime_log::Role::Daemon)
+                            .then(|| clipmonger_core::runtime_log::global_status(role))
+                            .flatten()
+                        {
+                            return Ok(serde_json::json!({"lines": lines, "sink_error": err}));
+                        }
+                        Ok(serde_json::json!({"lines": lines}))
+                    }
+                    Err(e) => Err(IpcError::new(
+                        "backend",
+                        format!("logs.tail: cannot read {} log: {e}", role.as_str()),
+                    )),
+                }
             }
-        };
-        let all: Vec<&str> = text.lines().collect();
-        let start = all.len().saturating_sub(want);
-        let lines: Vec<&str> = all[start..].to_vec();
-        Ok(serde_json::json!({"lines": lines}))
+            Some(other) => {
+                if other.contains('/') || other.contains('\\') || other.contains("..") {
+                    return Err(IpcError::new(
+                        "invalid_params",
+                        format!("logs.tail: invalid source {other}"),
+                    ));
+                }
+                Err(IpcError::new(
+                    "invalid_params",
+                    format!("logs.tail: unknown source {other}"),
+                ))
+            }
+        }
     }
 
     /// Dispatch one `permanent.*` method (perm.md §2).
@@ -2941,6 +3139,10 @@ impl DaemonState {
 
     // `self` is only used by the Windows arm; other backends are stateless.
     #[allow(clippy::unused_self)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep paste transaction and its error logging together"
+    )]
     fn paste_payloads_nonempty(
         &self,
         clip: clipmonger_platform::types::ClipRef,
@@ -2968,6 +3170,11 @@ impl DaemonState {
                 .map_or(now, |picked| picked.min(now))
                 + PASTE_DEADLINE_MS;
             if now > deadline_ms {
+                daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "paste.failed",
+                    &[("operation", "paste_deadline"), ("class", "expired")],
+                );
                 return Err(IpcError::new(
                     "unavailable",
                     format!("paste.execute: {PASTE_EXPIRED}"),
@@ -2981,7 +3188,17 @@ impl DaemonState {
                 }
                 None => paste.capture_target(),
             }
-            .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
+            .map_err(|e| {
+                daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "paste.failed",
+                    &[
+                        ("operation", "paste_target_or_delivery"),
+                        ("class", runtime_platform_class(&e)),
+                    ],
+                );
+                IpcError::new("unavailable", format!("paste.execute: {e}"))
+            })?;
             if clipmonger_backend_windows::target_integrity(&target.handle) == Integrity::High {
                 let target_id = match target.handle {
                     clipmonger_platform::types::PlatformHandle::WinHwnd(hwnd) => {
@@ -2993,6 +3210,11 @@ impl DaemonState {
                 let token_ok =
                     token.is_some_and(|t| self.consume_gesture_token(t, now_ms(), target_id));
                 if !token_ok {
+                    daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "paste.failed",
+                        &[("operation", "paste_gesture"), ("class", "denied")],
+                    );
                     self.audit_elevation_refused("missing or invalid gesture token");
                     return Err(IpcError::new(
                         "denied",
@@ -3000,6 +3222,16 @@ impl DaemonState {
                     ));
                 }
                 let res = self.paste_via_helper(&target, payloads, deadline_ms, settings);
+                if res.is_err() {
+                    daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "paste.failed",
+                        &[
+                            ("operation", "paste_helper_route"),
+                            ("class", "helper_unavailable_or_refused"),
+                        ],
+                    );
+                }
                 if res.is_ok() {
                     let _ = self
                         .store_read()?
@@ -3011,6 +3243,14 @@ impl DaemonState {
             paste
                 .paste_payloads(&target, &clip, payloads)
                 .map_err(|e| {
+                    daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "paste.failed",
+                        &[
+                            ("operation", "paste_delivery"),
+                            ("class", runtime_platform_class(&e)),
+                        ],
+                    );
                     let message = e.to_string();
                     if message.starts_with("denied") || message.contains("refused") {
                         IpcError::new("denied", format!("paste.execute: {e}"))
@@ -3035,6 +3275,14 @@ impl DaemonState {
         )))]
         {
             let _ = (self, clip, payloads, params);
+            daemon_runtime_emit(
+                clipmonger_core::runtime_log::Severity::Warn,
+                "paste.failed",
+                &[
+                    ("operation", "paste_delivery"),
+                    ("class", "backend_unavailable"),
+                ],
+            );
             Err(IpcError::new(
                 "unavailable",
                 format!("paste unavailable: {SKELETON_NOTE}"),
@@ -3049,9 +3297,17 @@ impl DaemonState {
         let has_data =
             probe_current().protocol != clipmonger_backend_wayland::probe::Protocol::None;
         let paste = WlPaste::new(has_data);
-        let outcome = paste
-            .paste_payloads(payloads)
-            .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
+        let outcome = paste.paste_payloads(payloads).map_err(|e| {
+            daemon_runtime_emit(
+                clipmonger_core::runtime_log::Severity::Warn,
+                "paste.failed",
+                &[
+                    ("operation", "paste_target_or_delivery"),
+                    ("class", runtime_platform_class(&e)),
+                ],
+            );
+            IpcError::new("unavailable", format!("paste.execute: {e}"))
+        })?;
         let mut result = serde_json::json!({"pasted": true});
         if let Some(toast) = outcome.toast {
             result["toast"] = Value::from(toast);
@@ -3472,6 +3728,264 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = clipmonger_core::Store::open(&dir).expect("store");
         (dir, DaemonState::new(store))
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One end-to-end recovery script checks all status readers.
+    fn capture_recovery_updates_actual_status_and_caps_readers() {
+        use clipmonger_platform::traits::ClipboardMonitor;
+        use clipmonger_platform::types::{
+            Affinity, BackendCaps, CaptureEvent, CaptureOrigin, Error, Level, PasteCaps,
+            PasteStrategy, SubscribeKind,
+        };
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        struct Monitor {
+            subscribe_fails: bool,
+            subscribed: bool,
+            polls: VecDeque<clipmonger_platform::types::Result<Vec<CaptureEvent>>>,
+        }
+        impl ClipboardMonitor for Monitor {
+            const AFFINITY: Affinity = Affinity::Worker;
+            fn subscribe(
+                &mut self,
+                kinds: &[SubscribeKind],
+            ) -> clipmonger_platform::types::Result<()> {
+                assert_eq!(kinds, &[SubscribeKind::Clipboard]);
+                if self.subscribe_fails {
+                    return Err(Error::Unavailable("subscribe refused".into()));
+                }
+                self.subscribed = true;
+                Ok(())
+            }
+            fn poll(
+                &mut self,
+                _: Duration,
+            ) -> clipmonger_platform::types::Result<Vec<CaptureEvent>> {
+                assert!(self.subscribed, "failed subscription entered capture owner");
+                self.polls
+                    .pop_front()
+                    .expect("finite poll script exhausted")
+            }
+        }
+        for backend in ["windows", "x11", "wayland"] {
+            let (_dir, state) = fresh_state(&format!("capture-status-{backend}"));
+            let base = BackendCaps {
+                monitor: Level::Unavailable,
+                transfer: Level::Degraded,
+                hotkey: Level::Full,
+                paste: PasteCaps {
+                    level: Level::Degraded,
+                    strategy: PasteStrategy::ElevatedRoute,
+                    reason: "helper policy".into(),
+                },
+                tray: Level::Unavailable,
+                autostart: false,
+                primary_selection: true,
+                notes: vec![
+                    "privacy policy retained".into(),
+                    "helper policy retained".into(),
+                ],
+            };
+            state.register_backend(backend, base);
+            state.register_backend(
+                "unrelated",
+                BackendCaps {
+                    monitor: Level::Unavailable,
+                    transfer: Level::Unavailable,
+                    hotkey: Level::Unavailable,
+                    paste: PasteCaps {
+                        level: Level::Unavailable,
+                        strategy: PasteStrategy::Unavailable,
+                        reason: "other session".into(),
+                    },
+                    tray: Level::Unavailable,
+                    autostart: false,
+                    primary_selection: false,
+                    notes: Vec::new(),
+                },
+            );
+            let before = state.caps_snapshot();
+            let check = |level: &str| {
+                let status = state.handle("status", &serde_json::json!({})).unwrap();
+                let caps = state.handle("caps.get", &serde_json::json!({})).unwrap();
+                assert_eq!(status["caps"], caps);
+                assert_eq!(
+                    state
+                        .handle("caps.refresh", &serde_json::json!({}))
+                        .unwrap(),
+                    caps
+                );
+                assert_eq!(caps["backends"][backend]["monitor"]["level"], level);
+                for key in ["paste", "autostart", "primary_selection"] {
+                    assert_eq!(
+                        caps["backends"][backend][key], before["backends"][backend][key],
+                        "{backend} changed unrelated {key}"
+                    );
+                }
+                for key in ["transfer", "tray"] {
+                    assert_eq!(
+                        caps["backends"][backend][key]["level"],
+                        before["backends"][backend][key]["level"]
+                    );
+                }
+                assert_eq!(
+                    caps["backends"]["unrelated"],
+                    before["backends"]["unrelated"]
+                );
+                let notes = caps["backends"][backend]["notes"].as_array().unwrap();
+                assert!(notes.contains(&Value::from("privacy policy retained")));
+                assert!(notes.contains(&Value::from("helper policy retained")));
+            };
+            let stop = AtomicBool::new(false);
+            let mut attempts = 0;
+            let mut captures = 0;
+            crate::capture::run_backend(
+                None,
+                Duration::ZERO,
+                &stop,
+                &state,
+                backend,
+                || {
+                    attempts += 1;
+                    check("degraded");
+                    if attempts == 1 {
+                        return Err(Error::Unavailable("factory unavailable".into()));
+                    }
+                    if attempts == 5 {
+                        assert_eq!(
+                            state.caps_snapshot()["backends"][backend]["hotkey"]["level"],
+                            "degraded"
+                        );
+                        stop.store(true, Ordering::Relaxed);
+                        return Err(Error::Unavailable("still unavailable at shutdown".into()));
+                    }
+                    crate::capture::subscribed(
+                        || {
+                            Ok(Monitor {
+                                subscribe_fails: attempts == 2,
+                                subscribed: false,
+                                polls: VecDeque::from([
+                                    Ok(vec![CaptureEvent {
+                                        offers: Vec::new(),
+                                        origin: CaptureOrigin::Clipboard,
+                                        sensitive: true,
+                                    }]),
+                                    Err(Error::Unavailable("worker exited after delivery".into())),
+                                ]),
+                            })
+                        },
+                        &[SubscribeKind::Clipboard],
+                    )
+                },
+                |events| {
+                    assert_eq!(events.len(), 1);
+                    assert!(events[0].sensitive);
+                    captures += 1;
+                    check("full");
+                    if captures > 1 {
+                        assert_eq!(
+                            state.caps_snapshot()["backends"][backend]["hotkey"]["level"],
+                            "degraded",
+                            "monitor recovery overwrote hotkey state"
+                        );
+                    }
+                    state.set_hotkey_status(
+                        backend,
+                        &crate::popup::ChordStatus::Refused("held elsewhere".into()),
+                    );
+                },
+                |_| {},
+            );
+            assert_eq!(attempts, 5);
+            assert_eq!(captures, 2);
+            check("degraded");
+            assert_eq!(
+                state.caps_snapshot()["backends"][backend]["hotkey"]["level"],
+                "degraded"
+            );
+        }
+    }
+
+    #[test]
+    fn hotkey_recovery_publishes_status_without_restoring_monitor_or_paste() {
+        use clipmonger_platform::fakes::FakeHotkeys;
+        use clipmonger_platform::types::{
+            BackendCaps, Error, HotkeyId, Level, PasteCaps, PasteStrategy,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for backend in ["windows", "x11"] {
+            let (_dir, state) = fresh_state(&format!("hotkey-status-{backend}"));
+            state.register_backend(
+                backend,
+                BackendCaps {
+                    monitor: Level::Full,
+                    transfer: Level::Degraded,
+                    hotkey: Level::Full,
+                    paste: PasteCaps {
+                        level: Level::Degraded,
+                        strategy: PasteStrategy::ElevatedRoute,
+                        reason: "helper routing retained".into(),
+                    },
+                    tray: Level::Unavailable,
+                    autostart: false,
+                    primary_selection: true,
+                    notes: vec!["privacy retained".into()],
+                },
+            );
+            state.set_monitor_available(backend, false);
+            let before = state.caps_snapshot();
+            let stop = AtomicBool::new(false);
+            let mut attempts = 0;
+            let mut levels = Vec::new();
+            crate::popup::run_hotkeys(
+                None,
+                &stop,
+                || {
+                    attempts += 1;
+                    if attempts == 1 {
+                        return Err(Error::Unavailable("initial manager unavailable".into()));
+                    }
+                    Ok(FakeHotkeys::new(vec![vec![HotkeyId(1)]]))
+                },
+                || "ctrl+alt+h".to_string(),
+                || {},
+                |status| {
+                    state.set_hotkey_status(backend, &status);
+                    let actual =
+                        state.handle("status", &serde_json::json!({})).unwrap()["caps"].clone();
+                    assert_eq!(
+                        actual,
+                        state.handle("caps.get", &serde_json::json!({})).unwrap()
+                    );
+                    for key in ["paste", "autostart", "primary_selection"] {
+                        assert_eq!(
+                            actual["backends"][backend][key],
+                            before["backends"][backend][key]
+                        );
+                    }
+                    for key in ["monitor", "transfer", "tray"] {
+                        assert_eq!(
+                            actual["backends"][backend][key]["level"],
+                            before["backends"][backend][key]["level"]
+                        );
+                    }
+                    levels.push(actual["backends"][backend]["hotkey"]["level"].clone());
+                },
+                || {
+                    assert_eq!(
+                        state.caps_snapshot()["backends"][backend]["hotkey"]["level"],
+                        "full"
+                    );
+                    stop.store(true, Ordering::Relaxed);
+                },
+                |_| {},
+            );
+            assert_eq!(levels, [Value::from("degraded"), Value::from("full")]);
+            assert_eq!(attempts, 2);
+        }
     }
 
     fn history_texts(state: &DaemonState) -> Vec<String> {
@@ -3977,12 +4491,15 @@ mod oversize_source_controls {
                 })
                 .expect_err("entropy failure must propagate");
             assert_eq!(error.code, "unavailable");
-            assert!(state
-                .handle("history.list", &serde_json::json!({}))
-                .unwrap()["clips"]
-                .as_array()
-                .unwrap()
-                .is_empty());
+            assert_eq!(
+                state
+                    .handle("history.list", &serde_json::json!({}))
+                    .unwrap()["clips"]
+                    .as_array()
+                    .unwrap()
+                    .as_slice(),
+                [] as [serde_json::Value; 0]
+            );
             let conn = rusqlite::Connection::open(path.join("clipstore.sqlite3")).unwrap();
             for table in ["clips", "clip_payloads", "clip_blobs", "clips_fts"] {
                 assert_eq!(

@@ -85,13 +85,20 @@ pub struct PopupApp {
     hide_unconfirmed: bool,
     /// The popup has been seen focused since it opened.
     seen_focus: bool,
-    /// The popup window was moved to the monitor centre.
-    centered: bool,
+    /// Placement pending for next desktop context.
+    placement_pending: bool,
+    placement_waiting_for_geometry: bool,
+    placement: placement::Placement,
+    pending_physical_pos: Option<(i32, i32)>,
     /// Put the keyboard focus into the search box at the next render.
     focus_search: bool,
     /// Theme last applied to the contexts: popup, settings (dark, font scale bits).
     theme_applied: [Option<(bool, u32)>; 2],
+    preview_width: u32,
     pending_activation: bool,
+    pending_reveal: Option<(Option<String>, usize, uuid::Uuid)>,
+    last_reveal: Option<(Option<String>, usize, uuid::Uuid)>,
+    last_query: String,
 }
 
 impl PopupApp {
@@ -133,10 +140,17 @@ impl PopupApp {
             paused: false,
             hide_unconfirmed: false,
             seen_focus: false,
-            centered: false,
+            placement_pending: open,
+            placement_waiting_for_geometry: false,
+            placement: placement::Placement::Center,
+            pending_physical_pos: None,
             focus_search: open,
             theme_applied: [None, None],
+            preview_width: 80,
             pending_activation: false,
+            pending_reveal: None,
+            last_reveal: None,
+            last_query: String::new(),
         };
         app.apply_effects(Shell::start());
         if open {
@@ -224,7 +238,13 @@ impl PopupApp {
                 target: context.target.is_some(),
                 gesture: context.gesture.is_some(),
             });
+            // Pending placement for closed-to-open transition; not for raise while open.
+            self.placement_pending = true;
+            self.placement_waiting_for_geometry = false;
         } else if was_open && !is_open {
+            self.pending_physical_pos = None;
+            self.placement_pending = false;
+            self.placement_waiting_for_geometry = false;
             self.record(&TraceEvent::Hide { reason });
         }
         let error_shown = is_open
@@ -362,11 +382,25 @@ impl PopupApp {
             UiEvent::Permanents(body) => {
                 if let Ok(mut config) = self.config.lock() {
                     config.perm_vm.apply_list(&body);
+                    if config.perm_source.is_some()
+                        && self.shell.desired().popup_open
+                        && !self.shell.desired().settings_open
+                    {
+                        config.perm_vm.clamp_for(&self.vm.query);
+                        config.perm_source = Some(config.perm_vm.active_group);
+                    }
                 }
             }
             UiEvent::PermGroups(body) => {
                 if let Ok(mut config) = self.config.lock() {
                     config.perm_vm.apply_groups(&body);
+                    if config.perm_source.is_some()
+                        && self.shell.desired().popup_open
+                        && !self.shell.desired().settings_open
+                    {
+                        config.perm_vm.clamp_for(&self.vm.query);
+                        config.perm_source = Some(config.perm_vm.active_group);
+                    }
                 }
             }
             UiEvent::PermanentSaved => {
@@ -391,24 +425,46 @@ impl PopupApp {
                 self.send(UiCmd::PermGroups);
             }
             UiEvent::BackupDone(path) => {
-                if let Ok(mut config) = self.config.lock() {
-                    config.error = format!("{} {path}", strings::text("config.backup_saved"));
+                if self.shell.desired().settings_open {
+                    if let Ok(mut config) = self.config.lock() {
+                        config.error = format!("{} {path}", strings::text("config.backup_saved"));
+                    }
                 }
             }
             UiEvent::RestoreDone => {
-                if let Ok(mut config) = self.config.lock() {
-                    config.error = strings::text("config.restore_done").to_string();
+                if self.shell.desired().settings_open {
+                    if let Ok(mut config) = self.config.lock() {
+                        config.error = strings::text("config.restore_done").to_string();
+                    }
                 }
                 self.send(UiCmd::ListHistory);
             }
-            UiEvent::LogsTail(lines) => {
+            UiEvent::LogsTail {
+                source,
+                lines,
+                sink_error,
+            } => {
                 if let Ok(mut config) = self.config.lock() {
-                    config.log_lines = lines;
+                    if config.log_source == source {
+                        config.log_lines = lines;
+                        config.log_error = sink_error.unwrap_or_default();
+                    }
+                }
+            }
+            UiEvent::LogsTailError { source, message } => {
+                if let Ok(mut config) = self.config.lock() {
+                    if config.log_source == source {
+                        config.log_error = message;
+                    }
                 }
             }
             UiEvent::ConfigError(message) => {
-                if let Ok(mut config) = self.config.lock() {
-                    config.error = message;
+                if self.shell.desired().settings_open {
+                    if let Ok(mut config) = self.config.lock() {
+                        config.error = message;
+                    }
+                } else {
+                    self.feed(Event::Bridge(UiEvent::Error(message)));
                 }
             }
             UiEvent::MonitorPaused(paused) => {
@@ -434,16 +490,38 @@ impl PopupApp {
             }
             UiEvent::Config(body) => {
                 let doc = config_model::ConfigDoc::from_snapshot(&body);
+                let width = doc
+                    .get("popup.preview_width")
+                    .and_then(Value::as_u64)
+                    .map_or(80, |n| u32::try_from(n).unwrap_or(80));
+                let placement_str = doc
+                    .get("popup.placement")
+                    .and_then(Value::as_str)
+                    .unwrap_or("center");
+                let new_placement = match placement_str {
+                    "cursor" => placement::Placement::Cursor,
+                    _ => placement::Placement::Center,
+                };
+                let placement_changed = new_placement != self.placement;
                 if let Ok(mut config) = self.config.lock() {
                     config.doc = Some(doc);
                     config.edits.clear();
+                }
+                self.preview_width = width;
+                if placement_changed {
+                    self.placement = new_placement;
+                    self.placement_waiting_for_geometry = false;
+                    // Reposition once for an effective mode change while open.
+                    if self.shell.desired().popup_open {
+                        self.placement_pending = true;
+                    }
                 }
                 self.feed(Event::Bridge(UiEvent::Config(body)));
             }
             UiEvent::Error(message) => {
                 let settings_open = self.shell.desired().settings_open;
                 let routed = self.config.lock().is_ok_and(|mut config| {
-                    let routed = settings_open || !config.pending_apply.is_empty();
+                    let routed = settings_open;
                     if routed {
                         config.error.clone_from(&message);
                         config.pending_apply.clear();
@@ -611,22 +689,43 @@ impl PopupApp {
         }
     }
 
-    /// Move the popup to the monitor centre once: when the ROOT viewport knows
-    /// its monitor size, send `ViewportCommand::OuterPosition` with
-    /// `placement::place(Center, ..)` over that monitor and set `centered`.
-    fn center_popup(&mut self, ctx: &egui::Context) {
-        let size = ctx.input(|input| {
-            input
-                .raw
-                .viewports
-                .get(&egui::ViewportId::ROOT)
-                .and_then(|info| info.monitor_size)
-        });
-        if let Some(size) = size {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                popup_position_for_monitor(size),
-            ));
-            self.centered = true;
+    #[allow(clippy::cast_precision_loss)]
+    fn handle_pending_placement(&mut self, ctx: &egui::Context) {
+        if let Some(pending_pos) = self.pending_physical_pos.take() {
+            let ppp = ctx.pixels_per_point();
+            let egui_pos = egui::pos2(pending_pos.0 as f32 / ppp, pending_pos.1 as f32 / ppp);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui_pos));
+        }
+    }
+}
+
+impl PopupApp {
+    fn compute_reveal_key(&self) -> Option<(Option<String>, usize, uuid::Uuid)> {
+        let config = self.config.lock().ok()?;
+        if config.perm_source.is_some() {
+            let group = config
+                .perm_vm
+                .group_names()
+                .get(config.perm_vm.active_group)?
+                .clone();
+            Some((
+                Some(group),
+                config.perm_vm.selected,
+                config.perm_vm.selected_id(&self.vm.query)?,
+            ))
+        } else {
+            Some((
+                None,
+                self.vm.selected,
+                self.vm.clip_at(self.vm.selected)?.id,
+            ))
+        }
+    }
+
+    fn request_reveal(&mut self, ctx: &egui::Context) {
+        self.pending_reveal = self.compute_reveal_key();
+        if self.pending_reveal.is_some() {
+            ctx.request_repaint();
         }
     }
 }
@@ -643,7 +742,7 @@ impl runner::App for PopupApp {
     ///    `last_poll` (and reset it); when the pause deadline has passed while
     ///    paused, clear it and send `MonitorToggle`;
     /// 8. `vm.set_offline(shell.offline())`, `apply_theme`;
-    /// 9. `center_popup` while not centered;
+    /// 9. emit a position supplied by the runner for this open;
     /// 10. `schedule_wake`.
     ///
     /// Settings: `apply_theme`; when the ROOT viewport events contain Close,
@@ -694,9 +793,7 @@ impl runner::App for PopupApp {
                 }
                 self.vm.set_offline(self.shell.offline());
                 self.apply_theme(ctx, kind);
-                if !self.centered {
-                    self.center_popup(ctx);
-                }
+                self.handle_pending_placement(ctx);
                 self.schedule_wake(ctx);
             }
             WindowKind::Settings => {
@@ -705,6 +802,7 @@ impl runner::App for PopupApp {
                     self.feed(Event::SettingsClose);
                     if let Ok(mut config) = self.config.lock() {
                         config.error.clear();
+                        config.pending_apply.clear();
                     }
                 }
             }
@@ -738,26 +836,62 @@ impl runner::App for PopupApp {
         }
     }
 
+    fn preserve_native_super(&self, kind: runner::WindowKind) -> bool {
+        kind == runner::WindowKind::Popup
+    }
+
+    fn native_key_override(
+        &self,
+        kind: runner::WindowKind,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) -> bool {
+        if kind != runner::WindowKind::Popup {
+            return false;
+        }
+        let Some(key) = Self::egui_key_to_chord_name(key) else {
+            return false;
+        };
+        self.vm.has_binding(&crate::keymap::KeyEvent {
+            key,
+            ctrl: modifiers.ctrl,
+            alt: modifiers.alt,
+            shift: modifiers.shift,
+            super_key: modifiers.mac_cmd,
+        })
+    }
+
     fn take_popup_activation(&mut self) -> bool {
         std::mem::take(&mut self.pending_activation)
     }
-}
 
-/// The popup centre for a monitor of `size` points.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
-fn popup_position_for_monitor(size: egui::Vec2) -> egui::Pos2 {
-    let monitor = placement::monitor_rect_from_size(Some((size.x as u32, size.y as u32)));
-    let (px, py) = placement::place(
-        placement::Placement::Center,
-        (0, 0),
-        &[monitor],
-        placement::POPUP_DEFAULT,
-    );
-    egui::pos2(px as f32, py as f32)
+    fn wants_desktop_context(&self) -> bool {
+        self.shell.desired().popup_open && self.placement_pending
+    }
+
+    fn provide_desktop_context(&mut self, ctx: crate::placement::DesktopContext) {
+        if !self.wants_desktop_context() {
+            return;
+        }
+        self.placement_pending = false;
+        self.placement_waiting_for_geometry = ctx.supports_global_position
+            && !ctx
+                .monitors
+                .iter()
+                .any(|monitor| monitor.w > 0 && monitor.h > 0);
+        self.pending_physical_pos = if self.placement_waiting_for_geometry {
+            None
+        } else {
+            crate::placement::place_with_context(self.placement, &ctx)
+        };
+    }
+
+    fn desktop_geometry_changed(&mut self) {
+        if self.shell.desired().popup_open && self.placement_waiting_for_geometry {
+            self.placement_pending = true;
+            self.placement_waiting_for_geometry = false;
+        }
+    }
 }
 
 #[cfg(test)]

@@ -56,7 +56,7 @@ impl Fixture {
     }
 
     fn assert_empty(&self, privacy_skips: i64) {
-        assert!(self.history().is_empty());
+        assert_eq!(self.history(), [] as [Value; 0]);
         for table in ["clips", "clip_payloads", "clip_blobs", "clips_fts"] {
             assert_eq!(
                 self.scalar(&format!("SELECT COUNT(*) FROM {table}")),
@@ -95,8 +95,8 @@ impl Fixture {
             .get_clip(id)
             .expect("actual payload reader")
             .expect("persisted row");
-        assert!(payloads.is_empty());
-        assert!(stored.formats.is_empty());
+        assert_eq!(payloads, [] as [(String, Vec<u8>); 0]);
+        assert_eq!(stored.formats, [] as [String; 0]);
         let got = self
             .state
             .handle("history.get", &json!({"clip": id.to_string()}))

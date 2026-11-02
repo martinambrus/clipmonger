@@ -12,7 +12,9 @@ use clipmonger_platform::types::{Affinity, Error, PayloadMap, Result};
 #[cfg(any(windows, test))]
 fn decode_unicode_bounded(raw: &[u8], max_bytes: u64) -> Result<Vec<u8>> {
     let units = raw
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .take_while(|unit| *unit != 0);
     let mut out = Vec::new();
@@ -401,7 +403,7 @@ pub(crate) mod imp {
     }
 
     /// Check native size while borrowed; copy only after the cap passes.
-    /// Every caller holds with_open's exclusive clipboard session.
+    /// Every caller holds `with_open`'s exclusive clipboard session.
     pub(crate) fn read_native_bounded(id: u32, max_raw_bytes: u64) -> Result<Vec<u8>> {
         crate::sys::with_clipboard_bytes(id, |bytes| {
             check_cap(bytes.len(), max_raw_bytes)?;

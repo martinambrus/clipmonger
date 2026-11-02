@@ -84,7 +84,7 @@ impl Drop for ClipboardDataLock {
 }
 
 /// Inspect native bytes without first copying the entire clipboard handle.
-/// The caller must hold the exclusive clipboard session from with_open for
+/// The caller must hold the exclusive clipboard session from `with_open` for
 /// the whole call. The callback cannot retain the borrowed memory. No handle
 /// is freed: the clipboard owns it, and the lock guard only unlocks it.
 #[cfg(windows)]
@@ -193,6 +193,9 @@ impl Drop for ClipboardWindow {
 #[cfg(windows)]
 unsafe impl Send for crate::hotkeys::WinHotkeys {}
 
+#[cfg(windows)]
+static PENDING_STARTUP: crate::pump_startup::Registry = crate::pump_startup::Registry::new();
+
 /// RAII handle for the hidden-window clipboard listener thread.
 ///
 /// The HWND is stored as `usize` (handle values round-trip losslessly) so
@@ -205,7 +208,7 @@ pub(crate) struct PumpHandle {
 
 #[cfg(windows)]
 impl PumpHandle {
-    /// Ask the pump thread to exit and wait for it.
+    /// Ask the pump to exit; retain its join owner until it finishes.
     #[cfg(windows)]
     pub(crate) fn stop(&mut self) {
         // Safety: hwnd names a live message-only window owned by the pump thread.
@@ -214,7 +217,7 @@ impl PumpHandle {
             PostMessageW(self.hwnd as HWND, WM_CLOSE, 0, 0);
         }
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            PENDING_STARTUP.retain(thread);
         }
     }
 }
@@ -287,101 +290,114 @@ unsafe extern "system" fn monitor_wndproc(
 /// pump's `join` waits forever).
 #[cfg(windows)]
 pub(crate) fn start_pump(wakes: Sender<()>) -> Result<PumpHandle, String> {
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<usize, String>>();
-    let thread = std::thread::spawn(move || {
-        let class: Vec<u16> = to_wide("ClipmongerMonitor");
-        // Safety: GetModuleHandleW(null) returns the current module handle or fails.
-        let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
-        if instance.is_null() {
-            let _ = ready_tx.send(Err(format!("GetModuleHandleW failed: {}", last_error())));
-            return;
-        }
-        let mut class_info = WNDCLASSEXW {
-            cbSize: u32::try_from(std::mem::size_of::<WNDCLASSEXW>()).unwrap_or(u32::MAX),
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(monitor_wndproc),
-            hInstance: instance,
-            lpszClassName: class.as_ptr(),
-            ..Default::default()
-        };
-        // Safety: class struct is fully initialised; Atom 0 means failure or already-registered.
-        let atom = unsafe { RegisterClassExW(&raw mut class_info) };
-        if atom == 0 {
-            // Safety: reading the thread error slot after a failed call.
-            let code = unsafe { GetLastError() };
-            if code != ERROR_CLASS_ALREADY_EXISTS {
-                let _ = ready_tx.send(Err(format!("RegisterClassExW failed: win32 error {code}")));
-                return;
+    let started = PENDING_STARTUP.start(
+        std::time::Duration::from_secs(5),
+        move |cancel| {
+            let class: Vec<u16> = to_wide("ClipmongerMonitor");
+            // Safety: GetModuleHandleW(null) returns the current module handle or fails.
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("monitor startup cancelled".to_string());
             }
-        }
-        let boxed: Box<Sender<()>> = Box::new(wakes);
-        let param = Box::into_raw(boxed).cast::<c_void>();
-        // Safety: class is registered, strings are nul-terminated, param is reclaimed at WM_DESTROY.
-        let hwnd = unsafe {
-            CreateWindowExW(
-                0,
-                class.as_ptr(),
-                class.as_ptr(),
-                0,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                HWND_MESSAGE,
-                std::ptr::null_mut(),
-                instance,
-                param,
-            )
-        };
-        if hwnd.is_null() {
-            drop(unsafe { Box::from_raw(param.cast::<Sender<()>>()) });
-            let _ = ready_tx.send(Err(format!("CreateWindowExW failed: {}", last_error())));
-            return;
-        }
-        // Safety: hwnd names a live window created above on this thread.
-        let added = unsafe { AddClipboardFormatListener(hwnd) };
-        if added == 0 {
-            let err = format!("AddClipboardFormatListener refused: {}", last_error());
-            // Safety: listener never attached; tearing down the window created above.
-            // (DestroyWindow runs WM_DESTROY synchronously, which reclaims
-            // the boxed sender, so it must not be reclaimed again here.)
+            let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+            if instance.is_null() {
+                return Err(format!("GetModuleHandleW failed: {}", last_error()));
+            }
+            let mut class_info = WNDCLASSEXW {
+                cbSize: u32::try_from(std::mem::size_of::<WNDCLASSEXW>()).unwrap_or(u32::MAX),
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(monitor_wndproc),
+                hInstance: instance,
+                lpszClassName: class.as_ptr(),
+                ..Default::default()
+            };
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("monitor startup cancelled".to_string());
+            }
+            // Safety: class struct is fully initialised; Atom 0 means failure or already-registered.
+            let atom = unsafe { RegisterClassExW(&raw mut class_info) };
+            if atom == 0 {
+                // Safety: reading the thread error slot after a failed call.
+                let code = unsafe { GetLastError() };
+                if code != ERROR_CLASS_ALREADY_EXISTS {
+                    return Err(format!("RegisterClassExW failed: win32 error {code}"));
+                }
+            }
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("monitor startup cancelled".to_string());
+            }
+            let boxed: Box<Sender<()>> = Box::new(wakes);
+            let param = Box::into_raw(boxed).cast::<c_void>();
+            // Safety: class is registered, strings are nul-terminated, param is reclaimed at WM_DESTROY.
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    0,
+                    class.as_ptr(),
+                    class.as_ptr(),
+                    0,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    HWND_MESSAGE,
+                    std::ptr::null_mut(),
+                    instance,
+                    param,
+                )
+            };
+            if hwnd.is_null() {
+                drop(unsafe { Box::from_raw(param.cast::<Sender<()>>()) });
+                return Err(format!("CreateWindowExW failed: {}", last_error()));
+            }
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                // Safety: this thread owns the just-created window and its sender.
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                }
+                return Err("monitor startup cancelled".to_string());
+            }
+            // Safety: hwnd names a live window created above on this thread.
+            let added = unsafe { AddClipboardFormatListener(hwnd) };
+            if added == 0 {
+                let err = format!("AddClipboardFormatListener refused: {}", last_error());
+                // Safety: listener never attached; tearing down the window created above.
+                // (DestroyWindow runs WM_DESTROY synchronously, which reclaims
+                // the boxed sender, so it must not be reclaimed again here.)
+                #[cfg(windows)]
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                }
+                return Err(err);
+            }
+            Ok(hwnd as usize)
+        },
+        |_| {
+            // Safety: standard pump; GetMessageW returns 0 only on WM_QUIT.
+            // WM_CLOSE (posted by `stop`) falls through to DefWindowProc, which
+            // destroys the window; WM_DESTROY posts the quit that ends this loop.
+            // A stalled stop remains owned and blocks replacement.
             #[cfg(windows)]
             unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                let mut msg: MSG = std::mem::zeroed();
+                while GetMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                    DispatchMessageW(&raw const msg);
+                }
             }
-            let _ = ready_tx.send(Err(err));
-            return;
-        }
-        let _ = ready_tx.send(Ok(hwnd as usize));
-        // Safety: standard pump; GetMessageW returns 0 only on WM_QUIT.
-        // WM_CLOSE (posted by `stop`) falls through to DefWindowProc, which
-        // destroys the window; WM_DESTROY posts the quit that ends this loop,
-        // so the `join` in `stop` cannot wait forever.
-        #[cfg(windows)]
-        unsafe {
-            let mut msg: MSG = std::mem::zeroed();
-            while GetMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-                DispatchMessageW(&raw const msg);
+        },
+        |hwnd| {
+            // Safety: cleanup runs on the creating thread, including abandoned readiness.
+            unsafe {
+                let hwnd = hwnd as HWND;
+                RemoveClipboardFormatListener(hwnd);
+                if windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(hwnd) != 0 {
+                    windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                }
             }
-        }
-        // Safety: listener was added; removing before thread exit.
-        #[cfg(windows)]
-        unsafe {
-            RemoveClipboardFormatListener(hwnd);
-        }
-    });
-    // Wait (bounded) for the pump thread to install the listener.
-    match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(Ok(hwnd)) => Ok(PumpHandle {
-            hwnd,
-            thread: Some(thread),
-        }),
-        Ok(Err(e)) => {
-            let _ = thread.join();
-            Err(e)
-        }
-        Err(_) => Err("monitor pump thread exited during startup".to_string()),
-    }
+        },
+    )?;
+    Ok(PumpHandle {
+        hwnd: started.value,
+        thread: Some(started.thread),
+    })
 }
 
 // ---------------------------------------------------------------------------

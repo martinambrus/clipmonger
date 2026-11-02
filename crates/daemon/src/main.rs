@@ -132,6 +132,15 @@ fn ui_launcher(profile: PathBuf) -> clipmonger_daemon::popup::UiLauncher {
                 true
             }
             Err(e) => {
+                let _ = clipmonger_core::runtime_log::global_emit(
+                    clipmonger_core::runtime_log::Role::Daemon,
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "ui.spawn_failed",
+                    &[
+                        ("class", "io"),
+                        ("code", &e.raw_os_error().unwrap_or(0).to_string()),
+                    ],
+                );
                 eprintln!("daemon: UI start failed: {e}");
                 false
             }
@@ -185,25 +194,16 @@ fn setup_windows_backend(
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     use clipmonger_backend_windows::{caps as backend_caps, WinAutostart, WinMonitor, WinTransfer};
-    use clipmonger_platform::traits::{AutostartManager, ClipboardMonitor};
-    use clipmonger_platform::types::{Level, SubscribeKind};
+    use clipmonger_platform::traits::AutostartManager;
+    use clipmonger_platform::types::SubscribeKind;
 
     let transfer = Arc::new(WinTransfer::new());
 
-    let mut monitor_ok = true;
-    let monitor = match WinMonitor::new() {
-        Ok(mut monitor) => {
-            if monitor.subscribe(&[SubscribeKind::Clipboard]).is_err() {
-                monitor_ok = false;
-            }
-            Some(monitor)
-        }
-        Err(e) => {
-            eprintln!("daemon: windows monitor unavailable: {e}");
-            monitor_ok = false;
-            None
-        }
-    };
+    let initial_monitor =
+        clipmonger_daemon::capture::subscribed(WinMonitor::new, &[SubscribeKind::Clipboard])
+            .map_err(|e| eprintln!("daemon: windows monitor unavailable: {e}"))
+            .ok();
+    let monitor_ok = initial_monitor.is_some();
 
     // Autostart handle for future UI wiring; never enabled at startup.
     // Portable when the profile lives beside the daemon binary.
@@ -214,12 +214,13 @@ fn setup_windows_backend(
     let autostart = WinAutostart::new(exe, profile.starts_with(&exe_dir));
     let _ = autostart.is_enabled();
 
-    let mut caps = backend_caps::caps_for(false, false);
-    if !monitor_ok {
-        caps.monitor = Level::Degraded;
-        caps.notes
-            .push("monitor Degraded: session clipboard unavailable".to_string());
-    }
+    let base_caps = backend_caps::caps_for(false, false);
+    state.register_backend("windows", base_caps);
+    state.set_monitor_available("windows", monitor_ok);
+    state.set_hotkey_status(
+        "windows",
+        &clipmonger_daemon::popup::ChordStatus::Refused("popup hotkey starting".into()),
+    );
     {
         // The chord thread registers the caps with its hotkey state; wait
         // for its first try so `status` reports a refused chord from the
@@ -227,7 +228,7 @@ fn setup_windows_backend(
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let state = Arc::clone(state);
         let shutdown = Arc::clone(shutdown);
-        std::thread::spawn(move || popup_chord_loop(&state, &caps, &shutdown, ready_tx));
+        std::thread::spawn(move || popup_chord_loop(&state, &shutdown, ready_tx));
         let _ = ready_rx.recv_timeout(std::time::Duration::from_secs(5));
     }
     {
@@ -237,42 +238,42 @@ fn setup_windows_backend(
         std::thread::spawn(move || admin_consent_loop(&profile, &state, &shutdown));
     }
 
-    if let Some(monitor) = monitor {
+    {
         let state = Arc::clone(state);
         let transfer = Arc::clone(&transfer);
         let poll_ms = config.monitor.poll_ms;
         let shutdown = Arc::clone(shutdown);
         std::thread::spawn(move || {
             let poll_timeout = std::time::Duration::from_millis(poll_ms.clamp(50, 5000));
-            clipmonger_daemon::capture::run(
-                monitor,
+            clipmonger_daemon::capture::run_backend(
+                initial_monitor,
                 poll_timeout,
                 &shutdown,
+                &state,
+                "windows",
                 || {
-                    let mut monitor = WinMonitor::new()?;
-                    monitor.subscribe(&[SubscribeKind::Clipboard])?;
-                    Ok(monitor)
+                    clipmonger_daemon::capture::subscribed(
+                        WinMonitor::new,
+                        &[SubscribeKind::Clipboard],
+                    )
                 },
                 |events| {
                     for event in events {
                         if let Err(error) =
-                            state.capture_event("windows", event, &*transfer, |line| {
+                            state.capture_event("windows", event, transfer.as_ref(), |line| {
                                 eprintln!("daemon: windows {line}");
-                                let _ = std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open("C:\\Temp\\monitor.log")
-                                    .and_then(|mut file| {
-                                        use std::io::Write as _;
-                                        writeln!(file, "{line}")
-                                    });
                             })
                         {
+                            let _ = clipmonger_core::runtime_log::global_emit(
+                                clipmonger_core::runtime_log::Role::Daemon,
+                                clipmonger_core::runtime_log::Severity::Error,
+                                "capture.unavailable",
+                                &[("operation", "capture"), ("class", "unavailable")],
+                            );
                             eprintln!("daemon: windows capture unavailable: {error}");
                         }
                     }
                 },
-                std::thread::sleep,
                 |line| eprintln!("daemon: windows {line}"),
             );
         });
@@ -286,46 +287,36 @@ fn setup_windows_backend(
 #[cfg(all(windows, feature = "backend-windows"))]
 fn popup_chord_loop(
     state: &DaemonState,
-    base_caps: &clipmonger_platform::types::BackendCaps,
     shutdown: &std::sync::atomic::AtomicBool,
     ready: std::sync::mpsc::Sender<()>,
 ) {
     use clipmonger_backend_windows::WinHotkeys;
-    use clipmonger_daemon::popup::{ChordStatus, PopupChord, PopupSource};
-    use clipmonger_platform::traits::HotkeyManager;
-    use clipmonger_platform::types::{HotkeyId, Level};
-
-    // The `global-hotkey` window belongs to the thread that builds the
-    // manager and fires only while that thread pumps (inside `poll`).
-    let mut hotkeys = WinHotkeys::new();
-    let mut chord = PopupChord::default();
     let mut ready = Some(ready);
-    while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-        let wanted = state.popup_hotkey();
-        if let Some(status) = chord.sync(&mut hotkeys, &wanted, std::time::Instant::now()) {
-            let mut caps = base_caps.clone();
-            if let ChordStatus::Refused(why) = status {
-                eprintln!("daemon: popup hotkey unavailable: {why}");
-                caps.hotkey = Level::Degraded;
-                caps.notes.push(format!("hotkey Degraded: {why}"));
+    clipmonger_daemon::popup::run_hotkeys(
+        None,
+        shutdown,
+        || Ok(WinHotkeys::new()),
+        || state.popup_hotkey(),
+        || {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(());
             }
-            state.register_backend("windows", caps);
-        }
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(());
-        }
-        match hotkeys.poll(std::time::Duration::from_millis(200)) {
-            Ok(ids) => {
-                if ids.contains(&HotkeyId(1)) {
-                    state.trigger_popup(PopupSource::Press);
-                }
+        },
+        |status| {
+            if let clipmonger_daemon::popup::ChordStatus::Refused(why) = &status {
+                eprintln!("daemon: windows popup hotkey unavailable: {why}");
+            } else {
+                eprintln!("daemon: windows popup hotkey available");
             }
-            Err(e) => {
-                eprintln!("daemon: hotkey poll failed: {e}");
-                break;
-            }
-        }
-    }
+            state.set_hotkey_status("windows", &status);
+        },
+        || {
+            state.trigger_popup(clipmonger_daemon::popup::PopupSource::Press);
+        },
+        |delay| {
+            clipmonger_daemon::capture::sleep_interruptible(shutdown, delay, std::thread::sleep);
+        },
+    );
 }
 
 /// Admin-window support (Windows): when an elevated window is focused and
@@ -427,12 +418,18 @@ fn setup_x11_backend(
     use clipmonger_backend_x11::{
         caps as backend_caps, MonitorOpts, X11Autostart, X11Hotkeys, X11Monitor, X11Transfer,
     };
-    use clipmonger_platform::traits::{AutostartManager, ClipboardMonitor, HotkeyManager};
-    use clipmonger_platform::types::{HotkeyId, Level, SubscribeKind};
+    use clipmonger_platform::traits::AutostartManager;
+    use clipmonger_platform::types::SubscribeKind;
 
     let transfer = match X11Transfer::connect(None) {
         Ok(transfer) => Some(Arc::new(transfer)),
         Err(e) => {
+            let _ = clipmonger_core::runtime_log::global_emit(
+                clipmonger_core::runtime_log::Role::Daemon,
+                clipmonger_core::runtime_log::Severity::Warn,
+                "capture.transfer_init_failed",
+                &[("class", clipmonger_daemon::runtime_platform_class(&e))],
+            );
             eprintln!("daemon: x11 transfer unavailable: {e}");
             None
         }
@@ -440,7 +437,6 @@ fn setup_x11_backend(
 
     let mut denylist = config.monitor.ignores.clone();
     denylist.extend(config.privacy.denylist.iter().cloned());
-    let mut monitor_ok = transfer.is_some();
     let monitor_opts = MonitorOpts {
         capture_primary: config.monitor.capture_primary,
         debounce_ms: config.monitor.primary_debounce_ms,
@@ -451,38 +447,12 @@ fn setup_x11_backend(
     if config.monitor.capture_primary {
         kinds.push(SubscribeKind::Primary);
     }
-    let monitor = match X11Monitor::connect(None, monitor_opts.clone()) {
-        Ok(mut monitor) => {
-            if monitor.subscribe(&kinds).is_err() {
-                monitor_ok = false;
-            }
-            Some(monitor)
-        }
-        Err(e) => {
-            eprintln!("daemon: x11 monitor unavailable: {e}");
-            monitor_ok = false;
-            None
-        }
-    };
-
-    let mut hotkeys = match X11Hotkeys::connect(None) {
-        Ok(hotkeys) => Some(hotkeys),
-        Err(e) => {
-            eprintln!("daemon: x11 hotkeys unavailable: {e}");
-            None
-        }
-    };
-    let mut hotkey_conflict = false;
-    if let Some(hotkeys) = hotkeys.as_mut() {
-        // Registered once: a `popup.hotkey` change needs a daemon restart on
-        // X11 (live on Windows via `popup_chord_loop`; ADR-004 open item 1).
-        if let Err(e) = hotkeys.register(HotkeyId(1), &config.popup.hotkey) {
-            eprintln!("daemon: popup hotkey unavailable: {e}");
-            hotkey_conflict = true;
-        }
-    } else {
-        hotkey_conflict = true;
-    }
+    let monitor = clipmonger_daemon::capture::subscribed(
+        || X11Monitor::connect(None, monitor_opts.clone()),
+        &kinds,
+    )
+    .map_err(|e| eprintln!("daemon: x11 monitor unavailable: {e}"))
+    .ok();
 
     // Autostart handle for future UI wiring; never enabled at startup.
     // Portable when the profile lives beside the daemon binary.
@@ -495,74 +465,98 @@ fn setup_x11_backend(
     let _ = autostart.is_enabled();
 
     let display = std::env::var("DISPLAY").ok().filter(|d| !d.is_empty());
-    let mut caps = backend_caps(display.as_deref());
-    if hotkey_conflict {
-        caps.hotkey = Level::Degraded;
-        caps.notes
-            .push("hotkey Degraded: popup chord already registered".to_string());
-    }
-    if !monitor_ok {
-        caps.monitor = Level::Degraded;
-        caps.notes
-            .push("monitor Degraded: X session clipboard unavailable".to_string());
-    }
-    state.register_backend("x11", caps);
+    state.register_backend("x11", backend_caps(display.as_deref()));
+    let monitor = if transfer.is_some() { monitor } else { None };
+    state.set_monitor_available("x11", monitor.is_some());
+    state.set_hotkey_status(
+        "x11",
+        &clipmonger_daemon::popup::ChordStatus::Refused("popup hotkey starting".into()),
+    );
 
-    if let (Some(monitor), Some(transfer)) = (monitor, transfer) {
+    // Capture thread always starts; shared recovery retries factory with backoff.
+    {
         let state = Arc::clone(state);
+        let transfer = transfer.clone();
         let poll_ms = config.monitor.poll_ms;
         let shutdown = Arc::clone(shutdown);
+        let monitor_opts_clone = monitor_opts.clone();
+        let kinds_clone = kinds.clone();
+        let initial_monitor_opt = monitor;
         std::thread::spawn(move || {
             let poll_timeout = std::time::Duration::from_millis(poll_ms.clamp(50, 5000));
-            clipmonger_daemon::capture::run(
-                monitor,
+            let transfer = std::cell::RefCell::new(transfer);
+            clipmonger_daemon::capture::run_backend(
+                initial_monitor_opt,
                 poll_timeout,
                 &shutdown,
+                &state,
+                "x11",
                 || {
-                    let mut monitor = X11Monitor::connect(None, monitor_opts.clone())?;
-                    monitor.subscribe(&kinds)?;
-                    Ok(monitor)
+                    let missing_transfer = transfer.borrow().is_none();
+                    if missing_transfer {
+                        *transfer.borrow_mut() = Some(Arc::new(X11Transfer::connect(None)?));
+                    }
+                    clipmonger_daemon::capture::subscribed(
+                        || X11Monitor::connect(None, monitor_opts_clone.clone()),
+                        &kinds_clone,
+                    )
                 },
                 |events| {
+                    let transfer = transfer.borrow();
+                    let Some(transfer) = transfer.as_ref() else {
+                        return;
+                    };
                     for event in events {
-                        if let Err(error) = state.capture_event("x11", event, &*transfer, |line| {
-                            eprintln!("daemon: x11 {line}");
-                            let _ = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open("C:\\Temp\\monitor.log")
-                                .and_then(|mut file| {
-                                    use std::io::Write as _;
-                                    writeln!(file, "{line}")
-                                });
-                        }) {
+                        if let Err(error) =
+                            state.capture_event("x11", event, transfer.as_ref(), |line| {
+                                eprintln!("daemon: x11 {line}");
+                            })
+                        {
+                            let _ = clipmonger_core::runtime_log::global_emit(
+                                clipmonger_core::runtime_log::Role::Daemon,
+                                clipmonger_core::runtime_log::Severity::Error,
+                                "capture.unavailable",
+                                &[("operation", "capture"), ("class", "unavailable")],
+                            );
                             eprintln!("daemon: x11 capture unavailable: {error}");
                         }
                     }
                 },
-                std::thread::sleep,
                 |line| eprintln!("daemon: x11 {line}"),
             );
         });
     }
 
-    if let Some(mut hotkeys) = hotkeys {
+    {
         let shutdown = Arc::clone(shutdown);
         let state = Arc::clone(state);
+        let popup_chord = config.popup.hotkey.clone();
         std::thread::spawn(move || {
-            while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                match hotkeys.poll(std::time::Duration::from_millis(200)) {
-                    Ok(ids) => {
-                        if ids.contains(&HotkeyId(1)) {
-                            state.trigger_popup(clipmonger_daemon::popup::PopupSource::Press);
-                        }
+            clipmonger_daemon::popup::run_hotkeys(
+                None,
+                &shutdown,
+                || X11Hotkeys::connect(None),
+                || popup_chord.clone(),
+                || {},
+                |status| {
+                    if let clipmonger_daemon::popup::ChordStatus::Refused(why) = &status {
+                        eprintln!("daemon: x11 popup hotkey unavailable: {why}");
+                    } else {
+                        eprintln!("daemon: x11 popup hotkey available");
                     }
-                    Err(e) => {
-                        eprintln!("daemon: hotkey poll failed: {e}");
-                        break;
-                    }
-                }
-            }
+                    state.set_hotkey_status("x11", &status);
+                },
+                || {
+                    state.trigger_popup(clipmonger_daemon::popup::PopupSource::Press);
+                },
+                |delay| {
+                    clipmonger_daemon::capture::sleep_interruptible(
+                        &shutdown,
+                        delay,
+                        std::thread::sleep,
+                    );
+                },
+            );
         });
     }
 }
@@ -595,7 +589,6 @@ fn setup_wayland_backend(
     use clipmonger_backend_wayland::{
         caps as backend_caps, probe_current, WlMonitor, WlMonitorOpts, WlTransfer,
     };
-    use clipmonger_platform::traits::ClipboardMonitor;
 
     let capture_primary = config.monitor.capture_primary;
     let probe = probe_current();
@@ -604,12 +597,17 @@ fn setup_wayland_backend(
     let transfer = match WlTransfer::connect() {
         Ok(transfer) => Some(Arc::new(transfer)),
         Err(e) => {
+            let _ = clipmonger_core::runtime_log::global_emit(
+                clipmonger_core::runtime_log::Role::Daemon,
+                clipmonger_core::runtime_log::Severity::Warn,
+                "capture.transfer_init_failed",
+                &[("class", clipmonger_daemon::runtime_platform_class(&e))],
+            );
             eprintln!("daemon: wayland transfer unavailable: {e}");
             None
         }
     };
 
-    let mut monitor_ok = transfer.is_some();
     let monitor_opts = WlMonitorOpts {
         primary: capture_primary,
         debounce_ms: config.monitor.primary_debounce_ms,
@@ -621,55 +619,61 @@ fn setup_wayland_backend(
     if capture_primary {
         kinds.push(clipmonger_platform::types::SubscribeKind::Primary);
     }
-    let monitor = match WlMonitor::connect(monitor_opts) {
-        Ok(mut monitor) => {
-            if monitor.subscribe(&kinds).is_err() {
-                monitor_ok = false;
-            }
-            Some(monitor)
-        }
-        Err(e) => {
-            eprintln!("daemon: wayland monitor unavailable: {e}");
-            monitor_ok = false;
-            None
-        }
-    };
+    let monitor =
+        clipmonger_daemon::capture::subscribed(|| WlMonitor::connect(monitor_opts), &kinds)
+            .map_err(|e| eprintln!("daemon: wayland monitor unavailable: {e}"))
+            .ok();
 
-    let mut caps = caps;
-    if !monitor_ok {
-        caps.monitor = clipmonger_platform::types::Level::Degraded;
-        caps.notes
-            .push("monitor Degraded: Wayland session clipboard unavailable".to_string());
-    }
     state.register_backend("wayland", caps);
+    let monitor = if transfer.is_some() { monitor } else { None };
+    state.set_monitor_available("wayland", monitor.is_some());
 
-    if let (Some(monitor), Some(transfer)) = (monitor, transfer) {
+    {
         let state = Arc::clone(state);
         let poll_ms = config.monitor.poll_ms;
         let shutdown = Arc::clone(shutdown);
+        let transfer_opt = transfer.clone();
+        let initial_monitor_opt = monitor;
         std::thread::spawn(move || {
             let poll_timeout = std::time::Duration::from_millis(poll_ms.clamp(50, 5000));
-            clipmonger_daemon::capture::run(
-                monitor,
+            let transfer = std::cell::RefCell::new(transfer_opt);
+            clipmonger_daemon::capture::run_backend(
+                initial_monitor_opt,
                 poll_timeout,
                 &shutdown,
+                &state,
+                "wayland",
                 || {
-                    let mut monitor = WlMonitor::connect(monitor_opts)?;
-                    monitor.subscribe(&kinds)?;
-                    Ok(monitor)
+                    let missing_transfer = transfer.borrow().is_none();
+                    if missing_transfer {
+                        *transfer.borrow_mut() = Some(Arc::new(WlTransfer::connect()?));
+                    }
+                    clipmonger_daemon::capture::subscribed(
+                        || WlMonitor::connect(monitor_opts),
+                        &kinds,
+                    )
                 },
                 |events| {
+                    let transfer = transfer.borrow();
+                    let Some(transfer) = transfer.as_ref() else {
+                        return;
+                    };
                     for event in events {
                         if let Err(error) =
-                            state.capture_event("wayland", event, &*transfer, |line| {
+                            state.capture_event("wayland", event, transfer.as_ref(), |line| {
                                 eprintln!("daemon: wayland {line}");
                             })
                         {
+                            let _ = clipmonger_core::runtime_log::global_emit(
+                                clipmonger_core::runtime_log::Role::Daemon,
+                                clipmonger_core::runtime_log::Severity::Error,
+                                "capture.unavailable",
+                                &[("operation", "capture"), ("class", "unavailable")],
+                            );
                             eprintln!("daemon: wayland capture unavailable: {error}");
                         }
                     }
                 },
-                std::thread::sleep,
                 |line| eprintln!("daemon: wayland {line}"),
             );
         });
@@ -886,9 +890,26 @@ async fn main() {
         }
     };
 
+    if let Err(e) = clipmonger_core::runtime_log::init_global(
+        &profile,
+        clipmonger_core::runtime_log::Role::Daemon,
+    ) {
+        eprintln!("daemon: runtime log init failed: {e}");
+    }
+
     let store = match clipmonger_core::Store::open(&profile) {
         Ok(store) => store,
         Err(e) => {
+            let _ = clipmonger_core::runtime_log::global_emit(
+                clipmonger_core::runtime_log::Role::Daemon,
+                clipmonger_core::runtime_log::Severity::Error,
+                "startup.store_open_failed",
+                &[
+                    ("operation", "store_open"),
+                    ("class", clipmonger_core::runtime_log::core_class(&e)),
+                    ("code", &clipmonger_core::runtime_log::core_code(&e)),
+                ],
+            );
             eprintln!("daemon: store open failed: {e}");
             std::process::exit(1);
         }
@@ -897,6 +918,12 @@ async fn main() {
     let token = match write_token(&profile) {
         Ok(token) => token,
         Err(e) => {
+            let _ = clipmonger_core::runtime_log::global_emit(
+                clipmonger_core::runtime_log::Role::Daemon,
+                clipmonger_core::runtime_log::Severity::Error,
+                "startup.token_failed",
+                &[("class", "io")],
+            );
             eprintln!("daemon: {e}");
             std::process::exit(1);
         }
@@ -909,6 +936,15 @@ async fn main() {
     #[cfg(unix)]
     if let Some(parent) = socket.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
+            let _ = clipmonger_core::runtime_log::global_emit(
+                clipmonger_core::runtime_log::Role::Daemon,
+                clipmonger_core::runtime_log::Severity::Error,
+                "startup.socket_dir_failed",
+                &[
+                    ("class", "io"),
+                    ("code", &e.raw_os_error().unwrap_or(0).to_string()),
+                ],
+            );
             eprintln!("daemon: socket dir failed: {e}");
             std::process::exit(1);
         }
@@ -916,7 +952,15 @@ async fn main() {
 
     // WIN-F2: load `<profile>/config.toml`, defaults when missing. The popup
     // hotkey and paste budget below are wired from it on Windows.
-    let config = Config::load(&profile.join("config.toml")).unwrap_or_default();
+    let config = Config::load(&profile.join("config.toml")).unwrap_or_else(|error| {
+        let _ = clipmonger_core::runtime_log::global_emit(
+            clipmonger_core::runtime_log::Role::Daemon,
+            clipmonger_core::runtime_log::Severity::Warn,
+            "startup.config_failed",
+            &[("class", clipmonger_core::runtime_log::core_class(&error))],
+        );
+        Config::default()
+    });
 
     let state = Arc::new(DaemonState::new(store));
     state.set_profile_dir(&profile);
@@ -979,6 +1023,16 @@ async fn main() {
     if let Err(e) =
         clipmonger_ipc::server::Server::bind_with(&socket, token, handler, options).await
     {
+        let _ = clipmonger_core::runtime_log::global_emit(
+            clipmonger_core::runtime_log::Role::Daemon,
+            clipmonger_core::runtime_log::Severity::Warn,
+            "startup.bind_failed",
+            &[
+                ("operation", "ipc_bind"),
+                ("class", "ipc"),
+                ("code", "bind_failed"),
+            ],
+        );
         eprintln!("daemon: bind failed: {e}");
         std::process::exit(1);
     }
@@ -989,10 +1043,29 @@ async fn main() {
         handler,
         options,
     ) {
+        let _ = clipmonger_core::runtime_log::global_emit(
+            clipmonger_core::runtime_log::Role::Daemon,
+            clipmonger_core::runtime_log::Severity::Warn,
+            "startup.bind_failed",
+            &[
+                ("operation", "ipc_bind"),
+                ("class", "ipc"),
+                ("code", "bind_failed"),
+            ],
+        );
         eprintln!("daemon: bind failed: {e}");
         std::process::exit(1);
     }
     if let Err(e) = write_rendezvous(&profile, &socket) {
+        let _ = clipmonger_core::runtime_log::global_emit(
+            clipmonger_core::runtime_log::Role::Daemon,
+            clipmonger_core::runtime_log::Severity::Warn,
+            "startup.rendezvous_failed",
+            &[
+                ("class", clipmonger_core::runtime_log::core_class(&e)),
+                ("code", &clipmonger_core::runtime_log::core_code(&e)),
+            ],
+        );
         eprintln!("daemon: rendezvous failed: {e}");
         std::process::exit(1);
     }

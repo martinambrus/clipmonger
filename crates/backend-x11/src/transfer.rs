@@ -122,7 +122,8 @@ impl X11Transfer {
         if target == 0 {
             return Err(Error::Unsupported(format!("unknown target '{mime}'")));
         }
-        let mut serve = |_: &xproto::SelectionRequestEvent| {};
+        let mut serve = |_: session::OwnerEvent<'_>| false;
+        let mut deferred = session::DeferredQueue::new();
         let (_actual, value) = session::convert_read(
             &conn,
             atoms.clipboard,
@@ -132,6 +133,7 @@ impl X11Transfer {
             max_bytes,
             TRANSFER_TIMEOUT,
             &mut serve,
+            &mut deferred,
         )?;
         let observed = session::selection_owner(&conn, atoms.clipboard);
         drop(conn);
@@ -238,7 +240,8 @@ impl ClipboardTransfer for X11Transfer {
         let (conn, screen) = session::connect(self.display.as_deref())?;
         let atoms = Atoms::intern(&conn)?;
         let win = session::create_window(&conn, screen)?;
-        let mut serve = |_: &xproto::SelectionRequestEvent| {};
+        let mut serve = |_: session::OwnerEvent<'_>| false;
+        let mut deferred = session::DeferredQueue::new();
         let targets = session::read_targets(
             &conn,
             atoms.clipboard,
@@ -247,6 +250,7 @@ impl ClipboardTransfer for X11Transfer {
             atoms.tmp_prop,
             TRANSFER_TIMEOUT,
             &mut serve,
+            &mut deferred,
         )?;
         let mut out = Vec::new();
         for atom in targets {

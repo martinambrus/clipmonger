@@ -103,7 +103,7 @@ fn backup_bridge_success_events_carry_daemon_replies() {
     tx.send(UiCmd::LogsTail(100)).expect("send tail");
     let ev = rx.recv_timeout(Duration::from_secs(2)).expect("tail event");
     assert!(
-        matches!(&ev, UiEvent::LogsTail(lines) if lines == &vec!["{\"a\":1}".to_string(), "{\"a\":2}".to_string()]),
+        matches!(&ev, UiEvent::LogsTail { source, lines, sink_error } if source == "audit" && sink_error.is_none() && lines == &vec!["{\"a\":1}".to_string(), "{\"a\":2}".to_string()]),
         "logs.tail ok must yield LogsTail lines, got {ev:?}"
     );
 }
@@ -125,7 +125,107 @@ fn backup_bridge_errors_surface_as_config_error() {
     tx.send(UiCmd::LogsTail(100)).expect("send tail");
     let ev = rx.recv_timeout(Duration::from_secs(2)).expect("tail event");
     assert!(
-        matches!(&ev, UiEvent::ConfigError(_)),
-        "logs error must surface as ConfigError text, got {ev:?}"
+        matches!(&ev, UiEvent::LogsTailError { source, message } if source == "audit" && message.contains("dest required")),
+        "logs error must retain audit source and error text, got {ev:?}"
     );
+}
+
+#[test]
+fn runtime_bridge_preserves_source_lines_sink_error_and_malformed_identity() {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "callback signature required by test transport contract"
+    )]
+    fn runtime_reply(
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, clipmonger_ipc::proto::IpcError> {
+        assert_eq!(method, "logs.tail");
+        assert_eq!(params, &json!({"source":"daemon","lines":2}));
+        Ok(json!({"lines":["readable diagnostic"],"sink_error":"runtime_log.refused_file"}))
+    }
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "callback signature required by test transport contract"
+    )]
+    fn malformed(_: &str, _: &Value) -> Result<Value, clipmonger_ipc::proto::IpcError> {
+        Ok(json!({"lines":[12]}))
+    }
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "callback signature required by test transport contract"
+    )]
+    fn missing(_: &str, _: &Value) -> Result<Value, clipmonger_ipc::proto::IpcError> {
+        Ok(json!({}))
+    }
+    let cmd = UiCmd::LogsTailSource {
+        source: "daemon".into(),
+        lines: 2,
+    };
+    assert_eq!(
+        ipc_bridge::params_for(&cmd),
+        json!({"source":"daemon","lines":2})
+    );
+    let (tx, rx) = ipc_bridge::Bridge::spawn(Box::new(Fake {
+        respond: runtime_reply,
+    }));
+    tx.send(cmd).unwrap();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        UiEvent::LogsTail {
+            source: "daemon".into(),
+            lines: vec!["readable diagnostic".into()],
+            sink_error: Some("runtime_log.refused_file".into())
+        }
+    );
+    let (tx, rx) = ipc_bridge::Bridge::spawn(Box::new(Fake { respond: malformed }));
+    tx.send(UiCmd::LogsTailSource {
+        source: "ui".into(),
+        lines: 2,
+    })
+    .unwrap();
+    assert!(
+        matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),UiEvent::LogsTailError {source,message} if source=="ui" && message.contains("invalid"))
+    );
+    let (tx, rx) = ipc_bridge::Bridge::spawn(Box::new(Fake { respond: missing }));
+    tx.send(UiCmd::LogsTail(100)).unwrap();
+    assert!(
+        matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),UiEvent::LogsTailError {source,..} if source=="audit")
+    );
+    let (tx, rx) = ipc_bridge::Bridge::spawn(Box::new(Fake { respond: denied }));
+    tx.send(UiCmd::LogsTailSource {
+        source: "daemon".into(),
+        lines: 2,
+    })
+    .unwrap();
+    assert!(
+        matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),UiEvent::LogsTailError {source,message} if source=="daemon" && message.contains("dest required"))
+    );
+}
+
+#[test]
+fn ui_owned_initialization_status_enters_actual_bridge_reply() {
+    use clipmonger_core::runtime_log::{self, Role};
+    let dir = std::env::temp_dir().join(format!(
+        "cm-runtime-ui-bridge-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("logs"), "obstruction").unwrap();
+    assert!(runtime_log::init_global(&dir, Role::Ui).is_err());
+    let (tx, rx) = ipc_bridge::Bridge::spawn(Box::new(Fake { respond: ok_tail }));
+    tx.send(UiCmd::LogsTailSource {
+        source: "ui".into(),
+        lines: 100,
+    })
+    .unwrap();
+    let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(
+        matches!(event,UiEvent::LogsTail {source,lines,sink_error:Some(error)} if source=="ui" && lines.len()==2 && error=="runtime_log.refused_logs_directory")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }

@@ -145,10 +145,7 @@ mod bounded_tests {
             remaining: 12,
             read_bytes: &read,
         };
-        assert!(matches!(
-            read_bounded(reader, 4),
-            Err(Error::TooLarge(_))
-        ));
+        assert!(matches!(read_bounded(reader, 4), Err(Error::TooLarge(_))));
         assert_eq!(read.get(), 5);
         assert_eq!(read_bounded(&b"abcd"[..], 4).unwrap(), b"abcd");
     }

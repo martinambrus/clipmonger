@@ -32,8 +32,11 @@ pub fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>, String> {
 /// budget, not an aggregate cap on conversion and DIB output allocations.
 const PNG_MAX_ALLOC: u64 = MAX_PIXELS * 8 + 64 * 1024;
 
+// The production construction seam takes a finite byte budget so the actual
+// decoder's allocation rejection can also be exercised with a small image.
 fn png_decoder(png: &[u8], max_alloc: u64) -> image::ImageResult<PngDecoder<Cursor<&[u8]>>> {
     let mut limits = Limits::default();
+    // Keep wide ordinary images valid; the separate pixel guard still applies.
     limits.max_image_width = None;
     limits.max_image_height = None;
     limits.max_alloc = Some(max_alloc);
@@ -306,6 +309,8 @@ mod tests {
         let expected = sample();
         let png = encode_png(&expected).unwrap();
         assert!(png.len() < 1024, "allocation control must stay small");
+        // png 0.18 reserves an expanded output row during read_info, inside
+        // PngDecoder construction. The 3-pixel RGBA8 row needs 12 bytes.
         let Err(error) = png_decoder(&png, 11) else {
             panic!("construction accepted less than one output row");
         };
@@ -386,7 +391,7 @@ mod tests {
         let small = sample();
         let png = encode_png(&small).unwrap();
         let dib = png_to_dib(&png).unwrap();
-        assert!(matches!(dib_to_png_classified(&dib), Ok(_)));
+        assert!(dib_to_png_classified(&dib).is_ok());
         let back = dib_to_png(&dib).unwrap();
         assert_eq!(image::load_from_memory(&back).unwrap().to_rgba8(), small);
 
@@ -396,7 +401,7 @@ mod tests {
         let png = encode_png(&wide).unwrap();
         let dib = png_to_dib(&png).unwrap();
         assert_eq!(i32::from_le_bytes(dib[4..8].try_into().unwrap()), 9000);
-        assert!(matches!(dib_to_png_classified(&dib), Ok(_)));
+        assert!(dib_to_png_classified(&dib).is_ok());
         let back = dib_to_png(&dib).unwrap();
         assert_eq!(image::load_from_memory(&back).unwrap().to_rgba8(), wide);
     }
