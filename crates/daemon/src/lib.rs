@@ -57,11 +57,11 @@ fn runtime_origin(origin: &str) -> &'static str {
 
 /// Protocol tag written to the rendezvous file.
 pub const PROTOCOL: &str = "ipc/v1";
-/// Daemon crate version reported by `status`.
 pub mod popup;
 #[cfg(all(unix, feature = "backend-wayland"))]
 pub mod portal;
 
+/// Daemon crate version reported by `status`.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Note carried by every skeleton capability snapshot.
 pub const SKELETON_NOTE: &str = "no backends in foundation skeleton";
