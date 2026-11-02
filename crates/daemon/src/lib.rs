@@ -668,6 +668,14 @@ impl CapsAggregator {
         }
     }
 
+    fn update_backend(&self, name: &str, update: impl FnOnce(&mut BackendCaps)) {
+        if let Ok(mut backends) = self.backends.lock() {
+            if let Some(caps) = backends.get_mut(name) {
+                update(caps);
+            }
+        }
+    }
+
     /// Flip the GNOME extension link state.
     pub fn set_extension_connected(&self, connected: bool) {
         if let Ok(mut flag) = self.extension_connected.lock() {
@@ -1552,6 +1560,38 @@ impl DaemonState {
             }
         }
         self.caps.register_backend(name, caps);
+    }
+
+    /// Refresh only capture availability; concurrent hotkey, helper and
+    /// configured paste capabilities remain intact.
+    pub fn set_monitor_available(&self, name: &str, available: bool) {
+        const NOTE: &str = "monitor Degraded: session clipboard unavailable";
+        self.caps.update_backend(name, |caps| {
+            caps.monitor = if available {
+                Level::Full
+            } else {
+                Level::Degraded
+            };
+            caps.notes.retain(|note| note != NOTE);
+            if !available {
+                caps.notes.push(NOTE.to_string());
+            }
+        });
+    }
+
+    /// Publish the popup registration result without replacing other caps.
+    pub fn set_hotkey_status(&self, name: &str, status: &popup::ChordStatus) {
+        self.caps.update_backend(name, |caps| {
+            caps.notes
+                .retain(|note| !note.starts_with("hotkey Degraded:"));
+            match status {
+                popup::ChordStatus::Held => caps.hotkey = Level::Full,
+                popup::ChordStatus::Refused(why) => {
+                    caps.hotkey = Level::Degraded;
+                    caps.notes.push(format!("hotkey Degraded: {why}"));
+                }
+            }
+        });
     }
 
     /// Override the paste delivery budget from config.
@@ -2905,6 +2945,264 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = clipmonger_core::Store::open(&dir).expect("store");
         (dir, DaemonState::new(store))
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One end-to-end recovery script checks all status readers.
+    fn capture_recovery_updates_actual_status_and_caps_readers() {
+        use clipmonger_platform::traits::ClipboardMonitor;
+        use clipmonger_platform::types::{
+            Affinity, BackendCaps, CaptureEvent, CaptureOrigin, Error, Level, PasteCaps,
+            PasteStrategy, SubscribeKind,
+        };
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        struct Monitor {
+            subscribe_fails: bool,
+            subscribed: bool,
+            polls: VecDeque<clipmonger_platform::types::Result<Vec<CaptureEvent>>>,
+        }
+        impl ClipboardMonitor for Monitor {
+            const AFFINITY: Affinity = Affinity::Worker;
+            fn subscribe(
+                &mut self,
+                kinds: &[SubscribeKind],
+            ) -> clipmonger_platform::types::Result<()> {
+                assert_eq!(kinds, &[SubscribeKind::Clipboard]);
+                if self.subscribe_fails {
+                    return Err(Error::Unavailable("subscribe refused".into()));
+                }
+                self.subscribed = true;
+                Ok(())
+            }
+            fn poll(
+                &mut self,
+                _: Duration,
+            ) -> clipmonger_platform::types::Result<Vec<CaptureEvent>> {
+                assert!(self.subscribed, "failed subscription entered capture owner");
+                self.polls
+                    .pop_front()
+                    .expect("finite poll script exhausted")
+            }
+        }
+        for backend in ["windows", "x11", "wayland"] {
+            let (_dir, state) = fresh_state(&format!("capture-status-{backend}"));
+            let base = BackendCaps {
+                monitor: Level::Unavailable,
+                transfer: Level::Degraded,
+                hotkey: Level::Full,
+                paste: PasteCaps {
+                    level: Level::Degraded,
+                    strategy: PasteStrategy::ElevatedRoute,
+                    reason: "helper policy".into(),
+                },
+                tray: Level::Unavailable,
+                autostart: false,
+                primary_selection: true,
+                notes: vec![
+                    "privacy policy retained".into(),
+                    "helper policy retained".into(),
+                ],
+            };
+            state.register_backend(backend, base);
+            state.register_backend(
+                "unrelated",
+                BackendCaps {
+                    monitor: Level::Unavailable,
+                    transfer: Level::Unavailable,
+                    hotkey: Level::Unavailable,
+                    paste: PasteCaps {
+                        level: Level::Unavailable,
+                        strategy: PasteStrategy::Unavailable,
+                        reason: "other session".into(),
+                    },
+                    tray: Level::Unavailable,
+                    autostart: false,
+                    primary_selection: false,
+                    notes: Vec::new(),
+                },
+            );
+            let before = state.caps_snapshot();
+            let check = |level: &str| {
+                let status = state.handle("status", &serde_json::json!({})).unwrap();
+                let caps = state.handle("caps.get", &serde_json::json!({})).unwrap();
+                assert_eq!(status["caps"], caps);
+                assert_eq!(
+                    state
+                        .handle("caps.refresh", &serde_json::json!({}))
+                        .unwrap(),
+                    caps
+                );
+                assert_eq!(caps["backends"][backend]["monitor"]["level"], level);
+                for key in ["paste", "autostart", "primary_selection"] {
+                    assert_eq!(
+                        caps["backends"][backend][key], before["backends"][backend][key],
+                        "{backend} changed unrelated {key}"
+                    );
+                }
+                for key in ["transfer", "tray"] {
+                    assert_eq!(
+                        caps["backends"][backend][key]["level"],
+                        before["backends"][backend][key]["level"]
+                    );
+                }
+                assert_eq!(
+                    caps["backends"]["unrelated"],
+                    before["backends"]["unrelated"]
+                );
+                let notes = caps["backends"][backend]["notes"].as_array().unwrap();
+                assert!(notes.contains(&Value::from("privacy policy retained")));
+                assert!(notes.contains(&Value::from("helper policy retained")));
+            };
+            let stop = AtomicBool::new(false);
+            let mut attempts = 0;
+            let mut captures = 0;
+            crate::capture::run_backend(
+                None,
+                Duration::ZERO,
+                &stop,
+                &state,
+                backend,
+                || {
+                    attempts += 1;
+                    check("degraded");
+                    if attempts == 1 {
+                        return Err(Error::Unavailable("factory unavailable".into()));
+                    }
+                    if attempts == 5 {
+                        assert_eq!(
+                            state.caps_snapshot()["backends"][backend]["hotkey"]["level"],
+                            "degraded"
+                        );
+                        stop.store(true, Ordering::Relaxed);
+                        return Err(Error::Unavailable("still unavailable at shutdown".into()));
+                    }
+                    crate::capture::subscribed(
+                        || {
+                            Ok(Monitor {
+                                subscribe_fails: attempts == 2,
+                                subscribed: false,
+                                polls: VecDeque::from([
+                                    Ok(vec![CaptureEvent {
+                                        offers: Vec::new(),
+                                        origin: CaptureOrigin::Clipboard,
+                                        sensitive: true,
+                                    }]),
+                                    Err(Error::Unavailable("worker exited after delivery".into())),
+                                ]),
+                            })
+                        },
+                        &[SubscribeKind::Clipboard],
+                    )
+                },
+                |events| {
+                    assert_eq!(events.len(), 1);
+                    assert!(events[0].sensitive);
+                    captures += 1;
+                    check("full");
+                    if captures > 1 {
+                        assert_eq!(
+                            state.caps_snapshot()["backends"][backend]["hotkey"]["level"],
+                            "degraded",
+                            "monitor recovery overwrote hotkey state"
+                        );
+                    }
+                    state.set_hotkey_status(
+                        backend,
+                        &crate::popup::ChordStatus::Refused("held elsewhere".into()),
+                    );
+                },
+                |_| {},
+            );
+            assert_eq!(attempts, 5);
+            assert_eq!(captures, 2);
+            check("degraded");
+            assert_eq!(
+                state.caps_snapshot()["backends"][backend]["hotkey"]["level"],
+                "degraded"
+            );
+        }
+    }
+
+    #[test]
+    fn hotkey_recovery_publishes_status_without_restoring_monitor_or_paste() {
+        use clipmonger_platform::fakes::FakeHotkeys;
+        use clipmonger_platform::types::{
+            BackendCaps, Error, HotkeyId, Level, PasteCaps, PasteStrategy,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for backend in ["windows", "x11"] {
+            let (_dir, state) = fresh_state(&format!("hotkey-status-{backend}"));
+            state.register_backend(
+                backend,
+                BackendCaps {
+                    monitor: Level::Full,
+                    transfer: Level::Degraded,
+                    hotkey: Level::Full,
+                    paste: PasteCaps {
+                        level: Level::Degraded,
+                        strategy: PasteStrategy::ElevatedRoute,
+                        reason: "helper routing retained".into(),
+                    },
+                    tray: Level::Unavailable,
+                    autostart: false,
+                    primary_selection: true,
+                    notes: vec!["privacy retained".into()],
+                },
+            );
+            state.set_monitor_available(backend, false);
+            let before = state.caps_snapshot();
+            let stop = AtomicBool::new(false);
+            let mut attempts = 0;
+            let mut levels = Vec::new();
+            crate::popup::run_hotkeys(
+                None,
+                &stop,
+                || {
+                    attempts += 1;
+                    if attempts == 1 {
+                        return Err(Error::Unavailable("initial manager unavailable".into()));
+                    }
+                    Ok(FakeHotkeys::new(vec![vec![HotkeyId(1)]]))
+                },
+                || "ctrl+alt+h".to_string(),
+                || {},
+                |status| {
+                    state.set_hotkey_status(backend, &status);
+                    let actual =
+                        state.handle("status", &serde_json::json!({})).unwrap()["caps"].clone();
+                    assert_eq!(
+                        actual,
+                        state.handle("caps.get", &serde_json::json!({})).unwrap()
+                    );
+                    for key in ["paste", "autostart", "primary_selection"] {
+                        assert_eq!(
+                            actual["backends"][backend][key],
+                            before["backends"][backend][key]
+                        );
+                    }
+                    for key in ["monitor", "transfer", "tray"] {
+                        assert_eq!(
+                            actual["backends"][backend][key]["level"],
+                            before["backends"][backend][key]["level"]
+                        );
+                    }
+                    levels.push(actual["backends"][backend]["hotkey"]["level"].clone());
+                },
+                || {
+                    assert_eq!(
+                        state.caps_snapshot()["backends"][backend]["hotkey"]["level"],
+                        "full"
+                    );
+                    stop.store(true, Ordering::Relaxed);
+                },
+                |_| {},
+            );
+            assert_eq!(levels, [Value::from("degraded"), Value::from("full")]);
+            assert_eq!(attempts, 2);
+        }
     }
 
     fn history_texts(state: &DaemonState) -> Vec<String> {
