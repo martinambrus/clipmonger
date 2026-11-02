@@ -148,10 +148,11 @@ impl Drop for WlMonitor {
 
 /// Unblock every watcher loop via its cancel handle (best-effort).
 fn cancel_all(shared: &Arc<Mutex<MonitorShared>>) {
-    if let Ok(guard) = shared.lock() {
-        for cancel in &guard.cancels {
-            cancel.cancel();
-        }
+    let guard = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for cancel in &guard.cancels {
+        cancel.cancel();
     }
 }
 
@@ -171,13 +172,14 @@ impl ClipboardMonitor for WlMonitor {
         let deadline = Instant::now() + timeout;
         loop {
             {
-                let mut shared = self
-                    .shared
-                    .lock()
-                    .map_err(|e| Error::Io(format!("monitor state lock failed: {e}")))?;
+                let (mut shared, poisoned) = match self.shared.lock() {
+                    Ok(shared) => (shared, false),
+                    Err(error) => (error.into_inner(), true),
+                };
                 let mut out = std::mem::take(&mut shared.queue);
-                let fire =
-                    shared.pending_primary.is_some() && shared.debouncer.poll(now_ms()).is_some();
+                let fire = !poisoned
+                    && shared.pending_primary.is_some()
+                    && shared.debouncer.poll(now_ms()).is_some();
                 if fire {
                     if let Some(pending) = shared.pending_primary.take() {
                         out.push(CaptureEvent {
@@ -196,6 +198,12 @@ impl ClipboardMonitor for WlMonitor {
                 }
                 if !out.is_empty() {
                     return Ok(out);
+                }
+                let regular_dead = self.workers.first().is_none_or(JoinHandle::is_finished);
+                if poisoned || regular_dead {
+                    return Err(Error::Unavailable(
+                        "wayland monitor worker exited".to_string(),
+                    ));
                 }
             }
             if Instant::now() >= deadline {
@@ -382,5 +390,121 @@ fn read_limited(mut reader: impl std::io::Read, cap: usize) -> Option<Vec<u8>> {
             }
             Err(_) => return None,
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn finished(panic: bool) -> JoinHandle<()> {
+        finish_worker(move || {
+            assert!(!panic, "worker panic fixture");
+        })
+    }
+
+    fn finish_worker(work: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
+        let handle = std::thread::spawn(work);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !handle.is_finished() {
+            assert!(Instant::now() < deadline, "finite worker gate timed out");
+            std::thread::yield_now();
+        }
+        handle
+    }
+
+    #[test]
+    fn exited_or_panicked_worker_delivers_queue_then_unavailable() {
+        for panic in [false, true] {
+            let shared = Arc::new(Mutex::new(MonitorShared {
+                queue: vec![CaptureEvent {
+                    offers: Vec::new(),
+                    origin: CaptureOrigin::Clipboard,
+                    sensitive: true,
+                }],
+                ..MonitorShared::default()
+            }));
+            let stop = Arc::new(AtomicBool::new(false));
+            let handle = finished(panic);
+            let mut monitor = WlMonitor {
+                shared,
+                stop,
+                workers: vec![handle],
+            };
+            let events = monitor.poll(Duration::ZERO).unwrap();
+            assert_eq!(events.len(), 1);
+            assert!(events[0].sensitive);
+            assert!(matches!(
+                monitor.poll(Duration::ZERO),
+                Err(Error::Unavailable(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn panicked_producer_preserves_poisoned_queue_before_terminal_error() {
+        let shared = Arc::new(Mutex::new(MonitorShared::default()));
+        let producer = Arc::clone(&shared);
+        let handle = finish_worker(move || {
+            let mut queue = producer.lock().unwrap();
+            queue.queue.push(CaptureEvent {
+                offers: Vec::new(),
+                origin: CaptureOrigin::Clipboard,
+                sensitive: true,
+            });
+            panic!("producer failed while owning the queue");
+        });
+        let mut monitor = WlMonitor {
+            shared,
+            stop: Arc::new(AtomicBool::new(false)),
+            workers: vec![handle],
+        };
+        assert_eq!(monitor.poll(Duration::ZERO).unwrap().len(), 1);
+        assert!(matches!(
+            monitor.poll(Duration::ZERO),
+            Err(Error::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn alive_idle_is_empty_and_stopped_worker_is_unavailable() {
+        let shared = Arc::new(Mutex::new(MonitorShared::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+        let mut monitor = WlMonitor {
+            shared,
+            stop: Arc::clone(&stop),
+            workers: vec![handle],
+        };
+        assert_eq!(monitor.poll(Duration::ZERO).unwrap(), []);
+        stop.store(true, Ordering::Relaxed);
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !monitor.workers[0].is_finished() {
+            assert!(Instant::now() < deadline, "finite shutdown gate timed out");
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            monitor.poll(Duration::ZERO),
+            Err(Error::Unavailable(_))
+        ));
+    }
+    #[test]
+    fn primary_only_exit_does_not_invalidate_regular_watcher() {
+        let (release_tx, release_rx) = mpsc::channel();
+        let regular = std::thread::spawn(move || {
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+        let mut monitor = WlMonitor {
+            shared: Arc::new(Mutex::new(MonitorShared::default())),
+            stop: Arc::new(AtomicBool::new(false)),
+            workers: vec![regular, finished(false)],
+        };
+        assert_eq!(monitor.poll(Duration::ZERO).unwrap(), []);
+        release_tx.send(()).unwrap();
     }
 }
