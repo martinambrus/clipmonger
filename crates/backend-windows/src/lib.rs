@@ -25,6 +25,8 @@ pub mod html;
 pub mod monitor;
 pub mod optout;
 pub mod paste;
+#[cfg(any(windows, test))]
+mod pump_startup;
 pub mod sys;
 pub mod transfer;
 pub mod uri;

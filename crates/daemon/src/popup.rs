@@ -217,8 +217,130 @@ impl PopupChord {
                 Some(ChordStatus::Held)
             }
             Err(e) => {
+                if !retry {
+                    crate::daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "hotkey.register_failed",
+                        &[("class", crate::runtime_platform_class(&e))],
+                    );
+                }
                 self.refused = Some((wanted.to_string(), now));
                 (!retry).then(|| ChordStatus::Refused(format!("{wanted}: {e}")))
+            }
+        }
+    }
+}
+
+/// Own a popup hotkey manager through factory, registration and poll
+/// failures. Every replacement starts with fresh chord-registration state.
+#[allow(clippy::too_many_arguments)]
+pub fn run_hotkeys<H: HotkeyManager>(
+    mut hotkeys: Option<H>,
+    shutdown: &std::sync::atomic::AtomicBool,
+    mut factory: impl FnMut() -> clipmonger_platform::types::Result<H>,
+    mut wanted: impl FnMut() -> String,
+    mut ready: impl FnMut(),
+    mut publish: impl FnMut(ChordStatus),
+    mut press: impl FnMut(),
+    mut sleep: impl FnMut(Duration),
+) {
+    use std::sync::atomic::Ordering;
+    let mut chord = PopupChord::default();
+    let mut last_status = None;
+    let mut registration = None;
+    let mut last_working: Option<String> = None;
+    let mut delay = Duration::from_millis(100);
+    while !shutdown.load(Ordering::Relaxed) {
+        let mut report = |status: ChordStatus| {
+            if last_status.as_ref() != Some(&status) {
+                publish(status.clone());
+                last_status = Some(status);
+            }
+        };
+        if hotkeys.is_none() {
+            match factory() {
+                Ok(mut replacement) => {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // A refused configuration change may have kept an older
+                    // working chord. Re-register that fallback on the new
+                    // manager before trying the current configuration.
+                    let fallback = last_working.clone();
+                    chord = PopupChord::default();
+                    registration = fallback
+                        .and_then(|held| chord.sync(&mut replacement, &held, Instant::now()));
+                    hotkeys = Some(replacement);
+                }
+                Err(error) => {
+                    crate::daemon_runtime_emit(
+                        clipmonger_core::runtime_log::Severity::Warn,
+                        "hotkey.init_failed",
+                        &[("class", crate::runtime_platform_class(&error))],
+                    );
+                    report(ChordStatus::Refused(error.to_string()));
+                    ready();
+                    sleep(delay);
+                    delay = (delay * 2).min(Duration::from_secs(2));
+                    continue;
+                }
+            }
+        }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(manager) = hotkeys.as_mut() else {
+            continue;
+        };
+        if let Some(status) = chord.sync(manager, &wanted(), Instant::now()) {
+            if matches!(&status, ChordStatus::Refused(_)) {
+                report(status.clone());
+            }
+            registration = Some(status);
+        }
+        if let Some(held) = &chord.held {
+            last_working = Some(held.clone());
+        }
+        ready();
+        if chord.held.is_none() {
+            // An initially refused registration is retried with a new owner;
+            // a refused change keeps the previous working chord instead.
+            drop(hotkeys.take());
+            sleep(delay);
+            delay = (delay * 2).min(Duration::from_secs(2));
+            continue;
+        }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        match manager.poll(Duration::from_millis(200)) {
+            Ok(ids) => {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Some(status) = &registration {
+                    report(status.clone());
+                }
+                delay = Duration::from_millis(100);
+                if ids.contains(&HotkeyId(1)) {
+                    press();
+                }
+            }
+            Err(error) => {
+                crate::daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "hotkey.poll_failed",
+                    &[
+                        ("operation", "hotkey_poll"),
+                        ("class", crate::runtime_platform_class(&error)),
+                    ],
+                );
+                report(ChordStatus::Refused(error.to_string()));
+                // Drop before waiting/constructing the replacement, including
+                // its native window and registrations on the owning thread.
+                drop(hotkeys.take());
+                sleep(delay);
+                delay = (delay * 2).min(Duration::from_secs(2));
             }
         }
     }
@@ -686,5 +808,206 @@ mod press_tests {
             press_decision(None, None, Some(UI_PID), None),
             (None, false)
         );
+    }
+}
+
+#[cfg(test)]
+mod hotkey_recovery_tests {
+    use super::*;
+    use clipmonger_platform::types::{Affinity, Error, Result};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct Manager {
+        held: bool,
+        register_fails: bool,
+        poll_fails: bool,
+        live: Arc<AtomicUsize>,
+        registered: Arc<AtomicUsize>,
+    }
+    impl Drop for Manager {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    impl HotkeyManager for Manager {
+        const AFFINITY: Affinity = Affinity::Worker;
+        fn register(&mut self, id: HotkeyId, chord: &str) -> Result<()> {
+            assert_eq!(id, HotkeyId(1));
+            assert_eq!(chord, "ctrl+alt+h");
+            if self.register_fails {
+                return Err(Error::Denied("registration conflict".into()));
+            }
+            self.held = true;
+            self.registered.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn unregister(&mut self, _: HotkeyId) -> Result<()> {
+            self.held = false;
+            Ok(())
+        }
+        fn poll(&mut self, _: Duration) -> Result<Vec<HotkeyId>> {
+            assert!(
+                self.held,
+                "recreated manager must actually register before polling"
+            );
+            if self.poll_fails {
+                return Err(Error::Unavailable("manager exited".into()));
+            }
+            Ok(vec![HotkeyId(1)])
+        }
+    }
+
+    #[test]
+    fn factory_registration_poll_failure_recreate_and_shutdown_use_real_loop() {
+        let stop = AtomicBool::new(false);
+        let live = Arc::new(AtomicUsize::new(0));
+        let registered = Arc::new(AtomicUsize::new(0));
+        // Factory unavailable, refused initial registration, registered but
+        // dead poll owner, then a fully working replacement.
+        let mut script = VecDeque::from([
+            None,
+            Some((true, false)),
+            Some((false, true)),
+            Some((false, false)),
+        ]);
+        let mut statuses = Vec::new();
+        let mut waits = Vec::new();
+        let mut presses = 0;
+        run_hotkeys(
+            None,
+            &stop,
+            || {
+                assert_eq!(
+                    live.load(Ordering::SeqCst),
+                    0,
+                    "old native owner must drop before factory"
+                );
+                let Some((register_fails, poll_fails)) = script.pop_front().unwrap() else {
+                    return Err(Error::Unavailable("factory unavailable".into()));
+                };
+                live.fetch_add(1, Ordering::SeqCst);
+                Ok(Manager {
+                    held: false,
+                    register_fails,
+                    poll_fails,
+                    live: Arc::clone(&live),
+                    registered: Arc::clone(&registered),
+                })
+            },
+            || "ctrl+alt+h".to_string(),
+            || {},
+            |s| statuses.push(s),
+            || {
+                presses += 1;
+                stop.store(true, Ordering::Relaxed);
+            },
+            |d| waits.push(d.as_millis()),
+        );
+        assert_eq!(presses, 1);
+        assert_eq!(registered.load(Ordering::SeqCst), 2);
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert_eq!(waits, [100, 200, 400]);
+        assert!(matches!(statuses.first(), Some(ChordStatus::Refused(_))));
+        assert_eq!(statuses.last(), Some(&ChordStatus::Held));
+    }
+
+    #[test]
+    fn recreation_rebinds_previous_working_chord_after_refused_change() {
+        use std::cell::Cell;
+        use std::sync::Mutex;
+        struct FallbackManager {
+            dies: bool,
+            polls: usize,
+            held: bool,
+            registrations: Arc<Mutex<Vec<String>>>,
+        }
+        impl HotkeyManager for FallbackManager {
+            const AFFINITY: Affinity = Affinity::Worker;
+            fn register(&mut self, _: HotkeyId, chord: &str) -> Result<()> {
+                self.registrations.lock().unwrap().push(chord.to_string());
+                if chord == "ctrl+alt+j" {
+                    return Err(Error::Denied("new chord occupied".into()));
+                }
+                self.held = true;
+                Ok(())
+            }
+            fn unregister(&mut self, _: HotkeyId) -> Result<()> {
+                Ok(())
+            }
+            fn poll(&mut self, _: Duration) -> Result<Vec<HotkeyId>> {
+                assert!(self.held, "fallback registration lost on replacement");
+                self.polls += 1;
+                if self.dies {
+                    if self.polls == 1 {
+                        return Ok(Vec::new());
+                    }
+                    return Err(Error::Unavailable("manager exited".into()));
+                }
+                Ok(vec![HotkeyId(1)])
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let registrations = Arc::new(Mutex::new(Vec::new()));
+        let reads = Cell::new(0);
+        let mut attempts = 0;
+        run_hotkeys(
+            None,
+            &stop,
+            || {
+                attempts += 1;
+                Ok(FallbackManager {
+                    dies: attempts == 1,
+                    polls: 0,
+                    held: false,
+                    registrations: Arc::clone(&registrations),
+                })
+            },
+            || {
+                reads.set(reads.get() + 1);
+                if reads.get() == 1 {
+                    "ctrl+alt+h".into()
+                } else {
+                    "ctrl+alt+j".into()
+                }
+            },
+            || {},
+            |_| {},
+            || stop.store(true, Ordering::Relaxed),
+            |_| {},
+        );
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            *registrations.lock().unwrap(),
+            ["ctrl+alt+h", "ctrl+alt+j", "ctrl+alt+h", "ctrl+alt+j"]
+        );
+    }
+
+    #[test]
+    fn stop_during_backoff_does_not_create_replacement() {
+        let stop = AtomicBool::new(false);
+        let mut attempts = 0;
+        let mut slices = Vec::new();
+        run_hotkeys::<Manager>(
+            None,
+            &stop,
+            || {
+                attempts += 1;
+                Err(Error::Unavailable("factory unavailable".into()))
+            },
+            || "ctrl+alt+h".into(),
+            || {},
+            |_| {},
+            || panic!("press after stop"),
+            |delay| {
+                crate::capture::sleep_interruptible(&stop, delay, |slice| {
+                    slices.push(slice);
+                    stop.store(true, Ordering::Relaxed);
+                });
+            },
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(slices, [Duration::from_millis(20)]);
     }
 }

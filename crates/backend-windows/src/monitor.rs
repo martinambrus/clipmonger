@@ -6,10 +6,12 @@
 //! produce an event with `sensitive=true` so the daemon counts them in
 //! `privacy_skips` without storing anything.
 
+#[cfg(any(windows, test))]
+use std::sync::mpsc::Receiver;
 #[cfg(windows)]
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Sender;
 use std::time::Duration;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 use std::time::Instant;
 
 use clipmonger_platform::traits::ClipboardMonitor;
@@ -28,9 +30,7 @@ pub struct WinMonitor {
     #[cfg(windows)]
     subscribed_clipboard: bool,
     #[cfg(windows)]
-    last_seq: Option<u32>,
-    #[cfg(windows)]
-    last_hash: Option<String>,
+    poll_state: PollState,
 }
 
 impl WinMonitor {
@@ -50,8 +50,7 @@ impl WinMonitor {
                 pump: Some(pump),
                 wakes: Some(rx),
                 subscribed_clipboard: false,
-                last_seq: None,
-                last_hash: None,
+                poll_state: PollState::default(),
             })
         }
         #[cfg(not(windows))]
@@ -184,7 +183,7 @@ impl ClipboardMonitor for WinMonitor {
         #[cfg(windows)]
         {
             self.subscribed_clipboard = kinds.contains(&SubscribeKind::Clipboard);
-            self.last_seq = current_seq();
+            self.poll_state.last_seq = current_seq();
             Ok(())
         }
         #[cfg(not(windows))]
@@ -206,80 +205,14 @@ impl ClipboardMonitor for WinMonitor {
                 .wakes
                 .as_ref()
                 .ok_or_else(|| Error::Unavailable("monitor pump is not running".to_string()))?;
-            let deadline = Instant::now() + timeout;
-            let mut events = Vec::new();
-            loop {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                match rx.recv_timeout(deadline - now) {
-                    Ok(()) => {
-                        // One wake may race transient lock contention (another
-                        // process holding the clipboard open); resample until
-                        // the deadline so a Timeout never loses the update.
-                        // Each attempt self-paces (open retries ~100 ms), so
-                        // no extra sleep is needed and the deadline bounds us.
-                        let mut retries = 15;
-                        while retries > 0 && Instant::now() < deadline {
-                            retries -= 1;
-                            let seq = current_seq();
-                            if seq == self.last_seq {
-                                std::thread::sleep(std::time::Duration::from_millis(20));
-                                continue;
-                            }
-                            match current_event() {
-                                Ok(event) => {
-                                    if event.offers.is_empty() {
-                                        std::thread::sleep(std::time::Duration::from_millis(40));
-                                        continue;
-                                    }
-                                    self.last_seq = seq;
-                                    self.last_hash = Some(content_fingerprint(&event));
-                                    events.push(event);
-                                    std::thread::sleep(std::time::Duration::from_millis(30));
-                                }
-                                Err(Error::Timeout(_)) => {
-                                    std::thread::sleep(std::time::Duration::from_millis(20));
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        }
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(Error::Unavailable("monitor pump thread exited".to_string()));
-                    }
-                }
-            }
-            if events.is_empty() {
-                if let Some(seq) = current_seq() {
-                    if Some(seq) != self.last_seq {
-                        match current_event() {
-                            Ok(event) => {
-                                let fp = content_fingerprint(&event);
-                                self.last_seq = Some(seq);
-                                self.last_hash = Some(fp);
-                                events.push(event);
-                            }
-                            Err(Error::Timeout(_)) => {}
-                            Err(e) => return Err(e),
-                        }
-                    }
-                }
-                if events.is_empty() {
-                    if let Ok(event) = current_event() {
-                        if !event.offers.is_empty() {
-                            let fp = content_fingerprint(&event);
-                            if self.last_hash.as_deref() != Some(&fp) {
-                                self.last_hash = Some(fp);
-                                events.push(event);
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(events)
+            self.poll_state.poll(
+                rx,
+                timeout,
+                current_seq,
+                current_event,
+                content_fingerprint,
+                std::thread::sleep,
+            )
         }
         #[cfg(not(windows))]
         {
@@ -288,6 +221,119 @@ impl ClipboardMonitor for WinMonitor {
                 "clipboard monitor needs a Windows session".to_string(),
             ))
         }
+    }
+}
+
+/// Poll bookkeeping shared by the native wake reader and channel controls.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct PollState {
+    last_seq: Option<u32>,
+    last_hash: Option<String>,
+    pending_error: Option<Error>,
+}
+
+#[cfg(any(windows, test))]
+impl PollState {
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn poll(
+        &mut self,
+        rx: &Receiver<()>,
+        timeout: Duration,
+        mut current_seq: impl FnMut() -> Option<u32>,
+        mut current_event: impl FnMut() -> Result<CaptureEvent>,
+        mut content_fingerprint: impl FnMut(&CaptureEvent) -> String,
+        mut sleep: impl FnMut(Duration),
+    ) -> Result<Vec<CaptureEvent>> {
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
+        let deadline = Instant::now() + timeout;
+        let mut events = Vec::new();
+        let mut deferred: Option<Error> = None;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match rx.recv_timeout(deadline - now) {
+                Ok(()) => {
+                    let mut retries = 15;
+                    while retries > 0 && Instant::now() < deadline {
+                        retries -= 1;
+                        let seq = current_seq();
+                        if seq == self.last_seq {
+                            sleep(std::time::Duration::from_millis(20));
+                            continue;
+                        }
+                        match current_event() {
+                            Ok(event) => {
+                                if event.offers.is_empty() {
+                                    sleep(std::time::Duration::from_millis(40));
+                                    continue;
+                                }
+                                self.last_seq = seq;
+                                self.last_hash = Some(content_fingerprint(&event));
+                                events.push(event);
+                                sleep(std::time::Duration::from_millis(30));
+                            }
+                            Err(Error::Timeout(_)) => {
+                                sleep(std::time::Duration::from_millis(20));
+                            }
+                            Err(e) => {
+                                if events.is_empty() {
+                                    return Err(e);
+                                }
+                                deferred = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    if deferred.is_some() {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    if events.is_empty() {
+                        return Err(Error::Unavailable("monitor pump thread exited".to_string()));
+                    }
+                    deferred = Some(Error::Unavailable("monitor pump thread exited".to_string()));
+                    break;
+                }
+            }
+        }
+        if deferred.is_none() && events.is_empty() {
+            if let Some(seq) = current_seq() {
+                if Some(seq) != self.last_seq {
+                    match current_event() {
+                        Ok(event) => {
+                            let fp = content_fingerprint(&event);
+                            self.last_seq = Some(seq);
+                            self.last_hash = Some(fp);
+                            events.push(event);
+                        }
+                        Err(Error::Timeout(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            if events.is_empty() {
+                if let Ok(event) = current_event() {
+                    if !event.offers.is_empty() {
+                        let fp = content_fingerprint(&event);
+                        if self.last_hash.as_deref() != Some(&fp) {
+                            self.last_hash = Some(fp);
+                            events.push(event);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(err) = deferred {
+            self.pending_error = Some(err);
+        }
+        Ok(events)
     }
 }
 
@@ -360,5 +406,100 @@ mod tests {
         assert_eq!(fingerprint_parts(Some(b"a"), empty), "af63dc4c8601ec8c:1");
         let text = b"hello world";
         assert!(fingerprint_parts(Some(text), empty).ends_with(":11"));
+    }
+
+    #[test]
+    fn wake_read_error_delivers_committed_events_then_exact_error() {
+        use super::PollState;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, Error};
+        use std::cell::Cell;
+        use std::time::Duration;
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(()).unwrap();
+        let sequence = Cell::new(0);
+        let reads = Cell::new(0);
+        let mut state = PollState::default();
+        let events = state
+            .poll(
+                &rx,
+                Duration::from_secs(1),
+                || {
+                    sequence.set(sequence.get() + 1);
+                    Some(sequence.get())
+                },
+                || {
+                    reads.set(reads.get() + 1);
+                    if reads.get() == 1 {
+                        Ok(CaptureEvent {
+                            offers: vec![offer("text/plain")],
+                            origin: CaptureOrigin::Clipboard,
+                            sensitive: true,
+                        })
+                    } else {
+                        Err(Error::Io("exact read error".into()))
+                    }
+                },
+                |_| "committed fingerprint".into(),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].sensitive);
+        assert_eq!(state.last_seq, Some(1));
+        assert_eq!(state.last_hash.as_deref(), Some("committed fingerprint"));
+        let error = state
+            .poll(
+                &rx,
+                Duration::ZERO,
+                || panic!("read before pending error"),
+                || panic!("read before pending error"),
+                |_| panic!("hash before pending error"),
+                |_| {},
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::Io(detail) if detail == "exact read error"));
+        assert_eq!(reads.get(), 2);
+        assert_eq!(state.last_seq, Some(1));
+    }
+
+    #[test]
+    fn queued_wake_then_disconnect_delivers_before_unavailable() {
+        use super::PollState;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, Error};
+        use std::time::Duration;
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(()).unwrap();
+        drop(tx);
+        let mut state = PollState::default();
+        let events = state
+            .poll(
+                &rx,
+                Duration::from_secs(1),
+                || Some(9),
+                || {
+                    Ok(CaptureEvent {
+                        offers: vec![offer("text/html")],
+                        origin: CaptureOrigin::Clipboard,
+                        sensitive: false,
+                    })
+                },
+                |_| "hash".into(),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let error = state
+            .poll(
+                &rx,
+                Duration::ZERO,
+                || None,
+                || panic!("no reads"),
+                |_| String::new(),
+                |_| {},
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Unavailable(detail) if detail == "monitor pump thread exited")
+        );
     }
 }

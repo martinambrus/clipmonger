@@ -23,6 +23,185 @@ const POLL_STEP: Duration = Duration::from_millis(5);
 /// Scratch property name for requestor conversions.
 const TMP_PROP: &[u8] = b"CLIPMONGER_TMP";
 
+/// Bounded FIFO that preserves monitor events consumed during a synchronous
+/// conversion so the outer pump can handle them exactly once, in order.
+///
+/// Ownership:
+/// - `Worker` owns one `DeferredQueue` that persists across all its
+///   `convert_read`/`read_targets` calls (direct + INCR). It is drained
+///   before every outer poll of the X connection.
+/// - `X11Transfer` per-call reads own a local ephemeral queue that is
+///   discarded after the call; they do not own manager duties (no replay
+///   to the monitor). This avoids background threads or cross-lock replay.
+///
+/// Normal flow: `convert_read`/`incr_receive` push unrelated
+/// event (`ClientMessage` `SAVE_TARGETS`, Xfixes ownership changes,
+/// `SelectionClear`, `PropertyNotify` DELETE, etc.) via `try_push`; the
+/// matching `SelectionNotify` (or current INCR `PropertyNotify` `NEW_VALUE`) is
+/// consumed. `SelectionRequest` and active owner-side INCR acknowledgements
+/// are served inline to avoid deadlock; scratch-property events are consumed.
+///
+/// INCR flow: `incr_receive` defers identically; its matching
+/// `PropertyNotify` `NEW_VALUE` for the current chunk is consumed, others are
+/// deferred.
+///
+/// Error/overflow: `try_push` fails closed when `len == capacity`; the
+/// queue becomes sticky-terminal and every subsequent `check_terminal` and
+/// conversion returns `Error::Unavailable("x11 monitor disconnected: ...")`.
+/// Poll errors (`poll_for_event` Err) also set the sticky terminal and
+/// return the same Unavailable. Normal owner errors (Denied/Timeout/
+/// TooLarge/no-selection-owner) remain non-terminal and do not set the
+/// terminal flag; callers may swallow them without disconnecting.
+///
+/// The bound is fixed and small; monitor callers that previously used
+/// `.ok()`/`unwrap_or_default` must observe the terminal via
+/// `check_terminal` after each conversion, otherwise `pump_events` will
+/// surface the terminal on its next drain and fail the worker.
+pub(crate) struct DeferredQueue {
+    events: std::collections::VecDeque<Event>,
+    terminal: Option<String>,
+    capacity: usize,
+}
+
+impl DeferredQueue {
+    pub(crate) const DEFAULT_CAPACITY: usize = 32;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            events: std::collections::VecDeque::new(),
+            terminal: None,
+            capacity: Self::DEFAULT_CAPACITY,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            events: std::collections::VecDeque::new(),
+            terminal: None,
+            capacity,
+        }
+    }
+
+    pub(crate) fn try_push(&mut self, event: Event) -> Result<()> {
+        if let Some(msg) = &self.terminal {
+            return Err(Error::Unavailable(format!(
+                "x11 monitor disconnected: {msg}"
+            )));
+        }
+        if self.events.len() >= self.capacity {
+            self.terminal = Some("deferred queue overflow".to_string());
+            return Err(Error::Unavailable(
+                "x11 monitor disconnected: deferred queue overflow".to_string(),
+            ));
+        }
+        self.events.push_back(event);
+        Ok(())
+    }
+
+    pub(crate) fn pop_front(&mut self) -> Option<Event> {
+        self.events.pop_front()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_terminal(&self) -> bool {
+        self.terminal.is_some()
+    }
+
+    pub(crate) fn check_terminal(&self) -> Result<()> {
+        if let Some(msg) = self.terminal_message() {
+            return Err(Error::Unavailable(format!(
+                "x11 monitor disconnected: {msg}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_terminal(&mut self, msg: impl Into<String>) {
+        let m = msg.into();
+        if self.terminal.is_none() {
+            self.terminal = Some(m);
+        }
+    }
+
+    pub(crate) fn terminal_message(&self) -> Option<&str> {
+        self.terminal.as_deref()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReceivePhase {
+    Direct { selection: Atom, target: Atom },
+    Incr,
+}
+
+enum Incoming {
+    Selection(xproto::SelectionNotifyEvent),
+    Chunk,
+    Served,
+    Deferred,
+    Housekeeping,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum OwnerEvent<'a> {
+    Request(&'a xproto::SelectionRequestEvent),
+    Delete(&'a xproto::PropertyNotifyEvent),
+}
+
+/// Classify exactly the events consumed by the synchronous receive loops.
+/// Only notifications for our own scratch property are housekeeping; deletes
+/// for another window/property remain available to the owner-side pump.
+fn receive_event(
+    event: Event,
+    requestor: Window,
+    property: Atom,
+    phase: ReceivePhase,
+    serve: &mut dyn FnMut(OwnerEvent<'_>) -> bool,
+    deferred: &mut DeferredQueue,
+) -> Result<Incoming> {
+    deferred.check_terminal()?;
+    match event {
+        Event::SelectionNotify(notify)
+            if matches!(phase, ReceivePhase::Direct { selection, target }
+                if notify.requestor == requestor && notify.selection == selection
+                    && notify.target == target && (notify.property == property || notify.property == 0)) =>
+        {
+            Ok(Incoming::Selection(notify))
+        }
+        Event::PropertyNotify(event)
+            if event.state == xproto::Property::DELETE && serve(OwnerEvent::Delete(&event)) =>
+        {
+            Ok(Incoming::Served)
+        }
+        Event::PropertyNotify(event) if event.window == requestor && event.atom == property => {
+            if matches!(phase, ReceivePhase::Incr) && event.state == xproto::Property::NEW_VALUE {
+                Ok(Incoming::Chunk)
+            } else {
+                Ok(Incoming::Housekeeping)
+            }
+        }
+        Event::SelectionRequest(req) => {
+            serve(OwnerEvent::Request(&req));
+            Ok(Incoming::Served)
+        }
+        other => {
+            deferred.try_push(other)?;
+            Ok(Incoming::Deferred)
+        }
+    }
+}
+
 /// Connect to `display` (or `$DISPLAY` when `None`).
 pub(crate) fn connect(display: Option<&str>) -> Result<(RustConnection, usize)> {
     let (conn, screen) = x11rb14::connect(display)
@@ -248,7 +427,8 @@ pub(crate) fn convert_read(
     property: Atom,
     max_bytes: u64,
     timeout: Duration,
-    serve: &mut dyn FnMut(&x11rb14::protocol::xproto::SelectionRequestEvent),
+    serve: &mut dyn FnMut(OwnerEvent<'_>) -> bool,
+    deferred: &mut DeferredQueue,
 ) -> Result<(Atom, Vec<u8>)> {
     if selection_owner(conn, selection) == 0 {
         return Err(Error::Unavailable("no selection owner".to_string()));
@@ -282,27 +462,36 @@ pub(crate) fn convert_read(
                 "selection transfer timed out waiting for the owner".to_string(),
             ));
         }
+        deferred.check_terminal()?;
         match conn.poll_for_event() {
-            Ok(Some(Event::SelectionNotify(notify)))
-                if notify.requestor == requestor
-                    && notify.selection == selection
-                    && notify.target == target =>
-            {
-                if notify.property == 0 {
-                    return Err(Error::Denied("owner refused the conversion".to_string()));
+            Ok(Some(event)) => {
+                if let Incoming::Selection(notify) = receive_event(
+                    event,
+                    requestor,
+                    property,
+                    ReceivePhase::Direct { selection, target },
+                    serve,
+                    deferred,
+                )? {
+                    if notify.property == 0 {
+                        return Err(Error::Denied("owner refused the conversion".to_string()));
+                    }
+                    let (actual, value) = take_property(conn, requestor, property)?;
+                    if actual == incr_atom(conn) {
+                        return incr_receive(
+                            conn, requestor, property, &value, max_bytes, deadline, serve, deferred,
+                        );
+                    }
+                    return Ok((actual, value));
                 }
-                let (actual, value) = take_property(conn, requestor, property)?;
-                if actual == incr_atom(conn) {
-                    return incr_receive(
-                        conn, requestor, property, &value, max_bytes, deadline, serve,
-                    );
-                }
-                return Ok((actual, value));
             }
-            Ok(Some(Event::SelectionRequest(req))) => serve(&req),
-            Ok(Some(_)) => {}
             Ok(None) => std::thread::sleep(POLL_STEP),
-            Err(e) => return Err(Error::Io(format!("x11 event poll failed: {e}"))),
+            Err(e) => {
+                deferred.set_terminal(format!("x11 event poll failed: {e}"));
+                return Err(Error::Unavailable(format!(
+                    "x11 monitor disconnected: x11 event poll failed: {e}"
+                )));
+            }
         }
     }
 }
@@ -317,6 +506,10 @@ fn incr_atom(conn: &RustConnection) -> Atom {
 
 /// Receive INCR chunks after the announce (`announce` holds the total
 /// size); each chunk is deleted to ACK it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "INCR receive needs the transfer bounds and owner service state"
+)]
 fn incr_receive(
     conn: &RustConnection,
     requestor: Window,
@@ -324,7 +517,8 @@ fn incr_receive(
     announce: &[u8],
     max_bytes: u64,
     deadline: Instant,
-    serve: &mut dyn FnMut(&x11rb14::protocol::xproto::SelectionRequestEvent),
+    serve: &mut dyn FnMut(OwnerEvent<'_>) -> bool,
+    deferred: &mut DeferredQueue,
 ) -> Result<(Atom, Vec<u8>)> {
     let mut size_bytes = [0u8; 4];
     size_bytes.copy_from_slice(&announce[0..announce.len().min(4)]);
@@ -345,32 +539,45 @@ fn incr_receive(
                 "INCR transfer timed out before the final chunk".to_string(),
             ));
         }
+        deferred.check_terminal()?;
         match conn.poll_for_event() {
-            Ok(Some(Event::PropertyNotify(event)))
-                if event.window == requestor
-                    && event.atom == property
-                    && event.state == xproto::Property::NEW_VALUE =>
-            {
-                let (kind, chunk) = take_property(conn, requestor, property)?;
-                if chunk.is_empty() {
-                    return Ok((kind, buf));
+            Ok(Some(event)) => {
+                if let Incoming::Chunk = receive_event(
+                    event,
+                    requestor,
+                    property,
+                    ReceivePhase::Incr,
+                    serve,
+                    deferred,
+                )? {
+                    let (kind, chunk) = take_property(conn, requestor, property)?;
+                    if chunk.is_empty() {
+                        return Ok((kind, buf));
+                    }
+                    if (buf.len() as u64) + (chunk.len() as u64) > max_bytes {
+                        return Err(Error::TooLarge(format!(
+                            "INCR payload exceeds {max_bytes} bytes"
+                        )));
+                    }
+                    buf.extend_from_slice(&chunk);
                 }
-                if (buf.len() as u64) + (chunk.len() as u64) > max_bytes {
-                    return Err(Error::TooLarge(format!(
-                        "INCR payload exceeds {max_bytes} bytes"
-                    )));
-                }
-                buf.extend_from_slice(&chunk);
             }
-            Ok(Some(Event::SelectionRequest(req))) => serve(&req),
-            Ok(Some(_)) => {}
             Ok(None) => std::thread::sleep(POLL_STEP),
-            Err(e) => return Err(Error::Io(format!("x11 event poll failed: {e}"))),
+            Err(e) => {
+                deferred.set_terminal(format!("x11 event poll failed: {e}"));
+                return Err(Error::Unavailable(format!(
+                    "x11 monitor disconnected: x11 event poll failed: {e}"
+                )));
+            }
         }
     }
 }
 
 /// Convert `TARGETS` from `selection` and return the offered atom list.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "TARGETS conversion needs the requestor and owner service state"
+)]
 pub(crate) fn read_targets(
     conn: &RustConnection,
     selection: Atom,
@@ -378,7 +585,8 @@ pub(crate) fn read_targets(
     requestor: Window,
     property: Atom,
     timeout: Duration,
-    serve: &mut dyn FnMut(&x11rb14::protocol::xproto::SelectionRequestEvent),
+    serve: &mut dyn FnMut(OwnerEvent<'_>) -> bool,
+    deferred: &mut DeferredQueue,
 ) -> Result<Vec<Atom>> {
     let (actual, value) = convert_read(
         conn,
@@ -389,6 +597,7 @@ pub(crate) fn read_targets(
         64 << 10,
         timeout,
         serve,
+        deferred,
     )?;
     if actual != AtomEnum::ATOM.into() || !value.len().is_multiple_of(4) {
         return Ok(Vec::new());
@@ -451,6 +660,27 @@ impl ServerState {
             pending: HashMap::new(),
             last_time: 0,
         }
+    }
+}
+
+/// Serve requests and acknowledgements that can progress without starting a
+/// nested selection conversion. Other deletes remain ordered in the FIFO.
+pub(crate) fn serve_owner_event(
+    conn: &RustConnection,
+    atoms: &Atoms,
+    state: &mut ServerState,
+    event: OwnerEvent<'_>,
+) -> bool {
+    match event {
+        OwnerEvent::Request(req) => {
+            serve_selection_request(conn, atoms, req, state);
+            true
+        }
+        OwnerEvent::Delete(ev) if state.pending.contains_key(&(ev.window, ev.atom)) => {
+            serve_property_delete(conn, ev.window, ev.atom, state);
+            true
+        }
+        OwnerEvent::Delete(_) => false,
     }
 }
 
@@ -651,5 +881,296 @@ pub(crate) fn serve_property_delete(
         )
         .ok()
         .and_then(|cookie| cookie.check().ok());
+    }
+}
+
+#[cfg(test)]
+mod deferred_tests {
+    use super::*;
+    use x11rb14::protocol::xproto::{ClientMessageEvent, PropertyNotifyEvent, SelectionClearEvent};
+    use x11rb14::protocol::Event;
+
+    fn client_msg(save_targets: u32) -> Event {
+        Event::ClientMessage(ClientMessageEvent {
+            response_type: 33,
+            sequence: 0,
+            window: 1,
+            type_: save_targets,
+            format: 32,
+            data: [0u32; 5].into(),
+        })
+    }
+
+    fn selection_clear(manager: u32) -> Event {
+        Event::SelectionClear(SelectionClearEvent {
+            response_type: 0,
+            sequence: 0,
+            time: 0,
+            selection: manager,
+            owner: 2,
+        })
+    }
+
+    fn property_delete(window: u32, atom: u32) -> Event {
+        Event::PropertyNotify(PropertyNotifyEvent {
+            response_type: 0,
+            sequence: 0,
+            window,
+            atom,
+            time: 0,
+            state: x11rb14::protocol::xproto::Property::DELETE,
+        })
+    }
+
+    fn notify(selection: u32, target: u32, property: u32) -> Event {
+        Event::SelectionNotify(xproto::SelectionNotifyEvent {
+            response_type: 31,
+            sequence: 0,
+            time: 0,
+            requestor: 1,
+            selection,
+            target,
+            property,
+        })
+    }
+
+    fn request() -> Event {
+        Event::SelectionRequest(xproto::SelectionRequestEvent {
+            response_type: 30,
+            sequence: 0,
+            time: 0,
+            owner: 1,
+            requestor: 7,
+            selection: 2,
+            target: 3,
+            property: 8,
+        })
+    }
+
+    #[test]
+    fn receive_classifier_preserves_unmatched_and_serves_inline() {
+        let mut q = DeferredQueue::new();
+        let mut requests = 0;
+        let mut serve = |event: OwnerEvent<'_>| match event {
+            OwnerEvent::Request(_) => {
+                requests += 1;
+                true
+            }
+            OwnerEvent::Delete(_) => false,
+        };
+        let phase = ReceivePhase::Direct {
+            selection: 2,
+            target: 3,
+        };
+        assert!(matches!(
+            receive_event(request(), 1, 4, phase, &mut serve, &mut q).unwrap(),
+            Incoming::Served
+        ));
+        assert!(matches!(
+            receive_event(notify(2, 5, 4), 1, 4, phase, &mut serve, &mut q).unwrap(),
+            Incoming::Deferred
+        ));
+        assert!(matches!(
+            receive_event(client_msg(10), 1, 4, phase, &mut serve, &mut q).unwrap(),
+            Incoming::Deferred
+        ));
+        assert!(matches!(
+            receive_event(selection_clear(20), 1, 4, phase, &mut serve, &mut q).unwrap(),
+            Incoming::Deferred
+        ));
+        let owner_change =
+            Event::XfixesSelectionNotify(x11rb14::protocol::xfixes::SelectionNotifyEvent {
+                response_type: 0,
+                subtype: x11rb14::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER,
+                sequence: 0,
+                window: 1,
+                owner: 12,
+                selection: 2,
+                timestamp: 0,
+                selection_timestamp: 0,
+            });
+        assert!(matches!(
+            receive_event(owner_change, 1, 4, phase, &mut serve, &mut q).unwrap(),
+            Incoming::Deferred
+        ));
+        assert!(matches!(
+            receive_event(property_delete(7, 8), 1, 4, phase, &mut serve, &mut q).unwrap(),
+            Incoming::Deferred
+        ));
+        assert!(matches!(
+            receive_event(notify(2, 3, 4), 1, 4, phase, &mut serve, &mut q).unwrap(),
+            Incoming::Selection(_)
+        ));
+        assert!(matches!(
+            receive_event(notify(2, 3, 0), 1, 4, phase, &mut serve, &mut q).unwrap(),
+            Incoming::Selection(_)
+        ));
+        assert!(matches!(q.pop_front(), Some(Event::SelectionNotify(_))));
+        assert!(matches!(q.pop_front(), Some(Event::ClientMessage(_))));
+        assert!(matches!(q.pop_front(), Some(Event::SelectionClear(_))));
+        assert!(matches!(
+            q.pop_front(),
+            Some(Event::XfixesSelectionNotify(_))
+        ));
+        assert!(matches!(q.pop_front(), Some(Event::PropertyNotify(_))));
+        drop(serve);
+        assert_eq!(requests, 1);
+    }
+
+    #[test]
+    fn receive_classifier_handles_many_incr_acknowledgements_and_overflow() {
+        let mut q = DeferredQueue::new();
+        let mut served_delete = 0;
+        let mut serve = |event: OwnerEvent<'_>| match event {
+            OwnerEvent::Request(_) => true,
+            OwnerEvent::Delete(e) if e.window == 7 && e.atom == 8 => {
+                served_delete += 1;
+                true
+            }
+            OwnerEvent::Delete(_) => false,
+        };
+        for _ in 0..64 {
+            assert!(matches!(
+                receive_event(
+                    property_delete(1, 4),
+                    1,
+                    4,
+                    ReceivePhase::Incr,
+                    &mut serve,
+                    &mut q
+                )
+                .unwrap(),
+                Incoming::Housekeeping
+            ));
+            let Event::PropertyNotify(mut new_value) = property_delete(1, 4) else {
+                unreachable!();
+            };
+            new_value.state = xproto::Property::NEW_VALUE;
+            assert!(matches!(
+                receive_event(
+                    Event::PropertyNotify(new_value),
+                    1,
+                    4,
+                    ReceivePhase::Incr,
+                    &mut serve,
+                    &mut q
+                )
+                .unwrap(),
+                Incoming::Chunk
+            ));
+        }
+        assert!(q.is_empty());
+        assert!(matches!(
+            receive_event(
+                property_delete(7, 8),
+                1,
+                4,
+                ReceivePhase::Incr,
+                &mut serve,
+                &mut q
+            )
+            .unwrap(),
+            Incoming::Served
+        ));
+        assert!(matches!(
+            receive_event(
+                notify(2, 3, 4),
+                1,
+                4,
+                ReceivePhase::Incr,
+                &mut serve,
+                &mut q
+            )
+            .unwrap(),
+            Incoming::Deferred
+        ));
+        for i in 0..31 {
+            receive_event(client_msg(i), 1, 4, ReceivePhase::Incr, &mut serve, &mut q).unwrap();
+        }
+        assert!(receive_event(
+            selection_clear(1),
+            1,
+            4,
+            ReceivePhase::Incr,
+            &mut serve,
+            &mut q
+        )
+        .is_err());
+        assert!(receive_event(request(), 1, 4, ReceivePhase::Incr, &mut serve, &mut q).is_err());
+        assert!(q.check_terminal().is_err());
+        drop(serve);
+        assert_eq!(served_delete, 1);
+    }
+
+    #[test]
+    fn deferred_queue_preserves_fifo_order() {
+        let mut q = DeferredQueue::new();
+        let message = client_msg(100);
+        let clear = selection_clear(200);
+        let deletion = property_delete(3, 400);
+        q.try_push(message).unwrap();
+        q.try_push(clear).unwrap();
+        q.try_push(deletion).unwrap();
+        assert_eq!(q.len(), 3);
+        let first = q.pop_front().unwrap();
+        assert!(matches!(first, Event::ClientMessage(m) if m.type_ == 100));
+        let second = q.pop_front().unwrap();
+        assert!(matches!(second, Event::SelectionClear(m) if m.selection == 200));
+        let third = q.pop_front().unwrap();
+        assert!(matches!(third, Event::PropertyNotify(m) if m.atom == 400));
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn deferred_queue_overflow_is_terminal_and_sticky() {
+        let mut q = DeferredQueue::with_capacity(2);
+        q.try_push(client_msg(1)).unwrap();
+        q.try_push(client_msg(2)).unwrap();
+        let err = q.try_push(client_msg(3)).unwrap_err();
+        assert!(matches!(err, Error::Unavailable(m) if m.contains("overflow")));
+        assert!(q.has_terminal());
+        assert!(q.check_terminal().is_err());
+        let err2 = q.try_push(client_msg(4)).unwrap_err();
+        assert!(matches!(err2, Error::Unavailable(m) if m.contains("overflow")));
+        assert!(q.pop_front().is_some());
+        assert!(q.has_terminal());
+    }
+
+    #[test]
+    fn deferred_queue_poll_error_sets_terminal() {
+        let mut q = DeferredQueue::new();
+        q.set_terminal("x11 event poll failed: closed");
+        assert!(q.has_terminal());
+        assert!(q.check_terminal().is_err());
+        let err = q.try_push(client_msg(9)).unwrap_err();
+        assert!(matches!(err, Error::Unavailable(m) if m.contains("monitor disconnected")));
+    }
+
+    #[test]
+    fn deferred_queue_direct_and_incr_events_share_same_queue_semantics() {
+        let mut q = DeferredQueue::with_capacity(32);
+        q.try_push(client_msg(10)).unwrap();
+        q.try_push(selection_clear(20)).unwrap();
+        q.try_push(property_delete(5, 30)).unwrap();
+        assert_eq!(q.len(), 3);
+        let mut seen = Vec::new();
+        while let Some(ev) = q.pop_front() {
+            match ev {
+                Event::ClientMessage(m) => seen.push(("client", m.type_)),
+                Event::SelectionClear(m) => seen.push(("clear", m.selection)),
+                Event::PropertyNotify(m) => seen.push(("prop", m.atom)),
+                _ => seen.push(("other", 0)),
+            }
+        }
+        assert_eq!(seen, vec![("client", 10), ("clear", 20), ("prop", 30)]);
+    }
+
+    #[test]
+    fn deferred_queue_terminal_propagates_through_convert_helpers() {
+        let mut q = DeferredQueue::new();
+        q.set_terminal("deferred queue overflow");
+        assert!(q.check_terminal().is_err());
+        let err = q.check_terminal().unwrap_err();
+        assert!(matches!(err, Error::Unavailable(m) if m.contains("overflow")));
     }
 }
