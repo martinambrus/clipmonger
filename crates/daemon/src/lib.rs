@@ -1737,6 +1737,8 @@ pub struct DaemonState {
     thumbnail: crate::thumbnail::ThumbnailService,
     #[cfg(test)]
     thumbnail_snapshot_hook: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    thumbnail_payload_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl DaemonState {
@@ -1778,6 +1780,8 @@ impl DaemonState {
             thumbnail: crate::thumbnail::ThumbnailService::new_for_daemon(),
             #[cfg(test)]
             thumbnail_snapshot_hook: Mutex::new(None),
+            #[cfg(test)]
+            thumbnail_payload_reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
     pub fn new_with_thumbnail(store: Store, thumbnail: crate::thumbnail::ThumbnailService) -> Self {
@@ -2564,7 +2568,25 @@ impl DaemonState {
         }
     }
 
+    pub fn thumbnail_context_handler(state: std::sync::Arc<Self>) -> clipmonger_ipc::server::ContextHandler {
+        clipmonger_ipc::server::ContextHandler {
+            method: "history.thumbnail".to_string(),
+            handler: std::sync::Arc::new(move |params, cancel| state.handle_history_thumbnail_with_cancel(&params, Some(cancel))),
+        }
+    }
+
     fn handle_history_thumbnail(&self, params: &Value) -> Result<Value, IpcError> {
+        self.handle_history_thumbnail_with_cancel(params, None)
+    }
+
+    fn handle_history_thumbnail_with_cancel(&self, params: &Value, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> Result<Value, IpcError> {
+        let check_cancel = || {
+            if cancel.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                Err(IpcError::new("cancelled", "thumbnail cancelled".to_string()))
+            } else {
+                Ok(())
+            }
+        };
         use crate::thumbnail::{DEFAULT_MAX_PX, MAX_INPUT_BYTES, MAX_PX, MIN_PX};
         // --- validation before admission ---
         let clip_val = params.get("clip").ok_or_else(|| IpcError::new("invalid_params", "clip required".to_string()))?;
@@ -2586,6 +2608,7 @@ impl DaemonState {
                 return Err(IpcError::new("invalid_params", "mime must be image/png".to_string()));
             }
         }
+        check_cancel()?;
         // --- admission before store allocation ---
         let permit = self.thumbnail.try_admit().map_err(|e| match e {
             crate::thumbnail::ThumbnailError::Busy => IpcError::new("busy", "thumbnail busy".to_string()),
@@ -2593,6 +2616,7 @@ impl DaemonState {
             crate::thumbnail::ThumbnailError::SpawnFailed(_) => IpcError::new("unavailable", "thumbnail unavailable".to_string()),
             _ => IpcError::new(e.code(), "thumbnail unavailable".to_string()),
         })?;
+        check_cancel()?;
         // --- snapshot within with_store then release guard before child ---
         let snapshot_opt = {
             let result: Result<Option<clipmonger_core::PayloadSnapshot>, IpcError> = self.with_store(|store| {
@@ -2601,6 +2625,9 @@ impl DaemonState {
                     let hook = self.thumbnail_snapshot_hook.lock().ok().and_then(|slot| slot.clone());
                     if let Some(hook) = hook { hook(); }
                 }
+                check_cancel()?;
+                #[cfg(test)]
+                self.thumbnail_payload_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 match store.get_payload(clip_id, "image/png", MAX_INPUT_BYTES) {
                     Ok(opt) => Ok(opt),
                     Err(e) => Err(IpcError::new(e.code(), "store error".to_string())),
@@ -2608,11 +2635,12 @@ impl DaemonState {
             });
             result?
         };
+        check_cancel()?;
         let snapshot = match snapshot_opt {
             None => return Ok(serde_json::json!({"thumbnail": null})),
             Some(s) => s,
         };
-        let output = permit.decode_with_cancel(&snapshot.data, max_px, None).map_err(|e| match e {
+        let output = permit.decode_with_cancel(&snapshot.data, max_px, cancel).map_err(|e| match e {
             crate::thumbnail::ThumbnailError::Busy => IpcError::new("busy", "thumbnail busy".to_string()),
             crate::thumbnail::ThumbnailError::Shutdown => IpcError::new("shutdown", "thumbnail shutdown".to_string()),
             crate::thumbnail::ThumbnailError::Timeout => IpcError::new("timeout", "thumbnail timeout".to_string()),

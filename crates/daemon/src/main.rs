@@ -1036,9 +1036,10 @@ async fn async_main(args: Vec<String>) {
         #[cfg(not(all(windows, feature = "backend-windows")))]
         pipe_peer_pid: None,
     };
+    let context = DaemonState::thumbnail_context_handler(Arc::clone(&state));
     #[cfg(unix)]
     if let Err(e) =
-        clipmonger_ipc::server::Server::bind_with(&socket, token, handler, options).await
+        clipmonger_ipc::server::Server::bind_with_context(&socket, token, handler, options, context).await
     {
         let _ = clipmonger_core::runtime_log::global_emit(
             clipmonger_core::runtime_log::Role::Daemon,
@@ -1054,11 +1055,12 @@ async fn async_main(args: Vec<String>) {
         std::process::exit(1);
     }
     #[cfg(windows)]
-    if let Err(e) = clipmonger_ipc::server::Server::bind_pipe_with(
+    if let Err(e) = clipmonger_ipc::server::Server::bind_pipe_with_context(
         &socket.to_string_lossy(),
         token,
         handler,
         options,
+        context,
     ) {
         let _ = clipmonger_core::runtime_log::global_emit(
             clipmonger_core::runtime_log::Role::Daemon,

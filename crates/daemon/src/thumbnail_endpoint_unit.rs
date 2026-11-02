@@ -232,3 +232,142 @@ fn base64_segments_and_padding_round_trip() {
     assert_eq!(encode_thumbnail_png(b"fo"), "Zm8=");
     assert_eq!(encode_thumbnail_png(b"foo"), "Zm9v");
 }
+
+#[cfg(unix)]
+mod wire_cancel {
+    use super::*;
+    use clipmonger_ipc::{framing::{decode_line, encode_line}, proto::{Envelope, FrameKind, IPC_VERSION}, server::{Handler, ServeOptions, Server}};
+    use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, net::unix::{OwnedReadHalf, OwnedWriteHalf}, time::timeout};
+
+    fn frame(id: &str, kind: FrameKind, method: Option<&str>, params: Option<Value>) -> Envelope {
+        Envelope { v: IPC_VERSION.into(), id: id.into(), kind, method: method.map(str::to_owned), params, result: None, error: None, seq: None }
+    }
+    async fn send(w: &mut OwnedWriteHalf, f: Envelope) {
+        timeout(Duration::from_secs(2), w.write_all(&encode_line(&f).unwrap())).await.unwrap().unwrap();
+    }
+    async fn receive(r: &mut BufReader<OwnedReadHalf>) -> Envelope {
+        let mut line = Vec::new();
+        assert_ne!(timeout(Duration::from_secs(2), r.read_until(b'\n', &mut line)).await.unwrap().unwrap(), 0);
+        decode_line(&line).unwrap()
+    }
+    async fn connect(path: &Path) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
+        let (r, mut w) = tokio::net::UnixStream::connect(path).await.unwrap().into_split();
+        let mut r = BufReader::new(r);
+        send(&mut w, frame("hello", FrameKind::Req, Some("hello"), Some(serde_json::json!({"token":"tok"})))).await;
+        assert!(receive(&mut r).await.result.is_some());
+        (r, w)
+    }
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        timeout(Duration::from_secs(2), async { while !condition() { tokio::task::yield_now().await; } }).await.expect("timed out waiting for observation");
+    }
+    async fn parsed_pid(path: &Path) -> u32 {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(path).ok().and_then(|text| text.parse().ok()) {
+                    return pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("fixture did not write a parseable PID")
+    }
+    struct Release(PathBuf);
+    impl Drop for Release { fn drop(&mut self) { let _ = std::fs::write(&self.0, b"release"); } }
+
+    async fn active_child(disconnect: bool) {
+        let profile = Profile::new();
+        let store = Store::open(&profile.0).unwrap();
+        let id = uuid::Uuid::now_v7();
+        let (clip, payloads) = fixture_clip(id, fixture_png([10, 20, 30, 255]));
+        store.insert_clip(&clip, &payloads).unwrap();
+        let path = profile.0.join("child.controlled");
+        let _release = Release(path.with_extension("release"));
+        let (state, observation, live) = controlled_state(store, &path, None, None);
+        let handler_state = state.clone();
+        let handler: Handler = Arc::new(move |method, params| handler_state.handle(&method, &params));
+        let socket = profile.0.join("ipc.sock");
+        let _server = Server::bind_with_context(&socket, "tok".into(), handler, ServeOptions::default(), DaemonState::thumbnail_context_handler(state.clone())).await.unwrap();
+        let (first_read, mut first_write) = connect(&socket).await;
+        let mut first_read = Some(first_read);
+        let (mut second_read, mut second_write) = connect(&socket).await;
+        let params = serde_json::json!({"clip":id.to_string()});
+        send(&mut first_write, frame("same", FrameKind::Req, Some("history.thumbnail"), Some(params.clone()))).await;
+        let pid = parsed_pid(&path).await;
+        let previous = live.load(Ordering::SeqCst);
+        wait_until(|| live.load(Ordering::SeqCst) > previous).await;
+        assert!(observation.lock().unwrap().is_none());
+        send(&mut second_write, frame("same", FrameKind::Req, Some("history.thumbnail"), Some(params.clone()))).await;
+        assert_eq!(receive(&mut second_read).await.error.unwrap().code, "busy");
+        if disconnect {
+            drop(first_write);
+            drop(first_read.take());
+        } else {
+            send(&mut first_write, frame("same", FrameKind::Cancel, None, None)).await;
+        }
+        wait_until(|| observation.lock().unwrap().is_some()).await;
+        assert_eq!(*observation.lock().unwrap(), Some((pid, true, true)));
+        if !disconnect {
+            let reply = receive(first_read.as_mut().unwrap()).await;
+            assert_eq!(reply.error.unwrap().code, "cancelled");
+        }
+        wait_until(|| state.thumbnail.try_admit().is_ok()).await;
+        // The other connection retains its same ID and can reuse the permit.
+        std::fs::remove_file(&path).unwrap();
+        *observation.lock().unwrap() = None;
+        let previous = live.load(Ordering::SeqCst);
+        send(&mut second_write, frame("same", FrameKind::Req, Some("history.thumbnail"), Some(params))).await;
+        let second_pid = parsed_pid(&path).await;
+        wait_until(|| live.load(Ordering::SeqCst) > previous).await;
+        std::fs::write(path.with_extension("release"), b"release").unwrap();
+        let result = receive(&mut second_read).await.result.unwrap();
+        assert_eq!(result["thumbnail"]["content_hash"], clip.content_hash);
+        let data = b64_decode(result["thumbnail"]["png_base64"].as_str().unwrap()).unwrap();
+        assert_eq!(image::load_from_memory(&data).unwrap().to_rgba8().get_pixel(0, 0).0, [10, 20, 30, 255]);
+        assert_eq!(*observation.lock().unwrap(), Some((second_pid, true, true)));
+        send(&mut second_write, frame("ping", FrameKind::Req, Some("ping"), None)).await;
+        assert_eq!(receive(&mut second_read).await.result.unwrap()["pong"], true);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_reaps_owned_child_and_preserves_other_connection() { active_child(false).await; }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnect_reaps_owned_child_and_preserves_other_connection() { active_child(true).await; }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_during_snapshot_prevents_spawn_and_releases_permit() {
+        let profile = Profile::new();
+        let store = Store::open(&profile.0).unwrap();
+        let id = uuid::Uuid::now_v7();
+        let (clip, payloads) = fixture_clip(id, fixture_png([1, 2, 3, 255]));
+        store.insert_clip(&clip, &payloads).unwrap();
+        let path = profile.0.join("child.controlled");
+        let (state, observation, _) = controlled_state(store, &path, None, None);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Mutex::new(release_rx);
+        struct ReleaseSender(Option<mpsc::SyncSender<()>>);
+        impl Drop for ReleaseSender { fn drop(&mut self) { if let Some(tx) = self.0.take() { let _ = tx.try_send(()); } } }
+        let mut release = ReleaseSender(Some(release_tx));
+        state.set_thumbnail_snapshot_hook(Some(Arc::new(move || {
+            if let Some(tx) = entered_tx.lock().unwrap().take() { let _ = tx.send(()); }
+            let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(3));
+        })));
+        let handler_state = state.clone();
+        let handler: Handler = Arc::new(move |method, params| handler_state.handle(&method, &params));
+        let socket = profile.0.join("ipc.sock");
+        let _server = Server::bind_with_context(&socket, "tok".into(), handler, ServeOptions::default(), DaemonState::thumbnail_context_handler(state.clone())).await.unwrap();
+        let (mut read, mut write) = connect(&socket).await;
+        send(&mut write, frame("job", FrameKind::Req, Some("history.thumbnail"), Some(serde_json::json!({"clip": id.to_string()})))).await;
+        timeout(Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+        send(&mut write, frame("job", FrameKind::Cancel, None, None)).await;
+        send(&mut write, frame("barrier", FrameKind::Req, Some("ping"), None)).await;
+        assert_eq!(receive(&mut read).await.id, "barrier");
+        release.0.take().unwrap().send(()).unwrap();
+        assert_eq!(receive(&mut read).await.error.unwrap().code, "cancelled");
+        assert!(!path.exists());
+        assert!(observation.lock().unwrap().is_none());
+        assert_eq!(state.thumbnail_payload_reads.load(Ordering::SeqCst), 0);
+        state.set_thumbnail_snapshot_hook(None);
+        assert!(state.handle("history.thumbnail", &serde_json::json!({"clip":uuid::Uuid::now_v7().to_string()})).unwrap()["thumbnail"].is_null());
+        assert_eq!(state.thumbnail_payload_reads.load(Ordering::SeqCst), 1);
+    }
+}
