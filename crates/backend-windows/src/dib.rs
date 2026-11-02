@@ -9,7 +9,6 @@ use image::codecs::png::{PngDecoder, PngEncoder};
 use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder as _, RgbaImage};
 
 /// Decode guards (seg-03 §8): bigger images are refused before decoding.
-const MAX_SIDE: u32 = 8192;
 const MAX_PIXELS: u64 = 64_000_000;
 
 /// Largest clipboard bitmap worth reading: the guard's pixel limit at
@@ -81,7 +80,7 @@ pub fn png_to_dib(png: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn check_size((width, height): (u32, u32)) -> Result<(), String> {
-    if width > MAX_SIDE || height > MAX_SIDE || u64::from(width) * u64::from(height) > MAX_PIXELS {
+    if u64::from(width) * u64::from(height) > MAX_PIXELS {
         return Err(format!("image {width}x{height} is over the decode limit"));
     }
     Ok(())
@@ -222,14 +221,42 @@ mod tests {
     #[test]
     fn decode_guard_refuses_before_reading_pixels() {
         // Headers alone: the guard must fire before any pixel read.
-        let err = dib_to_png(&header_only(9000, 1)).unwrap_err();
+        let err = dib_to_png(&header_only(5213, 12277)).unwrap_err();
         assert!(err.contains("decode limit"), "{err}");
         let err = dib_to_png(&header_only(8000, 8001)).unwrap_err();
         assert!(err.contains("decode limit"), "{err}");
-        let wide = encode_png(&RgbaImage::new(9000, 1)).unwrap();
-        let err = png_to_dib(&wide).unwrap_err();
-        assert!(err.contains("decode limit"), "{err}");
+        assert!(check_size((11520, 2160)).is_ok());
         assert!(check_size((8192, 7812)).is_ok());
+    }
+
+    #[test]
+    fn png_decode_guard_refuses_before_reading_pixels() {
+        // CRC-valid IHDR (5213x12277 RGBA8), IDAT with a zlib header,
+        // and IEND. Pixel data is deliberately incomplete.
+        let png = hex(
+            "89504e470d0a1a0a0000000d494844520000145d00002ff5080600000015e4077c0000000249444154789c62a4912b0000000049454e44ae426082",
+        );
+        let err = png_to_dib(&png).unwrap_err();
+        assert!(err.contains("decode limit"), "{err}");
+    }
+
+    #[test]
+    fn decode_guard_accepts_exact_pixel_limit() {
+        assert!(check_size((8000, 8000)).is_ok());
+    }
+
+    #[test]
+    fn wide_png_to_dib_to_png_keeps_pixels() {
+        let image = RgbaImage::from_fn(9000, 1, |x, _| {
+            image::Rgba([u8::try_from(x % 256).unwrap(), 120, 200, 255])
+        });
+        let png = encode_png(&image).unwrap();
+        let dib = png_to_dib(&png).unwrap();
+        assert_eq!(i32::from_le_bytes(dib[4..8].try_into().unwrap()), 9000);
+        assert_eq!(i32::from_le_bytes(dib[8..12].try_into().unwrap()), 1);
+        let back = dib_to_png(&dib).unwrap();
+        let decoded = image::load_from_memory(&back).unwrap().to_rgba8();
+        assert_eq!(decoded, image);
     }
 
     #[test]

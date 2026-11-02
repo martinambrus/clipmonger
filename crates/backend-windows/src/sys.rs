@@ -1,5 +1,6 @@
-//! Raw Win32 helpers. This is the only module in the crate that may use
-//! `unsafe`; every `unsafe` block carries a one-line safety note.
+//! Raw Win32 helpers: the primary unsafe FFI boundary. Additional direct
+//! calls in `elevated_task`, `helper`, and `hotkeys` have function-scoped allowances.
+//! Every unsafe operation requires its caller to uphold the documented contract.
 #![allow(unsafe_code)]
 
 #[cfg(windows)]

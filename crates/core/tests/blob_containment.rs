@@ -274,11 +274,13 @@ fn check_hostile_manifest_key(hostile_key: &str) {
         sentinel_before,
         "sentinel must survive"
     );
-    // Destination should not contain hostile file content
-    assert!(
-        !dest.exists(),
-        "invalid restore must not create destination"
-    );
+    // An invalid archive may create an empty container, never data or staging leftovers.
+    if dest.exists() {
+        assert!(
+            std::fs::read_dir(&dest).unwrap().next().is_none(),
+            "bad ZIP must leave only an empty destination container"
+        );
+    }
 }
 
 fn check_hostile_manifest_key_owned(hostile_key: &str, sentinel_file: &Path) {

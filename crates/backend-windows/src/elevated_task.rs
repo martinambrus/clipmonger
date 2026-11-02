@@ -230,6 +230,7 @@ pub fn run_task() -> Result<(), String> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)] // Direct Win32 FFI boundary.
 fn elevate_schtasks(params: &str) -> Result<(), String> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
@@ -304,6 +305,7 @@ pub fn uninstall() -> Result<(), String> {
 /// Returns true on Yes (on Windows), false on No/cancel/elsewhere.
 #[cfg(windows)]
 #[must_use]
+#[allow(unsafe_code)] // Direct Win32 FFI boundary.
 pub fn prompt_consent(installed: bool) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         MessageBoxW, MB_DEFBUTTON2, MB_ICONQUESTION, MB_SETFOREGROUND, MB_SYSTEMMODAL, MB_TOPMOST,

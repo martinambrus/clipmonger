@@ -198,6 +198,7 @@ fn native_api<T>(_action: impl FnOnce(&mut dyn EncodingApi) -> Result<T>) -> Res
 #[cfg(windows)]
 struct NativeApi;
 #[cfg(windows)]
+#[allow(unsafe_code)] // Direct Win32 text conversion FFI boundary.
 impl EncodingApi for NativeApi {
     fn system_lcid(&mut self) -> u32 {
         // SAFETY: reads the system locale; takes no pointers.

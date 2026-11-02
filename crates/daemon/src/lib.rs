@@ -16,6 +16,8 @@ use clipmonger_ipc::proto::IpcError;
 use clipmonger_platform::types::{BackendCaps, Level, PasteStrategy};
 use serde_json::Value;
 
+pub mod capture;
+
 /// Protocol tag written to the rendezvous file.
 pub const PROTOCOL: &str = "ipc/v1";
 /// Daemon crate version reported by `status`.
@@ -106,6 +108,25 @@ pub fn read_rendezvous(profile_dir: &Path) -> Result<(PathBuf, String), CoreErro
 /// Gesture-token TTL in ms (matches the backend helper contract; kept as a
 /// literal here so the daemon builds without the backend on non-Windows).
 pub const GESTURE_TTL_MS: i64 = 30_000;
+
+#[derive(Debug)]
+pub enum GestureError {
+    Entropy(clipmonger_core::entropy::Error),
+    Poisoned,
+    Exhausted,
+}
+
+impl std::fmt::Display for GestureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GestureError::Entropy(e) => write!(f, "entropy unavailable: {e}"),
+            GestureError::Poisoned => write!(f, "gesture store poisoned"),
+            GestureError::Exhausted => write!(f, "gesture entropy exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for GestureError {}
 
 /// Append one JSONL audit event to `<profile>/audit.log`.
 ///
@@ -1251,25 +1272,26 @@ pub fn replay_script(store: &Store, lines: impl Iterator<Item = String>) -> Vec<
         .collect()
 }
 
+#[cfg(test)]
+type RestoreHook = Box<dyn FnOnce(&clipmonger_core::store::PreparedRestore) + Send>;
+
 /// Shared daemon request state behind the IPC handler.
 pub struct DaemonState {
     /// Clip store for history methods. Interior mutability so
     /// `backup.restore` can reopen the store on the restored profile
     /// while other arms hold only read guards.
-    store: RwLock<Store>,
+    store: RwLock<Option<Store>>,
     /// Capability aggregator for status/caps methods.
     caps: CapsAggregator,
     /// Monitor pause flag toggled by `monitor.set`.
     monitoring_paused: Mutex<bool>,
-    /// Paste delivery budget (`popup.unicode_limit`, `popup.delivery_dwell_ms`).
-    paste_limits: Mutex<(u64, u64)>,
+    /// One coherent paste snapshot: unicode limit, dwell, delivery and restore.
+    paste_limits: Mutex<(u64, u64, clipmonger_core::PasteDelivery, bool)>,
     /// Profile dir for the audit log (set once at startup).
     profile_dir: Mutex<PathBuf>,
     /// Live single-use gesture tokens (hotkey/popup trigger path only):
     /// token -> (minted at, paste target it was minted for).
     gesture_tokens: Mutex<HashMap<u64, (i64, Option<u64>)>>,
-    /// Gesture mint sequence mixed into every token.
-    gesture_counter: Mutex<u64>,
     /// Elevation-refusal latch (caps paste Degraded until restart).
     elevation_refused: Mutex<bool>,
     /// Elevated-helper supervisor (Windows runas thread; idle elsewhere).
@@ -1278,6 +1300,12 @@ pub struct DaemonState {
     portal_bind_pending: Mutex<bool>,
     /// Loaded config served by `config.get`/`config.set`.
     config: Mutex<clipmonger_core::Config>,
+    /// Serialize profile operations (backup.create, backup.restore, config.set)
+    profile_op: Mutex<()>,
+    #[cfg(test)]
+    restore_hook: Mutex<Option<RestoreHook>>,
+    #[cfg(test)]
+    publication_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// In-flight `blob.put` assemblies keyed by `(clip, mime)`.
     blob_buf: Mutex<HashMap<(String, String), BlobAsm>>,
     /// Latest `hotkey.conflict` note surfaced in caps notes.
@@ -1300,17 +1328,26 @@ impl DaemonState {
     #[must_use]
     pub fn with_config(store: Store, config: clipmonger_core::Config) -> Self {
         Self {
-            store: RwLock::new(store),
+            store: RwLock::new(Some(store)),
             caps: CapsAggregator::new(),
             monitoring_paused: Mutex::new(false),
-            paste_limits: Mutex::new((65536, 1000)),
+            paste_limits: Mutex::new((
+                config.popup.unicode_limit,
+                config.popup.delivery_dwell_ms,
+                config.popup.delivery,
+                config.popup.restore_clipboard,
+            )),
             profile_dir: Mutex::new(PathBuf::new()),
             gesture_tokens: Mutex::new(HashMap::new()),
-            gesture_counter: Mutex::new(0),
             elevation_refused: Mutex::new(false),
             helper: Mutex::new(HelperSupervisor::new()),
             portal_bind_pending: Mutex::new(false),
             config: Mutex::new(config),
+            profile_op: Mutex::new(()),
+            #[cfg(test)]
+            restore_hook: Mutex::new(None),
+            #[cfg(test)]
+            publication_hook: Mutex::new(None),
             blob_buf: Mutex::new(HashMap::new()),
             hotkey_conflict_note: Mutex::new(None),
             popup: Mutex::new(popup::PopupTrigger::default()),
@@ -1321,9 +1358,7 @@ impl DaemonState {
 
     /// Replace the stored config (call once at startup with the loaded one).
     pub fn set_config(&self, config: clipmonger_core::Config) {
-        if let Ok(mut slot) = self.config.lock() {
-            *slot = config;
-        }
+        self.publish_config(config);
     }
 
     /// Flip the GNOME extension link state in caps.
@@ -1362,26 +1397,46 @@ impl DaemonState {
     /// captured one. HOTKEY/POPUP TRIGGER PATH ONLY: the generic
     /// `paste.execute` IPC arm must never call this (a same-user caller
     /// driving `paste.execute` gets standard-user paste at most).
-    pub fn mint_gesture_token(&self, target: Option<u64>) -> u64 {
+    ///
+    /// # Errors
+    /// Returns an error if entropy or token storage is unavailable, or retries exhaust.
+    pub fn mint_gesture_token(&self, target: Option<u64>) -> Result<u64, GestureError> {
         let at_ms = now_ms();
-        let seq = if let Ok(mut counter) = self.gesture_counter.lock() {
-            *counter = counter.wrapping_add(1);
-            *counter
-        } else {
-            at_ms.cast_unsigned()
-        };
-        let mut token = at_ms
-            .cast_unsigned()
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9));
-        if token == 0 {
-            token = 0x9E37_79B9_7F4A_7C15;
+        self.mint_gesture_token_with(target, at_ms, &mut || {
+            clipmonger_core::entropy::random_u64()
+        })
+    }
+
+    fn mint_gesture_token_with<F>(
+        &self,
+        target: Option<u64>,
+        at_ms: i64,
+        draw: &mut F,
+    ) -> Result<u64, GestureError>
+    where
+        F: FnMut() -> Result<u64, clipmonger_core::entropy::Error>,
+    {
+        let mut tokens = self
+            .gesture_tokens
+            .lock()
+            .map_err(|_| GestureError::Poisoned)?;
+        tokens.retain(|_, (minted, _)| {
+            at_ms
+                .checked_sub(*minted)
+                .is_some_and(|age| (0..=GESTURE_TTL_MS).contains(&age))
+        });
+        for _ in 0..8 {
+            let candidate = draw().map_err(GestureError::Entropy)?;
+            if candidate == 0 {
+                continue;
+            }
+            if tokens.contains_key(&candidate) {
+                continue;
+            }
+            tokens.insert(candidate, (at_ms, target));
+            return Ok(candidate);
         }
-        if let Ok(mut tokens) = self.gesture_tokens.lock() {
-            tokens.retain(|_, (minted, _)| at_ms >= *minted && at_ms - *minted <= GESTURE_TTL_MS);
-            tokens.insert(token, (at_ms, target));
-        }
-        token
+        Err(GestureError::Exhausted)
     }
 
     /// Consume one gesture token: true exactly once while unexpired, and
@@ -1394,8 +1449,9 @@ impl DaemonState {
             .ok()
             .and_then(|mut tokens| tokens.remove(&token));
         minted.is_some_and(|(minted, bound)| {
-            at_ms >= minted
-                && at_ms - minted <= GESTURE_TTL_MS
+            at_ms
+                .checked_sub(minted)
+                .is_some_and(|age| (0..=GESTURE_TTL_MS).contains(&age))
                 && bound.is_none_or(|bound| Some(bound) == target)
         })
     }
@@ -1501,25 +1557,50 @@ impl DaemonState {
     /// Override the paste delivery budget from config.
     pub fn set_paste_limits(&self, unicode_limit: u64, dwell_ms: u64) {
         if let Ok(mut limits) = self.paste_limits.lock() {
-            *limits = (unicode_limit, dwell_ms);
+            limits.0 = unicode_limit;
+            limits.1 = dwell_ms;
         }
     }
 
-    /// Current paste delivery budget; delivery is read live from the
-    /// stored config so UI changes apply without a restart.
+    #[allow(clippy::needless_pass_by_value)]
+    fn publish_config(&self, config: clipmonger_core::Config) {
+        if let Ok(mut slot) = self.config.lock() {
+            *slot = config.clone();
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.publication_hook.lock().unwrap().take() {
+            hook();
+        }
+        if let Ok(mut settings) = self.paste_limits.lock() {
+            *settings = (
+                config.popup.unicode_limit,
+                config.popup.delivery_dwell_ms,
+                config.popup.delivery,
+                config.popup.restore_clipboard,
+            );
+        }
+        self.caps.set_paste_strategy(
+            "windows",
+            match config.popup.delivery {
+                clipmonger_core::PasteDelivery::ClipboardRestore => PasteStrategy::ClipboardRestore,
+                clipmonger_core::PasteDelivery::UnicodeInject => PasteStrategy::UnicodeInject,
+            },
+        );
+    }
+
+    /// Snapshot all settings used by one paste. Restore publishes this tuple
+    /// in one assignment, so a delivery cannot combine two configurations.
     #[cfg_attr(not(all(windows, feature = "backend-windows")), allow(dead_code))]
-    fn paste_budget(&self) -> (u64, u64, clipmonger_core::PasteDelivery) {
-        let (unicode_limit, dwell_ms) = self
-            .paste_limits
-            .lock()
-            .map_or((65536, 1000), |limits| *limits);
-        let delivery = self
-            .config
-            .lock()
-            .map_or(clipmonger_core::PasteDelivery::ClipboardRestore, |config| {
-                config.popup.delivery
-            });
-        (unicode_limit, dwell_ms, delivery)
+    fn paste_budget(&self) -> (u64, u64, clipmonger_core::PasteDelivery, bool) {
+        self.paste_limits.lock().map_or(
+            (
+                65536,
+                1000,
+                clipmonger_core::PasteDelivery::ClipboardRestore,
+                true,
+            ),
+            |settings| *settings,
+        )
     }
 
     /// Mark a portal shortcut bind as outstanding or settled (W-F4).
@@ -1547,10 +1628,39 @@ impl DaemonState {
         sensitive: bool,
         payloads: &[(String, Vec<u8>)],
     ) -> bool {
+        match self.ingest_capture_checked(origin, sensitive, payloads) {
+            Ok(stored) => stored,
+            Err(error) => {
+                eprintln!("daemon: capture unavailable: {error}");
+                false
+            }
+        }
+    }
+
+    fn ingest_capture_checked(
+        &self,
+        origin: &str,
+        sensitive: bool,
+        payloads: &[(String, Vec<u8>)],
+    ) -> Result<bool, IpcError> {
+        let gate = self
+            .profile_op
+            .lock()
+            .map_err(|_| IpcError::new("internal", "profile op poisoned".to_string()))?;
+        let limits = self
+            .config
+            .lock()
+            .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))
+            .map(|cfg| retention_limits(&cfg))?;
+        let store_opt = self.store_read()?;
+        let store = store_opt
+            .as_ref()
+            .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?;
+        drop(gate);
         #[cfg(all(unix, feature = "backend-wayland"))]
         {
             if !sensitive && !payloads.is_empty() {
-                let key = clipmonger_backend_wayland::merge::MergeKey::of(&payloads.to_vec());
+                let key = clipmonger_backend_wayland::merge::MergeKey::of(payloads);
                 let mimes: Vec<String> = payloads.iter().map(|(mime, _)| mime.clone()).collect();
                 let at_ms = u64::try_from(now_ms().max(0)).unwrap_or_default();
                 let duplicate = self.merger.lock().is_ok_and(|mut merger| {
@@ -1558,39 +1668,33 @@ impl DaemonState {
                         == clipmonger_backend_wayland::merge::MergeDecision::SuppressDuplicate
                 });
                 if duplicate {
-                    return false;
+                    return Ok(false);
                 }
             }
         }
         let seed = u64::try_from(now_ms().max(0)).unwrap_or_default();
-        // Config before store: never hold both locks.
-        let limits = self.config.lock().map(|cfg| retention_limits(&cfg)).ok();
-        let Ok(store) = self.store.read() else {
-            return false;
-        };
         let stored = matches!(
-            store_payloads(&store, origin, sensitive, payloads, seed),
+            store_payloads(store, origin, sensitive, payloads, seed),
             (StoreDecision::Stored, _)
         );
-        if let (true, Some(limits)) = (stored, limits) {
+        if stored {
             match store.enforce_retention(&limits) {
                 Ok(0) => {}
                 Ok(purged) => eprintln!("daemon: retention purged {purged} clips"),
                 Err(e) => eprintln!("daemon: retention failed: {e}"),
             }
         }
-        stored
+        Ok(stored)
     }
 
     /// Find a stored clip id by its string form without naming the id type.
-    fn find_clip(&self, id: &str) -> Option<clipmonger_core::model::Clip> {
-        // Bounded scan window: `u64::MAX` overflows the SQL `LIMIT` cast
-        // and silently yields no rows (every get/paste misses).
-        let Ok(store) = self.store.read() else {
-            return None;
-        };
-        let clips = store.list_history(10_000, 0, true).unwrap_or_default();
-        clips.into_iter().find(|c| c.id.to_string() == id)
+    fn find_clip(&self, id: &str) -> Result<Option<clipmonger_core::model::Clip>, IpcError> {
+        self.with_store(|store| {
+            let clips = store
+                .list_history(10_000, 0, true)
+                .map_err(|error| IpcError::new(error.code(), error.to_string()))?;
+            Ok(clips.into_iter().find(|clip| clip.id.to_string() == id))
+        })
     }
 
     /// Whether the monitor is currently paused.
@@ -1599,14 +1703,39 @@ impl DaemonState {
     }
 
     /// Read guard on the clip store for `&self` arms.
-    fn store_read(&self) -> Result<std::sync::RwLockReadGuard<'_, Store>, IpcError> {
-        self.store
+    fn store_read(&self) -> Result<std::sync::RwLockReadGuard<'_, Option<Store>>, IpcError> {
+        let guard = self
+            .store
             .read()
-            .map_err(|_| IpcError::new("internal", "store lock poisoned".to_string()))
+            .map_err(|_| IpcError::new("internal", "store lock poisoned".to_string()))?;
+        if guard.is_none() {
+            return Err(IpcError::new(
+                "unavailable",
+                "store unavailable".to_string(),
+            ));
+        }
+        Ok(guard)
+    }
+
+    fn with_store<F, T>(&self, f: F) -> Result<T, IpcError>
+    where
+        F: FnOnce(&Store) -> Result<T, IpcError>,
+    {
+        let guard = self.store_read()?;
+        let Some(store) = guard.as_ref() else {
+            return Err(IpcError::new(
+                "unavailable",
+                "store unavailable".to_string(),
+            ));
+        };
+        f(store)
     }
 
     /// Requested clip id from `params`, looked up in the store.
-    fn requested_clip(&self, params: &Value) -> Option<clipmonger_core::model::Clip> {
+    fn requested_clip(
+        &self,
+        params: &Value,
+    ) -> Result<Option<clipmonger_core::model::Clip>, IpcError> {
         let id = params
             .get("clip")
             .and_then(Value::as_str)
@@ -1627,21 +1756,30 @@ impl DaemonState {
                     .unwrap_or(false);
                 let clips = self
                     .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .list_history(limit, offset, include_removed)
                     .map_err(|e| IpcError::new("backend", e.to_string()))?;
                 Ok(serde_json::json!({"clips": clips}))
             }
-            "history.get" => match self.requested_clip(params) {
-                Some(found) => match self.store_read()?.get_clip(found.id) {
+            "history.get" => match self.requested_clip(params)? {
+                Some(found) => match self
+                    .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
+                    .get_clip(found.id)
+                {
                     Ok(Some((clip, _))) => Ok(serde_json::json!({"clip": clip})),
                     Ok(None) => Ok(serde_json::json!({"clip": null})),
                     Err(e) => Err(IpcError::new("backend", e.to_string())),
                 },
                 None => Ok(serde_json::json!({"clip": null})),
             },
-            "history.delete" => match self.requested_clip(params) {
+            "history.delete" => match self.requested_clip(params)? {
                 Some(found) => self
                     .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .soft_delete(found.id)
                     .map_err(|e| IpcError::new("backend", e.to_string()))
                     .map(|()| serde_json::json!({"deleted": true})),
@@ -1652,11 +1790,22 @@ impl DaemonState {
                     .get("pinned")
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
-                match self.requested_clip(params) {
-                    Some(found) => match self.store_read()?.get_clip(found.id) {
+                match self.requested_clip(params)? {
+                    Some(found) => match self
+                        .store_read()?
+                        .as_ref()
+                        .ok_or_else(|| {
+                            IpcError::new("unavailable", "store unavailable".to_string())
+                        })?
+                        .get_clip(found.id)
+                    {
                         Ok(Some((mut clip, payloads))) => {
                             clip.pinned = pinned;
                             self.store_read()?
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    IpcError::new("unavailable", "store unavailable".to_string())
+                                })?
                                 .insert_clip(&clip, &payloads)
                                 .map_err(|e| IpcError::new("backend", e.to_string()))
                                 .map(|_| serde_json::json!({"pinned": pinned}))
@@ -1668,7 +1817,11 @@ impl DaemonState {
                 }
             }
             "history.purge_removed" => {
-                let purged = self.store_read()?.purge_removed();
+                let purged = self
+                    .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
+                    .purge_removed();
                 Ok(serde_json::json!({"purged": purged}))
             }
             other => Err(IpcError::new(
@@ -1697,15 +1850,15 @@ impl DaemonState {
     /// Dispatch `capture.report`: decode `{event, payloads:{mime: base64}}`
     /// and store the real payloads via `ingest_capture` (G-F3). Sensitive
     /// events only bump the privacy counter through the same path.
-    fn handle_capture(&self, params: &Value) -> Value {
+    fn handle_capture(&self, params: &Value) -> Result<Value, IpcError> {
         let event = params.get("event").cloned().unwrap_or(Value::Null);
         let sensitive = event
             .get("sensitive")
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if sensitive {
-            self.ingest_capture("gnome", true, &[]);
-            return serde_json::json!({"accepted": false});
+            self.ingest_capture_checked("gnome", true, &[])?;
+            return Ok(serde_json::json!({"accepted": false}));
         }
         let payloads_value = params
             .get("payloads")
@@ -1719,10 +1872,10 @@ impl DaemonState {
                 mimes.sort();
                 for mime in mimes {
                     let Some(encoded) = map.get(mime).and_then(Value::as_str) else {
-                        return serde_json::json!({"accepted": false});
+                        return Ok(serde_json::json!({"accepted": false}));
                     };
                     let Some(bytes) = b64_decode(encoded) else {
-                        return serde_json::json!({"accepted": false});
+                        return Ok(serde_json::json!({"accepted": false}));
                     };
                     payloads.push((mime.clone(), bytes));
                 }
@@ -1739,7 +1892,7 @@ impl DaemonState {
                         continue;
                     };
                     let Some(bytes) = b64_decode(encoded) else {
-                        return serde_json::json!({"accepted": false});
+                        return Ok(serde_json::json!({"accepted": false}));
                     };
                     payloads.push((mime.to_string(), bytes));
                 }
@@ -1747,10 +1900,10 @@ impl DaemonState {
             _ => {}
         }
         if payloads.is_empty() {
-            return serde_json::json!({"accepted": false});
+            return Ok(serde_json::json!({"accepted": false}));
         }
-        let accepted = self.ingest_capture("gnome", false, &payloads);
-        serde_json::json!({"accepted": accepted})
+        let accepted = self.ingest_capture_checked("gnome", false, &payloads)?;
+        Ok(serde_json::json!({"accepted": accepted}))
     }
 
     /// Dispatch `blob.put`: assemble chunks keyed by `(clip, mime)`; on
@@ -1836,7 +1989,7 @@ impl DaemonState {
                     ));
                 }
             }
-            self.ingest_capture("gnome", false, &[(mime, data)]);
+            self.ingest_capture_checked("gnome", false, &[(mime, data)])?;
         }
         Ok(serde_json::json!({"ok": true}))
     }
@@ -1863,6 +2016,10 @@ impl DaemonState {
     /// Dispatch `config.set`: apply one dotted key and persist
     /// `<profile>/config.toml`.
     fn handle_config_set(&self, params: &Value) -> Result<Value, IpcError> {
+        let _op = self
+            .profile_op
+            .lock()
+            .map_err(|_| IpcError::new("internal", "profile op poisoned".to_string()))?;
         let profile = self
             .profile_dir
             .lock()
@@ -1878,42 +2035,40 @@ impl DaemonState {
             .and_then(Value::as_str)
             .ok_or_else(|| IpcError::new("backend", "config.set: key required".to_string()))?;
         let value = params.get("value").cloned().unwrap_or(Value::Null);
-        let updated = {
-            let mut config = self
+        let candidate = {
+            let current = self
                 .config
                 .lock()
-                .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?;
-            apply_config_key(&mut config, key, &value)
+                .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))?
+                .clone();
+            let mut candidate = current;
+            apply_config_key(&mut candidate, key, &value)
                 .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
-
-            config.clone()
+            candidate
         };
-        updated
+        candidate
             .save(&profile.join("config.toml"))
             .map_err(|e| IpcError::new("backend", format!("config.set: {e}")))?;
-        if let Ok(mut cfg) = self.config.lock() {
-            *cfg = updated.clone();
-        }
-        self.set_paste_limits(updated.popup.unicode_limit, updated.popup.delivery_dwell_ms);
-        self.caps.set_paste_strategy(
-            "windows",
-            match updated.popup.delivery {
-                clipmonger_core::PasteDelivery::ClipboardRestore => PasteStrategy::ClipboardRestore,
-                clipmonger_core::PasteDelivery::UnicodeInject => PasteStrategy::UnicodeInject,
-            },
-        );
+        self.publish_config(candidate);
         Ok(serde_json::json!({"ok": true}))
     }
 
     /// Dispatch `backup.create`: snapshot the live store into a ZIP at `dest`.
     fn handle_backup_create(&self, params: &Value) -> Result<Value, IpcError> {
+        let _op = self
+            .profile_op
+            .lock()
+            .map_err(|_| IpcError::new("internal", "profile op poisoned".to_string()))?;
         let dest = params
             .get("dest")
             .and_then(Value::as_str)
             .ok_or_else(|| IpcError::new("backend", "backup.create: dest required".to_string()))?;
-        self.store_read()?
-            .backup_zip(Path::new(dest))
-            .map_err(|e| IpcError::new(e.code(), e.to_string()))?;
+        self.with_store(|store| {
+            store
+                .backup_zip(Path::new(dest))
+                .map_err(|e| IpcError::new(e.code(), e.to_string()))?;
+            Ok(())
+        })?;
         Ok(serde_json::json!({"path": dest}))
     }
 
@@ -1935,18 +2090,67 @@ impl DaemonState {
                 "backup.restore: no profile dir configured".to_string(),
             ));
         }
-        Store::restore_zip(Path::new(src), &profile)
+        let _op = self
+            .profile_op
+            .lock()
+            .map_err(|_| IpcError::new("internal", "profile op poisoned".to_string()))?;
+        // Prepare before closing Store
+        let prepared = Store::prepare_restore(Path::new(src), &profile)
             .map_err(|e| IpcError::new(e.code(), e.to_string()))?;
-        let reopened = Store::open(&profile).map_err(|e| IpcError::new(e.code(), e.to_string()))?;
-        match self.store.write() {
-            Ok(mut slot) => {
-                *slot = reopened;
-            }
-            Err(_) => {
-                return Err(IpcError::new("internal", "store lock poisoned".to_string()));
+        let candidate = if prepared.incoming().join("config.toml").exists() {
+            Some(
+                clipmonger_core::Config::load(&prepared.incoming().join("config.toml"))
+                    .map_err(|e| IpcError::new(e.code(), e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let result = self.install_prepared_restore(prepared);
+        if result.is_ok() {
+            if let Some(cfg) = candidate {
+                self.publish_config(cfg);
             }
         }
-        Ok(serde_json::json!({"ok": true}))
+        result
+    }
+
+    fn install_prepared_restore(
+        &self,
+        prepared: clipmonger_core::store::PreparedRestore,
+    ) -> Result<Value, IpcError> {
+        let mut write = self
+            .store
+            .write()
+            .map_err(|_| IpcError::new("internal", "store lock poisoned".to_string()))?;
+        let old = write
+            .take()
+            .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?;
+        if let Err((old, error)) = old.close() {
+            *write = Some(old);
+            return Err(IpcError::new(error.code(), error.to_string()));
+        }
+        #[cfg(test)]
+        {
+            let hook = self.restore_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(&prepared);
+            }
+        }
+        match prepared.install_and_open() {
+            Ok(store) => {
+                *write = Some(store);
+                Ok(serde_json::json!({"ok": true}))
+            }
+            Err(failure) => {
+                *write = failure.store;
+                let code = if failure.recovery_dir.is_some() {
+                    "unavailable"
+                } else {
+                    failure.error.code()
+                };
+                Err(IpcError::new(code, failure.error.to_string()))
+            }
+        }
     }
 
     /// Dispatch `logs.tail`: the last `lines` of `<profile>/audit.log`,
@@ -1988,6 +2192,8 @@ impl DaemonState {
                 let group = params.get("group").and_then(Value::as_str);
                 let permanents = self
                     .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .list_permanents(group)
                     .map_err(perm_err)?;
                 Ok(serde_json::json!({"permanents": permanents}))
@@ -1995,6 +2201,8 @@ impl DaemonState {
             "permanent.create" => {
                 let created = self
                     .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .create_permanent(
                         params.get("group").and_then(Value::as_str).unwrap_or(""),
                         params.get("name").and_then(Value::as_str).unwrap_or(""),
@@ -2016,6 +2224,8 @@ impl DaemonState {
                         .map_err(|e| IpcError::new("backend", format!("permanent.update: {e}")))?;
                 let updated = self
                     .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .update_permanent(&clip)
                     .map_err(perm_err)?;
                 Ok(serde_json::json!({"updated": updated}))
@@ -2028,11 +2238,21 @@ impl DaemonState {
                     .ok_or_else(|| {
                         IpcError::new("backend", "permanent.delete: id required".to_string())
                     })?;
-                let deleted = self.store_read()?.delete_permanent(id).map_err(perm_err)?;
+                let deleted = self
+                    .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
+                    .delete_permanent(id)
+                    .map_err(perm_err)?;
                 Ok(serde_json::json!({"deleted": deleted}))
             }
             "permanent.groups" => {
-                let groups = self.store_read()?.list_perm_groups().map_err(perm_err)?;
+                let groups = self
+                    .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
+                    .list_perm_groups()
+                    .map_err(perm_err)?;
                 let list: Vec<Value> = groups
                     .iter()
                     .map(|g| {
@@ -2044,6 +2264,8 @@ impl DaemonState {
             "permanent.group_create" => {
                 let created = self
                     .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .create_perm_group(params.get("name").and_then(Value::as_str).unwrap_or(""))
                     .map_err(perm_err)?;
                 Ok(serde_json::json!({"created": created}))
@@ -2051,6 +2273,8 @@ impl DaemonState {
             "permanent.group_delete" => {
                 let deleted = self
                     .store_read()?
+                    .as_ref()
+                    .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .delete_perm_group(params.get("name").and_then(Value::as_str).unwrap_or(""))
                     .map_err(perm_err)?;
                 Ok(serde_json::json!({"deleted": deleted}))
@@ -2078,6 +2302,8 @@ impl DaemonState {
         };
         let perm = self
             .store_read()?
+            .as_ref()
+            .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
             .get_permanent(id)
             .map_err(perm_err)?
             .ok_or_else(|| {
@@ -2110,11 +2336,13 @@ impl DaemonState {
             all(unix, feature = "backend-wayland")
         ))]
         {
-            let found = self.requested_clip(params).ok_or_else(|| {
+            let found = self.requested_clip(params)?.ok_or_else(|| {
                 IpcError::new("backend", "paste.execute: unknown clip".to_string())
             })?;
             let payloads = self
                 .store_read()?
+                .as_ref()
+                .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                 .get_clip(found.id)
                 .map_err(|e| IpcError::new("backend", e.to_string()))?
                 .map(|(_, payloads)| payloads)
@@ -2156,11 +2384,7 @@ impl DaemonState {
         {
             use clipmonger_backend_windows::Integrity;
             use clipmonger_platform::traits::PasteEngine as _;
-            let (unicode_limit, dwell_ms, delivery) = self.paste_budget();
-            let restore = self
-                .config
-                .lock()
-                .map_or(true, |cfg| cfg.popup.restore_clipboard);
+            let settings @ (unicode_limit, dwell_ms, delivery, restore) = self.paste_budget();
             let paste = clipmonger_backend_windows::WinPaste::new(
                 usize::try_from(unicode_limit).unwrap_or(65536),
             )
@@ -2208,13 +2432,12 @@ impl DaemonState {
                         "paste.execute: elevation refused (gesture required)".to_string(),
                     ));
                 }
-                let res = self.paste_via_helper(&target, payloads, deadline_ms);
+                let res = self.paste_via_helper(&target, payloads, deadline_ms, settings);
                 if res.is_ok() {
                     let _ = self
-                        .store
-                        .read()
-                        .ok()
-                        .and_then(|s| s.bump_clip(clip.0, now_ms()).ok());
+                        .store_read()?
+                        .as_ref()
+                        .and_then(|st| st.bump_clip(clip.0, now_ms()).ok());
                 }
                 return res;
             }
@@ -2229,10 +2452,9 @@ impl DaemonState {
                     }
                 })?;
             let _ = self
-                .store
-                .read()
-                .ok()
-                .and_then(|s| s.bump_clip(clip.0, now_ms()).ok());
+                .store_read()?
+                .as_ref()
+                .and_then(|st| st.bump_clip(clip.0, now_ms()).ok());
             Ok(serde_json::json!({"pasted": true}))
         }
         #[cfg(all(unix, feature = "backend-wayland"))]
@@ -2261,7 +2483,7 @@ impl DaemonState {
             probe_current().protocol != clipmonger_backend_wayland::probe::Protocol::None;
         let paste = WlPaste::new(has_data);
         let outcome = paste
-            .paste_payloads(&payloads.to_vec())
+            .paste_payloads(payloads)
             .map_err(|e| IpcError::new("unavailable", format!("paste.execute: {e}")))?;
         let mut result = serde_json::json!({"pasted": true});
         if let Some(toast) = outcome.toast {
@@ -2281,6 +2503,7 @@ impl DaemonState {
         target: &clipmonger_platform::types::PasteTarget,
         payloads: &[(String, Vec<u8>)],
         deadline_ms: i64,
+        settings: (u64, u64, clipmonger_core::PasteDelivery, bool),
     ) -> Result<Value, IpcError> {
         use clipmonger_platform::types::PlatformHandle;
         let hwnd = match &target.handle {
@@ -2301,11 +2524,7 @@ impl DaemonState {
         if !self.helper_connected() {
             return Err(helper_ipc_error(self, target, HELPER_NOT_RUNNING));
         }
-        let (_, dwell_ms, delivery) = self.paste_budget();
-        let restore = self
-            .config
-            .lock()
-            .map_or(true, |cfg| cfg.popup.restore_clipboard);
+        let (_, dwell_ms, delivery, restore) = settings;
         if delivery == clipmonger_core::PasteDelivery::ClipboardRestore {
             let swap = clipmonger_backend_windows::paste::ClipboardSwap::begin(payloads, restore)
                 .map_err(|e| IpcError::new("backend", format!("paste.execute: {e}")))?;
@@ -2421,7 +2640,7 @@ impl DaemonState {
             method if method.starts_with("history.") => self.handle_history(method, params),
             method if method.starts_with("permanent.") => self.handle_permanent(method, params),
             "monitor.set" => self.handle_monitor(params),
-            "capture.report" => Ok(self.handle_capture(params)),
+            "capture.report" => self.handle_capture(params),
             "blob.put" => self.handle_blob_put(params),
             "hotkey.fired" => {
                 // The GNOME extension reporting a press. On Windows the daemon
@@ -2487,24 +2706,196 @@ mod tests {
             !state.consume_gesture_token(12345, now_ms(), None),
             "an unknown token never spends"
         );
-        let bound = state.mint_gesture_token(Some(0x30838));
+        let bound = state.mint_gesture_token(Some(0x30838)).expect("mint");
         assert!(
             !state.consume_gesture_token(bound, now_ms(), Some(0x99)),
             "a token minted for one window refuses another"
         );
-        let bound = state.mint_gesture_token(Some(0x30838));
+        let bound = state.mint_gesture_token(Some(0x30838)).expect("mint");
         assert!(state.consume_gesture_token(bound, now_ms(), Some(0x30838)));
         assert!(
             !state.consume_gesture_token(bound, now_ms(), Some(0x30838)),
             "single use only"
         );
-        let unbound = state.mint_gesture_token(None);
+        let unbound = state.mint_gesture_token(None).expect("mint");
         assert!(state.consume_gesture_token(unbound, now_ms(), Some(0x77)));
-        let expired = state.mint_gesture_token(None);
+        let expired = state.mint_gesture_token(None).expect("mint");
         assert!(
             !state.consume_gesture_token(expired, now_ms() + super::GESTURE_TTL_MS + 1, None),
             "an expired token never spends"
         );
+    }
+
+    #[test]
+    fn gesture_entropy_failure_leaves_no_entry() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-fail-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        let mut failing = || Err(clipmonger_core::entropy::Error::UNSUPPORTED);
+        assert!(state
+            .mint_gesture_token_with(None, 1000, &mut failing)
+            .is_err());
+        assert!(state.gesture_tokens.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn gesture_zero_then_success_retries() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-zero-ok-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        let mut draws = vec![0u64, 42u64].into_iter();
+        let token = state
+            .mint_gesture_token_with(Some(1), 1000, &mut || {
+                draws
+                    .next()
+                    .ok_or(clipmonger_core::entropy::Error::UNSUPPORTED)
+            })
+            .expect("retry zero");
+        assert_eq!(token, 42);
+        assert!(state.gesture_tokens.lock().unwrap().contains_key(&42));
+    }
+
+    #[test]
+    fn gesture_repeated_zero_exhausts() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-zero-ex-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        let mut calls = 0;
+        let mut draws = || {
+            calls += 1;
+            Ok(0u64)
+        };
+        assert!(state
+            .mint_gesture_token_with(None, 1000, &mut draws)
+            .is_err());
+        assert_eq!(calls, 8);
+        assert!(state.gesture_tokens.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn gesture_collision_then_success_preserves_original() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-coll-ok-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        let first = state
+            .mint_gesture_token_with(Some(10), 1000, &mut || Ok(100))
+            .expect("first");
+        assert_eq!(first, 100);
+        let mut draws = vec![100u64, 200u64].into_iter();
+        let second = state
+            .mint_gesture_token_with(Some(20), 1001, &mut || {
+                draws
+                    .next()
+                    .ok_or(clipmonger_core::entropy::Error::UNSUPPORTED)
+            })
+            .expect("second");
+        assert_eq!(second, 200);
+        let map = state.gesture_tokens.lock().unwrap();
+        assert_eq!(map.get(&100), Some(&(1000, Some(10))));
+        assert_eq!(map.get(&200), Some(&(1001, Some(20))));
+    }
+
+    #[test]
+    fn gesture_collision_exhaustion_leaves_existing_untouched() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-coll-ex-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        state
+            .mint_gesture_token_with(Some(1), 1000, &mut || Ok(55))
+            .expect("first");
+        let mut draws = || Ok(55);
+        assert!(state
+            .mint_gesture_token_with(Some(2), 1001, &mut draws)
+            .is_err());
+        let map = state.gesture_tokens.lock().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&55), Some(&(1000, Some(1))));
+    }
+
+    #[test]
+    fn gesture_collision_then_entropy_failure_no_fallback() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-coll-fail-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        state
+            .mint_gesture_token_with(Some(1), 1000, &mut || Ok(77))
+            .expect("first");
+        let mut calls = 0;
+        let mut draw = || {
+            calls += 1;
+            if calls == 1 {
+                Ok(77)
+            } else {
+                Err(clipmonger_core::entropy::Error::UNSUPPORTED)
+            }
+        };
+        assert!(state
+            .mint_gesture_token_with(Some(2), 1001, &mut draw)
+            .is_err());
+        let map = state.gesture_tokens.lock().unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&77));
+    }
+
+    #[test]
+    fn gesture_poisoned_map_fails_without_authority() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-poison-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = state.gesture_tokens.lock().unwrap();
+            panic!("poison");
+        });
+        let mut draw = || panic!("poisoned map must not draw");
+        assert!(state
+            .mint_gesture_token_with(None, 1000, &mut draw)
+            .is_err());
+        assert!(state.gesture_tokens.is_poisoned());
+    }
+
+    #[test]
+    fn gesture_exact_ttl_and_backward_and_wrong_target_burn() {
+        let dir = std::env::temp_dir().join(format!("cm-gesture-ttl-{}", std::process::id()));
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let state = DaemonState::new(store);
+        let token = state
+            .mint_gesture_token_with(Some(0xAAA), 1000, &mut || Ok(12345))
+            .expect("mint");
+        assert!(state.consume_gesture_token(token, 1000 + super::GESTURE_TTL_MS, Some(0xAAA)));
+        let token2 = state
+            .mint_gesture_token_with(Some(0xBBB), 2000, &mut || Ok(23456))
+            .expect("mint2");
+        assert!(!state.consume_gesture_token(
+            token2,
+            2000 + super::GESTURE_TTL_MS + 1,
+            Some(0xBBB)
+        ));
+        let token3 = state
+            .mint_gesture_token_with(Some(0xCCC), 3000, &mut || Ok(34567))
+            .expect("mint3");
+        assert!(!state.consume_gesture_token(token3, 2999, Some(0xCCC)));
+        let bound = state
+            .mint_gesture_token_with(Some(0x30838), 4000, &mut || Ok(45678))
+            .expect("mint4");
+        assert!(!state.consume_gesture_token(bound, 4001, Some(0x99)));
+        assert!(!state.consume_gesture_token(bound, 4002, Some(0x30838)));
+        let unknown = 99999u64;
+        assert!(!state.consume_gesture_token(unknown, 5000, None));
+        let single = state
+            .mint_gesture_token_with(None, 6000, &mut || Ok(56789))
+            .expect("mint5");
+        assert!(state.consume_gesture_token(single, 6001, None));
+        assert!(!state.consume_gesture_token(single, 6002, None));
+        let extreme = state
+            .mint_gesture_token_with(None, i64::MIN, &mut || Ok(67890))
+            .unwrap();
+        assert!(!state.consume_gesture_token(extreme, i64::MAX, None));
+        state
+            .mint_gesture_token_with(None, i64::MIN, &mut || Ok(78901))
+            .unwrap();
+        assert!(state
+            .mint_gesture_token_with(None, i64::MAX, &mut || Ok(89012))
+            .is_ok());
     }
 
     fn fresh_state(name: &str) -> (std::path::PathBuf, DaemonState) {
@@ -2921,3 +3312,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "restore_tests.rs"]
+mod restore_tests;
