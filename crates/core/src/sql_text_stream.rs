@@ -15,6 +15,7 @@ const MAX_STEP: usize = 64 * 1024;
 pub(crate) enum TextColumn {
     SearchText,
     Preview,
+    Id,
 }
 
 impl TextColumn {
@@ -22,12 +23,14 @@ impl TextColumn {
         match self {
             Self::SearchText => "search_text",
             Self::Preview => "preview",
+            Self::Id => "id",
         }
     }
     fn type_sql(self) -> &'static str {
         match self {
             Self::SearchText => "SELECT typeof(search_text) FROM main.clips WHERE rowid = ?1",
             Self::Preview => "SELECT typeof(preview) FROM main.clips WHERE rowid = ?1",
+            Self::Id => "SELECT typeof(id) FROM main.clips WHERE rowid = ?1",
         }
     }
 }

@@ -35,6 +35,10 @@ pub(crate) enum SnapshotError {
     OwnerMismatch,
     Expired,
     Sql(rusqlite::Error),
+    TransactionEnded,
+    IndexMissing,
+    IndexMissingReadOnly,
+    IndexInvalid,
 }
 
 impl From<rusqlite::Error> for SnapshotError {
@@ -43,34 +47,47 @@ impl From<rusqlite::Error> for SnapshotError {
     }
 }
 
-struct Snapshot {
+pub(super) struct Snapshot {
     token: SnapshotToken,
     owner: u64,
     created: Instant,
     query: String,
-    conn: Connection,
+    pub(super) conn: Connection,
+    pub(super) scan: Option<super::compact_scan::ScanState>,
 }
 
 #[derive(Default)]
 pub(super) struct Registry {
-    entries: Vec<Snapshot>,
+    pub(super) entries: Vec<Snapshot>,
 }
 
 impl std::fmt::Debug for Registry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Registry").field("entries", &self.entries.len()).finish()
+        f.debug_struct("Registry")
+            .field("entries", &self.entries.len())
+            .finish()
     }
 }
 
 impl Registry {
     fn expire_at(&mut self, now: Instant) -> usize {
         let before = self.entries.len();
-        self.entries.retain(|entry| now.saturating_duration_since(entry.created) < MAX_AGE);
+        self.entries
+            .retain(|entry| now.saturating_duration_since(entry.created) < MAX_AGE);
         before - self.entries.len()
     }
 
-    fn find(&mut self, owner: u64, token: SnapshotToken, now: Instant) -> Result<usize, SnapshotError> {
-        let index = self.entries.iter().position(|entry| entry.token == token).ok_or(SnapshotError::Unknown)?;
+    pub(super) fn find(
+        &mut self,
+        owner: u64,
+        token: SnapshotToken,
+        now: Instant,
+    ) -> Result<usize, SnapshotError> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.token == token)
+            .ok_or(SnapshotError::Unknown)?;
         if self.entries[index].owner != owner {
             return Err(SnapshotError::OwnerMismatch);
         }
@@ -83,47 +100,129 @@ impl Registry {
 }
 
 impl Store {
+    // A panic can interrupt an operation after changing transaction state. Drop
+    // all old entries before reuse, then clear poison so new snapshots work.
+    pub(super) fn lock_compact_registry(&self) -> std::sync::MutexGuard<'_, Registry> {
+        match self.compact_snapshots.lock() {
+            Ok(guard) => guard,
+            Err(poison) => {
+                let mut guard = poison.into_inner();
+                guard.entries.clear();
+                self.compact_snapshots.clear_poison();
+                guard
+            }
+        }
+    }
     /// Begin an owned snapshot. Query and capacity are checked before opening
     /// the read-only connection. No primary-connection lock is acquired.
-    pub(crate) fn begin_compact_snapshot(&self, owner: u64, query: &str) -> Result<SnapshotToken, SnapshotError> {
+    pub(crate) fn begin_compact_snapshot(
+        &self,
+        owner: u64,
+        query: &str,
+    ) -> Result<SnapshotToken, SnapshotError> {
+        self.begin_snapshot(owner, query, false)
+    }
+
+    pub(super) fn begin_snapshot(
+        &self,
+        owner: u64,
+        query: &str,
+        scan: bool,
+    ) -> Result<SnapshotToken, SnapshotError> {
         if query.len() > MAX_QUERY_BYTES {
             return Err(SnapshotError::QueryTooLong);
         }
-        let mut registry = self.compact_snapshots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut registry = self.lock_compact_registry();
         registry.expire_at(Instant::now());
         if registry.entries.len() >= MAX_SNAPSHOTS {
             return Err(SnapshotError::Capacity);
         }
-        let sequence = NEXT_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        let sequence = NEXT_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| SnapshotError::IdentityExhausted)?;
         let mut nonce = [0; 16];
-        nonce[..8].copy_from_slice(&crate::entropy::random_u64().map_err(|_| SnapshotError::Entropy)?.to_ne_bytes());
-        nonce[8..].copy_from_slice(&crate::entropy::random_u64().map_err(|_| SnapshotError::Entropy)?.to_ne_bytes());
+        nonce[..8].copy_from_slice(
+            &crate::entropy::random_u64()
+                .map_err(|_| SnapshotError::Entropy)?
+                .to_ne_bytes(),
+        );
+        nonce[8..].copy_from_slice(
+            &crate::entropy::random_u64()
+                .map_err(|_| SnapshotError::Entropy)?
+                .to_ne_bytes(),
+        );
         let conn = Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(BUSY_WAIT)?;
         conn.execute_batch("BEGIN")?;
         // BEGIN is deferred: this actual table read pins the database snapshot,
         // including when clips is empty.
-        conn.query_row("SELECT EXISTS(SELECT 1 FROM main.clips LIMIT 1)", [], |row| row.get::<_, i64>(0))?;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.clips LIMIT 1)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if scan {
+            match super::compact_index::index_present(&conn) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(if self.read_only {
+                        SnapshotError::IndexMissingReadOnly
+                    } else {
+                        SnapshotError::IndexMissing
+                    })
+                }
+                Err(super::compact_index::CheckError::Invalid) => {
+                    return Err(SnapshotError::IndexInvalid)
+                }
+                Err(super::compact_index::CheckError::Sql(e)) => return Err(SnapshotError::Sql(e)),
+            }
+        }
+        let state = scan.then(|| super::compact_scan::ScanState::new(query));
         let token = SnapshotToken { nonce, sequence };
-        registry.entries.push(Snapshot { token, owner, created: Instant::now(), query: query.to_owned(), conn });
+        registry.entries.push(Snapshot {
+            token,
+            owner,
+            created: Instant::now(),
+            query: query.to_owned(),
+            conn,
+            scan: state,
+        });
         Ok(token)
     }
 
-    /// Run a bounded scanner operation while the registry owns the connection.
-    /// The higher-ranked callback cannot return a borrow of connection or query.
+    /// Test-only callback. Runs under the registry lock: no re-entry, primary
+    /// connection lock, manual transaction control, or escaped SQLite resources.
+    /// Before/after checks detect an ended transaction, not COMMIT followed by BEGIN.
+    #[cfg(test)]
     pub(crate) fn use_compact_snapshot<T>(
-        &self, owner: u64, token: SnapshotToken,
+        &self,
+        owner: u64,
+        token: SnapshotToken,
         f: impl for<'a> FnOnce(&'a Connection, &'a str) -> rusqlite::Result<T>,
     ) -> Result<T, SnapshotError> {
-        let mut registry = self.compact_snapshots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut registry = self.lock_compact_registry();
         let index = registry.find(owner, token, Instant::now())?;
+        if registry.entries[index].conn.is_autocommit() {
+            registry.entries.remove(index);
+            return Err(SnapshotError::TransactionEnded);
+        }
         let entry = &registry.entries[index];
-        f(&entry.conn, &entry.query).map_err(SnapshotError::Sql)
+        let result = f(&entry.conn, &entry.query);
+        if registry.entries[index].conn.is_autocommit() || result.is_err() {
+            registry.entries.remove(index);
+            if result.is_ok() {
+                return Err(SnapshotError::TransactionEnded);
+            }
+        }
+        result.map_err(SnapshotError::Sql)
     }
 
-    pub(crate) fn cancel_compact_snapshot(&self, owner: u64, token: SnapshotToken) -> Result<(), SnapshotError> {
-        let mut registry = self.compact_snapshots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    pub(crate) fn cancel_compact_snapshot(
+        &self,
+        owner: u64,
+        token: SnapshotToken,
+    ) -> Result<(), SnapshotError> {
+        let mut registry = self.lock_compact_registry();
         let index = registry.find(owner, token, Instant::now())?;
         registry.entries.remove(index);
         Ok(())
@@ -132,11 +231,11 @@ impl Store {
     /// Explicit maintenance. Expired entries may persist until this or a lazy
     /// check runs; this does not promise a hard deadline for SQLite operations.
     pub(crate) fn expire_compact_snapshots(&self) -> usize {
-        self.compact_snapshots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).expire_at(Instant::now())
+        self.lock_compact_registry().expire_at(Instant::now())
     }
 
     pub(super) fn drain_compact_snapshots(&self) {
-        self.compact_snapshots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.clear();
+        self.lock_compact_registry().entries.clear();
     }
 }
 
@@ -148,18 +247,25 @@ mod tests {
     struct Scratch(PathBuf);
     impl Scratch {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("compact-registry-{}", uuid::Uuid::now_v7()));
+            let path =
+                std::env::temp_dir().join(format!("compact-registry-{}", uuid::Uuid::now_v7()));
             std::fs::create_dir(&path).unwrap();
             Self(path)
         }
     }
     impl Drop for Scratch {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
     fn value(store: &Store, owner: u64, token: SnapshotToken) -> Result<String, SnapshotError> {
         store.use_compact_snapshot(owner, token, |conn, query| {
             assert_eq!(query, "needle");
-            conn.query_row("SELECT preview FROM clips WHERE id = 'fixture'", [], |row| row.get(0))
+            conn.query_row(
+                "SELECT preview FROM clips WHERE id = 'fixture'",
+                [],
+                |row| row.get(0),
+            )
         })
     }
     fn seed(store: &Store) {
@@ -172,7 +278,10 @@ mod tests {
         let store = Store::open(&scratch.0).unwrap();
         seed(&store);
         let old = store.begin_compact_snapshot(1, "needle").unwrap();
-        store.lock().execute("UPDATE clips SET preview='new' WHERE id='fixture'", []).unwrap();
+        store
+            .lock()
+            .execute("UPDATE clips SET preview='new' WHERE id='fixture'", [])
+            .unwrap();
         let new = store.begin_compact_snapshot(1, "needle").unwrap();
         assert_eq!(value(&store, 1, old).unwrap(), "old");
         assert_eq!(value(&store, 1, new).unwrap(), "new");
@@ -184,9 +293,13 @@ mod tests {
         let store = Store::open(&scratch.0).unwrap();
         let old = store.begin_compact_snapshot(1, "").unwrap();
         seed(&store);
-        let count = |token| store.use_compact_snapshot(1, token, |conn, _| {
-            conn.query_row("SELECT count(*) FROM clips", [], |row| row.get::<_, i64>(0))
-        }).unwrap();
+        let count = |token| {
+            store
+                .use_compact_snapshot(1, token, |conn, _| {
+                    conn.query_row("SELECT count(*) FROM clips", [], |row| row.get::<_, i64>(0))
+                })
+                .unwrap()
+        };
         assert_eq!(count(old), 0);
         let new = store.begin_compact_snapshot(1, "").unwrap();
         assert_eq!(count(new), 1);
@@ -196,30 +309,76 @@ mod tests {
     fn limits_owner_cancel_and_expiry() {
         let scratch = Scratch::new();
         let store = Store::open(&scratch.0).unwrap();
-        assert!(matches!(store.begin_compact_snapshot(1, &"é".repeat(2049)), Err(SnapshotError::QueryTooLong)));
+        assert!(matches!(
+            store.begin_compact_snapshot(1, &"é".repeat(2049)),
+            Err(SnapshotError::QueryTooLong)
+        ));
         let limit = store.begin_compact_snapshot(1, &"é".repeat(2048)).unwrap();
         store.cancel_compact_snapshot(1, limit).unwrap();
         let first = store.begin_compact_snapshot(1, "needle").unwrap();
-        assert!(matches!(store.cancel_compact_snapshot(2, first), Err(SnapshotError::OwnerMismatch)));
+        assert!(matches!(
+            store.cancel_compact_snapshot(2, first),
+            Err(SnapshotError::OwnerMismatch)
+        ));
         let mut tokens = vec![first];
-        for _ in 1..MAX_SNAPSHOTS { tokens.push(store.begin_compact_snapshot(1, "needle").unwrap()); }
-        assert!(matches!(store.begin_compact_snapshot(1, "needle"), Err(SnapshotError::Capacity)));
+        for _ in 1..MAX_SNAPSHOTS {
+            tokens.push(store.begin_compact_snapshot(1, "needle").unwrap());
+        }
+        assert!(matches!(
+            store.begin_compact_snapshot(1, "needle"),
+            Err(SnapshotError::Capacity)
+        ));
         store.cancel_compact_snapshot(1, first).unwrap();
-        assert!(matches!(store.cancel_compact_snapshot(1, first), Err(SnapshotError::Unknown)));
+        assert!(matches!(
+            store.cancel_compact_snapshot(1, first),
+            Err(SnapshotError::Unknown)
+        ));
         let replacement = store.begin_compact_snapshot(1, "needle").unwrap();
         assert_ne!(first, replacement);
         {
             let mut registry = store.compact_snapshots.lock().unwrap();
-            let entry = registry.entries.iter_mut().find(|entry| entry.token == replacement).unwrap();
+            let entry = registry
+                .entries
+                .iter_mut()
+                .find(|entry| entry.token == replacement)
+                .unwrap();
             entry.created = Instant::now().checked_sub(MAX_AGE).unwrap();
         }
-        assert!(matches!(store.cancel_compact_snapshot(1, replacement), Err(SnapshotError::Expired)));
+        assert!(matches!(
+            store.cancel_compact_snapshot(1, replacement),
+            Err(SnapshotError::Expired)
+        ));
         {
             let mut registry = store.compact_snapshots.lock().unwrap();
-            for entry in &mut registry.entries { entry.created = Instant::now().checked_sub(MAX_AGE).unwrap(); }
+            for entry in &mut registry.entries {
+                entry.created = Instant::now().checked_sub(MAX_AGE).unwrap();
+            }
         }
         assert_eq!(store.expire_compact_snapshots(), MAX_SNAPSHOTS - 1);
-        assert!(matches!(store.cancel_compact_snapshot(1, tokens[1]), Err(SnapshotError::Unknown)));
+        assert!(matches!(
+            store.cancel_compact_snapshot(1, tokens[1]),
+            Err(SnapshotError::Unknown)
+        ));
+    }
+
+    #[test]
+    fn scan_state_expires_and_closes_with_registry() {
+        let scratch = Scratch::new();
+        let store = Store::open(&scratch.0).unwrap();
+        store.lock().execute_batch("CREATE INDEX idx_clips_compact_history ON clips(removed,last_used_ms DESC,id DESC)").unwrap();
+        let stale = store.begin_compact_scan(1, "").unwrap();
+        {
+            let mut registry = store.lock_compact_registry();
+            registry.entries[0].created = Instant::now().checked_sub(MAX_AGE).unwrap();
+        }
+        assert!(matches!(
+            store.step_compact_scan(1, stale, 1, 1, 1),
+            Err(super::super::compact_scan::ScanError::Snapshot(
+                SnapshotError::Expired
+            ))
+        ));
+        let fresh = store.begin_compact_scan(1, "").unwrap();
+        store.cancel_compact_scan(1, fresh).unwrap();
     }
 
     #[test]
@@ -228,7 +387,10 @@ mod tests {
         let store = Store::open(&scratch.0).unwrap();
         seed(&store);
         let stale = store.begin_compact_snapshot(1, "needle").unwrap();
-        store.lock().execute("UPDATE clips SET preview='new' WHERE id='fixture'", []).unwrap();
+        store
+            .lock()
+            .execute("UPDATE clips SET preview='new' WHERE id='fixture'", [])
+            .unwrap();
         store.close().unwrap();
         let db = scratch.0.join(super::super::DB_NAME);
         let renamed = scratch.0.join("moved.sqlite3");
@@ -236,7 +398,10 @@ mod tests {
         std::fs::rename(&renamed, &db).unwrap();
         let reopened = Store::open(&scratch.0).unwrap();
         let fresh = reopened.begin_compact_snapshot(1, "needle").unwrap();
-        assert!(matches!(value(&reopened, 1, stale), Err(SnapshotError::Unknown)));
+        assert!(matches!(
+            value(&reopened, 1, stale),
+            Err(SnapshotError::Unknown)
+        ));
         assert_eq!(value(&reopened, 1, fresh).unwrap(), "new");
     }
 }

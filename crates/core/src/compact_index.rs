@@ -28,7 +28,7 @@ fn invalid_index() -> CoreError {
 
 // Check ownership, partial/unique flags, key columns, collations and directions;
 // the auxiliary rowid entry in index_xinfo is not a key column.
-enum CheckError {
+pub(super) enum CheckError {
     Sql(rusqlite::Error),
     Invalid,
 }
@@ -37,7 +37,7 @@ impl From<rusqlite::Error> for CheckError {
         Self::Sql(error)
     }
 }
-fn index_present(conn: &Connection) -> Result<bool, CheckError> {
+pub(super) fn index_present(conn: &Connection) -> Result<bool, CheckError> {
     let owner: Option<(String, String)> = conn
         .query_row(
             "SELECT type, tbl_name FROM main.sqlite_schema WHERE name = ?1 COLLATE NOCASE",
