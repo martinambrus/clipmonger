@@ -6,7 +6,7 @@
 //! short-lived per-call connections and never touch the serving lock while
 //! waiting, so a read from our own store cannot deadlock the server.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -27,6 +27,7 @@ pub struct X11Transfer {
     serving: Arc<ServingConn>,
     shared: Arc<Mutex<TransferShared>>,
     stop: Arc<AtomicBool>,
+    health: Arc<AtomicU8>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -45,6 +46,24 @@ struct TransferShared {
     /// Owner the indicator was recorded for (reads only refresh it when
     /// ownership moved, so a restore check never invalidates itself).
     last_owner: Option<Window>,
+}
+
+const SERVING_HEALTHY: u8 = 0;
+const SERVING_UNKNOWN: u8 = 1;
+const SERVING_DEAD: u8 = 2;
+
+fn connection_is_dead(error: &x11rb14::errors::ConnectionError) -> bool {
+    match error {
+        x11rb14::errors::ConnectionError::IoError(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::NotConnected
+        ),
+        _ => false,
+    }
 }
 
 impl X11Transfer {
@@ -73,11 +92,18 @@ impl X11Transfer {
             });
             let shared = Arc::new(Mutex::new(TransferShared::default()));
             let stop = Arc::new(AtomicBool::new(false));
+            let health = Arc::new(AtomicU8::new(SERVING_HEALTHY));
             let worker_serving = Arc::clone(&serving);
             let worker_shared = Arc::clone(&shared);
             let worker_stop = Arc::clone(&stop);
+            let worker_health = Arc::clone(&health);
             let worker = std::thread::spawn(move || {
-                serve_loop(&worker_serving, &worker_shared, &worker_stop);
+                serve_loop(
+                    &worker_serving,
+                    &worker_shared,
+                    &worker_stop,
+                    &worker_health,
+                );
             });
             Ok(Self {
                 display: display_name,
@@ -85,9 +111,50 @@ impl X11Transfer {
                 serving,
                 shared,
                 stop,
+                health,
                 worker: Some(worker),
             })
         }
+    }
+
+    /// Whether this transfer's retained serving connection is known alive.
+    ///
+    /// # Errors
+    /// Returns an error when health is unknown; only `Ok(false)` confirms death.
+    pub fn serving_health(&self) -> Result<bool> {
+        match self.health.load(Ordering::Acquire) {
+            SERVING_DEAD => Ok(false),
+            SERVING_HEALTHY
+                if self
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| !worker.is_finished()) =>
+            {
+                Ok(true)
+            }
+            _ => Err(Error::Unavailable(
+                "X11 serving connection health unknown".into(),
+            )),
+        }
+    }
+
+    /// Stop and join a confirmed-dead serving worker without retiring it.
+    ///
+    /// # Errors
+    /// Refuses to stop a healthy or unknown selection owner.
+    pub fn close_dead_serving(&mut self) -> Result<()> {
+        if self.health.load(Ordering::Acquire) != SERVING_DEAD {
+            return Err(Error::Denied(
+                "X11 serving connection is not known dead".into(),
+            ));
+        }
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| Error::Unavailable("X11 serving worker failed".into()))?;
+        }
+        Ok(())
     }
 
     /// Multi-format atomic write, served persistently afterwards.
@@ -199,13 +266,28 @@ fn serve_loop(
     serving: &Arc<ServingConn>,
     shared: &Arc<Mutex<TransferShared>>,
     stop: &Arc<AtomicBool>,
+    health: &Arc<AtomicU8>,
 ) {
     while !stop.load(Ordering::Relaxed) {
-        let event = serving
-            .conn
-            .lock()
-            .ok()
-            .and_then(|conn| conn.poll_for_event().ok().flatten());
+        let event = if let Ok(conn) = serving.conn.lock() {
+            match conn.poll_for_event() {
+                Ok(event) => {
+                    health.store(SERVING_HEALTHY, Ordering::Release);
+                    event
+                }
+                Err(error) if connection_is_dead(&error) => {
+                    health.store(SERVING_DEAD, Ordering::Release);
+                    break;
+                }
+                Err(_) => {
+                    health.store(SERVING_UNKNOWN, Ordering::Release);
+                    None
+                }
+            }
+        } else {
+            health.store(SERVING_UNKNOWN, Ordering::Release);
+            None
+        };
         match event {
             Some(Event::SelectionRequest(req)) => {
                 if let (Ok(conn), Ok(mut guard)) = (serving.conn.lock(), shared.lock()) {
@@ -291,4 +373,36 @@ pub(crate) fn window_exists(display: Option<&str>, win: Window) -> bool {
         return false;
     };
     session::window_alive(&conn, win)
+}
+
+#[cfg(test)]
+mod serving_health_tests {
+    use super::connection_is_dead;
+    use x11rb14::errors::ConnectionError;
+
+    #[test]
+    fn only_terminal_io_errors_confirm_dead_connection() {
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::NotConnected,
+        ] {
+            assert!(connection_is_dead(&ConnectionError::IoError(
+                std::io::Error::from(kind)
+            )));
+        }
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(!connection_is_dead(&ConnectionError::IoError(
+                std::io::Error::from(kind)
+            )));
+        }
+        assert!(!connection_is_dead(&ConnectionError::UnknownError));
+    }
 }

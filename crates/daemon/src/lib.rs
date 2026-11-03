@@ -1770,6 +1770,49 @@ pub fn replay_script(store: &Store, lines: impl Iterator<Item = String>) -> Vec<
 #[cfg(test)]
 type RestoreHook = Box<dyn FnOnce(&clipmonger_core::store::PreparedRestore) + Send>;
 
+#[cfg(all(unix, feature = "backend-x11"))]
+trait PermanentX11Engine: Send {
+    fn serving_health(&self) -> clipmonger_platform::types::Result<bool> {
+        Err(clipmonger_platform::types::Error::Unavailable(
+            "X11 engine health unknown".into(),
+        ))
+    }
+    fn close_dead_serving(&mut self) -> clipmonger_platform::types::Result<()> {
+        Err(clipmonger_platform::types::Error::Unavailable(
+            "X11 engine cleanup unavailable".into(),
+        ))
+    }
+    fn deliver(
+        &self,
+        target: &clipmonger_platform::types::PasteTarget,
+        id: uuid::Uuid,
+        payloads: &[(String, Vec<u8>)],
+    ) -> clipmonger_platform::types::Result<()>;
+}
+
+#[cfg(all(unix, feature = "backend-x11"))]
+struct PermanentX11Cache {
+    engine: Option<Box<dyn PermanentX11Engine>>,
+}
+
+#[cfg(all(unix, feature = "backend-x11"))]
+impl PermanentX11Engine for clipmonger_backend_x11::X11Paste {
+    fn serving_health(&self) -> clipmonger_platform::types::Result<bool> {
+        clipmonger_backend_x11::X11Paste::serving_health(self)
+    }
+    fn close_dead_serving(&mut self) -> clipmonger_platform::types::Result<()> {
+        clipmonger_backend_x11::X11Paste::close_dead_serving(self)
+    }
+    fn deliver(
+        &self,
+        target: &clipmonger_platform::types::PasteTarget,
+        id: uuid::Uuid,
+        payloads: &[(String, Vec<u8>)],
+    ) -> clipmonger_platform::types::Result<()> {
+        self.paste_payloads(target, &clipmonger_platform::types::ClipRef(id), payloads)
+    }
+}
+
 /// Shared daemon request state behind the IPC handler.
 pub struct DaemonState {
     /// Clip store for history methods. Interior mutability so
@@ -1809,6 +1852,9 @@ pub struct DaemonState {
     autostart: Mutex<Option<autostart::AutostartService>>,
     /// Popup trigger path: event hub, UI launcher, debounce state.
     popup: Mutex<popup::PopupTrigger>,
+    /// Keep the X11 clipboard owner alive across hotkey-manager replacements.
+    #[cfg(all(unix, feature = "backend-x11"))]
+    permanent_x11_engine: Mutex<PermanentX11Cache>,
     /// Dual-backend merge window state (seg-06 S8, W-F5: 2000 ms).
     #[cfg(all(unix, feature = "backend-wayland"))]
     merger: Mutex<clipmonger_backend_wayland::merge::Merger>,
@@ -1898,6 +1944,8 @@ impl DaemonState {
             hotkey_conflict_note: Mutex::new(None),
             autostart: Mutex::new(None),
             popup: Mutex::new(popup::PopupTrigger::default()),
+            #[cfg(all(unix, feature = "backend-x11"))]
+            permanent_x11_engine: Mutex::new(PermanentX11Cache { engine: None }),
             #[cfg(all(unix, feature = "backend-wayland"))]
             merger: Mutex::new(clipmonger_backend_wayland::merge::Merger::new(2000)),
             thumbnail: crate::thumbnail::ThumbnailService::new_for_daemon(),
@@ -3741,16 +3789,47 @@ impl DaemonState {
                             })
                     },
                     |target, payloads| {
-                        clipmonger_backend_x11::X11Paste::connect(None)?.paste_payloads(
-                            target,
-                            &clipmonger_platform::types::ClipRef(id),
-                            payloads,
-                        )
+                        self.deliver_x11_with_factory(id, target, payloads, || {
+                            Ok(Box::new(clipmonger_backend_x11::X11Paste::connect(None)?))
+                        })
                     },
                 );
             },
         );
         let _ = id;
+    }
+
+    #[cfg(all(unix, feature = "backend-x11"))]
+    fn deliver_x11_with_factory(
+        &self,
+        id: uuid::Uuid,
+        target: &clipmonger_platform::types::PasteTarget,
+        payloads: &[(String, Vec<u8>)],
+        factory: impl FnOnce() -> clipmonger_platform::types::Result<Box<dyn PermanentX11Engine>>,
+    ) -> clipmonger_platform::types::Result<()> {
+        let mut engine = self.permanent_x11_engine.lock().map_err(|_| {
+            clipmonger_platform::types::Error::Unavailable(
+                "permanent X11 engine state unavailable".into(),
+            )
+        })?;
+        if let Some(existing) = engine.engine.as_mut() {
+            if !existing.serving_health()? {
+                existing.close_dead_serving()?;
+                engine.engine.take();
+            }
+        }
+        if engine.engine.is_none() {
+            engine.engine = Some(factory()?);
+        }
+        engine
+            .engine
+            .as_deref()
+            .ok_or_else(|| {
+                clipmonger_platform::types::Error::Unavailable(
+                    "permanent X11 engine unavailable".into(),
+                )
+            })?
+            .deliver(target, id, payloads)
     }
 
     fn route_permanent(backend: &str, windows: impl FnOnce(), x11: impl FnOnce()) {
@@ -5318,6 +5397,489 @@ mod tests {
         );
         assert_eq!(*registrations.lock().unwrap(), ["ctrl+alt+j", "ctrl+alt+k"]);
         assert_eq!(fired, [(id, "ctrl+alt+k".to_string())]);
+    }
+
+    #[cfg(all(unix, feature = "backend-x11"))]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep the real owner and engine lifecycle in one regression"
+    )]
+    fn permanent_owner_reuses_x11_engine_across_manager_recreations() {
+        use clipmonger_platform::traits::HotkeyManager;
+        use clipmonger_platform::types::{
+            Affinity, AppId, Error, HotkeyId, PasteTarget, PlatformHandle, Result,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        struct Keys {
+            id: Option<HotkeyId>,
+        }
+        impl HotkeyManager for Keys {
+            const AFFINITY: Affinity = Affinity::Worker;
+            fn register(&mut self, id: HotkeyId, _: &str) -> Result<()> {
+                if id != HotkeyId(1) {
+                    self.id = Some(id);
+                }
+                Ok(())
+            }
+            fn unregister(&mut self, _: HotkeyId) -> Result<()> {
+                Ok(())
+            }
+            fn discard_pending(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn poll(&mut self, _: Duration) -> Result<Vec<HotkeyId>> {
+                Ok(vec![self.id.ok_or_else(|| {
+                    Error::Unavailable("not registered".into())
+                })?])
+            }
+        }
+        struct Engine {
+            identity: usize,
+            deliveries: Arc<Mutex<Vec<usize>>>,
+        }
+        impl super::PermanentX11Engine for Engine {
+            fn serving_health(&self) -> Result<bool> {
+                Ok(true)
+            }
+            fn deliver(
+                &self,
+                target: &PasteTarget,
+                _: uuid::Uuid,
+                payloads: &[(String, Vec<u8>)],
+            ) -> Result<()> {
+                assert_eq!(target.handle, PlatformHandle::X11Window(42));
+                assert_eq!(payloads[0].1, b"hello");
+                self.deliveries.lock().unwrap().push(self.identity);
+                Ok(())
+            }
+        }
+        let (_dir, state) = fresh_state("permanent-engine-reuse");
+        state.handle("permanent.create", &serde_json::json!({"group":"Work","name":"One","hotkey":"ctrl+alt+j","body":"hello"})).unwrap();
+        let target = PasteTarget {
+            app: AppId {
+                exe: "editor".into(),
+                title_hash: 0,
+            },
+            window_title_hash: 0,
+            handle: PlatformHandle::X11Window(42),
+            captured_ms: now_ms(),
+        };
+        let stop = AtomicBool::new(false);
+        let constructions = AtomicUsize::new(0);
+        let owners = AtomicUsize::new(0);
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        crate::popup::run_hotkeys(
+            None,
+            &stop,
+            || {
+                owners.fetch_add(1, Ordering::SeqCst);
+                Ok(Keys { id: None })
+            },
+            || state.popup_hotkey(),
+            || {},
+            |_| {},
+            || panic!("popup"),
+            |_| {},
+            Some(&state),
+            |id, chord, pause| {
+                state.press_x11_with(
+                    id,
+                    chord,
+                    || Ok(target.clone()),
+                    pause,
+                    || Ok(()),
+                    |_| true,
+                    |target, payloads| {
+                        state.deliver_x11_with_factory(id, target, payloads, || {
+                            let identity = constructions.fetch_add(1, Ordering::SeqCst) + 1;
+                            Ok(Box::new(Engine {
+                                identity,
+                                deliveries: Arc::clone(&deliveries),
+                            }))
+                        })
+                    },
+                );
+                if deliveries.lock().unwrap().len() == 3 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        assert_eq!(
+            owners.load(Ordering::SeqCst),
+            3,
+            "native owner is recreated after each press"
+        );
+        assert_eq!(
+            constructions.load(Ordering::SeqCst),
+            1,
+            "all three deliveries must share one engine"
+        );
+        assert_eq!(*deliveries.lock().unwrap(), [1, 1, 1]);
+    }
+
+    #[cfg(all(unix, feature = "backend-x11"))]
+    #[test]
+    fn permanent_x11_engine_retries_factory_after_failure_and_retains_on_delivery_error() {
+        use clipmonger_platform::types::{AppId, Error, PasteTarget, PlatformHandle, Result};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Engine(Arc<AtomicUsize>);
+        impl super::PermanentX11Engine for Engine {
+            fn serving_health(&self) -> Result<bool> {
+                Ok(true)
+            }
+            fn deliver(
+                &self,
+                _: &PasteTarget,
+                _: uuid::Uuid,
+                _: &[(String, Vec<u8>)],
+            ) -> Result<()> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(Error::Denied("temporary refusal".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let (_dir, state) = fresh_state("permanent-engine-retry");
+        let target = PasteTarget {
+            app: AppId {
+                exe: "editor".into(),
+                title_hash: 0,
+            },
+            window_title_hash: 0,
+            handle: PlatformHandle::X11Window(42),
+            captured_ms: now_ms(),
+        };
+        let id = uuid::Uuid::now_v7();
+        let payloads = [("text/plain;charset=utf-8".to_string(), b"hello".to_vec())];
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(state
+            .deliver_x11_with_factory(id, &target, &payloads, || Err(Error::Unavailable(
+                "factory".into()
+            )))
+            .is_err());
+        assert!(state
+            .deliver_x11_with_factory(id, &target, &payloads, || Ok(Box::new(Engine(Arc::clone(
+                &calls
+            )))))
+            .is_err());
+        assert!(state
+            .deliver_x11_with_factory(id, &target, &payloads, || panic!(
+                "successful engine must remain cached"
+            ))
+            .is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(all(unix, feature = "backend-x11"))]
+    #[test]
+    fn permanent_x11_engine_reconnects_once_after_io_failure() {
+        use clipmonger_platform::types::{AppId, Error, PasteTarget, PlatformHandle, Result};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Engine {
+            id: usize,
+            calls: Arc<AtomicUsize>,
+            dead: AtomicBool,
+        }
+        impl super::PermanentX11Engine for Engine {
+            fn serving_health(&self) -> Result<bool> {
+                Ok(!self.dead.load(Ordering::SeqCst))
+            }
+            fn close_dead_serving(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn deliver(
+                &self,
+                _: &PasteTarget,
+                _: uuid::Uuid,
+                _: &[(String, Vec<u8>)],
+            ) -> Result<()> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.id == 1 {
+                    self.dead.store(true, Ordering::SeqCst);
+                }
+                if self.id == 1 || call == 1 {
+                    Err(Error::Io("connection lost".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let (_dir, state) = fresh_state("permanent-engine-reconnect");
+        let target = PasteTarget {
+            app: AppId {
+                exe: "editor".into(),
+                title_hash: 0,
+            },
+            window_title_hash: 0,
+            handle: PlatformHandle::X11Window(42),
+            captured_ms: now_ms(),
+        };
+        let id = uuid::Uuid::now_v7();
+        let payloads = [("text/plain;charset=utf-8".into(), b"hello".to_vec())];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let builds = AtomicUsize::new(0);
+        let make = || {
+            let id = builds.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(Box::new(Engine {
+                id,
+                calls: Arc::clone(&calls),
+                dead: AtomicBool::new(false),
+            }) as Box<dyn super::PermanentX11Engine>)
+        };
+        assert!(state
+            .deliver_x11_with_factory(id, &target, &payloads, make)
+            .is_err());
+        assert!(state
+            .deliver_x11_with_factory(id, &target, &payloads, make)
+            .is_err());
+        assert!(state
+            .deliver_x11_with_factory(id, &target, &payloads, make)
+            .is_ok());
+        assert!(state
+            .deliver_x11_with_factory(id, &target, &payloads, make)
+            .is_ok());
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "the replacement must be reused after recovery"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[cfg(all(unix, feature = "backend-x11"))]
+    #[test]
+    fn permanent_x11_cache_recovers_after_multiple_dead_generations() {
+        use clipmonger_platform::types::{AppId, Error, PasteTarget, PlatformHandle, Result};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Engine {
+            id: usize,
+            dead: AtomicBool,
+            closed: Arc<AtomicUsize>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl super::PermanentX11Engine for Engine {
+            fn serving_health(&self) -> Result<bool> {
+                Ok(!self.dead.load(Ordering::SeqCst))
+            }
+            fn close_dead_serving(&mut self) -> Result<()> {
+                assert!(self.dead.load(Ordering::SeqCst));
+                self.closed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn deliver(
+                &self,
+                _: &PasteTarget,
+                _: uuid::Uuid,
+                _: &[(String, Vec<u8>)],
+            ) -> Result<()> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.id <= 2 {
+                    self.dead.store(true, Ordering::SeqCst);
+                    Err(Error::Io("serving connection dead".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let (_dir, state) = fresh_state("permanent-multiple-dead");
+        let target = PasteTarget {
+            app: AppId {
+                exe: "editor".into(),
+                title_hash: 0,
+            },
+            window_title_hash: 0,
+            handle: PlatformHandle::X11Window(42),
+            captured_ms: now_ms(),
+        };
+        let id = uuid::Uuid::now_v7();
+        let data = [("text/plain;charset=utf-8".into(), b"hello".to_vec())];
+        let builds = AtomicUsize::new(0);
+        let closed = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let make = || {
+            Ok(Box::new(Engine {
+                id: builds.fetch_add(1, Ordering::SeqCst) + 1,
+                dead: AtomicBool::new(false),
+                closed: Arc::clone(&closed),
+                calls: Arc::clone(&calls),
+            }) as Box<dyn super::PermanentX11Engine>)
+        };
+        assert!(state
+            .deliver_x11_with_factory(id, &target, &data, make)
+            .is_err());
+        assert!(state
+            .deliver_x11_with_factory(id, &target, &data, make)
+            .is_err());
+        assert!(
+            state
+                .deliver_x11_with_factory(id, &target, &data, make)
+                .is_ok(),
+            "a third healthy engine must recover without prior successful paste"
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            closed.load(Ordering::SeqCst),
+            2,
+            "each confirmed-dead worker is closed"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "each press is delivered at most once"
+        );
+    }
+
+    #[cfg(all(unix, feature = "backend-x11"))]
+    #[test]
+    fn permanent_x11_cache_retains_healthy_owner_across_input_errors() {
+        use clipmonger_platform::types::{AppId, Error, PasteTarget, PlatformHandle, Result};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Engine(Arc<AtomicUsize>, Arc<AtomicUsize>);
+        impl Drop for Engine {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl super::PermanentX11Engine for Engine {
+            fn serving_health(&self) -> Result<bool> {
+                Ok(true)
+            }
+            fn deliver(
+                &self,
+                _: &PasteTarget,
+                _: uuid::Uuid,
+                _: &[(String, Vec<u8>)],
+            ) -> Result<()> {
+                if self.0.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
+                    Ok(())
+                } else {
+                    Err(Error::Io("synthetic input unavailable".into()))
+                }
+            }
+        }
+        let (_dir, state) = fresh_state("permanent-healthy-input-errors");
+        let target = PasteTarget {
+            app: AppId {
+                exe: "editor".into(),
+                title_hash: 0,
+            },
+            window_title_hash: 0,
+            handle: PlatformHandle::X11Window(42),
+            captured_ms: now_ms(),
+        };
+        let id = uuid::Uuid::now_v7();
+        let data = [("text/plain;charset=utf-8".into(), b"hello".to_vec())];
+        let builds = AtomicUsize::new(0);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let make = || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Engine(Arc::clone(&calls), Arc::clone(&drops)))
+                as Box<dyn super::PermanentX11Engine>)
+        };
+        for i in 0..6 {
+            assert_eq!(
+                state
+                    .deliver_x11_with_factory(id, &target, &data, make)
+                    .is_ok(),
+                i % 2 == 0
+            );
+        }
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "input errors must not retire a healthy clipboard owner"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 6, "one attempt per press");
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "healthy selection owner must stay alive"
+        );
+    }
+
+    #[cfg(all(unix, feature = "backend-x11"))]
+    #[test]
+    fn permanent_x11_unknown_health_retains_owner_and_skips_delivery() {
+        use clipmonger_platform::types::{AppId, Error, PasteTarget, PlatformHandle, Result};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Engine {
+            unknown: Arc<AtomicBool>,
+            calls: Arc<AtomicUsize>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for Engine {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl super::PermanentX11Engine for Engine {
+            fn serving_health(&self) -> Result<bool> {
+                if self.unknown.load(Ordering::SeqCst) {
+                    Err(Error::Unavailable("unknown".into()))
+                } else {
+                    Ok(true)
+                }
+            }
+            fn deliver(
+                &self,
+                _: &PasteTarget,
+                _: uuid::Uuid,
+                _: &[(String, Vec<u8>)],
+            ) -> Result<()> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let (_dir, state) = fresh_state("permanent-engine-unknown");
+        let target = PasteTarget {
+            app: AppId {
+                exe: "editor".into(),
+                title_hash: 0,
+            },
+            window_title_hash: 0,
+            handle: PlatformHandle::X11Window(42),
+            captured_ms: now_ms(),
+        };
+        let id = uuid::Uuid::now_v7();
+        let data = [("text/plain;charset=utf-8".into(), b"hello".to_vec())];
+        let unknown = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        state
+            .deliver_x11_with_factory(id, &target, &data, || {
+                Ok(Box::new(Engine {
+                    unknown: Arc::clone(&unknown),
+                    calls: Arc::clone(&calls),
+                    drops: Arc::clone(&drops),
+                }))
+            })
+            .unwrap();
+        unknown.store(true, Ordering::SeqCst);
+        assert!(state
+            .deliver_x11_with_factory(id, &target, &data, || panic!(
+                "unknown must not replace owner"
+            ))
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        unknown.store(false, Ordering::SeqCst);
+        state
+            .deliver_x11_with_factory(id, &target, &data, || {
+                panic!("existing owner must be reused")
+            })
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

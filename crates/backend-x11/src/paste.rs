@@ -78,6 +78,22 @@ pub struct X11Paste {
 }
 
 impl X11Paste {
+    /// Report health of the retained clipboard-serving connection.
+    ///
+    /// # Errors
+    /// Returns an error when health cannot be determined.
+    pub fn serving_health(&self) -> Result<bool> {
+        self.transfer.serving_health()
+    }
+
+    /// Stop and join the serving worker only after its connection is known dead.
+    ///
+    /// # Errors
+    /// Refuses to discard a healthy or unknown clipboard owner.
+    pub fn close_dead_serving(&mut self) -> Result<()> {
+        self.transfer.close_dead_serving()
+    }
+
     /// Connect to `display` (or `$DISPLAY`).
     ///
     /// # Errors

@@ -135,10 +135,59 @@ impl Xvfb {
     fn addr(&self) -> &str {
         &self.display
     }
+
+    /// Ask this still-owned child to clean up its socket and lock, then reap it.
+    #[allow(unsafe_code)] // SIGTERM for the owned, unreaped child only.
+    fn stop_gracefully(&mut self) -> Result<(), String> {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        if self
+            .child
+            .try_wait()
+            .map_err(|e| format!("Xvfb status: {e}"))?
+            .is_some()
+        {
+            return Err("owned Xvfb exited before termination".into());
+        }
+        let pid = i32::try_from(self.child.id()).map_err(|_| "invalid Xvfb pid")?;
+        if pid <= 0 {
+            return Err("invalid Xvfb pid".into());
+        }
+        // Safety: this positive PID belongs to our unreaped Child, so it
+        // cannot be reused even if it exits between try_wait and kill.
+        if unsafe { kill(pid, 15) } != 0 {
+            return Err(format!(
+                "Xvfb SIGTERM failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if self
+                .child
+                .try_wait()
+                .map_err(|e| format!("Xvfb reap: {e}"))?
+                .is_some()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("Xvfb did not stop after SIGTERM".into());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 impl Drop for Xvfb {
     fn drop(&mut self) {
+        // A gracefully stopped child has already been reaped; do not signal a
+        // PID that could now belong to a different process.
+        match self.child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {}
+        }
         let _ = self.child.kill();
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -2200,6 +2249,76 @@ fn t511_held_modifier_cancels_before_clipboard_change() {
         transfer.read("text/plain;charset=utf-8", 1024).unwrap(),
         b"original-probe"
     );
+}
+
+#[test]
+#[ignore = "isolated Xvfb restart probe requires separate safety review"]
+fn t512_serving_health_restart_and_worker_cleanup() {
+    let Some((_guard, mut xvfb)) = fixture("serving_health_restart") else {
+        assert!(
+            std::env::var_os("CLIPMONGER_XVFB_REQUIRED").is_none(),
+            "required isolated Xvfb fixture did not start"
+        );
+        return;
+    };
+    let display = xvfb.addr().to_string();
+    let baseline = std::fs::read_dir("/proc/self/task").unwrap().count();
+    for generation in 0..3 {
+        let mut owner = X11Transfer::connect(Some(&display)).expect("owned transfer");
+        let payload = format!("probe-generation-{generation}").into_bytes();
+        owner
+            .write(&[("text/plain;charset=utf-8".into(), payload.clone())])
+            .unwrap();
+        assert!(owner.serving_health().unwrap());
+        assert!(
+            owner.close_dead_serving().is_err(),
+            "a healthy selection owner cannot be discarded"
+        );
+        assert_eq!(
+            owner.read("text/plain;charset=utf-8", 1024).unwrap(),
+            payload,
+            "healthy owner must still serve the selection"
+        );
+        xvfb.stop_gracefully().expect("stop and reap owned Xvfb");
+        let dead = poll_until(Duration::from_secs(5), || {
+            matches!(owner.serving_health(), Ok(false)).then_some(())
+        });
+        assert!(
+            dead.is_some(),
+            "the retained serving connection must report confirmed death"
+        );
+        owner
+            .close_dead_serving()
+            .expect("join confirmed-dead worker");
+        drop(owner);
+        assert!(
+            std::fs::read_dir("/proc/self/task").unwrap().count() <= baseline,
+            "dead worker must not be parked"
+        );
+        if generation < 2 {
+            let socket = format!("/tmp/.X11-unix/X{}", xvfb.display_no);
+            assert!(
+                poll_until(Duration::from_secs(5), || (!Path::new(&socket).exists())
+                    .then_some(()))
+                .is_some(),
+                "old socket must disappear"
+            );
+            let lock = format!("/tmp/.X{}-lock", xvfb.display_no);
+            assert!(
+                poll_until(Duration::from_secs(5), || (!Path::new(&lock).exists())
+                    .then_some(()))
+                .is_some(),
+                "old X lock must disappear"
+            );
+            drop(xvfb);
+            xvfb = Xvfb::start().expect("restart owned Xvfb");
+            assert_eq!(
+                xvfb.addr(),
+                display,
+                "restart must use the same isolated display"
+            );
+        }
+    }
 }
 
 #[test]
