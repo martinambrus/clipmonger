@@ -7,6 +7,14 @@ reserved for the release that passes all seg-11 §5 gates.
 
 ### Added
 
+- One CPU-rendered egui UI across Windows, X11 and Wayland, with independent
+  popup and Settings windows, hidden logic and persistent geometry (ADR-005).
+- Image/file-list previews, bounded thumbnail work and lazy file metadata.
+- Default-off Windows Scroll Lock monitoring toggle and decoded UTF-8
+  minimum-length filtering.
+- Self-write suppression diagnostics and capture filtering for daemon paste
+  and restore writes before history ingestion.
+
 - Paste delivery switch `popup.delivery` (config window, Popup tab):
   `clipboard_restore` (default — clipboard write + Ctrl+V with
   guarded restore, any size, standard and elevated routes) or
@@ -38,6 +46,22 @@ reserved for the release that passes all seg-11 §5 gates.
   (28 rows).
 
 ### Fixed
+
+- Popup context, keyboard ownership, placement and offline/shutdown handling
+  in the unified runner; Settings and remote displays use the same UI.
+- Windows popup activation uses asynchronous showing and bounded confirmation;
+  helper jobs recheck expiry before dispatch.
+- Linux popup events carry X11 timestamps and available Wayland activation
+  tokens; registered X11 popup presses toggle without creating a paste target.
+- Capture loops recover, oversized captures become visible stubs, and Windows
+  marker/fingerprint reads and image decoding stay bounded.
+- Blob reuse verifies stored content, ingestion failures are reported, and
+  backup/restore preserves raw config with checksum and rollback validation.
+- X11 text aliases are served consistently; self-write matching retains
+  privacy/size checks and complete backend projections.
+
+Current native acceptance for the CPU runner and clipboard paths remains
+pending; dated verification notes below retain their original scope.
 
 - Any process holding the profile token could obtain an admin-paste
   gesture through `hotkey.fired` (ADR-003 known limitation); gestures now

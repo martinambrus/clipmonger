@@ -209,6 +209,15 @@ MUST NOT be promised in v1.
   | plugins.enabled | bool | true | Plugins | v2 (ADR-001) |
   | plugins.<id>.enabled | bool (managed in UI) | true | Plugins | v2 (ADR-001) |
   | run.confirm_policy | enum | permanent-only | Permanents | v2 (macros) |
+- Windows monitoring: the default-off Scroll Lock control observes physical
+  rising edges every 50 ms. Minimum length counts decoded UTF-8 bytes and uses
+  the plain-text basis of mixed HTML/RTF captures. Genuine image/file-list and
+  rich-only captures retain their handling. Native opt-out, owner and sequence
+  checks still apply; unknown owners are best effort.
+- Image/file-list storage, PNG/DIB conversion, retention and oversized-capture
+  stubs are implemented in source. A stub records size/reason without claiming
+  that its payload was stored. Native wide-image and clipboard compatibility
+  acceptance remains release QA.
 - Backup/restore ZIP (F-602): `manifest.toml` + `clipstore.sqlite3` (via backup API) + `blobs/` + schema versions and optional raw `config.toml` (exact UTF-8 bytes with `config_bytes`/`config_sha256`; missing file omits entry/fields, never reserialize env-overridden live config).
   Legacy/no-config archives preserve existing destination `config.toml` and live config (fresh destination stays absent); never infer deletion from omission. Restore is TRANSACTIONAL (review finding 31): destination-local owned stage → validate present config digest/length/UTF-8/TOML plus manifest/schema/checksums/size caps → reject path traversal/symlinks/overlarge entries → run DB validation → atomic swap with rollback on reported errors and retained recovery directory. Some backend monitor/formats/poll/hotkey values snapshot at daemon start and require restart after config restore (documented limit, no backend hot reload). NEVER overwrite the only good profile pre-validation.
 
