@@ -22,6 +22,23 @@ pub fn plain_text(mime: &str) -> bool {
     mime.split(';').next().map(str::trim) == Some("text/plain")
 }
 
+/// Detect one physical key press while tracking releases even when disabled.
+#[derive(Debug)]
+pub struct ScrollLockEdge {
+    down: bool,
+}
+impl ScrollLockEdge {
+    #[must_use]
+    pub fn new(down: bool) -> Self {
+        Self { down }
+    }
+    pub fn observe(&mut self, enabled: bool, down: bool) -> bool {
+        let pressed = down && !self.down;
+        self.down = down;
+        enabled && pressed
+    }
+}
+
 /// Poll a session monitor until shutdown and deliver each batch to capture.
 /// Errors retry with 100 ms exponential backoff capped at two seconds. Log
 /// once per failure streak and again on recovery; any successful poll resets
@@ -203,6 +220,7 @@ mod tests {
 
     fn event(sensitive: bool) -> CaptureEvent {
         CaptureEvent {
+            native_sequence: None,
             offers: vec![FormatOffer {
                 mime: "text/plain".to_string(),
                 bytes_hint: None,

@@ -178,6 +178,7 @@ MUST NOT be promised in v1.
   | monitor.formats | string[] | [all canonical] | History | v1 |
   | monitor.max_bytes | int | 16 MiB | History | v1 |
   | monitor.min_len | int | 0 | History | v1 |
+  | monitor.scroll_lock_toggle | bool | false | History | v1 |
   | monitor.ignores | string[] (app classes) | [password mgrs] | History | v1 |
   | monitor.poll_ms | int | 500 (macOS/X11-poll) | History | v1 |
   | monitor.capture_primary | bool | false | History | v1 (H-11) |

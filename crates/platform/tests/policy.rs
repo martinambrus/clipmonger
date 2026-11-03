@@ -13,6 +13,7 @@ use clipmonger_platform::types::{
 fn script() -> Vec<Vec<CaptureEvent>> {
     vec![
         vec![CaptureEvent {
+            native_sequence: None,
             offers: vec![FormatOffer {
                 mime: "text/plain".to_string(),
                 bytes_hint: Some(5),
@@ -22,6 +23,7 @@ fn script() -> Vec<Vec<CaptureEvent>> {
         }],
         vec![],
         vec![CaptureEvent {
+            native_sequence: None,
             offers: vec![],
             origin: CaptureOrigin::Primary,
             sensitive: true,

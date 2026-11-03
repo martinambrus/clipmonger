@@ -15,6 +15,7 @@
 pub mod autostart;
 pub mod autostart_logic;
 pub mod caps;
+mod capture_policy;
 pub mod dib;
 pub mod elevated_task;
 pub mod foreground;
@@ -32,6 +33,7 @@ pub mod transfer;
 pub mod uri;
 
 pub use autostart::WinAutostart;
+pub use capture_policy::CapturePolicy;
 pub use foreground::{current_process_integrity, target_integrity, Integrity};
 pub use hotkeys::WinHotkeys;
 pub use monitor::WinMonitor;
@@ -44,7 +46,7 @@ pub use sys::{
     process_image_path, process_token_high, program_files_dir, show_owned_window,
     spawn_elevated_worker,
 };
-pub use transfer::WinTransfer;
+pub use transfer::{WinCaptureTransfer, WinTransfer};
 
 /// Healthy capability matrix for this backend (carries the `image/png`
 /// note via [`caps::normal_caps`]).

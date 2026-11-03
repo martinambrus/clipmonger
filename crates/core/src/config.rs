@@ -108,6 +108,8 @@ pub struct MonitorConfig {
     pub max_bytes: u64,
     #[serde(default)]
     pub min_len: u64,
+    #[serde(default)]
+    pub scroll_lock_toggle: bool,
     /// App classes to ignore. Default empty; per-OS classes land with backends.
     #[serde(default)]
     pub ignores: Vec<String>,
@@ -128,6 +130,7 @@ impl Default for MonitorConfig {
             formats: default_formats(),
             max_bytes: default_max_bytes(),
             min_len: 0,
+            scroll_lock_toggle: false,
             ignores: Vec::new(),
             poll_ms: default_poll_ms(),
             capture_primary: false,
@@ -393,6 +396,11 @@ impl Config {
                 self.monitor.min_len = n;
             }
         }
+        if let Some(v) = env_str("CLIPMONGER_MONITOR_SCROLL_LOCK_TOGGLE") {
+            if let Ok(b) = v.parse::<bool>() {
+                self.monitor.scroll_lock_toggle = b;
+            }
+        }
         if let Some(v) = env_str("CLIPMONGER_MONITOR_POLL_MS") {
             if let Ok(n) = v.parse::<u64>() {
                 self.monitor.poll_ms = n;
@@ -537,6 +545,15 @@ fn env_list(key: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_lock_toggle_defaults_off_and_roundtrips() {
+        let default = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(default["monitor"]["scroll_lock_toggle"], false);
+        let config: Config = toml::from_str("[monitor]\nscroll_lock_toggle = true\n").unwrap();
+        let rendered = serde_json::to_value(config).unwrap();
+        assert_eq!(rendered["monitor"]["scroll_lock_toggle"], true);
+    }
 
     #[test]
     fn delivery_defaults_to_clipboard_restore() {

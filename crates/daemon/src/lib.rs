@@ -105,8 +105,8 @@ fn daemon_runtime_emit(
 pub fn runtime_platform_class(error: &clipmonger_platform::types::Error) -> &'static str {
     use clipmonger_platform::types::Error;
     match error {
-        Error::Unavailable(_) => "unavailable",
-        Error::Denied(_) => "denied",
+        Error::Unavailable(_) | Error::CaptureChanged => "unavailable",
+        Error::Denied(_) | Error::CaptureExcluded => "denied",
         Error::Timeout(_) => "timeout",
         Error::TooLarge(_) => "too_large",
         Error::Unsupported(_) => "unsupported",
@@ -1176,6 +1176,37 @@ fn wanted_capture_mime(mime: &str, cfg: &clipmonger_core::Config) -> bool {
         && (!cfg.privacy.strict || capture::plain_text(mime))
 }
 
+fn strict_capture_requires_skip(
+    event: &clipmonger_platform::types::CaptureEvent,
+    cfg: &clipmonger_core::Config,
+) -> bool {
+    cfg.privacy.strict
+        && event.offers.iter().any(|offer| {
+            capture::wanted_format(&offer.mime, &cfg.monitor.formats)
+                && !capture::plain_text(&offer.mime)
+        })
+        && !event.offers.iter().any(|offer| {
+            capture::wanted_format(&offer.mime, &cfg.monitor.formats)
+                && capture::plain_text(&offer.mime)
+        })
+}
+
+fn short_windows_capture(origin: &str, min_len: u64, payloads: &[(String, Vec<u8>)]) -> bool {
+    if origin != "windows" || min_len == 0 {
+        return false;
+    }
+    let has_text = payloads.iter().any(|(mime, _)| capture::plain_text(mime));
+    let short_text = payloads
+        .iter()
+        .filter(|(mime, _)| capture::plain_text(mime))
+        .all(|(_, bytes)| (bytes.len() as u64) < min_len);
+    has_text
+        && short_text
+        && payloads.iter().all(|(mime, _)| {
+            capture::plain_text(mime) || matches!(mime.as_str(), "text/html" | "text/rtf")
+        })
+}
+
 fn report_source_ignored(app: Option<&str>, cfg: &clipmonger_core::Config) -> bool {
     app.is_some_and(|app| {
         let normalized = app.trim().to_ascii_lowercase();
@@ -1978,6 +2009,37 @@ impl DaemonState {
         self.publish_config(config);
     }
 
+    /// Live Windows capture exclusions; None means the config lock failed.
+    #[must_use]
+    pub fn windows_capture_exclusions(&self) -> Option<Vec<String>> {
+        self.config.lock().ok().map(|config| {
+            config
+                .monitor
+                .ignores
+                .iter()
+                .chain(&config.privacy.denylist)
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// Whether Scroll Lock toggling is configured.
+    #[must_use]
+    pub fn scroll_lock_toggle_enabled(&self) -> bool {
+        self.config
+            .lock()
+            .is_ok_and(|config| config.monitor.scroll_lock_toggle)
+    }
+
+    /// Apply the same monitor toggle used by IPC and status/tray.
+    ///
+    /// # Errors
+    /// Returns an error if the monitoring state cannot be locked.
+    pub fn toggle_monitor_from_scroll_lock(&self) -> Result<(), IpcError> {
+        self.handle_monitor(&serde_json::json!({"toggle": true}))
+            .map(|_| ())
+    }
+
     /// Flip the GNOME extension link state in caps.
     pub fn set_extension_connected(&self, connected: bool) {
         self.caps.set_extension_connected(connected);
@@ -2505,16 +2567,7 @@ impl DaemonState {
         if self.capture_paused()? {
             return Ok(false);
         }
-        if cfg.privacy.strict
-            && event.offers.iter().any(|offer| {
-                capture::wanted_format(&offer.mime, &cfg.monitor.formats)
-                    && !capture::plain_text(&offer.mime)
-            })
-            && !event.offers.iter().any(|offer| {
-                capture::wanted_format(&offer.mime, &cfg.monitor.formats)
-                    && capture::plain_text(&offer.mime)
-            })
-        {
+        if strict_capture_requires_skip(event, &cfg) {
             return self.record_capture_privacy_skip();
         }
         if event.offers.len() > MAX_CAPTURE_FORMATS {
@@ -2571,6 +2624,15 @@ impl DaemonState {
                     payloads.push((entry.mime, bytes));
                 }
                 Err(error) => {
+                    if origin == "windows" && event.native_sequence.is_some() {
+                        match error {
+                            clipmonger_platform::types::Error::CaptureExcluded => {
+                                return self.record_capture_privacy_skip()
+                            }
+                            clipmonger_platform::types::Error::CaptureChanged => return Ok(false),
+                            _ => {}
+                        }
+                    }
                     log_capture_read_skipped(&error);
                     if matches!(error, clipmonger_platform::types::Error::TooLarge(_)) {
                         // A native or decoder guard does not establish the final size.
@@ -2585,6 +2647,9 @@ impl DaemonState {
                     log(&format!("payload read skipped ({}): {error}", entry.mime));
                 }
             }
+        }
+        if short_windows_capture(origin, cfg.monitor.min_len, &payloads) {
+            return Ok(false);
         }
         if payloads.is_empty() {
             return Ok(false);
@@ -4771,6 +4836,7 @@ mod tests {
                                 subscribed: false,
                                 polls: VecDeque::from([
                                     Ok(vec![CaptureEvent {
+                                        native_sequence: None,
                                         offers: Vec::new(),
                                         origin: CaptureOrigin::Clipboard,
                                         sensitive: true,

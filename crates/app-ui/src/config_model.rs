@@ -82,6 +82,12 @@ pub const ROWS: &[Row] = &[
         label: "config.monitor_min_len",
     },
     Row {
+        key: "monitor.scroll_lock_toggle",
+        tab: Tab::History,
+        kind: Kind::Bool,
+        label: "config.monitor_scroll_lock_toggle",
+    },
+    Row {
         key: "monitor.ignores",
         tab: Tab::History,
         kind: Kind::StringList,

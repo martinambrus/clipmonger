@@ -1163,6 +1163,36 @@ pub(crate) fn startup_approved_blob() -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Clipboard owner's executable path, queried while the clipboard is open.
+#[cfg(windows)]
+pub(crate) fn clipboard_owner_executable() -> Option<String> {
+    use windows_sys::Win32::System::DataExchange::GetClipboardOwner;
+    // Safety: GetClipboardOwner has no preconditions; the returned window is only queried.
+    let hwnd = unsafe { GetClipboardOwner() };
+    if hwnd.is_null() {
+        return None;
+    }
+    let mut pid = 0;
+    // Safety: pid is a valid out pointer; a disappearing window yields zero.
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &raw mut pid);
+    }
+    if pid == 0 {
+        None
+    } else {
+        process_image_path(pid)
+    }
+}
+
+/// Current physical Scroll Lock key state.
+#[must_use]
+#[cfg(windows)]
+pub fn scroll_lock_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_SCROLL};
+    // Safety: GetAsyncKeyState accepts this virtual-key code.
+    unsafe { GetAsyncKeyState(i32::from(VK_SCROLL)) < 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{window_title_hash_units, window_title_hash_with, MAX_WINDOW_TITLE_UNITS};

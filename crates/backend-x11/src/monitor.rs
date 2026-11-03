@@ -454,6 +454,7 @@ impl Worker {
         push_event(
             &self.shared,
             CaptureEvent {
+                native_sequence: None,
                 offers,
                 origin: CaptureOrigin::Clipboard,
                 sensitive,
@@ -526,6 +527,7 @@ impl Worker {
         push_event(
             &self.shared,
             CaptureEvent {
+                native_sequence: None,
                 offers,
                 origin: CaptureOrigin::Primary,
                 sensitive,
@@ -677,6 +679,7 @@ mod lifecycle_tests {
         for panic in [false, true] {
             let shared = Arc::new(Mutex::new(MonitorShared {
                 queue: vec![CaptureEvent {
+                    native_sequence: None,
                     offers: Vec::new(),
                     origin: CaptureOrigin::Clipboard,
                     sensitive: true,
@@ -707,6 +710,7 @@ mod lifecycle_tests {
         let handle = finish_worker(move || {
             let mut queue = producer.lock().unwrap();
             queue.queue.push(CaptureEvent {
+                native_sequence: None,
                 offers: Vec::new(),
                 origin: CaptureOrigin::Clipboard,
                 sensitive: true,
