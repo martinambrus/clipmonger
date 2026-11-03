@@ -27,6 +27,13 @@
 6. While a hotkey-opened popup stays open, issue a CLI show-popup request.
    - Expected: the popup is raised with its current open context. Hiding
      afterward still clears that context.
+7. On Windows, establish the ordinary-app cycle A to B, open the popup from B,
+   then use Alt-Tab once. Repeat with Esc/outside dismissal and reopening.
+   - Expected: popup is transient, absent from taskbar/Alt-Tab, and does not
+     consume an ordinary-app switch: Alt-Tab dismisses it and reaches A. Record
+     the actual destination separately from native style/membership checks.
+     Search still accepts keyboard input, context clears on hide, and Settings
+     remains an ordinary taskbar/Alt-Tab window after close/reopen.
 
 ## Evidence to attach
 

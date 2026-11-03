@@ -13,6 +13,12 @@ Center placement. Wayland delegates placement to the compositor and remembers
 Settings size only. Settings normal geometry persists on close and exit;
 font zoom does not change its native size.
 
+The Windows popup is a transient tool window: it accepts search keyboard focus
+without a taskbar or Alt-Tab entry. Its native policy survives repeated show/hide
+and style changes. Settings remains an ordinary taskbar/Alt-Tab window. Opening
+and dismissing the popup must preserve the ordinary-app Alt-Tab cycle; verify
+the actual switch destination in T-905/T-908.
+
 Logic runs while hidden or minimized; painting is limited to drawable windows.
 Hidden texture updates survive until the next draw. Minimized startup stays
 hidden. Windows and X11 retain the popup; Wayland recreates it for a show and

@@ -4,12 +4,16 @@
 //! while the window is shown.
 
 pub mod geometry;
+#[cfg(all(test, target_os = "windows"))]
+mod native_window_tests;
 #[cfg(test)]
 mod placement_tests;
 pub mod render;
 pub mod sched;
 mod shutdown;
 pub mod window;
+#[cfg(target_os = "windows")]
+mod windows_popup;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -154,6 +158,7 @@ impl Handle {
 pub enum RunError {
     EventLoop(winit::error::EventLoopError),
     Window(winit::error::OsError),
+    NativeWindow(std::io::Error),
     Surface(softbuffer::SoftBufferError),
     Teardown(String),
 }
@@ -165,6 +170,7 @@ impl RunError {
         match self {
             Self::EventLoop(_) => "event_loop",
             Self::Window(_) => "window",
+            Self::NativeWindow(_) => "native_window",
             Self::Surface(_) => "surface",
             Self::Teardown(_) => "teardown",
         }
@@ -176,6 +182,7 @@ impl std::fmt::Display for RunError {
         match self {
             Self::EventLoop(e) => write!(f, "event loop: {e}"),
             Self::Window(e) => write!(f, "window: {e}"),
+            Self::NativeWindow(e) => write!(f, "native window: {e}"),
             Self::Surface(e) => write!(f, "surface: {e}"),
             Self::Teardown(m) => write!(f, "teardown: {m}"),
         }
@@ -651,6 +658,8 @@ impl<A: App> Runner<A> {
         );
         let window_id = window.id();
         let host_res = (|| {
+            #[cfg(target_os = "windows")]
+            windows_popup::install(&window, kind).map_err(RunError::NativeWindow)?;
             let ((state, presenter, info), visibility) = prepared.finish_setup(&*window, |b| {
                 egui_winit::apply_viewport_builder_to_window(ctx, &window, b);
                 let state = egui_winit::State::new(

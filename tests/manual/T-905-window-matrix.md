@@ -28,6 +28,16 @@
      native lifecycles with no duplicate UI or tray instance.
 7. Repeat show/hide, scale and monitor changes on RustDesk and a physical display.
    - Expected: the same CPU UI renders both; record focus/placement failures.
+8. On Windows, switch from ordinary app A to app B (for example ChatGPT to
+   Notepad), then open the popup by hotkey. Type in search, hold Alt and press
+   Tab, then release Alt. Repeat after Esc, outside-click dismissal, several
+   reopen cycles, and a DPI/monitor change.
+   - Expected: the popup has no taskbar button or Alt-Tab tile; search accepts
+     typing. Alt-Tab dismisses it and switches to A, preserving the ordinary-app
+     cycle instead of consuming a switch to return to B. Record membership
+     and actual destination separately; native style flags alone prove neither
+     the Explorer cycle nor the observed destination. Settings remains a normal
+     taskbar/Alt-Tab window through close/reopen.
 
 ## Evidence to attach
 
