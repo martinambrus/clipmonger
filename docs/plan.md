@@ -41,20 +41,41 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
 
 ## Current implementation update (2026-11-03)
 
-The current UI is the single CPU-rendered egui runner in ADR-005. D-024's
-separate Win32 fallback and the eframe/glow path are retired. Historical steps
-below preserve the evidence recorded for their original builds.
+The active implementation checkpoint is [v1 continuation](v1-continuation.md).
+Read it before using the historical step verdicts below: it names the combined
+candidate, draft PRs, exact-source QA results, remaining twelve task IDs, Windows
+test packet, Linux/licensing dependencies and the next-agent procedure.
 
-Phase 1 image/file-list storage, PNG/DIB conversion, retention and preview
-source are implemented, together with capture/storage hardening and daemon
-self-write suppression. Native platform acceptance and packaging/release
-signoff remain open. Windows capture controls include the default-off Scroll
-Lock toggle and UTF-8-byte minimum length. Settings currently has 29 rows.
+The recovered Windows v1/unified-UI batch has 65 tasks, 53 complete and 12 partial.
+Phase 1 storage, image/file-list conversion, retention and previews are implemented.
+The current UI uses the single CPU runner in ADR-005; the separate Win32 fallback
+and eframe/glow paths are retired. Windows capture includes a default-off Scroll
+Lock toggle and UTF-8-byte minimum length; Settings has 29 rows.
 
-Use STATUS.md and the current manual scripts for remaining acceptance.
-Elevated-task and failed-paste drafts are not counted as shipped here.
-Installer profile deletion and Linux protocol-output licensing clearance
-remain open. No tag or published release is authorized by these notes.
+The combined candidate also batches selected clipboard metadata reads; local
+release calibration reduced 10k-search p95 from 192.49 ms to 45.83 ms against
+the initial 50 ms target. Exact results and limits are in the continuation.
+
+Current stage: Phase 7 packaging/QA and native acceptance. The user will perform
+real Windows testing after the independent code/QA closeout. Software passes,
+release binaries and checked ZIP/NSIS payloads do not complete installer, clipboard,
+UAC/task protection, logon/reboot, display or Linux compositor acceptance. The
+helper-registration and failed-paste drafts remain native-held.
+
+The [v1 feature-to-test index](v1-qa-traceability.md) records source controls and
+coverage/evidence gaps. In addition to the recovered task board, the full seg-11
+release program still needs the 24-hour soak, million-case toolchain fuzzing,
+coverage/performance calibration, per-box goldens, applicable integration matrix,
+signed manual records and final release audit. Preserve measured search-budget
+misses until corrected or explicitly resolved; never infer a waiver from a test's
+looser sanity assertion. Linux generated blur-protocol licensing is unresolved.
+
+Next: use the exact candidate and Windows test packet, record each native/manual
+result, fix confirmed failures with regressions, refresh affected review/CI and
+artifacts, and reconcile the remaining release gates before integration/publication.
+The detailed procedure and protected-data boundaries are in the continuation.
+V2 and V3 remain future design-reopen milestones. No tag or publication follows
+from this update.
 
 ## Steps (historical records)
 
