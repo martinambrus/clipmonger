@@ -4415,6 +4415,44 @@ mod tests {
     }
 
     #[test]
+    fn captured_png_compact_row_retains_capture_identity() {
+        let (_dir, state) = fresh_state("compact-capture-hash");
+        let capture = state
+            .handle(
+                "capture.report",
+                &serde_json::json!({
+                    "event": {"sensitive": false, "origin": "Clipboard"},
+                    "payloads": {"image/png": "YQ=="}
+                }),
+            )
+            .unwrap();
+        assert_eq!(capture["accepted"], true);
+        state
+            .with_store(|store| {
+                store
+                    .prepare_compact_history_index(
+                        std::time::Duration::from_secs(10),
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let result = state
+            .handle(
+                "history.compact",
+                &serde_json::json!({
+                    "owner": 1, "generation": 1, "query": "", "cursor": null,
+                    "byte_budget": 65536, "candidate_budget": 32, "row_budget": 50
+                }),
+            )
+            .unwrap();
+        assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(result["rows"][0]["kind"], "image");
+        assert_eq!(result["rows"][0]["thumbnail_hash"], "af63dc4c8601ec8c");
+    }
+
+    #[test]
     fn blob_put_assembles_and_verifies_sha() {
         let (_dir, state) = fresh_state("blob-asm");
         let clip = "01900000-0000-7000-8000-000000000001";

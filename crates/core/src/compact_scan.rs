@@ -374,14 +374,7 @@ fn project_metadata(
                 match cursor.step(conn, NonZeroUsize::new(MAX_HASH_BYTES).unwrap(), |c| {
                     value.push(c)
                 }) {
-                    Ok(_)
-                        if value.len() == 64
-                            && value
-                                .bytes()
-                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
-                    {
-                        Some(value)
-                    }
+                    Ok(_) if crate::model::valid_clip_content_hash(&value) => Some(value),
                     Ok(_) | Err(TextStreamError::InvalidText | TextStreamError::WrongType) => None,
                     Err(e) => return Err(e.into()),
                 }
@@ -543,7 +536,7 @@ mod tests {
     #[test]
     fn compact_projection_uses_pinned_snapshot_and_valid_hash() {
         let (_s, db) = setup();
-        for n in 1..=8 {
+        for n in 1..=9 {
             insert(&db, n, n as i64, "", "row", false);
         }
         let valid = "a".repeat(64);
@@ -574,7 +567,13 @@ mod tests {
                 params!["a".repeat(100000), id(8)],
             )
             .unwrap();
+            conn.execute(
+                "UPDATE clips SET content_hash=?1 WHERE id=?2",
+                params!["af63dc4c8601ec8c", id(9)],
+            )
+            .unwrap();
             for (n, mime) in [
+                (9, "image/png"),
                 (1, "text/html"),
                 (1, "image/png"),
                 (2, "image/jpeg"),
@@ -611,6 +610,7 @@ mod tests {
         assert_eq!(row(3).kind, CompactKind::Html);
         assert_eq!(row(4).thumbnail_hash, None);
         assert_eq!(row(5).kind, CompactKind::Other);
+        assert_eq!(row(9).thumbnail_hash.as_deref(), Some("af63dc4c8601ec8c"));
         for n in 6..=8 {
             assert_eq!(row(n).thumbnail_hash, None);
         }

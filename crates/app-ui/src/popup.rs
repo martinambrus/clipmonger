@@ -1,6 +1,7 @@
 //! Popup view-model: clips, query, selection and banner state.
 
 use clipmonger_core::model::Clip;
+use clipmonger_core::store::{CompactHit, CompactKind};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -112,6 +113,37 @@ pub fn parse_history(body: &Value) -> Option<Vec<Clip>> {
     serde_json::from_value::<Vec<Clip>>(clips.clone()).ok()
 }
 
+/// A history row projected by the daemon. Unlike `Clip`, it contains no
+/// payload or search text; the daemon has already evaluated the full query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactRow {
+    pub id: Uuid,
+    pub pinned: bool,
+    pub preview: String,
+    pub kind: CompactKind,
+    pub thumbnail_hash: Option<String>,
+}
+
+impl TryFrom<CompactHit> for CompactRow {
+    type Error = ();
+
+    fn try_from(hit: CompactHit) -> Result<Self, Self::Error> {
+        let id = Uuid::parse_str(&hit.id).map_err(|_| ())?;
+        if hit.thumbnail_hash.as_ref().is_some_and(|hash| {
+            hit.kind != CompactKind::Image || !clipmonger_core::model::valid_clip_content_hash(hash)
+        }) {
+            return Err(());
+        }
+        Ok(Self {
+            id,
+            pinned: hit.pinned,
+            preview: hit.preview,
+            kind: hit.kind,
+            thumbnail_hash: hit.thumbnail_hash,
+        })
+    }
+}
+
 /// Number of rows a page key moves the selection.
 const PAGE_ROWS: isize = 10;
 
@@ -123,6 +155,7 @@ pub struct PopupVm {
     /// Selected row within [`Self::visible`].
     pub selected: usize,
     clips: Vec<Clip>,
+    compact_rows: Option<Vec<CompactRow>>,
     current: Option<Clip>,
     offline: bool,
     target_valid: bool,
@@ -146,6 +179,7 @@ impl PopupVm {
             query: String::new(),
             selected: 0,
             clips: Vec::new(),
+            compact_rows: None,
             current: Option::None,
             offline: false,
             target_valid: true,
@@ -157,9 +191,32 @@ impl PopupVm {
 
     /// Replace the clip list and reset the selection.
     pub fn set_clips(&mut self, clips: Vec<Clip>) {
+        self.compact_rows = None;
         self.clips = clips;
         self.selected = 0;
         self.clamp_selection();
+    }
+
+    /// Replace the displayed compact page. Its rows are already matched by
+    /// the server, including matches outside their display previews.
+    pub fn set_compact_rows(&mut self, rows: Vec<CompactRow>) {
+        self.clips.clear();
+        self.compact_rows = Some(rows);
+        self.selected = 0;
+    }
+
+    /// The current compact page, if compact history is active.
+    #[must_use]
+    pub fn compact_rows(&self) -> Option<&[CompactRow]> {
+        self.compact_rows.as_deref()
+    }
+
+    fn selected_id(&self) -> Option<Uuid> {
+        if let Some(rows) = &self.compact_rows {
+            rows.get(self.selected).map(|row| row.id)
+        } else {
+            self.clip_at(self.selected).map(|clip| clip.id)
+        }
     }
 
     /// Set the current-clipboard slot shown above the list.
@@ -226,11 +283,21 @@ impl PopupVm {
     /// Drop one clip after the server confirms the delete.
     pub fn remove_clip(&mut self, id: Uuid) {
         self.clips.retain(|clip| clip.id != id);
+        if let Some(rows) = &mut self.compact_rows {
+            rows.retain(|row| row.id != id);
+        }
         self.clamp_selection();
     }
 
     /// Apply the server-confirmed pin flag to one clip.
     pub fn apply_pin(&mut self, id: Uuid, pinned: bool) {
+        if let Some(row) = self
+            .compact_rows
+            .as_mut()
+            .and_then(|rows| rows.iter_mut().find(|row| row.id == id))
+        {
+            row.pinned = pinned;
+        }
         if let Some(clip) = self.clips.iter_mut().find(|clip| clip.id == id) {
             clip.pinned = pinned;
         }
@@ -240,6 +307,10 @@ impl PopupVm {
     #[must_use]
     pub fn is_pinned(&self, id: Uuid) -> bool {
         self.clips.iter().any(|clip| clip.id == id && clip.pinned)
+            || self
+                .compact_rows
+                .as_ref()
+                .is_some_and(|rows| rows.iter().any(|row| row.id == id && row.pinned))
     }
 
     /// Replace the list from a history-list reply body.
@@ -247,6 +318,7 @@ impl PopupVm {
         let Some(list) = parse_history(body) else {
             return HistoryApply::Malformed;
         };
+        self.compact_rows = None;
         if self.clips.len() == list.len()
             && self.clips.iter().zip(list.iter()).all(|(a, b)| {
                 a.id == b.id
@@ -277,7 +349,10 @@ impl PopupVm {
     /// Search-filtered clip indices in list order.
     #[must_use]
     pub fn visible(&self) -> Vec<usize> {
-        search::filter_clips(&self.clips, &self.query)
+        self.compact_rows.as_ref().map_or_else(
+            || search::filter_clips(&self.clips, &self.query),
+            |rows| (0..rows.len()).collect(),
+        )
     }
 
     /// Banner text for the current state, empty when all is well.
@@ -298,7 +373,14 @@ impl PopupVm {
         if self.paused {
             strings::text("popup.paused").to_string()
         } else {
-            strings::text("popup.count").replace("{count}", &self.clips.len().to_string())
+            strings::text("popup.count").replace(
+                "{count}",
+                &self
+                    .compact_rows
+                    .as_ref()
+                    .map_or(self.clips.len(), Vec::len)
+                    .to_string(),
+            )
         }
     }
 
@@ -378,26 +460,40 @@ impl PopupVm {
                 if !self.target_valid {
                     return VmEffect::None;
                 }
-                self.visible()
-                    .get(self.selected)
-                    .and_then(|index| self.clips.get(*index))
-                    .map_or(VmEffect::None, |clip| VmEffect::Paste(clip.id))
+                self.selected_id().map_or(VmEffect::None, VmEffect::Paste)
             }
             keymap::Action::Dismiss => VmEffect::Dismiss,
-            keymap::Action::Remove => self
-                .visible()
-                .get(self.selected)
-                .and_then(|index| self.clips.get(*index))
-                .map_or(VmEffect::None, |clip| VmEffect::Remove(clip.id)),
-            keymap::Action::Pin => self
-                .visible()
-                .get(self.selected)
-                .and_then(|index| self.clips.get(*index))
-                .map_or(VmEffect::None, |clip| VmEffect::Pin(clip.id)),
+            keymap::Action::Remove => self.selected_id().map_or(VmEffect::None, VmEffect::Remove),
+            keymap::Action::Pin => self.selected_id().map_or(VmEffect::None, VmEffect::Pin),
             keymap::Action::Refresh => VmEffect::Refresh,
             keymap::Action::GroupTab(n) => VmEffect::GroupTab(n),
             keymap::Action::Edit | keymap::Action::None => VmEffect::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod compact_row_tests {
+    use super::*;
+    #[test]
+    fn server_matches_are_not_filtered_by_preview_and_actions_use_row_id() {
+        let id = Uuid::from_u128(42);
+        let mut vm = PopupVm::new();
+        vm.query = "match beyond preview".into();
+        vm.set_compact_rows(vec![CompactRow {
+            id,
+            pinned: false,
+            preview: "short".into(),
+            kind: CompactKind::Text,
+            thumbnail_hash: None,
+        }]);
+        assert_eq!(vm.visible(), vec![0]);
+        assert_eq!(vm.on_action(keymap::Action::Paste), VmEffect::Paste(id));
+        assert_eq!(vm.on_action(keymap::Action::Pin), VmEffect::Pin(id));
+        vm.apply_pin(id, true);
+        assert!(vm.is_pinned(id));
+        vm.remove_clip(id);
+        assert!(vm.visible().is_empty());
     }
 }
 

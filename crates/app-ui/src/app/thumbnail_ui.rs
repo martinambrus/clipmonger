@@ -1,6 +1,5 @@
 //! Popup-owned thumbnail demand, CPU cache and context-local textures.
 use crate::thumbnail_worker::{Admission, Cache, CacheState, Key, Worker};
-use clipmonger_core::model::Clip;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -62,32 +61,30 @@ impl Thumbnails {
             self.cache.accept(result, Instant::now());
         }
     }
-    fn key(&self, clip: &Clip) -> Option<Key> {
-        if !clip.formats.iter().any(|s| s == "image/png")
-            || clip.content_hash.len() != 64
-            || !clip
-                .content_hash
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        {
-            return None;
-        }
+    fn key(&self, id: uuid::Uuid, hash: Option<&str>) -> Option<Key> {
+        let hash = hash.filter(|hash| clipmonger_core::model::valid_clip_content_hash(hash))?;
         Some(Key {
-            clip: clip.id,
-            content_hash: clip.content_hash.clone(),
+            clip: id,
+            content_hash: hash.to_string(),
             max_px: 128,
             generation: self.generation,
             context: self.generation,
         })
     }
-    pub fn slot(&mut self, ui: &mut egui::Ui, clip: &Clip, demand: &mut Vec<Key>) {
+    pub fn slot(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: uuid::Uuid,
+        hash: Option<&str>,
+        demand: &mut Vec<Key>,
+    ) {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
-        let key = self.key(clip);
+        let key = self.key(id, hash);
         if !ui.is_rect_visible(rect) {
             return;
         }
         #[cfg(test)]
-        self.slots.push((clip.id, rect));
+        self.slots.push((id, rect));
         if let Some(key) = &key {
             demand.push(key.clone());
         }
@@ -173,6 +170,7 @@ mod tests {
     use super::*;
     use crate::app::{AppParts, PopupApp};
     use crate::runner::{App, WindowKind};
+    use clipmonger_core::model::Clip;
     use clipmonger_ipc::{
         framing::{decode_line, encode_line},
         proto::{Envelope, FrameKind, IPC_VERSION},
@@ -343,10 +341,15 @@ mod tests {
     }
     #[test]
     fn real_popup_renders_delayed_worker_pixels_in_current_and_row() {
+        for hash_len in [16, 64] {
+            render_delayed_worker_pixels(hash_len);
+        }
+    }
+    fn render_delayed_worker_pixels(hash_len: usize) {
         let profile = Profile::new();
         let listener = UnixListener::bind(profile.0.join("clipmonger.sock")).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let red = clip(1, vec!["image/png"], &"a".repeat(64));
+        let red = clip(1, vec!["image/png"], &"a".repeat(hash_len));
         let text = clip(2, vec!["text/plain"], &"b".repeat(64));
         let id = red.id;
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -379,7 +382,7 @@ mod tests {
             reply(
                 &mut stream,
                 "t0",
-                serde_json::json!({"thumbnail":{"clip":id,"content_hash":"a".repeat(64),"mime":"image/png","width":1,"height":1,"png_base64":png([255,0,0,255])}}),
+                serde_json::json!({"thumbnail":{"clip":id,"content_hash":"a".repeat(hash_len),"mime":"image/png","width":1,"height":1,"png_base64":png([255,0,0,255])}}),
             );
             let end = Instant::now() + Duration::from_millis(300);
             while Instant::now() < end {
@@ -415,7 +418,7 @@ mod tests {
             reply(
                 &mut stream,
                 "t0",
-                serde_json::json!({"thumbnail":{"clip":id,"content_hash":"a".repeat(64),"mime":"image/png","width":1,"height":1,"png_base64":png([0,0,255,255])}}),
+                serde_json::json!({"thumbnail":{"clip":id,"content_hash":"a".repeat(hash_len),"mime":"image/png","width":1,"height":1,"png_base64":png([0,0,255,255])}}),
             );
         })));
         let mut release = Release(Some(release_tx));
@@ -438,7 +441,22 @@ mod tests {
             allow_foreground: Box::new(|| {}),
         });
         app.attach_thumbnails(worker);
-        app.vm_mut().set_clips(vec![red.clone(), text.clone()]);
+        app.vm_mut().set_compact_rows(vec![
+            crate::popup::CompactRow {
+                id: red.id,
+                pinned: false,
+                preview: red.preview.clone(),
+                kind: clipmonger_core::store::CompactKind::Image,
+                thumbnail_hash: Some(red.content_hash.clone()),
+            },
+            crate::popup::CompactRow {
+                id: text.id,
+                pinned: false,
+                preview: text.preview.clone(),
+                kind: clipmonger_core::store::CompactKind::Text,
+                thumbnail_hash: None,
+            },
+        ]);
         app.vm_mut().set_current(Some(red.clone()));
         let ctx = egui::Context::default();
         let mut raster = crate::runner::render::Rasterizer::new();
@@ -514,9 +532,10 @@ mod tests {
         let profile = Profile::new();
         let listener = UnixListener::bind(profile.0.join("clipmonger.sock")).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let original = clip(1, vec!["image/png"], &"a".repeat(64));
+        let hash_len = if restore { 64 } else { 16 };
+        let original = clip(1, vec!["image/png"], &"a".repeat(hash_len));
         let mut replacement = original.clone();
-        replacement.content_hash = if restore { "a" } else { "b" }.repeat(64);
+        replacement.content_hash = if restore { "a" } else { "b" }.repeat(hash_len);
         let target_hash = replacement.content_hash.clone();
         let id = original.id;
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -569,7 +588,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let (cmds, _) = mpsc::channel();
+        let (cmds, cmd_rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
         let mut app = PopupApp::new(AppParts {
             profile: profile.0.clone(),
@@ -583,27 +602,107 @@ mod tests {
             allow_foreground: Box::new(|| {}),
         });
         app.attach_thumbnails(worker);
-        app.vm_mut().set_clips(vec![original.clone()]);
-        app.vm_mut().set_current(Some(original));
+        app.vm_mut()
+            .set_compact_rows(vec![crate::popup::CompactRow {
+                id: original.id,
+                pinned: false,
+                preview: original.preview.clone(),
+                kind: clipmonger_core::store::CompactKind::Image,
+                thumbnail_hash: Some(original.content_hash.clone()),
+            }]);
+        app.vm_mut().set_current(Some(original.clone()));
         let ctx = egui::Context::default();
         let mut raster = crate::runner::render::Rasterizer::new();
         let _ = frame(&mut app, &ctx, &mut raster);
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let event = if restore {
-            crate::ipc_bridge::UiEvent::RestoreDone
-        } else {
-            crate::ipc_bridge::UiEvent::History(serde_json::json!({"clips":[replacement]}))
+        let initial_commands: Vec<_> = cmd_rx.try_iter().collect();
+        let initial = initial_commands
+            .iter()
+            .find_map(|cmd| match cmd {
+                crate::ipc_bridge::UiCmd::CompactHistory(tag) => Some(tag.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let initial_current = initial_commands
+            .iter()
+            .find_map(|cmd| match cmd {
+                crate::ipc_bridge::UiCmd::CompactCurrent(tag) => Some(*tag),
+                _ => None,
+            })
+            .unwrap();
+        events_tx
+            .send(crate::ipc_bridge::UiEvent::CompactCurrent(
+                initial_current,
+                Ok(serde_json::json!({"clips": [original]})),
+            ))
+            .unwrap();
+        let _ = frame(&mut app, &ctx, &mut raster);
+        if !restore {
+            app.refresh_current();
+        }
+        let make_reply = |tag: &crate::ipc_bridge::CompactRequest, rows| {
+            crate::ipc_bridge::UiEvent::CompactHistory(
+                tag.clone(),
+                Ok(
+                    serde_json::json!({"owner":tag.params.owner,"generation":tag.params.generation,"rows":rows,"cursor":null,"done":true,"bytes_read":0,"candidates":1}),
+                ),
+            )
         };
-        events_tx.send(event).unwrap();
+        if restore {
+            events_tx
+                .send(crate::ipc_bridge::UiEvent::RestoreDone)
+                .unwrap();
+            events_tx
+                .send(make_reply(&initial, serde_json::json!([])))
+                .unwrap();
+            let _ = frame(&mut app, &ctx, &mut raster);
+        }
+        let commands: Vec<_> = cmd_rx.try_iter().collect();
+        let tag = if restore {
+            commands
+                .iter()
+                .find_map(|cmd| match cmd {
+                    crate::ipc_bridge::UiCmd::CompactHistory(tag) => Some(tag.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        } else {
+            initial
+        };
+        let current_tag = commands
+            .iter()
+            .find_map(|cmd| match cmd {
+                crate::ipc_bridge::UiCmd::CompactCurrent(tag) => Some(*tag),
+                _ => None,
+            })
+            .expect("current lookup");
+        let row = serde_json::json!({"id":replacement.id,"pinned":false,"last_used_ms":1,"preview":replacement.preview,"preview_truncated":false,"kind":"image","thumbnail_hash":replacement.content_hash});
+        events_tx
+            .send(make_reply(&tag, serde_json::json!([row])))
+            .unwrap();
+        events_tx
+            .send(crate::ipc_bridge::UiEvent::CompactCurrent(
+                current_tag,
+                Ok(serde_json::json!({"clips": [replacement]})),
+            ))
+            .unwrap();
         let interim = frame(&mut app, &ctx, &mut raster);
         let rect = app.thumbnails.as_ref().unwrap().slots[0].1;
         assert_ne!(center(&interim, rect), 0xffff0000);
-        wake_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("replacement wake");
-        let final_pixels = frame(&mut app, &ctx, &mut raster);
-        let rect = app.thumbnails.as_ref().unwrap().slots[0].1;
-        assert_eq!(center(&final_pixels, rect), 0xff0000ff);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            wake_rx.recv_timeout(remaining).expect("replacement wake");
+            let final_pixels = frame(&mut app, &ctx, &mut raster);
+            let rect = app.thumbnails.as_ref().unwrap().slots[0].1;
+            if center(&final_pixels, rect) == 0xff0000ff {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement pixels did not arrive"
+            );
+        }
         drop(app);
         peer.join();
     }
@@ -674,7 +773,13 @@ mod tests {
                 .clips()
                 .iter()
                 .filter(|clip| expected.contains(&clip.id))
-                .map(|clip| app.thumbnails.as_ref().unwrap().key(clip).unwrap())
+                .map(|clip| {
+                    app.thumbnails
+                        .as_ref()
+                        .unwrap()
+                        .key(clip.id, Some(&clip.content_hash))
+                        .unwrap()
+                })
                 .collect();
             assert_eq!(keys.len(), expected.len());
             let ready = {

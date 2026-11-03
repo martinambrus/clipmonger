@@ -3,6 +3,16 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Validate a clip content identity used by thumbnail lookup. Captures use
+/// 16 lowercase hexadecimal digits; imported identities can use 64.
+#[must_use]
+pub fn valid_clip_content_hash(hash: &str) -> bool {
+    matches!(hash.len(), 16 | 64)
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Lamport-style last-writer-wins key for mutable annotations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rev {
@@ -81,4 +91,20 @@ pub struct PermanentClip {
     pub js: Option<String>,
     /// LWW key for sync.
     pub rev: Rev,
+}
+
+#[cfg(test)]
+mod content_hash_tests {
+    use super::valid_clip_content_hash;
+    #[test]
+    fn thumbnail_identity_accepts_only_supported_lowercase_hex_lengths() {
+        for len in [16, 64] {
+            assert!(valid_clip_content_hash(&"a".repeat(len)));
+            assert!(!valid_clip_content_hash(&"A".repeat(len)));
+            assert!(!valid_clip_content_hash(&"g".repeat(len)));
+        }
+        for len in [0, 15, 17, 63, 65] {
+            assert!(!valid_clip_content_hash(&"a".repeat(len)));
+        }
+    }
 }

@@ -331,10 +331,7 @@ pub async fn fetch(
         return Err(FetchError::Cancelled);
     }
     if !(1..=256).contains(&max_px)
-        || expected_hash.len() != 64
-        || !expected_hash
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        || !clipmonger_core::model::valid_clip_content_hash(expected_hash)
     {
         return Err(FetchError::Protocol);
     }

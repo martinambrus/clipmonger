@@ -210,6 +210,7 @@ impl PopupApp {
             }
         } else {
             self.vm.selected = 0;
+            self.reset_compact(false);
         }
     }
 
@@ -261,7 +262,26 @@ impl PopupApp {
         demand: &mut Vec<crate::thumbnail_worker::Key>,
     ) {
         if let Some(thumbs) = &mut self.thumbnails {
-            thumbs.slot(ui, clip, demand);
+            let hash = clip
+                .formats
+                .iter()
+                .any(|mime| mime == "image/png")
+                .then_some(clip.content_hash.as_str());
+            thumbs.slot(ui, clip.id, hash, demand);
+        } else {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+            super::thumbnail_ui::placeholder(ui, rect);
+        }
+    }
+
+    fn compact_thumbnail_slot(
+        &mut self,
+        ui: &mut egui::Ui,
+        row: &popup::CompactRow,
+        demand: &mut Vec<crate::thumbnail_worker::Key>,
+    ) {
+        if let Some(thumbs) = &mut self.thumbnails {
+            thumbs.slot(ui, row.id, row.thumbnail_hash.as_deref(), demand);
         } else {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
             super::thumbnail_ui::placeholder(ui, rect);
@@ -280,6 +300,8 @@ impl PopupApp {
         let mut delete_row: Option<usize> = Option::None;
         let mut search_focused = false;
         let mut open_settings = false;
+        let mut first_page = false;
+        let mut next_page = false;
         let mut thumbnail_demand = Vec::new();
         if let Some(thumbs) = &mut self.thumbnails {
             thumbs.begin_frame();
@@ -423,9 +445,30 @@ impl PopupApp {
                     });
             } else {
                 let count = self.vm.visible().len();
-                if count == 0 {
+                if self.compact.loading {
+                    ui.label(strings::text("popup.loading"));
+                } else if self.compact.error {
+                    let message = match self.compact.error_code.as_deref() {
+                        Some("not_ready") => "popup.history_preparing",
+                        Some("metadata_too_large") => "popup.history_metadata",
+                        _ => "popup.history_error",
+                    };
+                    ui.label(strings::text(message));
+                } else if count == 0 {
                     ui.label(strings::text("popup.empty"));
                 }
+                if self.compact.done && count > 0 {
+                    ui.label(strings::text("popup.history_end"));
+                }
+                ui.horizontal(|ui| {
+                    first_page = ui.button(strings::text("popup.first_page")).clicked();
+                    next_page = ui
+                        .add_enabled(
+                            !self.compact.loading && !self.compact.done && !self.compact.error,
+                            egui::Button::new(strings::text("popup.next_page")),
+                        )
+                        .clicked();
+                });
                 #[cfg(test)]
                 let mut history_clip = None;
                 let _history_area = egui::ScrollArea::vertical()
@@ -437,20 +480,47 @@ impl PopupApp {
                             history_clip = Some(ui.clip_rect());
                         }
                         for row in 0..count {
-                            let Some(clip) = self.vm.clip_at(row).cloned() else {
+                            let compact = self
+                                .vm
+                                .compact_rows()
+                                .and_then(|rows| rows.get(row))
+                                .cloned();
+                            let legacy = self.vm.clip_at(row).cloned();
+                            let Some((clip_id, pinned, preview)) = compact
+                                .as_ref()
+                                .map(|row| (row.id, row.pinned, row.preview.clone()))
+                                .or_else(|| {
+                                    legacy
+                                        .as_ref()
+                                        .map(|clip| (clip.id, clip.pinned, clip.preview.clone()))
+                                })
+                            else {
                                 continue;
                             };
-                            let clip_id = clip.id;
-                            let pinned = clip.pinned;
                             let selected = self.vm.selected == row;
-                            let truncated =
-                                popup::display_preview(&clip.preview, self.preview_width);
-                            let row_ui = ui.horizontal(|ui| {
-                                self.thumbnail_slot(ui, &clip, &mut thumbnail_demand);
-                                ui.selectable_label(selected, &truncated)
-                            });
+                            let truncated = popup::display_preview(&preview, self.preview_width);
+                            // Register the row as clickable when its child UI is created.
+                            // Adding click sense afterward clears focus on the next pass.
+                            let row_rect = egui::Rect::from_min_size(
+                                ui.next_widget_position(),
+                                egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                            );
+                            let row_ui = ui.scope_builder(
+                                egui::UiBuilder::new()
+                                    .max_rect(row_rect)
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                                    .sense(egui::Sense::click()),
+                                |ui| {
+                                    if let Some(row) = &compact {
+                                        self.compact_thumbnail_slot(ui, row, &mut thumbnail_demand);
+                                    } else if let Some(clip) = &legacy {
+                                        self.thumbnail_slot(ui, clip, &mut thumbnail_demand);
+                                    }
+                                    ui.selectable_label(selected, &truncated)
+                                },
+                            );
                             let label = row_ui.inner;
-                            let response = row_ui.response.interact(egui::Sense::click());
+                            let response = row_ui.response;
                             if selected
                                 && pending.as_ref().is_some_and(
                                     |(source, selected, selected_id)| {
@@ -505,6 +575,19 @@ impl PopupApp {
         if let Some(thumbs) = &mut self.thumbnails {
             thumbs.update(ui.ctx(), thumbnail_demand);
         }
+        if first_page {
+            self.reset_compact(false);
+        }
+        if next_page {
+            self.compact.next_page();
+            if let Some(thumbs) = &mut self.thumbnails {
+                thumbs.revoke_visibility();
+            }
+            self.vm.set_compact_rows(Vec::new());
+            if let Some(cmd) = self.compact.command() {
+                self.send(cmd);
+            }
+        }
         if open_settings {
             self.open_settings(None);
         }
@@ -519,6 +602,9 @@ impl PopupApp {
                 None => {
                     if let Ok(mut config) = self.config.lock() {
                         config.perm_source = None;
+                    }
+                    if !self.compact.query_matches(&self.vm.query) {
+                        self.reset_compact(false);
                     }
                     self.request_reveal(ui.ctx());
                 }
@@ -550,15 +636,25 @@ impl PopupApp {
             }
         }
         if let Some(row) = pin_row {
-            if let Some(clip) = self.vm.clip_at(row) {
-                let id = clip.id;
+            if let Some(id) = self
+                .vm
+                .compact_rows()
+                .and_then(|rows| rows.get(row))
+                .map(|r| r.id)
+                .or_else(|| self.vm.clip_at(row).map(|clip| clip.id))
+            {
                 let pinned = !self.vm.is_pinned(id);
                 self.send(ipc_bridge::UiCmd::PinClip(id, pinned));
             }
         }
         if let Some(row) = delete_row {
-            if let Some(clip) = self.vm.clip_at(row) {
-                let id = clip.id;
+            if let Some(id) = self
+                .vm
+                .compact_rows()
+                .and_then(|rows| rows.get(row))
+                .map(|r| r.id)
+                .or_else(|| self.vm.clip_at(row).map(|clip| clip.id))
+            {
                 self.send(ipc_bridge::UiCmd::DeleteClip(id));
             }
         }

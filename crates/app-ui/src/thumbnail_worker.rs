@@ -32,11 +32,7 @@ pub struct Key {
 impl Key {
     fn valid(&self) -> bool {
         (1..=256).contains(&self.max_px)
-            && self.content_hash.len() == 64
-            && self
-                .content_hash
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            && clipmonger_core::model::valid_clip_content_hash(&self.content_hash)
     }
 }
 /// An opaque request epoch issued by the cache for one visible identity.
