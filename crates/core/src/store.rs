@@ -38,6 +38,8 @@ const SCHEMA_VERSION: i64 = 1;
 const INLINE_LIMIT: usize = 256 * 1024;
 /// Dedupe scan window (matches default `history.dedupe_window`).
 const DEDUPE_WINDOW: usize = 100;
+/// Selected clip IDs per metadata query, below SQLite's minimum variable limit.
+const METADATA_BATCH_SIZE: usize = 128;
 /// Largest single ZIP entry accepted by restore.
 const RESTORE_MAX_ENTRY: u64 = 1024 * 1024 * 1024;
 /// Largest total ZIP payload accepted by restore.
@@ -2914,9 +2916,7 @@ impl Store {
             .collect::<Result<_, _>>()
             .map_err(|e| db_err(&e))?;
         drop(stmt);
-        for c in &mut clips {
-            c.formats = mime_list(&conn, &c.id.to_string())?;
-        }
+        fill_formats(&conn, &mut clips)?;
         Ok(clips)
     }
 
@@ -2939,9 +2939,7 @@ impl Store {
         if self.fts {
             if uri_ready {
                 if let Some(mut clips) = fts_search_with_uri(&conn, &tokens) {
-                    for clip in &mut clips {
-                        clip.formats = mime_list(&conn, &clip.id.to_string())?;
-                    }
+                    fill_formats(&conn, &mut clips)?;
                     return Ok(clips);
                 }
             }
@@ -2952,9 +2950,7 @@ impl Store {
                 .join(" AND ");
             if !uri_ready {
                 if let Some(mut clips) = fts_search(&conn, &match_q) {
-                    for c in &mut clips {
-                        c.formats = mime_list(&conn, &c.id.to_string())?;
-                    }
+                    fill_formats(&conn, &mut clips)?;
                     return Ok(clips);
                 }
             }
@@ -2979,9 +2975,7 @@ impl Store {
             .collect::<Result<_, _>>()
             .map_err(|e| db_err(&e))?;
         drop(stmt);
-        for c in &mut clips {
-            c.formats = mime_list(&conn, &c.id.to_string())?;
-        }
+        fill_formats(&conn, &mut clips)?;
         Ok(clips)
     }
 
@@ -3537,15 +3531,44 @@ fn native_id_of(mime: &str) -> Option<String> {
     }
 }
 
-/// MIME strings of one clip's payload rows, in insertion order.
-fn mime_list(conn: &Connection, id: &str) -> Result<Vec<String>, CoreError> {
-    let mut stmt = conn
-        .prepare("SELECT mime FROM clip_payloads WHERE clip_id=?1 ORDER BY rowid")
-        .map_err(|e| db_err(&e))?;
-    let mapped = stmt
-        .query_map(params![id], |r| r.get(0))
-        .map_err(|e| db_err(&e))?;
-    mapped.collect::<Result<_, _>>().map_err(|e| db_err(&e))
+/// Bounded selected-ID slots with positions to preserve the caller's order.
+fn metadata_batch_values() -> String {
+    (0..METADATA_BATCH_SIZE)
+        .map(|index| format!("(?{}, {index})", index + 1))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Fill selected payload MIME strings in insertion order, in bounded batches.
+fn fill_formats(conn: &Connection, clips: &mut [Clip]) -> Result<(), CoreError> {
+    if clips.is_empty() {
+        return Ok(());
+    }
+    let sql = format!(
+        "WITH selected(selected_id, position) AS (VALUES {}) \
+        SELECT p.mime, selected.position FROM selected CROSS JOIN clip_payloads p \
+        ON p.clip_id=selected.selected_id ORDER BY selected.position, p.rowid",
+        metadata_batch_values()
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| db_err(&e))?;
+    for batch in clips.chunks_mut(METADATA_BATCH_SIZE) {
+        let mut ids: Vec<Option<String>> =
+            batch.iter().map(|clip| Some(clip.id.to_string())).collect();
+        ids.resize_with(METADATA_BATCH_SIZE, || None);
+        for clip in &mut *batch {
+            clip.formats.clear();
+        }
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(ids), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u8>(1)?))
+            })
+            .map_err(|e| db_err(&e))?;
+        for row in rows {
+            let (mime, position) = row.map_err(|e| db_err(&e))?;
+            batch[usize::from(position)].formats.push(mime);
+        }
+    }
+    Ok(())
 }
 
 /// Escape one LIKE token (`%`, `_`, `\`).
@@ -3823,16 +3846,25 @@ fn fts_search_with_uri(conn: &Connection, tokens: &[String]) -> Option<Vec<Clip>
     for ids in intersection {
         matched.retain(|id| ids.contains(id));
     }
-    let sql = format!("SELECT {CLIP_COLS} FROM clips WHERE id=?1 AND removed=0");
+    if matched.is_empty() {
+        return Some(Vec::new());
+    }
+    let sql = format!(
+        "WITH selected(selected_id, position) AS (VALUES {}) \
+        SELECT {CLIP_COLS} FROM selected CROSS JOIN clips ON clips.id=selected.selected_id \
+        WHERE removed=0 ORDER BY selected.position",
+        metadata_batch_values()
+    );
+    let mut stmt = conn.prepare(&sql).ok()?;
     let mut clips = Vec::new();
-    for id in matched {
-        if let Some(clip) = conn
-            .query_row(&sql, [id.to_string()], clip_of)
-            .optional()
-            .ok()?
-        {
-            clips.push(clip);
-        }
+    let matched: Vec<Uuid> = matched.into_iter().collect();
+    for batch in matched.chunks(METADATA_BATCH_SIZE) {
+        let mut ids: Vec<Option<String>> = batch.iter().map(|id| Some(id.to_string())).collect();
+        ids.resize_with(METADATA_BATCH_SIZE, || None);
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(ids), clip_of)
+            .ok()?;
+        clips.extend(rows.collect::<Result<Vec<_>, _>>().ok()?);
     }
     clips.sort_by_key(|a| std::cmp::Reverse(a.last_used_ms));
     Some(clips)
@@ -5568,6 +5600,260 @@ mod tests {
             .formats
             .contains(&"x-os/win:HTML Format".to_string()));
         store.integrity_full().unwrap();
+    }
+
+    /// Metadata preparation stays constant while result and MIME order survive every branch.
+    #[test]
+    #[allow(clippy::too_many_lines)] // One fixture compares history and all search branches.
+    fn list_search_reuses_metadata_statements() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::Arc;
+
+        let profile = unique_dir("search-metadata-reuse");
+        let mut store = Store::open(&profile).unwrap();
+        let single = sample_clip(Uuid::now_v7(), "single", "reuse single", 10);
+        store
+            .insert_clip(&single, &text_payloads("single"))
+            .unwrap();
+        let multi = sample_clip(Uuid::now_v7(), "multi", "reuse multi", 20);
+        let formats = vec!["x-os/win:HTML Format".to_string(), "text/plain".to_string()];
+        store
+            .insert_clip(
+                &multi,
+                &[
+                    (formats[0].clone(), b"native".to_vec()),
+                    (formats[1].clone(), b"multi".to_vec()),
+                ],
+            )
+            .unwrap();
+        let stub = sample_clip(Uuid::now_v7(), "stub", "reuse stub", 30);
+        store.insert_metadata_capture(&stub).unwrap();
+        let removed = sample_clip(Uuid::now_v7(), "removed", "reuse removed", 40);
+        store
+            .insert_clip(&removed, &text_payloads("removed"))
+            .unwrap();
+        store.soft_delete(removed.id).unwrap();
+        let expected = vec![
+            (stub.id, vec![]),
+            (multi.id, formats),
+            (single.id, single.formats.clone()),
+        ];
+        let mime_prepares = Arc::new(AtomicU64::new(0));
+        let clip_prepares = Arc::new(AtomicU64::new(0));
+        let mime_seen = Arc::clone(&mime_prepares);
+        let clip_seen = Arc::clone(&clip_prepares);
+        store
+            .lock()
+            .authorizer(Some(move |ctx: AuthContext<'_>| {
+                if let AuthAction::Read {
+                    table_name,
+                    column_name,
+                } = ctx.action
+                {
+                    if table_name == "clip_payloads" {
+                        assert!(
+                            column_name != "data" && column_name != "blob_key",
+                            "metadata read payload storage"
+                        );
+                        if column_name == "mime" {
+                            mime_seen.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    if table_name == "clips" && column_name == "preview" {
+                        clip_seen.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+        let snapshot = |clips: Vec<Clip>| {
+            clips
+                .into_iter()
+                .map(|c| (c.id, c.formats))
+                .collect::<Vec<_>>()
+        };
+        let listed = snapshot(store.list_history(10, 0, false).unwrap());
+        assert_eq!(listed, expected);
+        assert_eq!(
+            mime_prepares.swap(0, Ordering::SeqCst),
+            1,
+            "history MIME preparations"
+        );
+        assert_eq!(
+            snapshot(store.list_history(1, 1, false).unwrap()),
+            expected[1..2]
+        );
+        let mut all = vec![(removed.id, removed.formats.clone())];
+        all.extend(expected.clone());
+        assert_eq!(snapshot(store.list_history(10, 0, true).unwrap()), all);
+        for branch in ["uri-fts", "uri-like", "plain-fts", "plain-like"] {
+            store.fts = branch.ends_with("fts");
+            if branch == "plain-fts" {
+                store
+                    .lock()
+                    .execute_batch("ALTER TABLE uri_search RENAME TO legacy_uri_search")
+                    .unwrap();
+            }
+            mime_prepares.store(0, Ordering::SeqCst);
+            clip_prepares.store(0, Ordering::SeqCst);
+            assert_eq!(
+                snapshot(store.search("reuse").unwrap()),
+                expected,
+                "{branch}"
+            );
+            assert_eq!(
+                mime_prepares.load(Ordering::SeqCst),
+                1,
+                "{branch} MIME preparations"
+            );
+            // Bound LIMIT/LIKE queries may be automatically recompiled by SQLite.
+            // Count only the optimized URI FTS lookup, which has neither clause.
+            if branch == "uri-fts" {
+                assert_eq!(
+                    clip_prepares.load(Ordering::SeqCst),
+                    1,
+                    "{branch} clip preparations"
+                );
+            }
+            mime_prepares.store(0, Ordering::SeqCst);
+            assert_eq!(store.search("absent").unwrap(), [] as [Clip; 0]);
+            assert_eq!(
+                mime_prepares.load(Ordering::SeqCst),
+                0,
+                "{branch} empty result"
+            );
+        }
+        store
+            .lock()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        // Unselected corrupt MIME metadata must not affect reads; selected corruption must fail.
+        store
+            .lock()
+            .execute(
+                "UPDATE clip_payloads SET mime=x'00' WHERE clip_id=?1",
+                [removed.id.to_string()],
+            )
+            .unwrap();
+        assert_eq!(snapshot(store.search("reuse").unwrap()), expected);
+        store
+            .lock()
+            .execute(
+                "UPDATE clip_payloads SET mime=x'00' WHERE clip_id=?1",
+                [single.id.to_string()],
+            )
+            .unwrap();
+        assert!(store.search("reuse").is_err());
+        assert!(store.list_history(10, 0, false).is_err());
+        assert_eq!(store.list_history(0, 0, false).unwrap(), [] as [Clip; 0]);
+        drop(store);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    /// Selected metadata stays ordered and isolated across multiple SQL batches.
+    #[test]
+    #[allow(clippy::too_many_lines)] // Shared fixture exercises both batches and selected corruption.
+    fn list_search_metadata_batch_boundaries() {
+        let profile = unique_dir("search-metadata-batches");
+        let mut store = Store::open(&profile).unwrap();
+        // More live hits than one batch, with timestamps independent of insertion order.
+        let count = 131;
+        let mut expected = Vec::new();
+        let mut removed_id = Uuid::nil();
+        for index in 0..count {
+            let clip = sample_clip(
+                Uuid::now_v7(),
+                "batch",
+                "batch selected",
+                (index * 37) % count,
+            );
+            let formats = match index % 3 {
+                0 => Vec::new(),
+                1 => vec!["text/plain".to_string()],
+                _ => vec!["x-os/win:HTML Format".to_string(), "text/plain".to_string()],
+            };
+            if formats.is_empty() {
+                store.insert_metadata_capture(&clip).unwrap();
+            } else {
+                let payloads = formats
+                    .iter()
+                    .map(|mime| (mime.clone(), format!("{mime}-{index}").into_bytes()))
+                    .collect::<Vec<_>>();
+                store.insert_clip(&clip, &payloads).unwrap();
+            }
+            if index == 1 {
+                store.soft_delete(clip.id).unwrap();
+                removed_id = clip.id;
+            } else {
+                expected.push((clip.last_used_ms, clip.id, formats));
+            }
+        }
+        expected.sort_by_key(|(time, _, _)| std::cmp::Reverse(*time));
+        let expected = expected
+            .into_iter()
+            .map(|(_, id, formats)| (id, formats))
+            .collect::<Vec<_>>();
+        let unselected = sample_clip(Uuid::now_v7(), "other", "unrelated", -1);
+        store
+            .insert_clip(&unselected, &text_payloads("unrelated"))
+            .unwrap();
+        for id in [unselected.id, removed_id] {
+            store
+                .lock()
+                .execute(
+                    "UPDATE clips SET preview=x'00' WHERE id=?1",
+                    [id.to_string()],
+                )
+                .unwrap();
+            store
+                .lock()
+                .execute(
+                    "UPDATE clip_payloads SET mime=x'00' WHERE clip_id=?1",
+                    [id.to_string()],
+                )
+                .unwrap();
+        }
+        let snapshot = |clips: Vec<Clip>| {
+            clips
+                .into_iter()
+                .map(|c| (c.id, c.formats))
+                .collect::<Vec<_>>()
+        };
+        let limit = u64::try_from(expected.len()).unwrap();
+        assert_eq!(
+            snapshot(store.list_history(limit, 0, false).unwrap()),
+            expected
+        );
+        assert_eq!(
+            snapshot(store.list_history(limit - 2, 1, false).unwrap()),
+            expected[1..expected.len() - 1]
+        );
+        for fts in [true, false] {
+            store.fts = fts;
+            assert_eq!(
+                snapshot(store.search("batch selected").unwrap()),
+                expected,
+                "FTS={fts}"
+            );
+        }
+        // Corruption in a selected tail batch must still propagate to the caller.
+        let tail_id = expected[super::METADATA_BATCH_SIZE..]
+            .iter()
+            .find(|(_, formats)| formats.len() == 1)
+            .unwrap()
+            .0;
+        store
+            .lock()
+            .execute(
+                "UPDATE clip_payloads SET mime=x'00' WHERE clip_id=?1",
+                [tail_id.to_string()],
+            )
+            .unwrap();
+        assert!(store.search("batch selected").is_err());
+        assert!(store.list_history(limit, 0, false).is_err());
+        assert_eq!(store.search("absent").unwrap(), [] as [Clip; 0]);
+        drop(store);
+        let _ = std::fs::remove_dir_all(profile);
     }
 
     /// Backup roundtrip with an external blob; source untouched.
