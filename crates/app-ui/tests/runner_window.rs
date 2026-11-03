@@ -1223,3 +1223,100 @@ fn assert_none_visible(window: &SetupWindow) {
     assert!(!window.native.on_screen());
     assert_eq!(window.native.calls(), NO_CALLS);
 }
+
+#[test]
+fn activation_keeps_each_shows_timestamp_until_visible_and_clears_on_hide() {
+    use clipmonger_app_ui::runner::window::{Activation, ActivationPolicy, OsWindow};
+    struct Timed {
+        visible: Cell<bool>,
+        times: RefCell<Vec<Option<u32>>>,
+    }
+    impl OsWindow for Timed {
+        fn is_visible(&self) -> Option<bool> {
+            Some(self.visible.get())
+        }
+        fn set_visible(&self, value: bool) {
+            self.visible.set(value);
+        }
+        fn is_minimized(&self) -> Option<bool> {
+            Some(false)
+        }
+        fn has_focus(&self) -> bool {
+            false
+        }
+        fn focus_window(&self) {
+            self.times.borrow_mut().push(None);
+        }
+        fn focus_with_time(&self, time: Option<u32>) {
+            self.times.borrow_mut().push(time);
+        }
+    }
+    let host = Timed {
+        visible: Cell::new(false),
+        times: RefCell::new(vec![]),
+    };
+    let mut activation = Activation::new();
+    activation.reconcile_with_time(
+        false,
+        false,
+        true,
+        Some(&host),
+        ActivationPolicy::Supported,
+        Some(123),
+    );
+    host.visible.set(true);
+    activation.reconcile_with_time(
+        false,
+        true,
+        true,
+        Some(&host),
+        ActivationPolicy::Supported,
+        None,
+    );
+    activation.reconcile_with_time(
+        false,
+        true,
+        true,
+        Some(&host),
+        ActivationPolicy::Supported,
+        None,
+    );
+    activation.reconcile_with_time(
+        false,
+        true,
+        false,
+        Some(&host),
+        ActivationPolicy::Supported,
+        None,
+    );
+    activation.reconcile_with_time(
+        false,
+        false,
+        true,
+        Some(&host),
+        ActivationPolicy::Supported,
+        Some(456),
+    );
+    assert_eq!(*host.times.borrow(), vec![Some(123), Some(456)]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn per_show_popup_creation_uses_only_that_shows_wayland_token() {
+    use clipmonger_app_ui::runner::window::show_attributes;
+    let first = show_attributes(
+        winit::window::WindowAttributes::default(),
+        true,
+        Some("first-show-token"),
+    );
+    let second = show_attributes(
+        winit::window::WindowAttributes::default(),
+        true,
+        Some("second-show-token"),
+    );
+    let absent = show_attributes(winit::window::WindowAttributes::default(), true, None);
+    assert!(format!("{first:?}").contains("first-show-token"));
+    assert!(format!("{second:?}").contains("second-show-token"));
+    assert!(!format!("{second:?}").contains("first-show-token"));
+    assert!(!format!("{absent:?}").contains("show-token"));
+}

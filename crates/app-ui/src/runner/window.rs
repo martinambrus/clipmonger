@@ -129,6 +129,25 @@ pub fn prepare_host(
     }
 }
 
+/// Apply platform activation metadata to each newly created popup.
+#[must_use]
+pub fn show_attributes(
+    attributes: WindowAttributes,
+    per_show_popup: bool,
+    token: Option<&str>,
+) -> WindowAttributes {
+    #[cfg(target_os = "linux")]
+    {
+        use winit::platform::startup_notify::WindowAttributesExtStartupNotify as _;
+        if let (true, Some(token)) = (per_show_popup, token) {
+            return attributes
+                .with_activation_token(winit::window::ActivationToken::from_raw(token.to_owned()));
+        }
+    }
+    let _ = (per_show_popup, token);
+    attributes
+}
+
 /// The Win32 window handle of `window` as `u64` (`hwnd as usize as u64`, never
 /// negative), `None` on other platforms. Winit refuses the handle off the
 /// event loop thread, so call this on that thread.
@@ -136,6 +155,17 @@ pub fn prepare_host(
 pub fn hwnd(window: &Window) -> Option<u64> {
     match window.window_handle().ok()?.as_raw() {
         RawWindowHandle::Win32(handle) => Some(handle.hwnd.get().cast_unsigned() as u64),
+        _ => None,
+    }
+}
+
+/// X11 window ID, when running on X11.
+#[must_use]
+pub fn x11_window(window: &Window) -> Option<u64> {
+    match window.window_handle().ok()?.as_raw() {
+        #[cfg(target_os = "linux")]
+        RawWindowHandle::Xlib(handle) => Some(handle.window),
+        RawWindowHandle::Xcb(handle) => Some(u64::from(handle.window.get())),
         _ => None,
     }
 }
@@ -210,6 +240,10 @@ pub trait OsWindow {
     fn has_focus(&self) -> bool;
     /// Bring the window to the front.
     fn focus_window(&self);
+    /// Focus using the originating X11 event time when available.
+    fn focus_with_time(&self, _time: Option<u32>) {
+        self.focus_window();
+    }
 }
 
 impl OsWindow for Window {
@@ -232,6 +266,69 @@ impl OsWindow for Window {
     fn focus_window(&self) {
         #[cfg(not(target_os = "windows"))]
         Window::focus_window(self);
+    }
+
+    fn focus_with_time(&self, time: Option<u32>) {
+        #[cfg(target_os = "linux")]
+        if let (Some(time), Some(window)) = (time, x11_window(self)) {
+            if send_x11_activation(window, time) {
+                return;
+            }
+        }
+        let _ = time;
+        OsWindow::focus_window(self);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_x11_activation(window: u64, time: u32) -> bool {
+    use x11rb::{
+        connection::Connection as _,
+        protocol::xproto::{ConnectionExt as _, EventMask},
+    };
+    let send = || -> Option<()> {
+        let window = u32::try_from(window).ok()?;
+        let (connection, _) = x11rb::connect(None).ok()?;
+        let root = connection.query_tree(window).ok()?.reply().ok()?.root;
+        let atom = connection
+            .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+            .ok()?
+            .reply()
+            .ok()?
+            .atom;
+        let event = x11_activation_event(window, atom, time);
+        connection
+            .send_event(
+                false,
+                root,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            )
+            .ok()?
+            .check()
+            .ok()?;
+        connection.flush().ok()?;
+        Some(())
+    };
+    send().is_some()
+}
+
+#[cfg(target_os = "linux")]
+fn x11_activation_event(
+    window: u32,
+    atom: u32,
+    time: u32,
+) -> x11rb::protocol::xproto::ClientMessageEvent {
+    x11rb::protocol::xproto::ClientMessageEvent::new(32, window, atom, [1, time, 0, 0, 0])
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod activation_message_tests {
+    #[test]
+    fn net_active_window_message_carries_original_input_time() {
+        let event = super::x11_activation_event(123, 456, 789);
+        assert_eq!((event.window, event.type_), (123, 456));
+        assert_eq!(event.data.as_data32(), [1, 789, 0, 0, 0]);
     }
 }
 
@@ -296,17 +393,66 @@ pub fn try_activate<W: OsWindow>(window: &W, per_show: bool) -> ActivationStatus
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Activation {
     pending: bool,
+    time: Option<u32>,
 }
 
 impl Activation {
     #[must_use]
     pub fn new() -> Self {
-        Self { pending: false }
+        Self {
+            pending: false,
+            time: None,
+        }
     }
 
     #[must_use]
     pub fn is_pending(&self) -> bool {
         self.pending
+    }
+
+    /// Reconcile with an input timestamp, retaining it while the host is not visible.
+    pub fn reconcile_with_time<W: OsWindow>(
+        &mut self,
+        request: bool,
+        previous_open: bool,
+        desired_open: bool,
+        host: Option<&W>,
+        policy: ActivationPolicy,
+        time: Option<u32>,
+    ) {
+        let edge = !previous_open && desired_open;
+        if !desired_open {
+            self.pending = false;
+            self.time = None;
+            return;
+        }
+        if request || edge {
+            self.time = time;
+        }
+        let mut pending = self.pending || request || edge;
+        if pending {
+            if let Some(window) = host {
+                let status = if policy == ActivationPolicy::Unsupported {
+                    ActivationStatus::Done
+                } else if window.is_visible() != Some(true) {
+                    ActivationStatus::Pending
+                } else if window.is_minimized() == Some(true) || window.has_focus() {
+                    ActivationStatus::Done
+                } else {
+                    window.focus_with_time(self.time);
+                    ActivationStatus::Done
+                };
+                if status == ActivationStatus::Done {
+                    pending = false;
+                }
+            } else if policy == ActivationPolicy::Supported {
+                pending = false;
+            }
+        }
+        self.pending = pending;
+        if !pending {
+            self.time = None;
+        }
     }
 
     pub fn reconcile<W: OsWindow>(
@@ -317,23 +463,7 @@ impl Activation {
         host: Option<&W>,
         policy: ActivationPolicy,
     ) {
-        let edge = !previous_open && desired_open;
-        let mut pending = self.pending || request || edge;
-        if !desired_open {
-            self.pending = false;
-            return;
-        }
-        if pending {
-            if let Some(window) = host {
-                match try_activate_with_policy(window, policy) {
-                    ActivationStatus::Done => pending = false,
-                    ActivationStatus::Pending => {}
-                }
-            } else if policy == ActivationPolicy::Supported {
-                pending = false;
-            }
-        }
-        self.pending = pending;
+        self.reconcile_with_time(request, previous_open, desired_open, host, policy, None);
     }
 }
 

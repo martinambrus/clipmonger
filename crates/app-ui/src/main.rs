@@ -329,10 +329,7 @@ fn build_app(
     let wake = startup.handle.waker();
     let (cmds, push_events, events) =
         ipc_bridge::Bridge::spawn_shared_with_wake(transport, wake.clone());
-    let extra = startup.popup_hwnd.map_or_else(
-        || serde_json::json!({}),
-        |hwnd| serde_json::json!({ "popup_hwnd": hwnd }),
-    );
+    let extra = serde_json::json!({ "popup_hwnd": startup.popup_hwnd, "popup_x11_window": startup.popup_x11_window });
     start_push_listener(profile.clone(), extra, push_events, wake.clone());
     let worker =
         clipmonger_app_ui::thumbnail_worker::Worker::start(profile.clone(), wake.clone()).ok();

@@ -5770,3 +5770,29 @@ fn restored_missing_and_partial_theme_resets_previous_theme_defaults() {
         assert_zoom(&rig.settings.ctx, expected_scale, "restored settings");
     }
 }
+
+#[test]
+fn popup_activation_metadata_follows_show_raise_and_hide() {
+    let mut rig = Rig::closed();
+    rig.push(clipmonger_app_ui::push::push_event(
+        clipmonger_ipc::proto::methods::SHOW_POPUP_TOPIC,
+        serde_json::json!({ "source": "hotkey", "x11_time": 812, "activation_token": "wayland-token" }),
+    ).expect("wire event"));
+    rig.tick();
+    assert_eq!(
+        rig.app.take_popup_activation_metadata(),
+        Some(clipmonger_app_ui::runner::PopupActivation {
+            x11_time: Some(812),
+            activation_token: Some("wayland-token".into())
+        })
+    );
+    assert_eq!(rig.app.take_popup_activation_metadata(), None);
+    rig.push(UiEvent::ShowPopup(ShowPopupEvent {
+        source: "hotkey".into(),
+        x11_time: Some(813),
+        ..ShowPopupEvent::default()
+    }));
+    rig.push(toggle());
+    rig.tick();
+    assert_eq!(rig.app.take_popup_activation_metadata(), None);
+}

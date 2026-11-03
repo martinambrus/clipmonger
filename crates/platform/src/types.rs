@@ -22,6 +22,24 @@ pub enum SubscribeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HotkeyId(pub u32);
 
+/// One hotkey firing and any activation authority supplied with that event.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HotkeyActivation {
+    /// X11 server timestamp, if supplied by the backend.
+    pub x11_time: Option<u32>,
+    /// Wayland activation token, if supplied by the compositor.
+    pub activation_token: Option<String>,
+}
+
+/// A hotkey firing with its own activation metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyEvent {
+    /// Registered hotkey.
+    pub id: HotkeyId,
+    /// Metadata associated with this firing.
+    pub activation: HotkeyActivation,
+}
+
 /// Foreground application identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppId {

@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use clipmonger_platform::chord;
 use clipmonger_platform::traits::HotkeyManager;
-use clipmonger_platform::types::{Affinity, Error, HotkeyId, Result};
+use clipmonger_platform::types::{
+    Affinity, Error, HotkeyActivation, HotkeyEvent, HotkeyId, Result,
+};
 use x11rb14::connection::Connection as _;
 use x11rb14::protocol::xproto::{self, ConnectionExt as _, GrabMode, ModMask, Window};
 use x11rb14::rust_connection::RustConnection;
@@ -95,7 +97,7 @@ impl X11Hotkeys {
     /// stream first (the live keymap is already past back-to-back
     /// synthesis) with the live keymap as backup. Multi-device echoes
     /// share one timestamp, and a recent grab or raw fire suppresses.
-    fn on_raw_press(&mut self, keycode: u8, time: u32, fired: &mut Vec<HotkeyId>) {
+    fn on_raw_press(&mut self, keycode: u8, time: u32, fired: &mut Vec<HotkeyEvent>) {
         let keymap = self.live_keymap();
         let matches: Vec<HotkeyId> = self
             .by_id
@@ -120,7 +122,7 @@ impl X11Hotkeys {
         keycode: u8,
         time: u32,
         matches: Vec<HotkeyId>,
-        fired: &mut Vec<HotkeyId>,
+        fired: &mut Vec<HotkeyEvent>,
     ) {
         let _ = keycode;
         for id in matches {
@@ -138,13 +140,25 @@ impl X11Hotkeys {
             }
             self.last_raw.insert(id, time);
             self.last_raw_at.insert(id, Instant::now());
-            if !fired.contains(&id) {
-                fired.push(id);
+            if !fired.iter().any(|event| event.id == id) {
+                fired.push(HotkeyEvent {
+                    id,
+                    activation: HotkeyActivation {
+                        x11_time: Some(time),
+                        ..Default::default()
+                    },
+                });
             }
         }
     }
 
-    fn on_grab_press(&mut self, keycode: u8, modifiers: u32, fired: &mut Vec<HotkeyId>) {
+    fn on_grab_press(
+        &mut self,
+        keycode: u8,
+        modifiers: u32,
+        time: u32,
+        fired: &mut Vec<HotkeyEvent>,
+    ) {
         for (id, grab) in &self.by_id {
             if grab_matches(grab, keycode, modifiers) {
                 self.last_grab.insert(*id, Instant::now());
@@ -152,8 +166,14 @@ impl X11Hotkeys {
                     .last_raw_at
                     .get(id)
                     .is_some_and(|at| at.elapsed() < Duration::from_millis(300));
-                if !raw_fired && !fired.contains(id) {
-                    fired.push(*id);
+                if !raw_fired && !fired.iter().any(|event| event.id == *id) {
+                    fired.push(HotkeyEvent {
+                        id: *id,
+                        activation: HotkeyActivation {
+                            x11_time: Some(time),
+                            ..Default::default()
+                        },
+                    });
                 }
             }
         }
@@ -342,6 +362,11 @@ impl HotkeyManager for X11Hotkeys {
     }
 
     fn poll(&mut self, timeout: Duration) -> Result<Vec<HotkeyId>> {
+        self.poll_events(timeout)
+            .map(|events| events.into_iter().map(|event| event.id).collect())
+    }
+
+    fn poll_events(&mut self, timeout: Duration) -> Result<Vec<HotkeyEvent>> {
         let deadline = Instant::now() + timeout;
         let mut fired = Vec::new();
         while Instant::now() < deadline {
@@ -354,7 +379,12 @@ impl HotkeyManager for X11Hotkeys {
             };
             match event {
                 Some(x11rb14::protocol::Event::KeyPress(press)) => {
-                    self.on_grab_press(press.detail, u32::from(u16::from(press.state)), &mut fired);
+                    self.on_grab_press(
+                        press.detail,
+                        u32::from(u16::from(press.state)),
+                        press.time,
+                        &mut fired,
+                    );
                 }
                 Some(x11rb14::protocol::Event::XinputRawKeyPress(raw)) => {
                     if self.raw_ok {
@@ -556,18 +586,22 @@ mod tests {
         };
         let mut fired = Vec::new();
         manager.on_raw_candidates(24, 100, vec![ctrl], &mut fired);
-        assert_eq!(fired, [ctrl]);
+        assert_eq!(
+            fired.iter().map(|event| event.id).collect::<Vec<_>>(),
+            [ctrl]
+        );
+        assert_eq!(fired[0].activation.x11_time, Some(100));
         fired.clear();
-        manager.on_grab_press(24, 0x04, &mut fired);
+        manager.on_grab_press(24, 0x04, 150, &mut fired);
         assert!(fired.is_empty(), "grab echo must not repeat the same chord");
         manager.on_raw_candidates(24, 101, vec![shifted], &mut fired);
         assert_eq!(
-            fired,
+            fired.iter().map(|event| event.id).collect::<Vec<_>>(),
             [shifted],
             "a different chord on the same key must fire"
         );
         fired.clear();
-        manager.on_grab_press(24, 0x05, &mut fired);
+        manager.on_grab_press(24, 0x05, 151, &mut fired);
         assert!(
             fired.is_empty(),
             "the second chord's grab echo must be suppressed"
@@ -580,18 +614,37 @@ mod tests {
         manager.last_grab.clear();
         manager.last_raw.clear();
         manager.last_raw_at.clear();
-        manager.on_grab_press(24, 0x04, &mut fired);
-        assert_eq!(fired, [ctrl]);
+        manager.on_grab_press(24, 0x04, 150, &mut fired);
+        assert_eq!(
+            fired.iter().map(|event| event.id).collect::<Vec<_>>(),
+            [ctrl]
+        );
+        assert_eq!(fired[0].activation.x11_time, Some(150));
         fired.clear();
         manager.on_raw_candidates(24, 200, vec![ctrl], &mut fired);
         assert!(fired.is_empty(), "raw echo after a grab must be suppressed");
         manager.on_raw_candidates(24, 201, vec![shifted], &mut fired);
-        assert_eq!(fired, [shifted]);
+        assert_eq!(
+            fired.iter().map(|event| event.id).collect::<Vec<_>>(),
+            [shifted]
+        );
         fired.clear();
         manager.on_raw_candidates(24, 202, vec![shifted], &mut fired);
         assert!(
             fired.is_empty(),
             "rapid repeats of one chord remain suppressed"
+        );
+        manager.last_grab.clear();
+        manager.last_raw.clear();
+        manager.last_raw_at.clear();
+        manager.on_raw_candidates(24, 301, vec![ctrl], &mut fired);
+        manager.on_raw_candidates(24, 302, vec![shifted], &mut fired);
+        assert_eq!(
+            fired
+                .iter()
+                .map(|e| (e.id, e.activation.x11_time))
+                .collect::<Vec<_>>(),
+            vec![(ctrl, Some(301)), (shifted, Some(302))]
         );
     }
 
