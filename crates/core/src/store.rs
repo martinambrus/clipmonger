@@ -1838,12 +1838,28 @@ impl Store {
 
     /// Crash-safe external blob write: temp, fsync, atomic rename.
     fn write_blob_file(&self, key: &str, bytes: &[u8]) -> Result<(), CoreError> {
+        self.write_blob_file_inner(
+            key,
+            bytes,
+            #[cfg(test)]
+            || {},
+        )
+    }
+
+    fn write_blob_file_inner(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        #[cfg(test)] before_collision_check: impl FnOnce(),
+    ) -> Result<(), CoreError> {
+        let (_, sha) = Self::blob_key_for(bytes);
         parse_blob_key(key).ok_or_else(|| CoreError::Corrupt {
             message: "invalid blob key".to_string(),
         })?;
         blobs_root_ok(&self.blobs)?;
         let final_path = safe_blob_path(&self.blobs, key)?;
         if fs::symlink_metadata(&final_path).is_ok() {
+            safe_blob_read_capped(&self.blobs, key, &sha, bytes.len())?;
             return Ok(());
         }
         let tmp_name = format!(
@@ -1880,7 +1896,10 @@ impl Store {
                     message: "blob temp became symlink".to_string(),
                 });
             }
+            #[cfg(test)]
+            before_collision_check();
             if fs::symlink_metadata(&final_path).is_ok() {
+                safe_blob_read_capped(&self.blobs, key, &sha, bytes.len())?;
                 return Ok(());
             }
             fs::rename(&tmp, &final_path).map_err(CoreError::Io)?;
@@ -2059,6 +2078,18 @@ impl Store {
                     params![key, sha, i64_from_usize(bytes.len())?, clip.created_ms],
                 )
                 .map_err(|e| db_err(&e))?;
+                let (stored_sha, stored_bytes): (String, i64) = tx
+                    .query_row(
+                        "SELECT sha256, bytes FROM clip_blobs WHERE blob_key=?1",
+                        params![key],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|e| db_err(&e))?;
+                if stored_sha != *sha || stored_bytes != i64_from_usize(bytes.len())? {
+                    return Err(CoreError::Corrupt {
+                        message: "external blob metadata mismatch".to_string(),
+                    });
+                }
                 let native = native_id_of(mime);
                 tx.execute(
                     "INSERT INTO clip_payloads(clip_id, mime, external, data, blob_key, native_id) \
@@ -3673,6 +3704,7 @@ fn enforce_bytes(tx: &rusqlite::Transaction<'_>, max: u64) -> Result<u64, CoreEr
                 [],
                 |r| r.get(0),
             )
+            .optional()
             .map_err(|e| db_err(&e))?;
         let Some(id) = id else { break };
         let bytes_i: i64 = tx
@@ -3999,6 +4031,26 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Barrier;
     use uuid::Uuid;
+
+    #[test]
+    fn t76_late_blob_collision_is_verified_and_temp_removed() {
+        for valid in [false, true] {
+            let profile = unique_dir("t76-late-collision");
+            let store = Store::open(&profile).unwrap();
+            let bytes = vec![42; 262_145];
+            let (key, _) = Store::blob_key_for(&bytes);
+            let path = profile.join("blobs").join(&key);
+            let mut collision = bytes.clone();
+            if !valid {
+                collision[0] ^= 1;
+            }
+            let result = store
+                .write_blob_file_inner(&key, &bytes, || std::fs::write(&path, collision).unwrap());
+            assert_eq!(result.is_ok(), valid);
+            assert_eq!(std::fs::read_dir(profile.join("blobs")).unwrap().count(), 1);
+            let _ = std::fs::remove_dir_all(profile);
+        }
+    }
 
     #[test]
     fn uri_backfill_upgrades_prototype_markers() {
