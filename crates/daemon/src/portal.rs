@@ -246,6 +246,7 @@ mod tests {
                     return Err(Error::Unavailable("factory still unavailable".into()));
                 }
                 Ok(FakeMonitor::with_results(vec![Ok(vec![CaptureEvent {
+                    native_sequence: None,
                     offers: Vec::new(),
                     origin: CaptureOrigin::Clipboard,
                     sensitive: true,

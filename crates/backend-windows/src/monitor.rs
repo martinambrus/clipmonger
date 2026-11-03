@@ -31,6 +31,8 @@ pub struct WinMonitor {
     subscribed_clipboard: bool,
     #[cfg(windows)]
     poll_state: PollState,
+    #[cfg(windows)]
+    policy: crate::capture_policy::CapturePolicy,
 }
 
 impl WinMonitor {
@@ -41,6 +43,14 @@ impl WinMonitor {
     /// Returns [`Error::Unavailable`] when the session cannot provide a
     /// clipboard listener (non-Windows builds always fail this way).
     pub fn new() -> Result<Self> {
+        Self::with_policy(std::sync::Arc::new(|| Some(Vec::new())))
+    }
+
+    /// Start a capture monitor with a live owner policy.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unavailable`] if the clipboard listener cannot start.
+    pub fn with_policy(policy: crate::capture_policy::CapturePolicy) -> Result<Self> {
         #[cfg(windows)]
         {
             let (tx, rx): (Sender<()>, Receiver<()>) = std::sync::mpsc::channel();
@@ -51,10 +61,12 @@ impl WinMonitor {
                 wakes: Some(rx),
                 subscribed_clipboard: false,
                 poll_state: PollState::default(),
+                policy,
             })
         }
         #[cfg(not(windows))]
         {
+            drop(policy);
             Err(Error::Unavailable(
                 "clipboard monitor needs a Windows session".to_string(),
             ))
@@ -246,6 +258,7 @@ fn capture_event_from_offers(
         })
         .collect();
     CaptureEvent {
+        native_sequence: None,
         offers,
         origin: CaptureOrigin::Clipboard,
         sensitive: refused_privacy_marker || crate::optout::should_skip(&decoded),
@@ -281,22 +294,43 @@ fn enumerate_with_source(marker_source: &dyn MarkerSource) -> Offers {
     (offers, probe)
 }
 
-/// Enumerate current offers plus opt-out `(name, value)` pairs.
 #[cfg(windows)]
 type Offers = (Vec<FormatOffer>, Vec<(String, MarkerValue)>);
 
-#[cfg(windows)]
-fn enumerate_offers() -> Result<Offers> {
-    crate::transfer::imp::with_open("enumerate", || {
-        Ok(enumerate_with_source(&NativeMarkerSource))
-    })
-}
-
 /// Build the capture event for the current clipboard content.
 #[cfg(windows)]
-fn current_event() -> Result<CaptureEvent> {
-    let (offers, probe) = enumerate_offers()?;
-    Ok(capture_event_from_offers(offers, probe))
+fn current_event(policy: &crate::capture_policy::CapturePolicy) -> Result<CaptureEvent> {
+    crate::transfer::imp::with_open("enumerate", || {
+        let sequence = current_seq();
+        let entries = policy();
+        let owner = crate::sys::clipboard_owner_executable();
+        match crate::capture_policy::admission(
+            sequence,
+            sequence,
+            owner.as_deref(),
+            entries.as_deref(),
+        ) {
+            crate::capture_policy::Admission::Stale => {
+                return Err(Error::Timeout("clipboard sequence unavailable".into()))
+            }
+            crate::capture_policy::Admission::OwnerDenied => {
+                return Ok(CaptureEvent {
+                    native_sequence: sequence,
+                    offers: vec![FormatOffer {
+                        mime: "text/plain".into(),
+                        bytes_hint: None,
+                    }],
+                    origin: CaptureOrigin::Clipboard,
+                    sensitive: true,
+                })
+            }
+            crate::capture_policy::Admission::Allow => {}
+        }
+        let (offers, probe) = enumerate_with_source(&NativeMarkerSource);
+        let mut event = capture_event_from_offers(offers, probe);
+        event.native_sequence = sequence;
+        Ok(event)
+    })
 }
 
 #[allow(dead_code)]
@@ -316,13 +350,24 @@ fn fingerprint_parts(text: Option<&[u8]>, offers: &[FormatOffer]) -> String {
 }
 
 #[cfg(windows)]
-fn content_fingerprint(event: &CaptureEvent) -> String {
+fn content_fingerprint(
+    event: &CaptureEvent,
+    policy: &crate::capture_policy::CapturePolicy,
+) -> String {
     if event.sensitive {
         return fingerprint_parts(None, &event.offers);
     }
     let result: Result<String> = crate::transfer::imp::with_open("fingerprint", || {
-        let source = NativeFingerprintSource;
-        Ok(fingerprint_with_source(event, &source))
+        let entries = policy();
+        let owner = crate::sys::clipboard_owner_executable();
+        Ok(crate::capture_policy::guarded(
+            event.native_sequence,
+            current_seq(),
+            owner.as_deref(),
+            entries.as_deref(),
+            || fingerprint_with_source(event, &NativeFingerprintSource),
+        )
+        .unwrap_or_else(|_| fingerprint_parts(None, &event.offers)))
     });
     result.unwrap_or_else(|_| fingerprint_parts(None, &event.offers))
 }
@@ -360,8 +405,8 @@ impl ClipboardMonitor for WinMonitor {
                 rx,
                 timeout,
                 current_seq,
-                current_event,
-                content_fingerprint,
+                || current_event(&self.policy),
+                |event| content_fingerprint(event, &self.policy),
                 std::thread::sleep,
             )
         }
@@ -423,7 +468,7 @@ impl PollState {
                                     sleep(std::time::Duration::from_millis(40));
                                     continue;
                                 }
-                                self.last_seq = seq;
+                                self.last_seq = event.native_sequence.or(seq);
                                 self.last_hash = Some(content_fingerprint(&event));
                                 events.push(event);
                                 sleep(std::time::Duration::from_millis(30));
@@ -460,7 +505,7 @@ impl PollState {
                     match current_event() {
                         Ok(event) => {
                             let fp = content_fingerprint(&event);
-                            self.last_seq = Some(seq);
+                            self.last_seq = event.native_sequence.or(Some(seq));
                             self.last_hash = Some(fp);
                             events.push(event);
                         }
@@ -603,6 +648,7 @@ mod tests {
     fn sensitive_fingerprint_does_not_invoke_reader() {
         let offers = [offer("text/plain")];
         let event = clipmonger_platform::types::CaptureEvent {
+            native_sequence: None,
             offers: offers.to_vec(),
             origin: clipmonger_platform::types::CaptureOrigin::Clipboard,
             sensitive: true,
@@ -631,6 +677,7 @@ mod tests {
     fn oversize_fingerprint_falls_back_without_reading() {
         let offers = [offer("text/plain")];
         let event = clipmonger_platform::types::CaptureEvent {
+            native_sequence: None,
             offers: offers.to_vec(),
             origin: clipmonger_platform::types::CaptureOrigin::Clipboard,
             sensitive: false,
@@ -655,6 +702,7 @@ mod tests {
     fn unknown_size_fingerprint_falls_back_without_reading() {
         let offers = [offer("text/plain")];
         let event = clipmonger_platform::types::CaptureEvent {
+            native_sequence: None,
             offers: offers.to_vec(),
             origin: clipmonger_platform::types::CaptureOrigin::Clipboard,
             sensitive: false,
@@ -679,6 +727,7 @@ mod tests {
     fn normal_text_fingerprint_stable() {
         let offers = [offer("text/plain"), offer("text/html")];
         let event = clipmonger_platform::types::CaptureEvent {
+            native_sequence: None,
             offers: offers.to_vec(),
             origin: clipmonger_platform::types::CaptureOrigin::Clipboard,
             sensitive: false,
@@ -855,6 +904,7 @@ mod tests {
                     reads.set(reads.get() + 1);
                     if reads.get() == 1 {
                         Ok(CaptureEvent {
+                            native_sequence: None,
                             offers: vec![offer("text/plain")],
                             origin: CaptureOrigin::Clipboard,
                             sensitive: true,
@@ -902,6 +952,7 @@ mod tests {
                 || Some(9),
                 || {
                     Ok(CaptureEvent {
+                        native_sequence: None,
                         offers: vec![offer("text/html")],
                         origin: CaptureOrigin::Clipboard,
                         sensitive: false,

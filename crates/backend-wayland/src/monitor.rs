@@ -183,6 +183,7 @@ impl ClipboardMonitor for WlMonitor {
                 if fire {
                     if let Some(pending) = shared.pending_primary.take() {
                         out.push(CaptureEvent {
+                            native_sequence: None,
                             offers: pending
                                 .mimes
                                 .iter()
@@ -281,6 +282,7 @@ fn run_regular_watcher(
                 }
                 let sensitive = is_sensitive(&mime_types);
                 let event = CaptureEvent {
+                    native_sequence: None,
                     offers: mime_types
                         .iter()
                         .map(|mime| FormatOffer {
@@ -352,6 +354,7 @@ fn run_primary_watcher(shared: &Arc<Mutex<MonitorShared>>, stop: &Arc<AtomicBool
                     }
                     if guard.debouncer.offer(len, now_ms()) {
                         guard.queue.push(CaptureEvent {
+                            native_sequence: None,
                             offers: mime_types
                                 .iter()
                                 .map(|mime| FormatOffer {
@@ -419,6 +422,7 @@ mod lifecycle_tests {
         for panic in [false, true] {
             let shared = Arc::new(Mutex::new(MonitorShared {
                 queue: vec![CaptureEvent {
+                    native_sequence: None,
                     offers: Vec::new(),
                     origin: CaptureOrigin::Clipboard,
                     sensitive: true,
@@ -449,6 +453,7 @@ mod lifecycle_tests {
         let handle = finish_worker(move || {
             let mut queue = producer.lock().unwrap();
             queue.queue.push(CaptureEvent {
+                native_sequence: None,
                 offers: Vec::new(),
                 origin: CaptureOrigin::Clipboard,
                 sensitive: true,

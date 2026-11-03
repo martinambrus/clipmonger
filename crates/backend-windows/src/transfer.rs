@@ -452,6 +452,75 @@ pub(crate) mod imp {
     }
 }
 
+#[cfg(windows)]
+fn read_open(mime: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    if mime == "text/plain" || mime == "text/plain;charset=utf-8" {
+        return read_text_candidates(|id| imp::read_one(id, "text/plain", max_bytes));
+    }
+    if mime == "image/png" {
+        return imp::read_png(max_bytes);
+    }
+    if mime == "text/uri-list" {
+        return imp::read_uri_list(max_bytes);
+    }
+    let id = imp::id_for_mime(mime)?;
+    imp::read_one(id, mime, max_bytes)
+}
+
+/// Transfer used only by native capture, bound to its observed sequence.
+pub struct WinCaptureTransfer {
+    sequence: Option<u32>,
+    policy: crate::capture_policy::CapturePolicy,
+}
+impl WinCaptureTransfer {
+    #[must_use]
+    pub fn new(sequence: Option<u32>, policy: crate::capture_policy::CapturePolicy) -> Self {
+        Self { sequence, policy }
+    }
+}
+impl ClipboardTransfer for WinCaptureTransfer {
+    const AFFINITY: Affinity = Affinity::Worker;
+    fn formats(&self) -> Result<Vec<String>> {
+        Err(Error::Unsupported("capture format enumeration".into()))
+    }
+    fn read(&self, mime: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        #[cfg(windows)]
+        {
+            imp::with_open("capture read", || {
+                let actual = clipboard_win::raw::seq_num().map(std::num::NonZeroU32::get);
+                let entries = (self.policy)();
+                let owner = crate::sys::clipboard_owner_executable();
+                match crate::capture_policy::guarded(
+                    self.sequence,
+                    actual,
+                    owner.as_deref(),
+                    entries.as_deref(),
+                    || read_open(mime, max_bytes),
+                ) {
+                    Ok(result) => result,
+                    Err(crate::capture_policy::Admission::OwnerDenied) => {
+                        Err(Error::CaptureExcluded)
+                    }
+                    Err(_) => Err(Error::CaptureChanged),
+                }
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (mime, max_bytes, self.sequence, &self.policy);
+            Err(Error::Unavailable(
+                "clipboard transfer needs a Windows session".into(),
+            ))
+        }
+    }
+    fn write(&self, _: &PayloadMap) -> Result<()> {
+        Err(Error::Unsupported("capture write".into()))
+    }
+    fn unchanged_indicator(&self) -> Option<String> {
+        None
+    }
+}
+
 impl ClipboardTransfer for WinTransfer {
     const AFFINITY: Affinity = Affinity::Worker;
 
@@ -481,19 +550,7 @@ impl ClipboardTransfer for WinTransfer {
     fn read(&self, mime: &str, max_bytes: u64) -> Result<Vec<u8>> {
         #[cfg(windows)]
         {
-            imp::with_open("read", || {
-                if mime == "text/plain" || mime == "text/plain;charset=utf-8" {
-                    return read_text_candidates(|id| imp::read_one(id, "text/plain", max_bytes));
-                }
-                if mime == "image/png" {
-                    return imp::read_png(max_bytes);
-                }
-                if mime == "text/uri-list" {
-                    return imp::read_uri_list(max_bytes);
-                }
-                let id = imp::id_for_mime(mime)?;
-                imp::read_one(id, mime, max_bytes)
-            })
+            imp::with_open("read", || read_open(mime, max_bytes))
         }
         #[cfg(not(windows))]
         {

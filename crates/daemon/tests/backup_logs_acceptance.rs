@@ -243,6 +243,7 @@ fn config_all_rows_persist_across_reload() {
         ("monitor.formats", json!(["text/plain"])),
         ("monitor.max_bytes", json!(1024)),
         ("monitor.min_len", json!(3)),
+        ("monitor.scroll_lock_toggle", json!(true)),
         ("monitor.ignores", json!(["nope"])),
         ("monitor.poll_ms", json!(250)),
         ("monitor.capture_primary", json!(true)),
@@ -274,8 +275,8 @@ fn config_all_rows_persist_across_reload() {
     ];
     assert_eq!(
         cases.len(),
-        28,
-        "27 ROWS keys (popup.keys.* by wire) + ui.theme"
+        29,
+        "28 ROWS keys (popup.keys.* by wire) + ui.theme"
     );
     for (key, value) in cases {
         state

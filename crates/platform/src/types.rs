@@ -67,6 +67,8 @@ pub enum CaptureOrigin {
 /// One monitor observation; `sensitive=true` means record NOTHING.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureEvent {
+    /// Native clipboard sequence binding for lazy capture reads, when available.
+    pub native_sequence: Option<u32>,
     /// Formats available for lazy read.
     pub offers: Vec<FormatOffer>,
     /// Buffer the event came from.
@@ -180,6 +182,12 @@ pub enum Error {
     /// Access denied by OS/policy.
     #[error("denied: {0}")]
     Denied(String),
+    /// Capture source changed since the monitor observation.
+    #[error("clipboard changed during capture")]
+    CaptureChanged,
+    /// Capture source was excluded by privacy policy.
+    #[error("capture owner excluded")]
+    CaptureExcluded,
     /// Operation timed out.
     #[error("timeout: {0}")]
     Timeout(String),
@@ -208,6 +216,11 @@ impl Error {
         let (kind, message) = match self {
             Self::Unavailable(m) => (BackendKind::Unavailable, m),
             Self::Denied(m) => (BackendKind::Denied, m),
+            Self::CaptureChanged => (
+                BackendKind::Unavailable,
+                "clipboard changed during capture".into(),
+            ),
+            Self::CaptureExcluded => (BackendKind::Denied, "capture owner excluded".into()),
             Self::Timeout(m) => (BackendKind::Timeout, m),
             Self::TooLarge(m) => (BackendKind::TooLarge, m),
             Self::Unsupported(m) => (BackendKind::Unsupported, m),

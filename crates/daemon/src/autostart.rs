@@ -316,8 +316,8 @@ where
 fn bounded_error(error: &Error) -> Error {
     const MESSAGE: &str = "autostart backend failed";
     match error {
-        Error::Unavailable(_) => Error::Unavailable(MESSAGE.into()),
-        Error::Denied(_) => Error::Denied(MESSAGE.into()),
+        Error::Unavailable(_) | Error::CaptureChanged => Error::Unavailable(MESSAGE.into()),
+        Error::Denied(_) | Error::CaptureExcluded => Error::Denied(MESSAGE.into()),
         Error::Timeout(_) => Error::Timeout(MESSAGE.into()),
         Error::TooLarge(_) => Error::TooLarge(MESSAGE.into()),
         Error::Unsupported(_) => Error::Unsupported(MESSAGE.into()),

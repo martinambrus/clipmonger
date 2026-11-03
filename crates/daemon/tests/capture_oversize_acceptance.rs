@@ -130,6 +130,9 @@ fn config(cap: u64) -> Config {
 enum Read {
     Bytes(Vec<u8>),
     TooLarge,
+    Denied,
+    Unavailable,
+    Missing,
     Io,
 }
 
@@ -162,6 +165,9 @@ impl ClipboardTransfer for Transfer {
             Read::TooLarge => Err(Error::TooLarge(
                 "bounded synthetic native guard".to_string(),
             )),
+            Read::Denied => Err(Error::CaptureExcluded),
+            Read::Unavailable => Err(Error::CaptureChanged),
+            Read::Missing => Err(Error::Unavailable("format unavailable".into())),
             Read::Io => Err(Error::Io(
                 "TooLarge text is not a typed oversize".to_string(),
             )),
@@ -177,6 +183,7 @@ impl ClipboardTransfer for Transfer {
 
 fn event(offers: &[(&str, Option<u64>)], sensitive: bool) -> CaptureEvent {
     CaptureEvent {
+        native_sequence: None,
         origin: CaptureOrigin::Clipboard,
         sensitive,
         offers: offers
@@ -711,4 +718,121 @@ fn gnome_strict_mixed_capture_keeps_only_plain_text() {
     })).unwrap()["accepted"], true);
     assert_eq!(fixture.history()[0]["preview"], "ok");
     assert_eq!(fixture.history()[0]["formats"], json!(["text/plain"]));
+}
+
+#[test]
+fn windows_min_len_counts_utf8_bytes_and_reloads() {
+    let mut cfg = config(1024);
+    cfg.monitor.min_len = 3;
+    let fixture = Fixture::new(cfg.clone());
+    let transfer = Transfer::new([("text/plain", Read::Bytes("é".as_bytes().to_vec()))]);
+    assert!(!capture(
+        &fixture,
+        &event(&[("text/plain", None)], false),
+        &transfer
+    ));
+    fixture.assert_empty(0);
+    cfg.monitor.min_len = 2;
+    fixture.state.set_config(cfg);
+    assert!(capture(
+        &fixture,
+        &event(&[("text/plain", None)], false),
+        &transfer
+    ));
+}
+
+#[test]
+fn scroll_lock_edges_follow_live_setting_and_status() {
+    let fixture = Fixture::new(config(1024));
+    let mut edge = clipmonger_daemon::capture::ScrollLockEdge::new(false);
+    let mut poll = |down| {
+        if edge.observe(fixture.state.scroll_lock_toggle_enabled(), down) {
+            fixture.state.toggle_monitor_from_scroll_lock().unwrap();
+        }
+        fixture.state.handle("status", &json!({})).unwrap()["monitoring_paused"]
+            .as_bool()
+            .unwrap()
+    };
+    assert!(!poll(true));
+    assert!(!poll(false));
+    let mut cfg = config(1024);
+    cfg.monitor.scroll_lock_toggle = true;
+    fixture.state.set_config(cfg);
+    assert!(poll(true));
+    assert!(poll(true));
+    assert!(poll(false));
+    assert!(!poll(true));
+}
+
+#[test]
+fn windows_min_len_preserves_nontext_and_oversize() {
+    let mut cfg = config(4);
+    cfg.monitor.min_len = 10;
+    let fixture = Fixture::new(cfg);
+    let transfer = Transfer::new([("text/uri-list", Read::Bytes(b"a".to_vec()))]);
+    assert!(capture(
+        &fixture,
+        &event(&[("text/uri-list", None)], false),
+        &transfer
+    ));
+    let other = Fixture::new({
+        let mut cfg = config(4);
+        cfg.monitor.min_len = 10;
+        cfg
+    });
+    assert!(capture(
+        &other,
+        &event(&[("text/plain", Some(5))], false),
+        &Transfer::new([])
+    ));
+    other.assert_stub("text/plain");
+}
+
+#[test]
+fn windows_capture_discards_prior_formats_when_owner_or_sequence_changes() {
+    for (second, skipped) in [(Read::Denied, 1), (Read::Unavailable, 0)] {
+        let fixture = Fixture::new(config(1024));
+        let transfer = Transfer::new([
+            ("text/plain", Read::Bytes(b"safe".to_vec())),
+            ("text/html", second),
+        ]);
+        let mut observed = event(&[("text/plain", None), ("text/html", None)], false);
+        observed.native_sequence = Some(7);
+        assert!(!capture(&fixture, &observed, &transfer));
+        assert_eq!(transfer.reads.borrow().len(), 2);
+        fixture.assert_empty(skipped);
+    }
+}
+
+#[test]
+fn windows_capture_keeps_prior_format_on_ordinary_unavailable() {
+    let fixture = Fixture::new(config(1024));
+    let transfer = Transfer::new([
+        ("text/plain", Read::Bytes(b"safe".to_vec())),
+        ("text/html", Read::Missing),
+    ]);
+    let mut observed = event(&[("text/plain", None), ("text/html", None)], false);
+    observed.native_sequence = Some(7);
+    assert!(fixture
+        .state
+        .capture_event("windows", &observed, &transfer, |_| {})
+        .unwrap());
+    assert_eq!(fixture.history().len(), 1);
+}
+
+#[test]
+fn windows_capture_exclusions_combine_live_config_lists() {
+    let fixture = Fixture::new(config(1024));
+    assert_eq!(
+        fixture.state.windows_capture_exclusions().unwrap(),
+        Vec::<String>::new()
+    );
+    let mut cfg = config(1024);
+    cfg.monitor.ignores = vec!["ignored.exe".into()];
+    cfg.privacy.denylist = vec!["secret.exe".into()];
+    fixture.state.set_config(cfg);
+    assert_eq!(
+        fixture.state.windows_capture_exclusions().unwrap(),
+        ["ignored.exe", "secret.exe"]
+    );
 }

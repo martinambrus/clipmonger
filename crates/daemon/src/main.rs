@@ -193,15 +193,21 @@ fn setup_windows_backend(
     config: &Config,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
 ) {
-    use clipmonger_backend_windows::{caps as backend_caps, WinMonitor, WinTransfer};
+    use clipmonger_backend_windows::{
+        caps as backend_caps, CapturePolicy, WinCaptureTransfer, WinMonitor,
+    };
     use clipmonger_platform::types::SubscribeKind;
 
-    let transfer = Arc::new(WinTransfer::new());
-
-    let initial_monitor =
-        clipmonger_daemon::capture::subscribed(WinMonitor::new, &[SubscribeKind::Clipboard])
-            .map_err(|e| eprintln!("daemon: windows monitor unavailable: {e}"))
-            .ok();
+    let policy: CapturePolicy = {
+        let state = Arc::clone(state);
+        Arc::new(move || state.windows_capture_exclusions())
+    };
+    let initial_monitor = clipmonger_daemon::capture::subscribed(
+        || WinMonitor::with_policy(Arc::clone(&policy)),
+        &[SubscribeKind::Clipboard],
+    )
+    .map_err(|e| eprintln!("daemon: windows monitor unavailable: {e}"))
+    .ok();
     let monitor_ok = initial_monitor.is_some();
 
     let base_caps = backend_caps::caps_for(false, false);
@@ -230,7 +236,24 @@ fn setup_windows_backend(
 
     {
         let state = Arc::clone(state);
-        let transfer = Arc::clone(&transfer);
+        let shutdown = Arc::clone(shutdown);
+        std::thread::spawn(move || {
+            let mut edge = clipmonger_daemon::capture::ScrollLockEdge::new(
+                clipmonger_backend_windows::sys::scroll_lock_down(),
+            );
+            while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                let down = clipmonger_backend_windows::sys::scroll_lock_down();
+                if edge.observe(state.scroll_lock_toggle_enabled(), down) {
+                    let _ = state.toggle_monitor_from_scroll_lock();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        let policy = Arc::clone(&policy);
         let poll_ms = config.monitor.poll_ms;
         let shutdown = Arc::clone(shutdown);
         std::thread::spawn(move || {
@@ -243,14 +266,16 @@ fn setup_windows_backend(
                 "windows",
                 || {
                     clipmonger_daemon::capture::subscribed(
-                        WinMonitor::new,
+                        || WinMonitor::with_policy(Arc::clone(&policy)),
                         &[SubscribeKind::Clipboard],
                     )
                 },
                 |events| {
                     for event in events {
+                        let transfer =
+                            WinCaptureTransfer::new(event.native_sequence, Arc::clone(&policy));
                         if let Err(error) =
-                            state.capture_event("windows", event, transfer.as_ref(), |line| {
+                            state.capture_event("windows", event, &transfer, |line| {
                                 eprintln!("daemon: windows {line}");
                             })
                         {
