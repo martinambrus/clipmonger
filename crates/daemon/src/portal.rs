@@ -93,9 +93,24 @@ async fn run_session(state: Arc<crate::DaemonState>, chord: String) {
     while let Some(signal) = futures_util::StreamExt::next(&mut activated).await {
         let payload = serde_json::json!({"shortcut_id": signal.shortcut_id()});
         if parse_activated(&payload).is_some() {
-            state.trigger_popup(crate::popup::PopupSource::Press);
+            let activation_token = shortcut_activation_token(signal.options());
+            state.trigger_popup_activation(clipmonger_platform::types::HotkeyActivation {
+                x11_time: None,
+                activation_token,
+            });
         }
     }
+}
+
+#[cfg(all(unix, feature = "backend-wayland"))]
+fn shortcut_activation_token(
+    options: &std::collections::HashMap<String, ashpd::zvariant::OwnedValue>,
+) -> Option<String> {
+    options
+        .get("activation_token")
+        .and_then(|value| <&str>::try_from(value).ok())
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
 }
 
 /// Publish only the portal-owned hotkey result, retaining capture and policy.
@@ -127,6 +142,25 @@ fn publish_hotkey(state: &crate::DaemonState, failure: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[test]
+    fn activated_signal_options_preserve_only_valid_tokens() {
+        use ashpd::zvariant::{OwnedValue, Str};
+        let mut options = std::collections::HashMap::new();
+        options.insert(
+            "activation_token".to_string(),
+            OwnedValue::from(Str::from("portal-token")),
+        );
+        assert_eq!(
+            super::shortcut_activation_token(&options).as_deref(),
+            Some("portal-token")
+        );
+        options.insert("activation_token".to_string(), OwnedValue::from(7u32));
+        assert_eq!(super::shortcut_activation_token(&options), None);
+        options.clear();
+        assert_eq!(super::shortcut_activation_token(&options), None);
+    }
+
     use super::*;
     use clipmonger_platform::fakes::FakeMonitor;
     use clipmonger_platform::types::{

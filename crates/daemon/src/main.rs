@@ -537,7 +537,7 @@ fn setup_x11_backend(
         let shutdown = Arc::clone(shutdown);
         let state = Arc::clone(state);
         std::thread::spawn(move || {
-            clipmonger_daemon::popup::run_hotkeys(
+            clipmonger_daemon::popup::run_hotkeys_with_activation(
                 None,
                 &shutdown,
                 || X11Hotkeys::connect(None),
@@ -551,8 +551,8 @@ fn setup_x11_backend(
                     }
                     state.set_hotkey_status("x11", &status);
                 },
-                || {
-                    state.trigger_popup(clipmonger_daemon::popup::PopupSource::Press);
+                |activation| {
+                    state.trigger_popup_activation(activation);
                 },
                 |delay| {
                     clipmonger_daemon::capture::sleep_interruptible(

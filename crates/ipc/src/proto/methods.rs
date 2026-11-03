@@ -295,10 +295,10 @@ pub struct ShowPopupEvent {
     /// Single-use gesture token minted for the press.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gesture: Option<u64>,
-    /// X11 server time of the press, for focus requests (reserved).
+    /// X11 server time of the press, for focus requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x11_time: Option<u32>,
-    /// Wayland xdg-activation token for the press (reserved).
+    /// Wayland xdg-activation token for the press when provided.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_token: Option<String>,
 }

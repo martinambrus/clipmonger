@@ -84,6 +84,21 @@ pub trait HotkeyManager: Send {
     /// Returns [`crate::types::Error`] when the backend fails.
     fn poll(&mut self, timeout: Duration) -> Result<Vec<HotkeyId>>;
 
+    /// Return firings with optional per-event activation metadata.
+    ///
+    /// # Errors
+    /// Returns an error when the backend fails.
+    fn poll_events(&mut self, timeout: Duration) -> Result<Vec<crate::types::HotkeyEvent>> {
+        self.poll(timeout).map(|ids| {
+            ids.into_iter()
+                .map(|id| crate::types::HotkeyEvent {
+                    id,
+                    activation: crate::types::HotkeyActivation::default(),
+                })
+                .collect()
+        })
+    }
+
     /// Discard queued events before assigning newly registered chords.
     ///
     /// # Errors

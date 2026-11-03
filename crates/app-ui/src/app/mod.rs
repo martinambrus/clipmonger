@@ -98,6 +98,7 @@ pub struct PopupApp {
     theme_applied: [Option<(bool, u32)>; 2],
     preview_width: u32,
     pending_activation: bool,
+    pending_activation_metadata: Option<runner::PopupActivation>,
     pending_reveal: Option<(Option<String>, usize, uuid::Uuid)>,
     last_reveal: Option<(Option<String>, usize, uuid::Uuid)>,
     last_query: String,
@@ -155,6 +156,7 @@ impl PopupApp {
             theme_applied: [None, None],
             preview_width: 80,
             pending_activation: false,
+            pending_activation_metadata: None,
             pending_reveal: None,
             last_reveal: None,
             last_query: String::new(),
@@ -238,6 +240,15 @@ impl PopupApp {
 
     /// Feed an event with its occurrence time on the shell clock.
     fn feed_at(&mut self, event: Event, at: Millis) {
+        let activation = match &event {
+            Event::Bridge(UiEvent::ShowPopup(show)) if !show.toggle => {
+                Some(runner::PopupActivation {
+                    x11_time: show.x11_time,
+                    activation_token: show.activation_token.clone(),
+                })
+            }
+            _ => None,
+        };
         let was_open = self.shell.desired().popup_open;
         let old_error = self.shell.error().map(str::to_owned);
         let error_kind = matches!(
@@ -248,6 +259,13 @@ impl PopupApp {
         let reason = trace::hide_reason(&event);
         let effects = self.shell.handle(event, at);
         let is_open = self.shell.desired().popup_open;
+        if is_open {
+            if let Some(activation) = activation {
+                self.pending_activation_metadata = Some(activation);
+            }
+        } else {
+            self.pending_activation_metadata = None;
+        }
         if !was_open && is_open {
             let context = self.shell.context();
             self.record(&TraceEvent::Open {
@@ -1078,6 +1096,10 @@ impl runner::App for PopupApp {
             shift: modifiers.shift,
             super_key: modifiers.mac_cmd,
         })
+    }
+
+    fn take_popup_activation_metadata(&mut self) -> Option<runner::PopupActivation> {
+        self.pending_activation_metadata.take()
     }
 
     fn take_popup_activation(&mut self) -> bool {

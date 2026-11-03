@@ -65,12 +65,46 @@ impl DaemonState {
         )
     }
 
+    /// Show a popup for a hotkey carrying optional platform activation metadata.
+    pub fn trigger_popup_activation(
+        &self,
+        activation: clipmonger_platform::types::HotkeyActivation,
+    ) -> bool {
+        self.trigger_popup_with_activation(
+            PopupSource::Press,
+            Instant::now(),
+            press_target,
+            &mut clipmonger_core::entropy::random_u64,
+            activation,
+        )
+    }
+
     fn trigger_popup_with<F>(
         &self,
         source: PopupSource,
         now: Instant,
         capture: impl FnOnce(Option<&SubscriberInfo>) -> (Option<u64>, bool),
         draw: &mut F,
+    ) -> bool
+    where
+        F: FnMut() -> Result<u64, clipmonger_core::entropy::Error>,
+    {
+        self.trigger_popup_with_activation(
+            source,
+            now,
+            capture,
+            draw,
+            clipmonger_platform::types::HotkeyActivation::default(),
+        )
+    }
+
+    fn trigger_popup_with_activation<F>(
+        &self,
+        source: PopupSource,
+        now: Instant,
+        capture: impl FnOnce(Option<&SubscriberInfo>) -> (Option<u64>, bool),
+        draw: &mut F,
+        activation: clipmonger_platform::types::HotkeyActivation,
     ) -> bool
     where
         F: FnMut() -> Result<u64, clipmonger_core::entropy::Error>,
@@ -127,8 +161,8 @@ impl DaemonState {
             toggle,
             target,
             gesture,
-            x11_time: None,
-            activation_token: None,
+            x11_time: activation.x11_time,
+            activation_token: activation.activation_token,
         };
         let params = serde_json::to_value(&event).unwrap_or_default();
         if hub.publish_or_hold(SHOW_POPUP_TOPIC, params) > 0 {
@@ -234,18 +268,46 @@ impl PopupChord {
 /// Own a popup hotkey manager through factory, registration and poll
 /// failures. Every replacement starts with fresh chord-registration state.
 #[allow(clippy::too_many_arguments)]
+pub fn run_hotkeys<H: HotkeyManager>(
+    hotkeys: Option<H>,
+    shutdown: &std::sync::atomic::AtomicBool,
+    factory: impl FnMut() -> clipmonger_platform::types::Result<H>,
+    wanted: impl FnMut() -> String,
+    ready: impl FnMut(),
+    publish: impl FnMut(ChordStatus),
+    mut press: impl FnMut(),
+    sleep: impl FnMut(Duration),
+    permanents: Option<&DaemonState>,
+    permanent_press: impl FnMut(uuid::Uuid, &str, &mut dyn FnMut() -> bool),
+) {
+    run_hotkeys_with_activation(
+        hotkeys,
+        shutdown,
+        factory,
+        wanted,
+        ready,
+        publish,
+        |_| press(),
+        sleep,
+        permanents,
+        permanent_press,
+    );
+}
+
+/// Own hotkeys and deliver popup activation metadata for each firing.
+#[allow(clippy::too_many_arguments)]
 #[expect(
     clippy::too_many_lines,
     reason = "keep the single owner and recovery loop together"
 )]
-pub fn run_hotkeys<H: HotkeyManager>(
+pub fn run_hotkeys_with_activation<H: HotkeyManager>(
     mut hotkeys: Option<H>,
     shutdown: &std::sync::atomic::AtomicBool,
     mut factory: impl FnMut() -> clipmonger_platform::types::Result<H>,
     mut wanted: impl FnMut() -> String,
     mut ready: impl FnMut(),
     mut publish: impl FnMut(ChordStatus),
-    mut press: impl FnMut(),
+    mut press: impl FnMut(clipmonger_platform::types::HotkeyActivation),
     mut sleep: impl FnMut(Duration),
     permanents: Option<&DaemonState>,
     mut permanent_press: impl FnMut(uuid::Uuid, &str, &mut dyn FnMut() -> bool),
@@ -364,7 +426,7 @@ pub fn run_hotkeys<H: HotkeyManager>(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        match manager.poll(Duration::from_millis(200)) {
+        match manager.poll_events(Duration::from_millis(200)) {
             Ok(ids) => {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
@@ -381,14 +443,14 @@ pub fn run_hotkeys<H: HotkeyManager>(
                 delay = Duration::from_millis(100);
                 let mut dispatched = false;
                 let mut drain_error = None;
-                if ids.contains(&HotkeyId(1)) {
-                    press();
+                if let Some(event) = ids.iter().find(|event| event.id == HotkeyId(1)) {
+                    press(event.activation.clone());
                     dispatched = permanents.is_some();
                 }
                 if !dispatched {
                     if let Some(state) = permanents {
-                        for id in ids {
-                            if let Some((clip, wanted)) = permanent_chords.held.get(&id) {
+                        for event in ids {
+                            if let Some((clip, wanted)) = permanent_chords.held.get(&event.id) {
                                 if state.permanent_hotkeys().is_ok_and(|rows| {
                                     rows.iter().any(|row| row.0 == *clip && row.1 == *wanted)
                                 }) {
@@ -597,9 +659,29 @@ fn registered_popup_hwnd(ui: &SubscriberInfo) -> Option<u64> {
         .and_then(serde_json::Value::as_u64)
 }
 
-/// Paste target of a press: the active X11 window (the UI decides toggling).
+#[cfg(all(unix, any(test, feature = "backend-x11")))]
+fn x11_press_decision(target: Option<u64>, popup: Option<u64>) -> (Option<u64>, bool) {
+    if target.is_some() && target == popup {
+        (None, true)
+    } else {
+        (target, false)
+    }
+}
+
+#[cfg(all(unix, any(test, feature = "backend-x11")))]
+fn x11_press_target_for_ui(
+    target: Option<u64>,
+    ui: Option<&SubscriberInfo>,
+) -> (Option<u64>, bool) {
+    let popup = ui
+        .and_then(|ui| ui.params.get("popup_x11_window"))
+        .and_then(serde_json::Value::as_u64);
+    x11_press_decision(target, popup)
+}
+
+/// Paste target of a press, unless the registered X11 popup is foreground.
 #[cfg(all(unix, feature = "backend-x11"))]
-fn press_target(_ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
+fn press_target(ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
     use clipmonger_platform::types::PlatformHandle;
     if std::env::var_os("DISPLAY").is_none() {
         return (None, false);
@@ -607,10 +689,11 @@ fn press_target(_ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
     let target = clipmonger_backend_x11::X11Foreground::connect(None)
         .and_then(|foreground| foreground.capture_target())
         .ok();
-    match target.map(|target| target.handle) {
-        Some(PlatformHandle::X11Window(window)) => (Some(window), false),
-        _ => (None, false),
-    }
+    let target = match target.map(|target| target.handle) {
+        Some(PlatformHandle::X11Window(window)) => Some(window),
+        _ => None,
+    };
+    x11_press_target_for_ui(target, ui)
 }
 
 /// No foreground target on this platform (Wayland, headless).
@@ -757,6 +840,68 @@ mod tests {
         assert_eq!(
             (request.source.as_str(), request.gesture),
             ("request", None)
+        );
+    }
+
+    #[test]
+    fn x11_popup_toggles_without_capturing_it_and_settings_remains_target() {
+        assert_eq!(super::x11_press_decision(Some(21), Some(21)), (None, true));
+        assert_eq!(
+            super::x11_press_decision(Some(22), Some(21)),
+            (Some(22), false)
+        );
+        assert_eq!(super::x11_press_decision(Some(22), None), (Some(22), false));
+        assert_eq!(super::x11_press_decision(None, Some(21)), (None, false));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registered_x11_popup_toggles_through_subscriber_without_gesture() {
+        let (state, sock, _) = served("x11-popup-toggle").await;
+        let stream = Client::connect(&sock, TOKEN)
+            .unwrap()
+            .subscribe(&[SHOW_POPUP_TOPIC], json!({"popup_x11_window": 21}))
+            .unwrap();
+        let now = Instant::now();
+        let mut draw = || Ok(321);
+        assert!(state.trigger_popup_with(
+            PopupSource::Press,
+            now,
+            |ui| super::x11_press_target_for_ui(Some(21), ui),
+            &mut draw
+        ));
+        let (stream, toggle) = next_show(stream, Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            (toggle.toggle, toggle.target, toggle.gesture),
+            (true, None, None)
+        );
+        assert!(state.trigger_popup_with(
+            PopupSource::Press,
+            now + PRESS_DEBOUNCE,
+            |ui| super::x11_press_target_for_ui(Some(22), ui),
+            &mut draw
+        ));
+        let (_, settings) = next_show(stream, Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            (settings.toggle, settings.target, settings.gesture),
+            (false, Some(22), Some(321))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn press_activation_metadata_reaches_the_subscriber() {
+        let (state, sock, _) = served("activation-metadata").await;
+        let stream = subscribe(&sock);
+        assert!(
+            state.trigger_popup_activation(clipmonger_platform::types::HotkeyActivation {
+                x11_time: Some(12345),
+                activation_token: Some("token-from-compositor".into()),
+            })
+        );
+        let (_, event) = next_show(stream, Duration::from_secs(2)).expect("show");
+        assert_eq!(event.x11_time, Some(12345));
+        assert_eq!(
+            event.activation_token.as_deref(),
+            Some("token-from-compositor")
         );
     }
 
@@ -1084,6 +1229,60 @@ mod hotkey_recovery_tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn popup_dispatch_uses_its_own_event_metadata_in_a_batch() {
+        use clipmonger_platform::types::{HotkeyActivation, HotkeyEvent};
+        struct Batched;
+        impl HotkeyManager for Batched {
+            const AFFINITY: Affinity = Affinity::Worker;
+            fn register(&mut self, _: HotkeyId, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn unregister(&mut self, _: HotkeyId) -> Result<()> {
+                Ok(())
+            }
+            fn poll(&mut self, _: Duration) -> Result<Vec<HotkeyId>> {
+                unreachable!()
+            }
+            fn poll_events(&mut self, _: Duration) -> Result<Vec<HotkeyEvent>> {
+                Ok(vec![
+                    HotkeyEvent {
+                        id: HotkeyId(2),
+                        activation: HotkeyActivation {
+                            x11_time: Some(111),
+                            ..HotkeyActivation::default()
+                        },
+                    },
+                    HotkeyEvent {
+                        id: HotkeyId(1),
+                        activation: HotkeyActivation {
+                            x11_time: Some(222),
+                            ..HotkeyActivation::default()
+                        },
+                    },
+                ])
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let mut received = None;
+        run_hotkeys_with_activation(
+            Some(Batched),
+            &stop,
+            || Ok(Batched),
+            || "ctrl+alt+h".into(),
+            || {},
+            |_| {},
+            |activation| {
+                received = activation.x11_time;
+                stop.store(true, Ordering::SeqCst);
+            },
+            |_| {},
+            None,
+            |_, _, _| unreachable!(),
+        );
+        assert_eq!(received, Some(222));
+    }
 
     struct Manager {
         held: bool,

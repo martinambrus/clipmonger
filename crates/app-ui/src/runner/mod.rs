@@ -45,6 +45,15 @@ pub struct Desired {
     pub exit: bool,
 }
 
+/// Platform metadata associated with a popup show or raise.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PopupActivation {
+    /// X11 server time of the triggering input.
+    pub x11_time: Option<u32>,
+    /// Compositor-provided Wayland activation token.
+    pub activation_token: Option<String>,
+}
+
 /// The application behind the windows.
 pub trait App {
     /// Runs on every pass of every window, hidden or visible: drain queues,
@@ -79,6 +88,11 @@ pub trait App {
         false
     }
 
+    /// Drain activation metadata associated with the pending popup show.
+    fn take_popup_activation_metadata(&mut self) -> Option<PopupActivation> {
+        None
+    }
+
     /// Whether placement needs fresh desktop context.
     fn wants_desktop_context(&self) -> bool {
         false
@@ -110,6 +124,8 @@ pub struct Startup {
     /// [`window::hwnd`]); `None` off Windows and on Wayland, where the popup
     /// is created per show.
     pub popup_hwnd: Option<u64>,
+    /// The popup X11 window ID when available.
+    pub popup_x11_window: Option<u64>,
 }
 
 /// Cloneable, `Send` handle to the event loop.
@@ -566,6 +582,7 @@ impl<A: App> Runner<A> {
         event_loop: &ActiveEventLoop,
         kind: WindowKind,
         visible: bool,
+        activation_token: Option<&str>,
     ) -> Result<Host, RunError> {
         let builder = match kind {
             WindowKind::Popup => window::popup_builder(
@@ -621,7 +638,12 @@ impl<A: App> Runner<A> {
             None
         };
         // Explicit window creation to capture WindowId if Presenter fails.
-        let prepared = window::prepare_host(ctx, builder.clone(), class, restore.as_ref());
+        let mut prepared = window::prepare_host(ctx, builder.clone(), class, restore.as_ref());
+        prepared.attributes = window::show_attributes(
+            prepared.attributes,
+            self.per_show && kind == WindowKind::Popup,
+            activation_token,
+        );
         let window = Arc::new(
             event_loop
                 .create_window(prepared.attributes.clone())
@@ -672,9 +694,11 @@ impl<A: App> Runner<A> {
         self.surface_context = Some(surface_context);
         self.per_show = window::is_wayland(event_loop);
         let mut popup_hwnd = None;
+        let mut popup_x11_window = None;
         if !self.per_show {
-            let host = self.create_host(event_loop, WindowKind::Popup, false)?;
+            let host = self.create_host(event_loop, WindowKind::Popup, false, None)?;
             popup_hwnd = window::hwnd(&host.window);
+            popup_x11_window = window::x11_window(&host.window);
             self.popup.native_input.reset();
             self.popup.host = Some(host);
         }
@@ -682,7 +706,11 @@ impl<A: App> Runner<A> {
         let handle = Handle {
             proxy: self.proxy.clone(),
         };
-        let app = make_app(Startup { handle, popup_hwnd });
+        let app = make_app(Startup {
+            handle,
+            popup_hwnd,
+            popup_x11_window,
+        });
         self.app = Some(app);
         self.popup.deadline.at(Instant::now());
         Ok(())
@@ -844,6 +872,7 @@ impl<A: App> Runner<A> {
         };
         let desired = app.desired();
         let request = app.take_popup_activation();
+        let metadata = app.take_popup_activation_metadata();
         let previous = std::mem::replace(&mut self.last, desired);
         if desired.exit {
             self.begin_shutdown(event_loop);
@@ -851,7 +880,13 @@ impl<A: App> Runner<A> {
         }
         let now = Instant::now();
         if desired.popup_open != previous.popup_open {
-            if let Err(e) = self.set_popup_open(event_loop, desired.popup_open) {
+            if let Err(e) = self.set_popup_open(
+                event_loop,
+                desired.popup_open,
+                metadata
+                    .as_ref()
+                    .and_then(|m| m.activation_token.as_deref()),
+            ) {
                 self.fail(event_loop, e);
                 return;
             }
@@ -868,20 +903,22 @@ impl<A: App> Runner<A> {
         }
         let policy = window::native_policy(self.per_show);
         if let Some(host) = self.popup.host.as_ref() {
-            self.pending_activation.reconcile(
+            self.pending_activation.reconcile_with_time(
                 request,
                 previous.popup_open,
                 desired.popup_open,
                 Some(&*host.window),
                 policy,
+                metadata.as_ref().and_then(|m| m.x11_time),
             );
         } else {
-            self.pending_activation.reconcile(
+            self.pending_activation.reconcile_with_time(
                 request,
                 previous.popup_open,
                 desired.popup_open,
                 None::<&winit::window::Window>,
                 policy,
+                metadata.as_ref().and_then(|m| m.x11_time),
             );
         }
         let context = self
@@ -897,10 +934,16 @@ impl<A: App> Runner<A> {
     }
 
     /// Show or hide the popup window.
-    fn set_popup_open(&mut self, event_loop: &ActiveEventLoop, open: bool) -> Result<(), RunError> {
+    fn set_popup_open(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        open: bool,
+        activation_token: Option<&str>,
+    ) -> Result<(), RunError> {
         if self.per_show {
             if open {
-                let host = self.create_host(event_loop, WindowKind::Popup, true)?;
+                let host =
+                    self.create_host(event_loop, WindowKind::Popup, true, activation_token)?;
                 self.popup.native_input.reset();
                 self.popup.host = Some(host);
             } else {
@@ -933,7 +976,7 @@ impl<A: App> Runner<A> {
                 .as_ref()
                 .is_some_and(|slot| slot.host.is_none());
             if needs_host {
-                let host = self.create_host(event_loop, WindowKind::Settings, true)?;
+                let host = self.create_host(event_loop, WindowKind::Settings, true, None)?;
                 if let Some(slot) = self.settings.as_mut() {
                     slot.native_input.reset();
                     slot.host = Some(host);
