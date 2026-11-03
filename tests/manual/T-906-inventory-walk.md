@@ -30,6 +30,14 @@
    Check minimum length using multibyte text and mixed plain/HTML or RTF.
    - Expected: persisted settings and behavior match seg-03, including privacy
      exclusions and separate genuine non-text handling.
+8. On Windows, inspect **Restore clipboard after paste** on a fresh profile or
+   a `[popup]` section with that key omitted; select an older synthetic clip
+   from the popup and then paste with Ctrl+V into a second target.
+   - Expected: the setting defaults unchecked and the selected clip stays on
+     the clipboard. Enable it, Apply, and repeat with distinct original/selected
+     clips: the original clipboard returns after the dwell if unchanged.
+     Restart with explicit true and then false saved; both choices persist
+     without changing unrelated settings.
 
 ## Evidence to attach
 

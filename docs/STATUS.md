@@ -10,6 +10,8 @@ implemented; Phase 7 packaging/QA and native acceptance remain open.
 - The single CPU-rendered egui runner (ADR-005) replaces eframe/glow and the
   separate Win32 fallback. Settings has 29 rows; GUI builds require Rust 1.95
   or newer for the locked dependencies.
+- Windows clipboard paste now defaults to keeping the selected item on the
+  clipboard; restoration is opt-in and existing explicit preferences are preserved.
 - The combined draft includes image/file-list storage, backup/restore safety,
   capture/storage hardening, helper-registration and failed-paste fixes. Source
   inclusion is not native acceptance or delivery to main.

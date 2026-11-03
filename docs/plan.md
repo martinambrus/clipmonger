@@ -52,6 +52,14 @@ The current UI uses the single CPU runner in ADR-005; the separate Win32 fallbac
 and eframe/glow paths are retired. Windows capture includes a default-off Scroll
 Lock toggle and UTF-8-byte minimum length; Settings has 29 rows.
 
+User decision (2026-11-03): Windows clipboard paste defaults to leaving the
+selected clip on the clipboard (`popup.restore_clipboard = false`). Restoring
+the previous clipboard is opt-in; existing explicit preferences are preserved.
+The default delivery strategy remains `clipboard_restore`. Earlier dated
+default-true results below retain their original scope.
+Guided Windows QA on a1dc017 confirmed that the selected item remains on the
+clipboard for a normal text paste; further native cases remain open.
+
 The combined candidate also batches selected clipboard metadata reads; local
 release calibration reduced 10k-search p95 from 192.49 ms to 45.83 ms against
 the initial 50 ms target. Exact results and limits are in the continuation.

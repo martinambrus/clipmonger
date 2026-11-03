@@ -17,13 +17,13 @@ alone as sufficient to publish.
 
 ## Source and artifacts
 
-- Delivered main before this documentation update: 6a515555b4a956e934eed58975d99e04215d311a.
-- Combined application candidate: 9635310125daede2d842bd67cb790492552bbba9 on packaging-qa-20261103,
+- Delivered main before this documentation update: a20af896e24976a5266cb1bd921b84ee88a8e1f5.
+- Combined application candidate: a1dc01796d945b1457a7b5db117d29557503be47 on packaging-qa-20261103,
   [draft PR #41](https://github.com/martinambrus/clipmonger/pull/41).
 - It includes the helper-registration work from [draft PR #37](https://github.com/martinambrus/clipmonger/pull/37)
   and failed-paste work from [draft PR #39](https://github.com/martinambrus/clipmonger/pull/39).
   Those drafts are not separately delivered or native-accepted.
-- Windows test packet: C:\Temp\clipmonger-review-9635310-b879a2ee. Use the files named in its SHA256SUMS
+- Windows test packet: C:\Temp\clipmonger-review-a1dc017-697134a7. Use the files named in its SHA256SUMS
   and the build-specific WINDOWS-TESTING.md. This is a local draft, not a release.
 - The packet contains Windows and Linux portable ZIPs and an unsigned Windows
   NSIS setup. Portable ZIPs carry a portable marker and full license notices;
@@ -34,7 +34,7 @@ alone as sufficient to publish.
 ## Completed software QA and limits
 
 For the combined candidate above, the complete Linux workspace/all-targets/all-features
-run recorded **1,456 passes, zero failures and 11 ignored tests**. Formatting,
+run recorded **1,461 passes, zero failures and 11 ignored tests**. Formatting,
 Linux and Windows GNU workspace checks and strict Clippy, and dependency policy
 also passed. The final candidate has a clean independent review, a clean
 exact-head automated PR review, and all five CI checks succeeded.
@@ -49,10 +49,11 @@ remains recorded as NOT PASS; it is not included as a successful run.
 The six normal release binaries were built for Linux x86_64 and Windows GNU
 x86_64. Actual package payloads, license notices, compiled GNOME schema, embedded
 uninstall helpers and combined checksums were checked. Linux CLI help passed;
-its rebuilt binary is byte-identical to that checked copy. Windows CLI help from
-a physical C-drive directory passed on the preceding a401911 package; the rebuilt
-Windows CLI needs the operator load check. These are not GUI, capture, paste, UAC,
-installer or compositor acceptance.
+its rebuilt bytes are unchanged. The rebuilt Windows CLI help and status checks
+passed from the physical C-drive test folder. The GUI was restarted with the
+dedicated test profile for guided acceptance; its visible behavior and remaining
+native matrix require operator results. CLI load and capability self-reports
+do not establish installer, UAC, compositor or full native acceptance.
 
 Synthetic Windows profile-removal components passed default/silent preservation,
 selected deletion, identity/target refusal and verified NTFS junction rejection.
@@ -89,10 +90,35 @@ A delivered source change does not close a native gate.
 
 ## Windows operator handoff
 
-The user takes over real Windows testing. Start with the packet's WINDOWS-TESTING.md:
+The user performs the visible Windows checks while the agent handles builds,
+starts and restarts. Start with the packet's WINDOWS-TESTING.md:
 portable fresh profile and disposable text windows; then Settings/keyboard/focus;
 then installed/UAC cases, and logon/display changes in separate sessions.
 The exact candidate and evidence must accompany every result.
+
+The active guided session reuses its dedicated profile at
+C:\Temp\clipmonger-review-9635310-b879a2ee\profile-portable-qa with the current
+candidate binaries. It has autostart disabled and no explicit restore setting,
+so the new default is exercised. Preserve that test history when restarting;
+do not substitute the working user profile.
+
+Guided Windows checks on the preceding 9635310 build passed tray presence, hotkey
+opening, ASCII and Unicode capture/paste (including Japanese and emoji), normal
+restoration under its old default, and tray Exit with both owned processes gone.
+These dated observations are preserved; repeat clipboard preference checks on
+the current rebuilt candidate.
+
+On a1dc017, the operator confirmed the new default in a standard Notepad window:
+pasting an older selected entry and then Ctrl+V produced that selected entry
+again. This proves the normal text path only; opt-in persistence, elevated helper,
+failure rollback and rich clipboard fidelity remain separate checks.
+
+Current Windows acceptance criterion (user decision, 2026-11-03): default
+`clipboard_restore` delivery keeps the selected clip on the clipboard, replacing
+the previous contents (`popup.restore_clipboard = false`). Restoring the previous
+clipboard is opt-in, and saved explicit true/false choices must survive restart.
+Verify both standard and elevated-helper delivery on the rebuilt candidate; older
+dated restoration passes do not validate this new default.
 
 Versioned acceptance scripts:
 [T-905](../tests/manual/T-905-window-matrix.md),
@@ -123,6 +149,9 @@ are STOP: record and hand off; do not explore or switch stations.
   [T-508](../tests/manual/T-508-x11-real-de.md),
   [T-606](../tests/manual/T-606-wayland-compositor-matrix.md),
   [T-607](../tests/manual/T-607-paste-spike-acceptance.md), and T-702 through T-705.
+  Pre-existing X11 permanent hotkeys restore the previous clipboard regardless
+  of `popup.restore_clipboard`; this needs a separate fix and Linux acceptance
+  before claiming the Windows preference behavior on X11.
 - Linux release licensing is unresolved for scanner-generated blur protocol output
   used by winit through wayland-protocols-plasma. The crate's MIT manifest and the
   successful dependency scan do not determine the file-specific output boundary.
