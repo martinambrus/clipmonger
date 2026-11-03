@@ -331,6 +331,30 @@ pub fn persistent_pipe_name(profile: &std::path::Path) -> String {
 // Elevated-worker target pinning (Windows only; manual-QA leg)
 // ---------------------------------------------------------------------------
 
+/// Run an operation while retaining the validated target pin.
+///
+/// # Errors
+/// Returns a target validation or injection refusal.
+pub fn run_pinned_job<P>(
+    job: &Job,
+    pin: impl FnOnce(&Job) -> Result<P, String>,
+    now: impl FnOnce() -> i64,
+    send: impl FnOnce(&str) -> Result<(), String>,
+    paste: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let pinned = pin(job)?;
+    if job_expired(job.expires_ms, now()) {
+        return Err("refused: job expired".to_string());
+    }
+    match job.op {
+        JobOp::SendInputBatch => send(&job.payload),
+        JobOp::PasteChord => paste(),
+    }
+    .map_err(|detail| format!("inject failed: {detail}"))?;
+    drop(pinned);
+    Ok(())
+}
+
 /// Target process pinned by open HANDLE across one job (no PID-reuse race).
 #[cfg(windows)]
 pub struct PinnedTarget {
@@ -357,8 +381,8 @@ impl Drop for PinnedTarget {
 ///
 /// The popup hands focus back as it hides; if Windows has not settled on
 /// the target yet, the helper (high integrity, so UIPI does not apply)
-/// activates exactly that window and waits briefly. The wait is capped by
-/// the job deadline, so a late job can never steal focus.
+/// activates exactly that window and waits briefly. The deadline is checked
+/// while settling and again after the target is pinned.
 ///
 /// # Errors
 ///
@@ -410,7 +434,11 @@ pub fn pin_helper_target(job: &Job) -> Result<PinnedTarget, String> {
     if handle.is_null() {
         return Err("refused: cannot pin target process".to_string());
     }
-    Ok(PinnedTarget { pid, handle })
+    let pinned = PinnedTarget { pid, handle };
+    if job_expired(job.expires_ms, unix_ms()) {
+        return Err("refused: job expired".to_string());
+    }
+    Ok(pinned)
 }
 
 /// Wall clock in unix ms (job deadlines are wall-clock values shared by the
@@ -425,6 +453,69 @@ fn unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_jobs_refuse_a_deadline_crossed_during_pin_for_both_operations() {
+        use std::cell::Cell;
+        struct Pin<'a>(&'a Cell<bool>);
+        impl Drop for Pin<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        for op in [JobOp::SendInputBatch, JobOp::PasteChord] {
+            for (before, after, accepted) in [
+                (1001, 1001, false),
+                (999, 1001, false),
+                (999, 1000, true),
+                (999, 999, true),
+            ] {
+                let clock = Cell::new(before);
+                let dropped = Cell::new(false);
+                let sent = Cell::new(false);
+                let pasted = Cell::new(false);
+                let pinned = Cell::new(false);
+                let job = Job {
+                    job_id: 1,
+                    target_pid: 2,
+                    op,
+                    payload: String::new(),
+                    target_hwnd: Some(3),
+                    expires_ms: Some(1000),
+                };
+                let result = run_pinned_job(
+                    &job,
+                    |job| {
+                        if job_expired(job.expires_ms, clock.get()) {
+                            return Err("refused: job expired".to_string());
+                        }
+                        pinned.set(true);
+                        clock.set(after);
+                        Ok(Pin(&dropped))
+                    },
+                    || clock.get(),
+                    |_| {
+                        assert!(!dropped.get());
+                        sent.set(true);
+                        Ok(())
+                    },
+                    || {
+                        assert!(!dropped.get());
+                        pasted.set(true);
+                        Ok(())
+                    },
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "{op:?} before={before} after={after}"
+                );
+                assert_eq!(sent.get(), accepted && op == JobOp::SendInputBatch);
+                assert_eq!(pasted.get(), accepted && op == JobOp::PasteChord);
+                assert_eq!(dropped.get(), pinned.get());
+            }
+        }
+    }
 
     #[test]
     fn persistent_pipe_name_matches_fnv1a64_vectors() {

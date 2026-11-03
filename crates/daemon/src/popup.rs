@@ -715,7 +715,50 @@ fn activate_popup(ui: Option<&SubscriberInfo>) {
         return;
     };
     if let (Some(hwnd), Some(pid)) = (registered_popup_hwnd(ui), ui.peer_pid) {
-        let _ = clipmonger_backend_windows::show_owned_window(hwnd.cast_signed(), pid);
+        report_popup_activation(
+            clipmonger_backend_windows::show_owned_window(hwnd.cast_signed(), pid),
+            |event, fields| {
+                crate::daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    event,
+                    fields,
+                );
+            },
+        );
+    }
+}
+
+#[cfg(any(test, all(windows, feature = "backend-windows")))]
+fn report_popup_activation(ok: bool, emit: impl FnOnce(&str, &[(&str, &str)])) {
+    if !ok {
+        emit("popup.activation_failed", &[("class", "unavailable")]);
+    }
+}
+
+#[cfg(test)]
+mod activation_report_tests {
+    use super::report_popup_activation;
+
+    #[test]
+    fn failure_emits_only_fixed_metadata_and_success_is_silent() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        report_popup_activation(false, |event, fields| {
+            calls.borrow_mut().push((
+                event.to_owned(),
+                fields
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect::<Vec<_>>(),
+            ));
+        });
+        report_popup_activation(true, |_, _| panic!("success must be silent"));
+        assert_eq!(
+            *calls.borrow(),
+            vec![(
+                "popup.activation_failed".to_owned(),
+                vec![("class".to_owned(), "unavailable".to_owned())]
+            )]
+        );
     }
 }
 
