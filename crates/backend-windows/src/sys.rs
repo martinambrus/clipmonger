@@ -1224,6 +1224,41 @@ pub fn scroll_lock_down() -> bool {
     unsafe { GetAsyncKeyState(i32::from(VK_SCROLL)) < 0 }
 }
 
+/// Enumerate under the caller's open session, distinguishing completion from
+/// failure. The legacy monitor/read iterators keep their existing behavior.
+#[cfg(windows)]
+pub(crate) fn clipboard_formats_checked() -> clipmonger_platform::types::Result<Vec<u32>> {
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_SUCCESS};
+    use windows_sys::Win32::System::DataExchange::EnumClipboardFormats;
+    let mut ids = Vec::new();
+    let mut previous = 0;
+    loop {
+        // Safety: caller holds an open clipboard; these calls use only a
+        // format id and the calling thread's last-error slot.
+        let (id, error) = unsafe {
+            SetLastError(ERROR_SUCCESS);
+            let id = EnumClipboardFormats(previous);
+            (id, GetLastError())
+        };
+        if id == 0 {
+            return if error == ERROR_SUCCESS {
+                Ok(ids)
+            } else {
+                Err(clipmonger_platform::types::Error::Io(format!(
+                    "clipboard enumeration failed: {error}"
+                )))
+            };
+        }
+        if ids.contains(&id) {
+            return Err(clipmonger_platform::types::Error::Io(
+                "clipboard enumeration repeated a format".into(),
+            ));
+        }
+        ids.push(id);
+        previous = id;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{window_title_hash_units, window_title_hash_with, MAX_WINDOW_TITLE_UNITS};

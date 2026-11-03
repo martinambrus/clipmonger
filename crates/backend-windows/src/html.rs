@@ -37,11 +37,12 @@ pub fn build_cf_html(fragment_html: &str) -> Vec<u8> {
     let pre = "<html>\r\n<body>\r\n<!--StartFragment-->";
     let post = "<!--EndFragment-->\r\n</body>\r\n</html>";
     let probe = format_header(0, 0, 0, 0);
-    let base = probe.len() + pre.len();
+    let start_html = probe.len();
+    let base = start_html + pre.len();
     let start_fragment = base;
     let end_fragment = base + fragment_html.len();
     let end_html = end_fragment + post.len();
-    let header = format_header(0, end_html, start_fragment, end_fragment);
+    let header = format_header(start_html, end_html, start_fragment, end_fragment);
     let mut out = Vec::with_capacity(header.len() + pre.len() + fragment_html.len() + post.len());
     out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(pre.as_bytes());
