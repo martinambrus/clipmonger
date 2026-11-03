@@ -1,7 +1,8 @@
 //! Synchronous clipboard data transfer over direct Win32 clipboard APIs.
 //!
 //! Writes are one `OpenClipboard` / `EmptyClipboard` / `SetClipboardData*n` /
-//! `CloseClipboard` sequence (atomic). Opening retries 5x20 ms; exhaustion
+//! `CloseClipboard` sequence. This excludes concurrent writers but does not
+//! roll back partial errors. Opening retries 5x20 ms; exhaustion
 //! maps to `Error::Timeout` (the clipboard is a shared lock).
 
 use clipmonger_platform::traits::ClipboardTransfer;
@@ -40,7 +41,7 @@ pub(crate) fn project_saved_snapshot(
 }
 
 #[cfg(any(windows, test))]
-fn ansi_snapshot_file_list(
+pub(crate) fn ansi_snapshot_file_list(
     saved: &[(u32, Vec<u8>)],
     cap: u64,
     within_budget: impl Fn() -> bool,
@@ -338,7 +339,7 @@ impl WinTransfer {
         Self
     }
 
-    /// Multi-format atomic write of any payload slice.
+    /// Multi-format exclusive write of any payload slice; errors may leave partial data.
     ///
     /// The slice form also accepts array literals and `&Vec` (via deref);
     /// the [`ClipboardTransfer`] impl delegates here.
@@ -426,12 +427,53 @@ impl Default for WinTransfer {
     }
 }
 
+#[cfg(all(not(windows), test))]
+pub(crate) mod imp {
+    use super::{Error, Result};
+    pub(crate) const CF_DIB: u32 = 8;
+    pub(crate) const CF_HDROP: u32 = 15;
+    pub(crate) const CF_UNICODETEXT: u32 = 13;
+    pub(crate) const PNG_FORMAT: &str = "PNG";
+    pub(crate) const DROP_EFFECT_FORMAT: &str = "Preferred DropEffect";
+    pub(crate) const DROP_EFFECT_MIME: &str = "x-os/Preferred DropEffect";
+    pub(crate) const DROPEFFECT_COPY: u32 = 1;
+    pub(crate) fn id_for_mime(mime: &str) -> Result<u32> {
+        match mime {
+            "text/plain" | "text/plain;charset=utf-8" => return Ok(CF_UNICODETEXT),
+            "text/uri-list" => return Ok(CF_HDROP),
+            "image/png" => return register(PNG_FORMAT),
+            _ => {}
+        }
+        if let Some(windows) = crate::formats::canonical_to_windows(mime) {
+            return register(windows);
+        }
+        if let Some(name) = mime.strip_prefix("x-os/") {
+            if name.is_empty() {
+                return Err(Error::Unsupported(format!("bad format name '{mime}'")));
+            }
+            return register(name);
+        }
+        Err(Error::Unsupported(format!("unsupported format '{mime}'")))
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::unnecessary_wraps)]
+    pub(crate) fn register(name: &str) -> Result<u32> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        name.hash(&mut h);
+        let id = (h.finish() as u32) | 0xC000;
+        if id == 0 {
+            Ok(0xC001)
+        } else {
+            Ok(id)
+        }
+    }
+}
+
 #[cfg(windows)]
 pub(crate) mod imp {
     use super::{Error, Result};
     use clipboard_win::raw;
-
-    type SavedSnapshot = (Vec<(u32, Vec<u8>)>, Option<Vec<u8>>);
 
     /// Attempts and pause between clipboard opens (spec retry budget).
     const OPEN_ATTEMPTS: u32 = 5;
@@ -595,70 +637,6 @@ pub(crate) mod imp {
         Ok(list)
     }
 
-    /// Raw bytes of the formats in `ids` that the clipboard holds, in
-    /// clipboard order, for [`restore`]. `None` when one is over
-    /// `max_bytes` or reading outlasts `budget` (owners render delayed
-    /// formats on demand, and the paste waits for this).
-    pub(crate) fn snapshot(
-        ids: &[u32],
-        max_bytes: u64,
-        budget: std::time::Duration,
-        file_limit: Option<u64>,
-    ) -> Option<SavedSnapshot> {
-        let started = std::time::Instant::now();
-        with_open("snapshot", || {
-            let mut saved = Vec::new();
-            let mut privacy_probe_failed = false;
-            for id in raw::EnumFormats::new() {
-                if !ids.contains(&id) {
-                    continue;
-                }
-                if started.elapsed() > budget
-                    || raw::size(id).is_some_and(|n| n.get() as u64 > max_bytes)
-                {
-                    return Err(Error::TooLarge(
-                        "clipboard snapshot over budget".to_string(),
-                    ));
-                }
-                let mut bytes = Vec::new();
-                if raw::get_vec(id, &mut bytes).is_ok() {
-                    saved.push((id, bytes));
-                } else if id >= 0xc000 {
-                    privacy_probe_failed |= raw::format_name_big(id)
-                        .is_none_or(|name| crate::optout::is_optout_name(&name));
-                }
-            }
-            let file_list = file_limit
-                .filter(|_| !privacy_probe_failed)
-                .and_then(|limit| {
-                    super::ansi_snapshot_file_list(
-                        &saved,
-                        limit.min(max_bytes.saturating_mul(5)),
-                        || started.elapsed() <= budget,
-                        raw::format_name_big,
-                        read_uri_list,
-                    )
-                });
-            Ok((saved, file_list))
-        })
-        .ok()
-    }
-
-    /// Put a [`snapshot`] back in one atomic write.
-    pub(crate) fn restore_with_sequence(
-        saved: &[(u32, Vec<u8>)],
-        done: impl FnOnce(Option<u32>),
-    ) -> Result<()> {
-        with_open("restore", || {
-            raw::empty().map_err(|e| clip_error("empty", e))?;
-            for (id, bytes) in saved {
-                raw::set_without_clear(*id, bytes).map_err(|e| clip_error("restore", e))?;
-            }
-            done(raw::seq_num().map(std::num::NonZeroU32::get));
-            Ok(())
-        })
-    }
-
     /// Check native size while borrowed; copy only after the cap passes.
     /// Every caller holds `with_open`'s exclusive clipboard session.
     pub(crate) fn read_native_bounded(id: u32, max_raw_bytes: u64) -> Result<Vec<u8>> {
@@ -683,29 +661,51 @@ pub(crate) mod imp {
     }
 
     pub(crate) fn write_one(id: u32, mime: &str, bytes: &[u8]) -> Result<()> {
-        use clipboard_win::{options::NoClear, raw};
-        if mime == "text/plain" || mime == "text/plain;charset=utf-8" {
-            let text = std::str::from_utf8(bytes)
-                .map_err(|e| Error::Internal(format!("text payload is not UTF-8: {e}")))?;
-            return raw::set_string_with(text, NoClear).map_err(|e| clip_error("write text", e));
+        let native = super::encode_native(mime, bytes)?;
+        raw::set_without_clear(id, &native).map_err(|e| clip_error("write", e))
+    }
+}
+
+/// Prepare bytes for the native format before destructive swap publication.
+/// Raw snapshots deliberately bypass this canonical MIME conversion.
+#[cfg(any(windows, test))]
+pub(crate) fn encode_native(mime: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    let utf8 = || {
+        std::str::from_utf8(bytes)
+            .map_err(|e| Error::Internal(format!("{mime} payload is not UTF-8: {e}")))
+    };
+    match mime {
+        "text/plain" | "text/plain;charset=utf-8" => Ok(utf8()?
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()),
+        "text/html" if crate::html::parse_cf_html(bytes).is_err() => {
+            Ok(crate::html::build_cf_html(utf8()?))
         }
-        if mime == "text/html" {
-            if crate::html::parse_cf_html(bytes).is_ok() {
-                return raw::set_without_clear(id, bytes).map_err(|e| clip_error("write html", e));
+        "text/uri-list" => {
+            let paths = crate::uri::uri_list_to_paths(utf8()?);
+            if paths.is_empty() {
+                return Err(Error::Unsupported(
+                    "text/uri-list names no Windows file".into(),
+                ));
             }
-            let fragment = std::str::from_utf8(bytes)
-                .map_err(|e| Error::Internal(format!("html payload is not UTF-8: {e}")))?;
-            return raw::set_html_with(id, fragment, NoClear)
-                .map_err(|e| clip_error("write html", e));
+            // DROPFILES: pFiles=20, POINT=(0,0), fNC=0, fWide=TRUE.
+            let mut out = [20_u32, 0, 0, 0, 1]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            for path in paths {
+                out.extend(
+                    path.encode_utf16()
+                        .chain(std::iter::once(0))
+                        .flat_map(u16::to_le_bytes),
+                );
+            }
+            out.extend([0, 0]);
+            Ok(out)
         }
-        if mime == "text/uri-list" {
-            let text = std::str::from_utf8(bytes)
-                .map_err(|e| Error::Internal(format!("uri-list payload is not UTF-8: {e}")))?;
-            let paths = crate::uri::uri_list_to_paths(text);
-            return raw::set_file_list_with(&paths, NoClear)
-                .map_err(|e| clip_error("write uri-list", e));
-        }
-        raw::set_without_clear(id, bytes).map_err(|e| clip_error("write", e))
+        _ => Ok(bytes.to_vec()),
     }
 }
 
@@ -1214,5 +1214,47 @@ mod bounded_tests {
             read_dib_candidates([17, 8], 1, |id| { (id == 17).then(|| Ok(dib.clone())) }),
             Err(Error::TooLarge(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod native_encoding_tests {
+    use super::encode_native;
+
+    #[test]
+    fn native_html_offsets_delimit_context_and_multibyte_fragment() {
+        for fragment in ["<p>héllo 🌍 日本語</p>", "<b>native</b>", ""] {
+            let bytes = encode_native("text/html", fragment.as_bytes()).unwrap();
+            let context_start = bytes
+                .windows(b"<html>".len())
+                .position(|part| part == b"<html>")
+                .unwrap();
+            let header = std::str::from_utf8(&bytes[..context_start]).unwrap();
+            let offset = |key: &str| -> usize {
+                let field = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix(key))
+                    .unwrap();
+                assert!(field.bytes().all(|byte| byte.is_ascii_digit()));
+                field.parse().unwrap()
+            };
+            let start_html = offset("StartHTML:");
+            let end_html = offset("EndHTML:");
+            let start_fragment = offset("StartFragment:");
+            let end_fragment = offset("EndFragment:");
+            assert_eq!(start_html, context_start);
+            assert_eq!(end_html, bytes.len());
+            assert_eq!(
+                &bytes[start_html..start_fragment],
+                b"<html>\r\n<body>\r\n<!--StartFragment-->"
+            );
+            assert_eq!(&bytes[start_fragment..end_fragment], fragment.as_bytes());
+            assert_eq!(
+                &bytes[end_fragment..end_html],
+                b"<!--EndFragment-->\r\n</body>\r\n</html>"
+            );
+            // The already-framed publication route must remain byte-for-byte raw.
+            assert_eq!(encode_native("text/html", &bytes).unwrap(), bytes);
+        }
     }
 }

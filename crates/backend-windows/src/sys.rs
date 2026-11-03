@@ -114,8 +114,7 @@ impl Drop for ClipboardDataLock {
 }
 
 /// Inspect native bytes without first copying the entire clipboard handle.
-/// The caller must hold the exclusive clipboard session from `with_open` for
-/// the whole call. The callback cannot retain the borrowed memory. No handle
+/// The caller must hold an exclusive clipboard session for the whole call. The callback cannot retain the borrowed memory. No handle
 /// is freed: the clipboard owns it, and the lock guard only unlocks it.
 #[cfg(windows)]
 pub(crate) fn with_clipboard_bytes<T>(
@@ -123,8 +122,8 @@ pub(crate) fn with_clipboard_bytes<T>(
     inspect: impl FnOnce(&[u8]) -> clipmonger_platform::types::Result<T>,
 ) -> clipmonger_platform::types::Result<T> {
     use clipmonger_platform::types::Error;
-    // Safety: all callers run inside transfer::imp::with_open, which keeps
-    // the clipboard exclusively open while this handle is inspected.
+    // Safety: all callers hold an exclusive clipboard session while this
+    // handle is inspected.
     let handle = unsafe { windows_sys::Win32::System::DataExchange::GetClipboardData(id) };
     if handle.is_null() {
         return Err(Error::Unavailable(
@@ -1223,6 +1222,41 @@ pub fn scroll_lock_down() -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_SCROLL};
     // Safety: GetAsyncKeyState accepts this virtual-key code.
     unsafe { GetAsyncKeyState(i32::from(VK_SCROLL)) < 0 }
+}
+
+/// Enumerate under the caller's open session, distinguishing completion from
+/// failure. The legacy monitor/read iterators keep their existing behavior.
+#[cfg(windows)]
+pub(crate) fn clipboard_formats_checked() -> clipmonger_platform::types::Result<Vec<u32>> {
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_SUCCESS};
+    use windows_sys::Win32::System::DataExchange::EnumClipboardFormats;
+    let mut ids = Vec::new();
+    let mut previous = 0;
+    loop {
+        // Safety: caller holds an open clipboard; these calls use only a
+        // format id and the calling thread's last-error slot.
+        let (id, error) = unsafe {
+            SetLastError(ERROR_SUCCESS);
+            let id = EnumClipboardFormats(previous);
+            (id, GetLastError())
+        };
+        if id == 0 {
+            return if error == ERROR_SUCCESS {
+                Ok(ids)
+            } else {
+                Err(clipmonger_platform::types::Error::Io(format!(
+                    "clipboard enumeration failed: {error}"
+                )))
+            };
+        }
+        if ids.contains(&id) {
+            return Err(clipmonger_platform::types::Error::Io(
+                "clipboard enumeration repeated a format".into(),
+            ));
+        }
+        ids.push(id);
+        previous = id;
+    }
 }
 
 #[cfg(test)]

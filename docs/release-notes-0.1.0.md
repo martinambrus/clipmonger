@@ -9,8 +9,18 @@ for this draft (R-F4); the user reviews artifacts and notes first.
   `clipmonger-cli.exe`, `clipmonger.exe` (UI). Cross-built on WSL2 with
   the windows-gnu target; not a native-runner build (seg-12 §2).
 - `clipmonger-0.1.0-linux-x86_64.zip` — `clipmonger-daemon`,
-  `clipmonger-cli`, `clipmonger` (UI), GNOME extension `dist/` payload.
-- `SHA256SUMS` — sha256sum-format checksums for every artifact above.
+  `clipmonger-cli`, `clipmonger` (UI), built GNOME extension under
+  `gnome-extension/`.
+- Both portable ZIPs contain `portable.marker`, portable-use instructions,
+  and the complete `licenses/` directory, including font notices and their
+  README, upstream license texts, and generated `RUST-NOTICES.txt`.
+- `clipmonger-0.1.0-windows-x86_64-setup.exe` — unsigned NSIS installer
+  for Program Files and a Start menu entry, with the same license payload.
+  Uninstall preserves profiles by default. The optional deletion checkbox
+  names the default roaming profile directory and all its contents, requires
+  separate confirmation, and refuses an unknown or different shell account.
+  Custom and portable profiles outside that directory are preserved.
+- `SHA256SUMS` — sha256sum-format checksums for both ZIPs and the installer.
 
 The brief-named artifact files use the `-x86_64` suffix; they correspond
 to the `linux-x64` / `windows-x64` naming in the release analysis.
@@ -29,8 +39,9 @@ SHA256SUMS` in the download directory.
 ## Coexistence note
 
 Clipmonger uses a passive clipboard listener by design and coexists
-with ArsClip and with sync tools (RustDesk/ScreenConnect verified by
-design in Step 2); pause sync tools only for clean manual test runs.
+with ArsClip and clipboard sync tools. Current-build interoperability with
+RustDesk and ScreenConnect still requires the native checks below; pause sync
+tools only for clean manual test runs.
 Only one Clipmonger daemon may hold a profile at a time
 (`already_running`); portable mode leaves no autostart entries.
 
@@ -39,3 +50,11 @@ Only one Clipmonger daemon may hold a profile at a time
 T-409/T-410 (Windows session), T-508, T-606/T-607, T-702..T-705
 (GNOME/Ubuntu), T-905..T-908 (real displays), per-box caps goldens,
 coverage floor, update-check (T-1202). See `CHANGELOG.md`.
+
+The current draft still needs installer/uninstaller, confirmation and recovery
+acceptance; elevated-helper and failed-paste acceptance; and the current CPU
+runner's native display and focus checks. The profile-deletion component's
+synthetic Windows fixture is not installer UI or UAC acceptance. Positive file
+symbolic-link controls remain unverified where the test token lacks privilege.
+Linux release clearance for the blur-derived protocol output remains open.
+A local draft artifact or checksum pass does not approve publication.
