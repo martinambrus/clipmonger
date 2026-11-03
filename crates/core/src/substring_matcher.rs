@@ -20,6 +20,15 @@ enum Context {
 // contains four scalars, including at most one variable-width scalar. Skipping
 // ignorable characters before testing Cased also handles overlapping properties.
 fn context(c: char) -> Context {
+    if c.is_ascii() {
+        return if c.is_ascii_alphabetic() {
+            Context::Cased
+        } else if matches!(c, '\'' | '.' | ':' | '^' | '`') {
+            Context::Ignorable
+        } else {
+            Context::Uncased
+        };
+    }
     let probe = |suffix: char| {
         format!("AΣ{c}{suffix}")
             .to_lowercase()
@@ -90,6 +99,9 @@ impl SubstringMatcher {
 
     /// Feed one complete Unicode scalar; calls may be split at any scalar boundary.
     pub(crate) fn feed(&mut self, c: char) {
+        if self.is_match() {
+            return;
+        }
         let class = context(c);
         if c == 'Σ' {
             assert!(class == Context::Cased, "uppercase sigma must be cased");
@@ -129,8 +141,7 @@ impl SubstringMatcher {
     }
 
     /// True only if every still-possible lowercase stream has matched.
-    #[cfg(test)]
-    pub(crate) fn is_match(&self) -> bool {
+    fn is_match(&self) -> bool {
         match self.pending {
             Some((medial, final_sigma)) => medial.matched && final_sigma.matched,
             None => self.current.matched,
@@ -165,6 +176,56 @@ mod tests {
             expected,
             "row={row:?} query={query:?} width={width}"
         );
+    }
+
+    #[test]
+    fn settled_match_stops_tracking_context() {
+        for query in ["", "hit"] {
+            let mut m = SubstringMatcher::new(query);
+            for c in "hit".chars() {
+                m.feed(c);
+            }
+            assert!(m.is_match());
+            let preceding = m.preceding_cased;
+            for c in " Σ\u{301} ".chars() {
+                m.feed(c);
+            }
+            assert_eq!(m.preceding_cased, preceding);
+            assert!(m.finish());
+        }
+        let mut m = SubstringMatcher::new("\u{301}");
+        for c in "AΣ\u{301}".chars() {
+            m.feed(c);
+        }
+        assert!(m.is_match());
+        assert!(m.pending.is_some());
+        m.feed(' ');
+        assert!(m.pending.is_some());
+        assert!(m.finish());
+    }
+
+    #[test]
+    fn ascii_context_matches_lowercase_probe() {
+        for byte in 0..=127 {
+            let c = char::from(byte);
+            let probe = |suffix| {
+                format!("AΣ{c}{suffix}")
+                    .to_lowercase()
+                    .chars()
+                    .nth(1)
+                    .unwrap()
+            };
+            let expected = match (probe('A'), probe(' ')) {
+                ('σ', 'σ') => Context::Cased,
+                ('σ', 'ς') => Context::Ignorable,
+                ('ς', 'ς') => Context::Uncased,
+                _ => panic!("unexpected probe for {byte}"),
+            };
+            assert!(context(c) == expected, "ASCII {byte}");
+            for suffix in ['A', ' '] {
+                check(&format!("AΣ{c}{suffix}"), "ς", 1);
+            }
+        }
     }
 
     #[test]
