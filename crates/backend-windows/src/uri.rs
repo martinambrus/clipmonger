@@ -12,6 +12,46 @@ pub fn paths_to_uri_list(paths: &[String]) -> String {
         .join("\r\n")
 }
 
+/// Decode a bounded wide DROPFILES snapshot using the same path-to-URI mapping
+/// as native capture. Non-wide and malformed snapshots fail open.
+#[cfg(any(windows, test))]
+pub(crate) fn dropfiles_to_uri_list(raw: &[u8], max_bytes: u64) -> Option<Vec<u8>> {
+    if raw.len() < 20 || raw.len() as u64 > max_bytes.saturating_mul(2).saturating_add(20) {
+        return None;
+    }
+    let offset = u32::from_le_bytes(raw[0..4].try_into().ok()?) as usize;
+    let wide = u32::from_le_bytes(raw[16..20].try_into().ok()?);
+    if wide == 0
+        || offset < 20
+        || !offset.is_multiple_of(2)
+        || offset > raw.len()
+        || !(raw.len() - offset).is_multiple_of(2)
+    {
+        return None;
+    }
+    let mut paths = Vec::new();
+    let mut current = Vec::new();
+    let mut ended = false;
+    for pair in raw[offset..].as_chunks::<2>().0 {
+        let unit = u16::from_le_bytes([pair[0], pair[1]]);
+        if unit == 0 {
+            if current.is_empty() {
+                ended = true;
+                break;
+            }
+            paths.push(String::from_utf16_lossy(&current));
+            current.clear();
+        } else {
+            current.push(unit);
+        }
+    }
+    if !ended || paths.is_empty() {
+        return None;
+    }
+    let list = paths_to_uri_list(&paths).into_bytes();
+    (list.len() as u64 <= max_bytes).then_some(list)
+}
+
 /// Parse a `text/uri-list` into Windows paths. Comment lines and URIs that
 /// do not name a Windows path (other schemes, Unix paths) are skipped; the
 /// older `file://C:/x` form and bare paths are accepted too.

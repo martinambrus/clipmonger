@@ -1819,6 +1819,15 @@ trait PermanentX11Engine: Send {
         id: uuid::Uuid,
         payloads: &[(String, Vec<u8>)],
     ) -> clipmonger_platform::types::Result<()>;
+    fn deliver_with(
+        &self,
+        target: &clipmonger_platform::types::PasteTarget,
+        id: uuid::Uuid,
+        payloads: &[(String, Vec<u8>)],
+        _write: &mut clipmonger_backend_x11::paste::ClipboardWriteHook<'_>,
+    ) -> clipmonger_platform::types::Result<()> {
+        self.deliver(target, id, payloads)
+    }
 }
 
 #[cfg(all(unix, feature = "backend-x11"))]
@@ -1842,10 +1851,26 @@ impl PermanentX11Engine for clipmonger_backend_x11::X11Paste {
     ) -> clipmonger_platform::types::Result<()> {
         self.paste_payloads(target, &clipmonger_platform::types::ClipRef(id), payloads)
     }
+    fn deliver_with(
+        &self,
+        target: &clipmonger_platform::types::PasteTarget,
+        id: uuid::Uuid,
+        payloads: &[(String, Vec<u8>)],
+        write: &mut clipmonger_backend_x11::paste::ClipboardWriteHook<'_>,
+    ) -> clipmonger_platform::types::Result<()> {
+        self.paste_payloads_with(
+            target,
+            &clipmonger_platform::types::ClipRef(id),
+            payloads,
+            write,
+        )
+    }
 }
 
 /// Shared daemon request state behind the IPC handler.
 pub struct DaemonState {
+    self_writes: std::sync::Arc<Mutex<clipmonger_platform::paste_policy::SuppressionRegistry>>,
+    self_write_clock: std::time::Instant,
     /// Clip store for history methods. Interior mutability so
     /// `backup.restore` can reopen the store on the restored profile
     /// while other arms hold only read guards.
@@ -1896,6 +1921,75 @@ pub struct DaemonState {
     thumbnail_payload_reads: std::sync::atomic::AtomicUsize,
 }
 
+#[cfg(all(windows, feature = "backend-windows"))]
+struct WindowsWriteObserver<'a>(&'a DaemonState);
+
+#[cfg(all(windows, feature = "backend-windows"))]
+impl clipmonger_backend_windows::paste::ClipboardWriteObserver for WindowsWriteObserver<'_> {
+    fn begin(&self, payloads: &[(String, Vec<u8>)]) -> Option<u64> {
+        let cfg = self.0.config.lock().ok()?;
+        let projected = clipmonger_backend_windows::transfer::project_write_payloads_filtered(
+            payloads,
+            cfg.monitor.max_bytes,
+            |mime| wanted_capture_mime(mime, &cfg),
+        )?;
+        if projected.is_empty() {
+            return None;
+        }
+        let hash = clipmonger_core::hash::content_hash(&projected);
+        drop(cfg);
+        self.0
+            .self_writes
+            .lock()
+            .ok()
+            .map(|mut registry| registry.register_pending(hash, self.0.self_write_now()))
+    }
+
+    fn written(&self, id: u64, sequence: Option<u32>) {
+        if let Ok(mut registry) = self.0.self_writes.lock() {
+            if let Some(sequence) = sequence {
+                registry.finalize_pending(id, sequence.to_string());
+            } else {
+                registry.cancel_tracked(id);
+            }
+        }
+    }
+
+    fn failed(&self, id: u64) {
+        if let Ok(mut registry) = self.0.self_writes.lock() {
+            registry.cancel_tracked(id);
+        }
+    }
+
+    fn snapshot_file_limit(&self) -> Option<u64> {
+        let cfg = self.0.config.lock().ok()?;
+        wanted_capture_mime("text/uri-list", &cfg).then_some(cfg.monitor.max_bytes)
+    }
+
+    fn begin_restore(
+        &self,
+        saved: &[(u32, Vec<u8>)],
+        name_for_id: &dyn Fn(u32) -> Option<String>,
+        saved_file_list: Option<&[u8]>,
+    ) -> Option<u64> {
+        let cfg = self.0.config.lock().ok()?;
+        let projected = clipmonger_backend_windows::transfer::project_saved_snapshot_with_file(
+            saved,
+            name_for_id,
+            cfg.monitor.max_bytes,
+            |mime| wanted_capture_mime(mime, &cfg),
+            saved_file_list,
+        )?;
+        let hash = clipmonger_core::hash::content_hash(&projected);
+        drop(cfg);
+        self.0
+            .self_writes
+            .lock()
+            .ok()
+            .map(|mut registry| registry.register_pending(hash, self.0.self_write_now()))
+    }
+}
+
 /// Owned background maintenance; dropping it cancels and joins its worker.
 pub struct CompactMaintenance {
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1941,6 +2035,110 @@ impl Drop for CompactMaintenance {
 }
 
 impl DaemonState {
+    #[cfg(all(unix, any(feature = "backend-wayland", feature = "backend-x11")))]
+    fn self_write_with<T, E>(
+        &self,
+        payloads: &[(String, Vec<u8>)],
+        alternate: Option<&[(String, Vec<u8>)]>,
+        origin: &str,
+        write: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let expected = self.config.lock().ok().and_then(|cfg| {
+            let hash = |items: &[(String, Vec<u8>)]| {
+                if items.len() > MAX_CAPTURE_FORMATS {
+                    return None;
+                }
+                let mut wanted = Vec::new();
+                for (mime, bytes) in items {
+                    if !valid_capture_mime(mime) || !wanted_capture_mime(mime, &cfg) {
+                        continue;
+                    }
+                    if mime.starts_with("x-os/")
+                        || mime.starts_with("x-os:")
+                        || bytes.len() as u64 > cfg.monitor.max_bytes
+                        || wanted.iter().any(|(prior, _)| prior == mime)
+                    {
+                        return None;
+                    }
+                    wanted.push((mime.clone(), bytes.clone()));
+                }
+                (!wanted.is_empty()).then(|| clipmonger_core::hash::content_hash(&wanted))
+            };
+            Some((hash(payloads)?, alternate.and_then(hash)))
+        });
+        let id = expected.and_then(|(hash, alternate)| {
+            self.self_writes.lock().ok().map(|mut registry| {
+                registry.register_bridged_for(origin, hash, alternate, self.self_write_now())
+            })
+        });
+        let result = write();
+        if result.is_err() {
+            if let Some(id) = id {
+                if let Ok(mut registry) = self.self_writes.lock() {
+                    registry.cancel_tracked(id);
+                }
+            }
+        }
+        result
+    }
+
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    fn wayland_self_write<T, E>(
+        &self,
+        payloads: &[(String, Vec<u8>)],
+        write: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        #[cfg(feature = "backend-x11")]
+        let alternate = Self::x11_projection(payloads);
+        #[cfg(feature = "backend-x11")]
+        let alternate = Some(alternate.as_slice());
+        #[cfg(not(feature = "backend-x11"))]
+        let alternate = None;
+        self.self_write_with(payloads, alternate, "wayland", write)
+    }
+
+    #[cfg(all(unix, feature = "backend-x11"))]
+    fn x11_projection(payloads: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
+        use clipmonger_backend_x11::mime::{
+            canonical_to_x11, served_target, targets_for, x11_to_canonical,
+        };
+        let names = payloads
+            .iter()
+            .map(|(mime, _)| mime.clone())
+            .collect::<Vec<_>>();
+        let mut projected = Vec::new();
+        for atom in targets_for(&names) {
+            if atom == "TARGETS" || atom == "TIMESTAMP" {
+                continue;
+            }
+            let Some(mime) = x11_to_canonical(&atom) else {
+                continue;
+            };
+            if projected.iter().any(|(prior, _)| prior == &mime) {
+                continue;
+            }
+            let target = canonical_to_x11(&mime)
+                .unwrap_or_else(|| mime.strip_prefix("x-os/").unwrap_or(&mime));
+            if let Some((_, bytes)) = served_target(target, payloads) {
+                projected.push((mime, bytes.to_vec()));
+            }
+        }
+        projected
+    }
+
+    #[cfg(all(unix, feature = "backend-x11"))]
+    fn x11_self_write<T, E>(
+        &self,
+        payloads: &[(String, Vec<u8>)],
+        write: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let projected = Self::x11_projection(payloads);
+        self.self_write_with(&projected, Some(payloads), "x11", write)
+    }
+
+    fn self_write_now(&self) -> u64 {
+        u64::try_from(self.self_write_clock.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
     /// Wrap an opened store with fresh skeleton caps.
     #[must_use]
     pub fn new(store: Store) -> Self {
@@ -1951,6 +2149,10 @@ impl DaemonState {
     #[must_use]
     pub fn with_config(store: Store, config: clipmonger_core::Config) -> Self {
         Self {
+            self_writes: std::sync::Arc::new(Mutex::new(
+                clipmonger_platform::paste_policy::SuppressionRegistry::new(),
+            )),
+            self_write_clock: std::time::Instant::now(),
             store: RwLock::new(Some(store)),
             caps: CapsAggregator::new(),
             monitoring_paused: Mutex::new(false),
@@ -2606,6 +2808,7 @@ impl DaemonState {
             return self.ingest_oversize_checked(origin, &known_oversize);
         }
         let mut payloads = Vec::new();
+        let mut read_failed = false;
         for entry in wanted {
             match transfer.read(&entry.mime, cfg.monitor.max_bytes) {
                 Ok(bytes) => {
@@ -2624,6 +2827,7 @@ impl DaemonState {
                     payloads.push((entry.mime, bytes));
                 }
                 Err(error) => {
+                    read_failed = true;
                     if origin == "windows" && event.native_sequence.is_some() {
                         match error {
                             clipmonger_platform::types::Error::CaptureExcluded => {
@@ -2648,13 +2852,38 @@ impl DaemonState {
                 }
             }
         }
-        if short_windows_capture(origin, cfg.monitor.min_len, &payloads) {
+        if payloads.is_empty() || short_windows_capture(origin, cfg.monitor.min_len, &payloads) {
             return Ok(false);
         }
-        if payloads.is_empty() {
+        if !read_failed && self.suppress_capture(origin, event, &payloads) {
             return Ok(false);
         }
         self.ingest_capture_checked(origin, false, &payloads)
+    }
+
+    fn suppress_capture(
+        &self,
+        origin: &str,
+        event: &clipmonger_platform::types::CaptureEvent,
+        payloads: &[(String, Vec<u8>)],
+    ) -> bool {
+        if event.origin != clipmonger_platform::types::CaptureOrigin::Clipboard
+            || payloads
+                .iter()
+                .any(|(mime, _)| mime.starts_with("x-os/") || mime.starts_with("x-os:"))
+        {
+            return false;
+        }
+        let hash = clipmonger_core::hash::content_hash(payloads);
+        let sequence = event.native_sequence.map(|value| value.to_string());
+        self.self_writes.lock().is_ok_and(|mut registry| {
+            registry.should_suppress_from(
+                &hash,
+                sequence.as_deref(),
+                self.self_write_now(),
+                Some(origin),
+            )
+        })
     }
 
     fn ingest_oversize_checked(
@@ -3894,7 +4123,9 @@ impl DaemonState {
                     "permanent X11 engine unavailable".into(),
                 )
             })?
-            .deliver(target, id, payloads)
+            .deliver_with(target, id, payloads, &mut |payload, write| {
+                self.x11_self_write(payload, write)
+            })
     }
 
     fn route_permanent(backend: &str, windows: impl FnOnce(), x11: impl FnOnce()) {
@@ -4104,8 +4335,9 @@ impl DaemonState {
                 }
                 return res;
             }
+            let observer = WindowsWriteObserver(self);
             paste
-                .paste_payloads(&target, &clip, payloads)
+                .paste_payloads_with(&target, &clip, payloads, Some(&observer))
                 .map_err(|e| {
                     daemon_runtime_emit(
                         clipmonger_core::runtime_log::Severity::Warn,
@@ -4131,7 +4363,7 @@ impl DaemonState {
         #[cfg(all(unix, feature = "backend-wayland"))]
         {
             let _ = (clip, params);
-            Self::paste_wayland_payloads(payloads)
+            self.paste_wayland_payloads(payloads)
         }
         #[cfg(not(any(
             all(windows, feature = "backend-windows"),
@@ -4156,22 +4388,24 @@ impl DaemonState {
 
     /// Deliver payloads through the Wayland backend and report its toast.
     #[cfg(all(unix, feature = "backend-wayland"))]
-    fn paste_wayland_payloads(payloads: &[(String, Vec<u8>)]) -> Result<Value, IpcError> {
+    fn paste_wayland_payloads(&self, payloads: &[(String, Vec<u8>)]) -> Result<Value, IpcError> {
         use clipmonger_backend_wayland::{probe_current, WlPaste};
         let has_data =
             probe_current().protocol != clipmonger_backend_wayland::probe::Protocol::None;
         let paste = WlPaste::new(has_data);
-        let outcome = paste.paste_payloads(payloads).map_err(|e| {
-            daemon_runtime_emit(
-                clipmonger_core::runtime_log::Severity::Warn,
-                "paste.failed",
-                &[
-                    ("operation", "paste_target_or_delivery"),
-                    ("class", runtime_platform_class(&e)),
-                ],
-            );
-            IpcError::new("unavailable", format!("paste.execute: {e}"))
-        })?;
+        let outcome = self
+            .wayland_self_write(payloads, || paste.paste_payloads(payloads))
+            .map_err(|e| {
+                daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "paste.failed",
+                    &[
+                        ("operation", "paste_target_or_delivery"),
+                        ("class", runtime_platform_class(&e)),
+                    ],
+                );
+                IpcError::new("unavailable", format!("paste.execute: {e}"))
+            })?;
         let mut result = serde_json::json!({"pasted": true});
         if let Some(toast) = outcome.toast {
             result["toast"] = Value::from(toast);
@@ -4213,8 +4447,13 @@ impl DaemonState {
         }
         let (_, dwell_ms, delivery, restore) = settings;
         if delivery == clipmonger_core::PasteDelivery::ClipboardRestore {
-            let swap = clipmonger_backend_windows::paste::ClipboardSwap::begin(payloads, restore)
-                .map_err(|e| IpcError::new("backend", format!("paste.execute: {e}")))?;
+            let observer = WindowsWriteObserver(self);
+            let swap = clipmonger_backend_windows::paste::ClipboardSwap::begin_with(
+                payloads,
+                restore,
+                Some(&observer),
+            )
+            .map_err(|e| IpcError::new("backend", format!("paste.execute: {e}")))?;
             let outcome = self.send_helper_job(
                 target,
                 pid,
@@ -4233,7 +4472,7 @@ impl DaemonState {
                 0
             };
             if restore {
-                swap.finish(dwell, true);
+                swap.finish_with(dwell, true, Some(&observer));
             }
             return outcome;
         }
@@ -4322,6 +4561,7 @@ impl DaemonState {
                 "running": true,
                 "version": DAEMON_VERSION,
                 "monitoring_paused": self.paused(),
+                "suppressed_self_writes": self.self_writes.lock().ok().map(|registry| registry.suppressed_count()),
             })),
             "caps.get" | "caps.refresh" => Ok(self.caps_snapshot()),
             "ping" => Ok(serde_json::json!({"pong": true})),
@@ -4592,6 +4832,508 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = clipmonger_core::Store::open(&dir).expect("store");
         (dir, DaemonState::new(store))
+    }
+
+    #[test]
+    fn self_write_is_dropped_at_real_capture_boundary_once() {
+        use clipmonger_platform::fakes::FakeTransfer;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
+        let (_dir, state) = fresh_state("self-write-capture");
+        let payloads = vec![("text/plain".to_string(), b"temporary value".to_vec())];
+        let hash = clipmonger_core::hash::content_hash(&payloads);
+        state
+            .self_writes
+            .lock()
+            .unwrap()
+            .register(hash, None, state.self_write_now());
+        let transfer = FakeTransfer::new(
+            vec!["text/plain".into()],
+            payloads.into_iter().collect(),
+            None,
+        );
+        let event = CaptureEvent {
+            native_sequence: None,
+            offers: vec![FormatOffer {
+                mime: "text/plain".into(),
+                bytes_hint: None,
+            }],
+            origin: CaptureOrigin::Clipboard,
+            sensitive: false,
+        };
+        assert!(!state
+            .capture_event("wayland", &event, &transfer, |_| {})
+            .unwrap());
+        assert_eq!(state.self_writes.lock().unwrap().suppressed_count(), 1);
+        assert_eq!(
+            state.handle("status", &serde_json::json!({})).unwrap()["suppressed_self_writes"],
+            1
+        );
+        assert!(state
+            .capture_event("wayland", &event, &transfer, |_| {})
+            .unwrap());
+    }
+
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[test]
+    fn wayland_write_registers_before_reentrant_capture() {
+        use clipmonger_platform::fakes::FakeTransfer;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
+        let (_dir, state) = fresh_state("self-write-reentrant");
+        let payloads = vec![("text/plain".to_string(), b"temporary value".to_vec())];
+        let transfer = FakeTransfer::new(
+            vec!["text/plain".into()],
+            payloads.clone().into_iter().collect(),
+            None,
+        );
+        let event = CaptureEvent {
+            native_sequence: None,
+            offers: vec![FormatOffer {
+                mime: "text/plain".into(),
+                bytes_hint: None,
+            }],
+            origin: CaptureOrigin::Clipboard,
+            sensitive: false,
+        };
+        state
+            .wayland_self_write(&payloads, || -> Result<(), ()> {
+                assert!(!state
+                    .capture_event("wayland", &event, &transfer, |_| {})
+                    .unwrap());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[test]
+    fn failed_wayland_write_does_not_suppress_later_copy() {
+        use clipmonger_platform::fakes::FakeTransfer;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
+        let (_dir, state) = fresh_state("self-write-failure");
+        let payloads = vec![("text/plain".to_string(), b"temporary value".to_vec())];
+        let transfer = FakeTransfer::new(
+            vec!["text/plain".into()],
+            payloads.clone().into_iter().collect(),
+            None,
+        );
+        let event = CaptureEvent {
+            native_sequence: None,
+            offers: vec![FormatOffer {
+                mime: "text/plain".into(),
+                bytes_hint: None,
+            }],
+            origin: CaptureOrigin::Clipboard,
+            sensitive: false,
+        };
+        let result: Result<(), ()> = state.wayland_self_write(&payloads, || Err(()));
+        assert!(result.is_err());
+        assert!(state
+            .capture_event("wayland", &event, &transfer, |_| {})
+            .unwrap());
+        assert_eq!(state.self_writes.lock().unwrap().suppressed_count(), 0);
+    }
+
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[test]
+    fn bridged_write_is_dropped_in_either_monitor_order() {
+        use clipmonger_platform::fakes::FakeTransfer;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
+        for (name, first, second) in [
+            ("self-bridge-x", "x11", "wayland"),
+            ("self-bridge-w", "wayland", "x11"),
+        ] {
+            let (_dir, state) = fresh_state(name);
+            let payloads = vec![("text/plain".to_string(), b"temporary value".to_vec())];
+            let transfer = FakeTransfer::new(
+                vec!["text/plain".into()],
+                payloads.clone().into_iter().collect(),
+                None,
+            );
+            let event = CaptureEvent {
+                native_sequence: None,
+                offers: vec![FormatOffer {
+                    mime: "text/plain".into(),
+                    bytes_hint: None,
+                }],
+                origin: CaptureOrigin::Clipboard,
+                sensitive: false,
+            };
+            state
+                .wayland_self_write(&payloads, || -> Result<(), ()> {
+                    assert!(!state
+                        .capture_event(first, &event, &transfer, |_| {})
+                        .unwrap());
+                    assert!(!state
+                        .capture_event(second, &event, &transfer, |_| {})
+                        .unwrap());
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(state.self_writes.lock().unwrap().suppressed_count(), 2);
+            assert!(state
+                .capture_event(second, &event, &transfer, |_| {})
+                .unwrap());
+        }
+    }
+
+    #[cfg(all(unix, feature = "backend-x11"))]
+    #[test]
+    fn x11_write_projection_handles_text_aliases_during_write() {
+        use clipmonger_platform::fakes::FakeTransfer;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
+        let (_dir, state) = fresh_state("self-write-x11-alias");
+        let payloads = vec![
+            ("text/plain".to_string(), b"plain".to_vec()),
+            ("text/plain;charset=utf-8".to_string(), b"utf8".to_vec()),
+        ];
+        let transfer = FakeTransfer::new(
+            payloads.iter().map(|(mime, _)| mime.clone()).collect(),
+            payloads.clone().into_iter().collect(),
+            None,
+        );
+        let event = CaptureEvent {
+            native_sequence: None,
+            offers: payloads
+                .iter()
+                .map(|(mime, _)| FormatOffer {
+                    mime: mime.clone(),
+                    bytes_hint: None,
+                })
+                .collect(),
+            origin: CaptureOrigin::Clipboard,
+            sensitive: false,
+        };
+        state
+            .x11_self_write(&payloads, || -> Result<(), ()> {
+                assert!(!state
+                    .capture_event("x11", &event, &transfer, |_| {})
+                    .unwrap());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[cfg(all(unix, feature = "backend-x11"))]
+    #[test]
+    fn x11_utf8_only_write_matches_both_capture_aliases() {
+        use clipmonger_backend_x11::mime::{
+            canonical_to_x11, served_target, targets_for, x11_to_canonical,
+        };
+        use clipmonger_platform::fakes::FakeTransfer;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
+        let (_dir, state) = fresh_state("self-write-x11-utf8");
+        let payloads = vec![(
+            "text/plain;charset=utf-8".to_string(),
+            b"permanent text".to_vec(),
+        )];
+        let mut data = std::collections::HashMap::new();
+        let mut offers = Vec::new();
+        for atom in targets_for(&[payloads[0].0.clone()]) {
+            if matches!(atom.as_str(), "TARGETS" | "TIMESTAMP") {
+                continue;
+            }
+            let mime = x11_to_canonical(&atom).unwrap();
+            let target = canonical_to_x11(&mime).unwrap();
+            let (_, bytes) =
+                served_target(target, &payloads).expect("every offered text alias is readable");
+            data.insert(mime.clone(), bytes.to_vec());
+            offers.push(FormatOffer {
+                mime,
+                bytes_hint: None,
+            });
+        }
+        assert_eq!(data.len(), 2);
+        let transfer = FakeTransfer::new(data.keys().cloned().collect(), data, None);
+        let event = CaptureEvent {
+            native_sequence: None,
+            offers,
+            origin: CaptureOrigin::Clipboard,
+            sensitive: false,
+        };
+        state
+            .x11_self_write(&payloads, || -> Result<(), ()> {
+                assert!(!state
+                    .capture_event("x11", &event, &transfer, |_| {})
+                    .unwrap());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(state.self_writes.lock().unwrap().suppressed_count(), 1);
+    }
+
+    #[cfg(all(unix, feature = "backend-x11", feature = "backend-wayland"))]
+    #[test]
+    fn bridge_matches_distinct_whole_capture_projections_in_both_orders() {
+        use clipmonger_platform::fakes::FakeTransfer;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
+        for (name, x11_first) in [("self-bridge-proj-x", true), ("self-bridge-proj-w", false)] {
+            let (_dir, state) = fresh_state(name);
+            let payloads = vec![(
+                "text/plain;charset=utf-8".to_string(),
+                b"permanent text".to_vec(),
+            )];
+            let x11 = DaemonState::x11_projection(&payloads);
+            assert_eq!(x11.len(), 2);
+            assert_ne!(
+                clipmonger_core::hash::content_hash(&payloads),
+                clipmonger_core::hash::content_hash(&x11)
+            );
+            let make_event = |items: &[(String, Vec<u8>)]| CaptureEvent {
+                native_sequence: None,
+                offers: items
+                    .iter()
+                    .map(|(mime, _)| FormatOffer {
+                        mime: mime.clone(),
+                        bytes_hint: None,
+                    })
+                    .collect(),
+                origin: CaptureOrigin::Clipboard,
+                sensitive: false,
+            };
+            let make_transfer = |items: &[(String, Vec<u8>)]| {
+                FakeTransfer::new(
+                    items.iter().map(|(mime, _)| mime.clone()).collect(),
+                    items.iter().cloned().collect(),
+                    None,
+                )
+            };
+            let xevent = make_event(&x11);
+            let wevent = make_event(&payloads);
+            let xfer = make_transfer(&x11);
+            let wfer = make_transfer(&payloads);
+            state
+                .x11_self_write(&payloads, || -> Result<(), ()> {
+                    let order = if x11_first {
+                        [("x11", &xevent, &xfer), ("wayland", &wevent, &wfer)]
+                    } else {
+                        [("wayland", &wevent, &wfer), ("x11", &xevent, &xfer)]
+                    };
+                    for (origin, event, transfer) in order {
+                        assert!(!state
+                            .capture_event(origin, event, transfer, |_| {})
+                            .unwrap());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(state.self_writes.lock().unwrap().suppressed_count(), 2);
+        }
+    }
+
+    #[cfg(all(unix, feature = "backend-x11", feature = "backend-wayland"))]
+    #[test]
+    fn bridge_swapped_backend_representation_is_a_user_capture() {
+        use clipmonger_platform::fakes::FakeTransfer;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
+        for (name, companion) in [("swapped-initial", false), ("swapped-companion", true)] {
+            let (_dir, state) = fresh_state(name);
+            let payloads = vec![(
+                "text/plain;charset=utf-8".to_string(),
+                b"same text".to_vec(),
+            )];
+            let event = CaptureEvent {
+                native_sequence: None,
+                offers: vec![FormatOffer {
+                    mime: payloads[0].0.clone(),
+                    bytes_hint: None,
+                }],
+                origin: CaptureOrigin::Clipboard,
+                sensitive: false,
+            };
+            let transfer = FakeTransfer::new(
+                vec![payloads[0].0.clone()],
+                payloads.clone().into_iter().collect(),
+                None,
+            );
+            state
+                .x11_self_write(&payloads, || -> Result<(), ()> {
+                    if companion {
+                        assert!(!state
+                            .capture_event("wayland", &event, &transfer, |_| {})
+                            .unwrap());
+                    }
+                    assert!(state
+                        .capture_event("x11", &event, &transfer, |_| {})
+                        .unwrap());
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    #[cfg(all(unix, feature = "backend-x11", feature = "backend-wayland"))]
+    #[test]
+    fn bridge_wayland_rejects_x11_representation_before_and_after_companion() {
+        use clipmonger_platform::fakes::FakeTransfer;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
+        for (name, companion) in [
+            ("swapped-wayland-initial", false),
+            ("swapped-wayland-companion", true),
+        ] {
+            let (_dir, state) = fresh_state(name);
+            let payloads = vec![(
+                "text/plain;charset=utf-8".to_string(),
+                b"same text".to_vec(),
+            )];
+            let projected = DaemonState::x11_projection(&payloads);
+            let transfer = FakeTransfer::new(
+                projected.iter().map(|(mime, _)| mime.clone()).collect(),
+                projected.clone().into_iter().collect(),
+                None,
+            );
+            let event = CaptureEvent {
+                native_sequence: None,
+                offers: projected
+                    .iter()
+                    .map(|(mime, _)| FormatOffer {
+                        mime: mime.clone(),
+                        bytes_hint: None,
+                    })
+                    .collect(),
+                origin: CaptureOrigin::Clipboard,
+                sensitive: false,
+            };
+            state
+                .x11_self_write(&payloads, || -> Result<(), ()> {
+                    if companion {
+                        assert!(!state
+                            .capture_event("x11", &event, &transfer, |_| {})
+                            .unwrap());
+                    }
+                    assert!(state
+                        .capture_event("wayland", &event, &transfer, |_| {})
+                        .unwrap());
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    #[cfg(all(windows, feature = "backend-windows"))]
+    #[test]
+    fn windows_pending_write_binds_capture_to_post_write_sequence() {
+        use clipmonger_backend_windows::paste::ClipboardWriteObserver as _;
+        use clipmonger_platform::fakes::FakeTransfer;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
+        let (_dir, state) = fresh_state("self-write-win-seq");
+        let payloads = vec![(
+            "text/plain;charset=utf-8".to_string(),
+            b"temporary value".to_vec(),
+        )];
+        let observer = super::WindowsWriteObserver(&state);
+        let id = observer.begin(&payloads).unwrap();
+        observer.written(id, Some(42));
+        let transfer = FakeTransfer::new(
+            vec!["text/plain".into()],
+            [("text/plain".into(), b"temporary value".to_vec())]
+                .into_iter()
+                .collect(),
+            None,
+        );
+        let mut event = CaptureEvent {
+            native_sequence: Some(41),
+            offers: vec![FormatOffer {
+                mime: "text/plain".into(),
+                bytes_hint: None,
+            }],
+            origin: CaptureOrigin::Clipboard,
+            sensitive: false,
+        };
+        assert!(state
+            .capture_event("windows", &event, &transfer, |_| {})
+            .unwrap());
+        event.native_sequence = Some(42);
+        assert!(!state
+            .capture_event("windows", &event, &transfer, |_| {})
+            .unwrap());
+        assert_eq!(state.self_writes.lock().unwrap().suppressed_count(), 1);
+    }
+
+    #[cfg(all(windows, feature = "backend-windows"))]
+    #[test]
+    fn windows_file_write_and_raw_restore_suppress_at_capture_boundary() {
+        use clipmonger_backend_windows::paste::ClipboardWriteObserver as _;
+        use clipmonger_platform::fakes::FakeTransfer;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
+        let (_dir, state) = fresh_state("self-write-win-files");
+        let observer = super::WindowsWriteObserver(&state);
+        let paths = vec![r"C:\Users\A B.txt".to_string()];
+        let uri = clipmonger_backend_windows::uri::paths_to_uri_list(&paths).into_bytes();
+        let payloads = vec![("text/uri-list".to_string(), uri.clone())];
+        let transfer = FakeTransfer::new(
+            vec!["text/uri-list".into()],
+            payloads.clone().into_iter().collect(),
+            None,
+        );
+        let event = CaptureEvent {
+            native_sequence: Some(42),
+            offers: vec![FormatOffer {
+                mime: "text/uri-list".into(),
+                bytes_hint: None,
+            }],
+            origin: CaptureOrigin::Clipboard,
+            sensitive: false,
+        };
+        let id = observer.begin(&payloads).unwrap();
+        observer.written(id, Some(42));
+        assert!(!state
+            .capture_event("windows", &event, &transfer, |_| {})
+            .unwrap());
+        let mut raw = vec![0u8; 20];
+        raw[0..4].copy_from_slice(&20u32.to_le_bytes());
+        raw[16..20].copy_from_slice(&1u32.to_le_bytes());
+        for unit in "C:\\Users\\A B.txt\0\0".encode_utf16() {
+            raw.extend_from_slice(&unit.to_le_bytes());
+        }
+        let id = observer
+            .begin_restore(&[(15, raw)], &|_| None, None)
+            .unwrap();
+        observer.written(id, Some(42));
+        assert!(!state
+            .capture_event("windows", &event, &transfer, |_| {})
+            .unwrap());
+        assert_eq!(state.self_writes.lock().unwrap().suppressed_count(), 2);
+    }
+
+    #[test]
+    fn self_write_expectation_does_not_bypass_privacy_or_consume_primary() {
+        use clipmonger_platform::fakes::FakeTransfer;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
+        let (_dir, state) = fresh_state("self-write-privacy-primary");
+        let payloads = vec![("text/plain".to_string(), b"temporary value".to_vec())];
+        state.self_writes.lock().unwrap().register(
+            clipmonger_core::hash::content_hash(&payloads),
+            None,
+            state.self_write_now(),
+        );
+        let transfer = FakeTransfer::new(
+            vec!["text/plain".into()],
+            payloads.into_iter().collect(),
+            None,
+        );
+        let mut event = CaptureEvent {
+            native_sequence: None,
+            offers: vec![FormatOffer {
+                mime: "text/plain".into(),
+                bytes_hint: None,
+            }],
+            origin: CaptureOrigin::Clipboard,
+            sensitive: true,
+        };
+        assert!(!state
+            .capture_event("x11", &event, &transfer, |_| {})
+            .unwrap());
+        event.sensitive = false;
+        event.origin = CaptureOrigin::Primary;
+        assert!(state
+            .capture_event("x11", &event, &transfer, |_| {})
+            .unwrap());
+        assert_eq!(state.self_writes.lock().unwrap().suppressed_count(), 0);
+        event.origin = CaptureOrigin::Clipboard;
+        assert!(!state
+            .capture_event("x11", &event, &transfer, |_| {})
+            .unwrap());
+        assert_eq!(state.self_writes.lock().unwrap().suppressed_count(), 1);
     }
 
     #[test]
