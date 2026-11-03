@@ -8,10 +8,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const NAME: &str = "idx_clips_compact_history";
+const MIME_NAME: &str = "idx_compact_payload_clip";
 const MAX_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum IndexStatus {
+pub enum IndexStatus {
     Ready,
     NotReadyReadOnly,
     NotReadyBusy,
@@ -22,7 +23,7 @@ fn invalid_index() -> CoreError {
     CoreError::Backend {
         backend: "sqlite".into(),
         kind: BackendKind::Internal,
-        message: format!("{NAME} has an unexpected definition"),
+        message: "compact history index has an unexpected definition".into(),
     }
 }
 
@@ -38,22 +39,38 @@ impl From<rusqlite::Error> for CheckError {
     }
 }
 pub(super) fn index_present(conn: &Connection) -> Result<bool, CheckError> {
+    let clips = check_index(
+        conn,
+        NAME,
+        "clips",
+        &[("removed", 0), ("last_used_ms", 1), ("id", 1)],
+    )?;
+    let payloads = check_index(conn, MIME_NAME, "clip_payloads", &[("clip_id", 0)])?;
+    Ok(clips && payloads)
+}
+
+fn check_index(
+    conn: &Connection,
+    name: &str,
+    expected_table: &str,
+    expected: &[(&str, i64)],
+) -> Result<bool, CheckError> {
     let owner: Option<(String, String)> = conn
         .query_row(
             "SELECT type, tbl_name FROM main.sqlite_schema WHERE name = ?1 COLLATE NOCASE",
-            [NAME],
+            [name],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
     let Some((kind, table)) = owner else {
         return Ok(false);
     };
-    if kind != "index" || table != "clips" {
+    if kind != "index" || table != expected_table {
         return Err(CheckError::Invalid);
     }
     let flags: Option<(i64, i64)> = conn.query_row(
-        "SELECT [unique], partial FROM pragma_index_list('clips', 'main') WHERE name = ?1 COLLATE NOCASE",
-        [NAME], |r| Ok((r.get(0)?, r.get(1)?)),
+        "SELECT [unique], partial FROM pragma_index_list(?2, 'main') WHERE name = ?1 COLLATE NOCASE",
+        [name, expected_table], |r| Ok((r.get(0)?, r.get(1)?)),
     ).optional()?;
     if flags != Some((0, 0)) {
         return Err(CheckError::Invalid);
@@ -62,7 +79,7 @@ pub(super) fn index_present(conn: &Connection) -> Result<bool, CheckError> {
         "SELECT name, [desc], coll FROM pragma_index_xinfo(?1, 'main') WHERE [key] = 1 ORDER BY seqno"
     )?;
     let keys = stmt
-        .query_map([NAME], |r| {
+        .query_map([name], |r| {
             Ok((
                 r.get::<_, Option<String>>(0)?,
                 r.get::<_, i64>(1)?,
@@ -70,18 +87,16 @@ pub(super) fn index_present(conn: &Connection) -> Result<bool, CheckError> {
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let expected = [("removed", 0), ("last_used_ms", 1), ("id", 1)];
     if keys.len() != expected.len()
-        || !keys
-            .iter()
-            .zip(expected)
-            .all(|((name, desc, coll), (want, direction))| {
+        || !keys.iter().zip(expected.iter().copied()).all(
+            |((name, desc, coll), (want, direction))| {
                 name.as_deref() == Some(want)
                     && *desc == direction
                     && coll
                         .as_deref()
                         .is_some_and(|c| c.eq_ignore_ascii_case("BINARY"))
-            })
+            },
+        )
     {
         return Err(CheckError::Invalid);
     }
@@ -105,7 +120,7 @@ impl Store {
     /// Prepare outside critical startup. The deadline is cooperative, not an OS
     /// deadline or a bound on SQLite's total memory. Cancellation is shared.
     #[allow(dead_code)]
-    pub(super) fn prepare_compact_history_index(
+    pub fn prepare_compact_history_index(
         &self,
         budget: Duration,
         cancel: Arc<AtomicBool>,
@@ -176,6 +191,9 @@ impl Store {
             }
             ddl_active.store(true, Ordering::Relaxed);
             if let Err(e) = conn.execute_batch("CREATE INDEX IF NOT EXISTS main.idx_clips_compact_history ON clips(removed, last_used_ms DESC, id DESC)") {
+                return classify(e);
+            }
+            if let Err(e) = conn.execute_batch("CREATE INDEX IF NOT EXISTS main.idx_compact_payload_clip ON clip_payloads(clip_id)") {
                 return classify(e);
             }
             ddl_active.store(false, Ordering::Relaxed);
@@ -250,6 +268,17 @@ mod tests {
         insert_rows(&conn, 64);
         drop(conn);
         assert_eq!(prepare(&store), IndexStatus::Ready);
+        store
+            .lock()
+            .execute_batch("DROP INDEX idx_compact_payload_clip")
+            .unwrap();
+        assert!(matches!(
+            store.begin_compact_scan(1, ""),
+            Err(super::super::compact_scan::ScanError::Snapshot(
+                super::super::compact_registry::SnapshotError::IndexMissing
+            ))
+        ));
+        assert_eq!(prepare(&store), IndexStatus::Ready);
         let conn = store.conn.lock().unwrap();
         assert_eq!(catalog(&conn), 1);
         let version: i64 = conn
@@ -273,6 +302,14 @@ mod tests {
             .unwrap();
         assert!(plan.iter().any(|p| p.contains(NAME)), "{plan:?}");
         assert!(!plan.iter().any(|p| p.contains("TEMP B-TREE")), "{plan:?}");
+        let metadata_plan: Vec<String> = conn.prepare("EXPLAIN QUERY PLAN SELECT rowid FROM main.clip_payloads INDEXED BY idx_compact_payload_clip WHERE clip_id=?1 LIMIT 33").unwrap()
+            .query_map(["id"], |r| r.get(3)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert!(
+            metadata_plan
+                .iter()
+                .any(|p| p.contains("COVERING INDEX idx_compact_payload_clip")),
+            "{metadata_plan:?}"
+        );
         let expected: Vec<(String, i64)> = (0..64)
             .rev()
             .filter(|n| n % 7 != 0)
@@ -403,6 +440,12 @@ mod tests {
         assert_eq!(prepare(&readonly), IndexStatus::Ready);
         assert_eq!(profile_bytes(&path), before);
         drop(readonly);
+        let store = Store::open(&path).unwrap();
+        store.lock().execute_batch("DROP INDEX idx_compact_payload_clip; CREATE INDEX idx_compact_payload_clip ON clip_payloads(mime)").unwrap();
+        assert!(store
+            .prepare_compact_history_index(MAX_BUDGET, Arc::new(AtomicBool::new(false)))
+            .is_err());
+        drop(store);
         std::fs::remove_dir_all(path).unwrap();
     }
 }

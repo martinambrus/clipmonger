@@ -21,11 +21,15 @@ use crate::policy::{self, DedupeCandidate, Limits};
 
 #[path = "compact_index.rs"]
 mod compact_index;
+pub use compact_index::IndexStatus as CompactIndexStatus;
 
 #[path = "compact_scan.rs"]
 mod compact_scan;
+pub use compact_scan::{CompactHit, CompactKind, ScanChunk, ScanError};
+pub use crate::sql_text_stream::TextStreamError;
 #[path = "compact_registry.rs"]
-pub(crate) mod compact_registry;
+mod compact_registry;
+pub use compact_registry::{SnapshotError, SnapshotToken};
 
 /// Schema version this code reads and writes (D-F1).
 const SCHEMA_VERSION: i64 = 1;
@@ -1553,6 +1557,17 @@ fn clip_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<Clip> {
 }
 
 impl Store {
+    /// Check an ID directly, including removed clips, without loading metadata or payloads.
+    pub fn contains_clip_id(&self, id: Uuid) -> Result<bool, CoreError> {
+        self.lock()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM clips WHERE id=?1)",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .map_err(|e| db_err(&e))
+    }
+
     /// Open or create a store at `profile/clipstore.sqlite3`.
     ///
     /// # Errors

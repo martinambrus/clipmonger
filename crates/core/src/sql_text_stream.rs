@@ -16,6 +16,8 @@ pub(crate) enum TextColumn {
     SearchText,
     Preview,
     Id,
+    Mime,
+    ContentHash,
 }
 
 impl TextColumn {
@@ -24,6 +26,14 @@ impl TextColumn {
             Self::SearchText => "search_text",
             Self::Preview => "preview",
             Self::Id => "id",
+            Self::Mime => "mime",
+            Self::ContentHash => "content_hash",
+        }
+    }
+    fn table(self) -> &'static str {
+        match self {
+            Self::Mime => "clip_payloads",
+            _ => "clips",
         }
     }
     fn type_sql(self) -> &'static str {
@@ -31,6 +41,8 @@ impl TextColumn {
             Self::SearchText => "SELECT typeof(search_text) FROM main.clips WHERE rowid = ?1",
             Self::Preview => "SELECT typeof(preview) FROM main.clips WHERE rowid = ?1",
             Self::Id => "SELECT typeof(id) FROM main.clips WHERE rowid = ?1",
+            Self::Mime => "SELECT typeof(mime) FROM main.clip_payloads WHERE rowid = ?1",
+            Self::ContentHash => "SELECT typeof(content_hash) FROM main.clips WHERE rowid = ?1",
         }
     }
 }
@@ -42,8 +54,9 @@ enum Encoding {
     Utf16Be,
 }
 
+/// Errors encountered while validating stored text incrementally.
 #[derive(Debug)]
-pub(crate) enum TextStreamError {
+pub enum TextStreamError {
     Sql(rusqlite::Error),
     TransactionRequired,
     WrongType,
@@ -93,7 +106,7 @@ impl TextCursor {
             "UTF-16be" => Encoding::Utf16Be,
             _ => return Err(TextStreamError::UnsupportedEncoding),
         };
-        let blob = conn.blob_open(MAIN_DB, "clips", column.name(), rowid, true)?;
+        let blob = conn.blob_open(MAIN_DB, column.table(), column.name(), rowid, true)?;
         Ok(Self {
             rowid,
             column,
@@ -104,6 +117,10 @@ impl TextCursor {
             carry_len: 0,
             finished: false,
         })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.length
     }
 
     /// Reads at most `min(budget, 64 KiB)` raw bytes and emits complete scalars.
@@ -123,7 +140,13 @@ impl TextCursor {
                 eof: true,
             });
         }
-        let blob = conn.blob_open(MAIN_DB, "clips", self.column.name(), self.rowid, true)?;
+        let blob = conn.blob_open(
+            MAIN_DB,
+            self.column.table(),
+            self.column.name(),
+            self.rowid,
+            true,
+        )?;
         if blob.len() != self.length {
             return Err(TextStreamError::LengthChanged);
         }

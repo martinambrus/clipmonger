@@ -20,25 +20,63 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Opaque identity: OS entropy separates process lifetimes; the checked process
 /// sequence prevents reuse by any Store instance in this process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SnapshotToken {
+pub struct SnapshotToken {
     nonce: [u8; 16],
     sequence: u64,
 }
 
 #[derive(Debug)]
-pub(crate) enum SnapshotError {
+pub enum SnapshotError {
     QueryTooLong,
     Capacity,
     Entropy,
     IdentityExhausted,
     Unknown,
     OwnerMismatch,
+    QueryMismatch,
+    InvalidToken,
     Expired,
     Sql(rusqlite::Error),
     TransactionEnded,
     IndexMissing,
     IndexMissingReadOnly,
     IndexInvalid,
+}
+
+impl SnapshotToken {
+    /// Canonical fixed-size lowercase hex representation.
+    pub fn encode(self) -> String {
+        let mut out = String::with_capacity(48);
+        for byte in self.nonce.into_iter().chain(self.sequence.to_be_bytes()) {
+            use std::fmt::Write;
+            write!(&mut out, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        out
+    }
+    /// Decode only the canonical 48-byte lowercase hexadecimal representation.
+    pub fn decode(value: &str) -> Result<Self, SnapshotError> {
+        let bytes = value.as_bytes();
+        if bytes.len() != 48
+            || !bytes
+                .iter()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+        {
+            return Err(SnapshotError::InvalidToken);
+        }
+        let mut raw = [0u8; 24];
+        for (out, pair) in raw.iter_mut().zip(bytes.chunks_exact(2)) {
+            let digit = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+            *out = digit(pair[0]) * 16 + digit(pair[1]);
+        }
+        let mut nonce = [0; 16];
+        nonce.copy_from_slice(&raw[..16]);
+        let mut seq = [0; 8];
+        seq.copy_from_slice(&raw[16..]);
+        Ok(Self {
+            nonce,
+            sequence: u64::from_be_bytes(seq),
+        })
+    }
 }
 
 impl From<rusqlite::Error> for SnapshotError {
@@ -51,7 +89,7 @@ pub(super) struct Snapshot {
     token: SnapshotToken,
     owner: u64,
     created: Instant,
-    query: String,
+    pub(super) query: String,
     pub(super) conn: Connection,
     pub(super) scan: Option<super::compact_scan::ScanState>,
 }
@@ -230,7 +268,7 @@ impl Store {
 
     /// Explicit maintenance. Expired entries may persist until this or a lazy
     /// check runs; this does not promise a hard deadline for SQLite operations.
-    pub(crate) fn expire_compact_snapshots(&self) -> usize {
+    pub fn expire_compact_snapshots(&self) -> usize {
         self.lock_compact_registry().expire_at(Instant::now())
     }
 
@@ -270,6 +308,23 @@ mod tests {
     }
     fn seed(store: &Store) {
         store.lock().execute_batch("INSERT INTO clips(id,created_ms,source_os,preview,search_text,content_hash,rev_ms,rev_dev,last_used_ms) VALUES('fixture',1,'test','old','old','hash',1,'test',1)").unwrap();
+    }
+
+    #[test]
+    fn compact_token_encoding_is_canonical() {
+        let token = SnapshotToken {
+            nonce: [0xab; 16],
+            sequence: 42,
+        };
+        let encoded = token.encode();
+        assert_eq!(encoded.len(), 48);
+        assert_eq!(SnapshotToken::decode(&encoded).unwrap(), token);
+        for invalid in ["", "A", &"A".repeat(48), &"a".repeat(49), &"g".repeat(48)] {
+            assert!(matches!(
+                SnapshotToken::decode(invalid),
+                Err(SnapshotError::InvalidToken)
+            ));
+        }
     }
 
     #[test]
@@ -365,7 +420,7 @@ mod tests {
     fn scan_state_expires_and_closes_with_registry() {
         let scratch = Scratch::new();
         let store = Store::open(&scratch.0).unwrap();
-        store.lock().execute_batch("CREATE INDEX idx_clips_compact_history ON clips(removed,last_used_ms DESC,id DESC)").unwrap();
+        store.lock().execute_batch("CREATE INDEX idx_clips_compact_history ON clips(removed,last_used_ms DESC,id DESC); CREATE INDEX IF NOT EXISTS idx_compact_payload_clip ON clip_payloads(clip_id)").unwrap();
         let stale = store.begin_compact_scan(1, "").unwrap();
         {
             let mut registry = store.lock_compact_registry();

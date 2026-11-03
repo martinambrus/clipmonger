@@ -48,6 +48,49 @@ pub struct HistoryListResult {
     #[serde(default)]
     pub clips: Vec<Clip>,
 }
+/// Bounded scan request; owner is a client session correlation, not authentication.
+/// `byte_budget` counts search/preview/ID bytes. Metadata has separate per-step
+/// bounds of 1,056 index entries and 266,240 raw bytes; oversized MIME count or
+/// MIME value returns `metadata_too_large`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryCompactParams {
+    pub owner: u64,
+    pub generation: u64,
+    pub query: String,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    pub byte_budget: usize,
+    pub candidate_budget: usize,
+    pub row_budget: usize,
+}
+/// Compact page; an empty page with a cursor is progress, not completion.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HistoryCompactResult {
+    pub owner: u64,
+    pub generation: u64,
+    pub rows: Vec<clipmonger_core::store::CompactHit>,
+    pub cursor: Option<String>,
+    pub done: bool,
+    pub bytes_read: usize,
+    pub candidates: usize,
+}
+/// Cancel a session's current query cursor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryCompactCancelParams {
+    pub owner: u64,
+    pub generation: u64,
+    pub query: String,
+    pub cursor: String,
+}
+/// Cancellation correlation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCompactCancelResult {
+    pub owner: u64,
+    pub generation: u64,
+    pub cancelled: bool,
+}
 /// Clip lookup for `history.get`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryGetParams {

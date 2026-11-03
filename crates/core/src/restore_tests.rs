@@ -258,14 +258,19 @@ fn checked_close_failure_returns_original_usable_store() {
     let scratch = Scratch::new();
     let store = Store::open(&scratch.0).unwrap();
     let id = seed(&store, "original", 9);
-    store.lock().execute_batch("CREATE INDEX idx_clips_compact_history ON clips(removed,last_used_ms DESC,id DESC)").unwrap();
+    store.lock().execute_batch("CREATE INDEX idx_clips_compact_history ON clips(removed,last_used_ms DESC,id DESC); CREATE INDEX IF NOT EXISTS idx_compact_payload_clip ON clip_payloads(clip_id)").unwrap();
     let stale = store.begin_compact_scan(1, "query").unwrap();
     let _ = store.step_compact_scan(1, stale, 1, 1, 1).unwrap();
     faults(&[RestoreFault::Close]);
     let (store, error) = store.close().unwrap_err();
     assert!(error.to_string().contains("Close"));
     assert!(store.get_clip(id).unwrap().is_some());
-    assert!(matches!(store.cancel_compact_scan(1, stale), Err(super::compact_scan::ScanError::Snapshot(super::compact_registry::SnapshotError::Unknown))));
+    assert!(matches!(
+        store.cancel_compact_scan(1, stale),
+        Err(super::compact_scan::ScanError::Snapshot(
+            super::compact_registry::SnapshotError::Unknown
+        ))
+    ));
     let fresh = store.begin_compact_scan(1, "query").unwrap();
     store.cancel_compact_scan(1, fresh).unwrap();
     store.close().unwrap();
@@ -287,7 +292,10 @@ fn busy_checkpoint_returns_store_without_discarding_committed_wal() {
     let (store, error) = store.close().unwrap_err();
     assert!(error.to_string().contains("busy"));
     assert!(store.get_clip(id).unwrap().is_some());
-    assert!(matches!(store.cancel_compact_snapshot(1, stale), Err(super::compact_registry::SnapshotError::Unknown)));
+    assert!(matches!(
+        store.cancel_compact_snapshot(1, stale),
+        Err(super::compact_registry::SnapshotError::Unknown)
+    ));
     let fresh = store.begin_compact_snapshot(1, "query").unwrap();
     store.cancel_compact_snapshot(1, fresh).unwrap();
     reader.execute_batch("ROLLBACK").unwrap();

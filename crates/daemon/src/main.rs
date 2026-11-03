@@ -980,6 +980,7 @@ async fn async_main(args: Vec<String>) {
     });
 
     let state = Arc::new(DaemonState::new(store));
+    let _compact_maintenance = clipmonger_daemon::CompactMaintenance::start(&state);
     state.set_profile_dir(&profile);
     state.set_config(config.clone());
     state.set_paste_limits(config.popup.unicode_limit, config.popup.delivery_dwell_ms);
@@ -1039,7 +1040,8 @@ async fn async_main(args: Vec<String>) {
     let context = DaemonState::thumbnail_context_handler(Arc::clone(&state));
     #[cfg(unix)]
     if let Err(e) =
-        clipmonger_ipc::server::Server::bind_with_context(&socket, token, handler, options, context).await
+        clipmonger_ipc::server::Server::bind_with_context(&socket, token, handler, options, context)
+            .await
     {
         let _ = clipmonger_core::runtime_log::global_emit(
             clipmonger_core::runtime_log::Role::Daemon,
@@ -1119,7 +1121,9 @@ async fn async_main(args: Vec<String>) {
 
 async fn shutdown_thumbnails(state: &Arc<DaemonState>) -> bool {
     let thumb_state = Arc::clone(state);
-    if let Err(error) = tokio::task::spawn_blocking(move || thumb_state.thumbnail_shutdown_and_wait()).await {
+    if let Err(error) =
+        tokio::task::spawn_blocking(move || thumb_state.thumbnail_shutdown_and_wait()).await
+    {
         eprintln!("daemon: thumbnail cleanup join failed: {error}");
         // Attempt cleanup again, but retain the failure status.
         state.thumbnail_shutdown_and_wait();

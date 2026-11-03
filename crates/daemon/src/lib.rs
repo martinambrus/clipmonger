@@ -1741,6 +1741,49 @@ pub struct DaemonState {
     thumbnail_payload_reads: std::sync::atomic::AtomicUsize,
 }
 
+/// Owned background maintenance; dropping it cancels and joins its worker.
+pub struct CompactMaintenance {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl CompactMaintenance {
+    pub fn start(state: &std::sync::Arc<DaemonState>) -> Self {
+        let weak = std::sync::Arc::downgrade(state);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = std::sync::Arc::clone(&cancel);
+        let worker = std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let Some(state) = weak.upgrade() else { break };
+                if let Ok(guard) = state.store.read() {
+                    if let Some(store) = guard.as_ref() {
+                        store.expire_compact_snapshots();
+                        let _ = store.prepare_compact_history_index(
+                            std::time::Duration::from_secs(2),
+                            std::sync::Arc::clone(&stop),
+                        );
+                    }
+                }
+                drop(state);
+                std::thread::park_timeout(std::time::Duration::from_secs(5));
+            }
+        });
+        Self {
+            cancel,
+            worker: Some(worker),
+        }
+    }
+}
+impl Drop for CompactMaintenance {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            let _ = worker.join();
+        }
+    }
+}
+
 impl DaemonState {
     /// Wrap an opened store with fresh skeleton caps.
     #[must_use]
@@ -1793,7 +1836,10 @@ impl DaemonState {
         self.thumbnail.shutdown_and_wait();
     }
     #[cfg(test)]
-    pub fn set_thumbnail_snapshot_hook(&self, hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    pub fn set_thumbnail_snapshot_hook(
+        &self,
+        hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    ) {
         if let Ok(mut slot) = self.thumbnail_snapshot_hook.lock() {
             *slot = hook;
         }
@@ -2416,13 +2462,18 @@ impl DaemonState {
         Ok(true)
     }
 
-    /// Find a stored clip id by its string form without naming the id type.
-    fn find_clip(&self, id: &str) -> Result<Option<clipmonger_core::model::Clip>, IpcError> {
+    /// Resolve canonical UUIDs with a direct metadata-only lookup, including removed clips.
+    fn find_clip(&self, id: &str) -> Result<Option<uuid::Uuid>, IpcError> {
+        let parsed = uuid::Uuid::parse_str(id)
+            .map_err(|_| IpcError::new("bad_params", "invalid clip UUID".to_string()))?;
+        if parsed.hyphenated().to_string() != id {
+            return Err(IpcError::new("bad_params", "invalid clip UUID".to_string()));
+        }
         self.with_store(|store| {
-            let clips = store
-                .list_history(10_000, 0, true)
-                .map_err(|error| IpcError::new(error.code(), error.to_string()))?;
-            Ok(clips.into_iter().find(|clip| clip.id.to_string() == id))
+            store
+                .contains_clip_id(parsed)
+                .map(|found| found.then_some(parsed))
+                .map_err(|error| IpcError::new(error.code(), error.to_string()))
         })
     }
 
@@ -2468,10 +2519,7 @@ impl DaemonState {
     }
 
     /// Requested clip id from `params`, looked up in the store.
-    fn requested_clip(
-        &self,
-        params: &Value,
-    ) -> Result<Option<clipmonger_core::model::Clip>, IpcError> {
+    fn requested_clip(&self, params: &Value) -> Result<Option<uuid::Uuid>, IpcError> {
         let id = params
             .get("clip")
             .and_then(Value::as_str)
@@ -2480,9 +2528,112 @@ impl DaemonState {
         self.find_clip(&id)
     }
 
+    fn compact_error(error: clipmonger_core::store::ScanError) -> IpcError {
+        use clipmonger_core::store::{ScanError, SnapshotError};
+        let code = match error {
+            ScanError::MetadataTooLarge => "metadata_too_large",
+            ScanError::InvalidBudget
+            | ScanError::Snapshot(
+                SnapshotError::QueryTooLong
+                | SnapshotError::InvalidToken
+                | SnapshotError::QueryMismatch
+                | SnapshotError::OwnerMismatch,
+            ) => "bad_params",
+            ScanError::Snapshot(SnapshotError::Unknown | SnapshotError::Expired) => "stale_cursor",
+            ScanError::Snapshot(SnapshotError::Capacity) => "capacity",
+            ScanError::Snapshot(
+                SnapshotError::IndexMissing
+                | SnapshotError::IndexMissingReadOnly
+                | SnapshotError::IndexInvalid,
+            ) => "not_ready",
+            _ => "backend",
+        };
+        IpcError::new(code, "compact history request failed".to_string())
+    }
+
+    fn handle_compact(&self, params: &Value) -> Result<Value, IpcError> {
+        use clipmonger_ipc::proto::methods::{HistoryCompactParams, HistoryCompactResult};
+        let request: HistoryCompactParams = serde_json::from_value(params.clone())
+            .map_err(|_| IpcError::new("bad_params", "invalid compact request".into()))?;
+        if request.query.len() > 4096
+            || !(1..=65536).contains(&request.byte_budget)
+            || !(1..=32).contains(&request.candidate_budget)
+            || !(1..=50).contains(&request.row_budget)
+        {
+            return Err(IpcError::new(
+                "bad_params",
+                "invalid compact budget or query".into(),
+            ));
+        }
+        self.with_store(|store| {
+            let token = match request.cursor.as_deref() {
+                Some(value) => {
+                    let token = clipmonger_core::store::SnapshotToken::decode(value)
+                        .map_err(|e| Self::compact_error(e.into()))?;
+                    store
+                        .validate_compact_query(request.owner, token, &request.query)
+                        .map_err(Self::compact_error)?;
+                    token
+                }
+                None => store
+                    .begin_compact_scan(request.owner, &request.query)
+                    .map_err(Self::compact_error)?,
+            };
+            let chunk = store
+                .step_compact_scan(
+                    request.owner,
+                    token,
+                    request.byte_budget,
+                    request.candidate_budget,
+                    request.row_budget,
+                )
+                .map_err(Self::compact_error)?;
+            let result = HistoryCompactResult {
+                owner: request.owner,
+                generation: request.generation,
+                rows: chunk.rows,
+                cursor: (!chunk.done).then(|| token.encode()),
+                done: chunk.done,
+                bytes_read: chunk.bytes_read,
+                candidates: chunk.candidates,
+            };
+            serde_json::to_value(result)
+                .map_err(|_| IpcError::new("backend", "compact serialization failed".into()))
+        })
+    }
+
+    fn handle_compact_cancel(&self, params: &Value) -> Result<Value, IpcError> {
+        use clipmonger_ipc::proto::methods::{
+            HistoryCompactCancelParams, HistoryCompactCancelResult,
+        };
+        let request: HistoryCompactCancelParams = serde_json::from_value(params.clone())
+            .map_err(|_| IpcError::new("bad_params", "invalid compact cancel".into()))?;
+        if request.query.len() > 4096 {
+            return Err(IpcError::new("bad_params", "invalid compact query".into()));
+        }
+        let token = clipmonger_core::store::SnapshotToken::decode(&request.cursor)
+            .map_err(|e| Self::compact_error(e.into()))?;
+        self.with_store(|store| {
+            store
+                .validate_compact_query(request.owner, token, &request.query)
+                .map_err(Self::compact_error)?;
+            store
+                .cancel_compact_scan(request.owner, token)
+                .map_err(Self::compact_error)?;
+            serde_json::to_value(HistoryCompactCancelResult {
+                owner: request.owner,
+                generation: request.generation,
+                cancelled: true,
+            })
+            .map_err(|_| IpcError::new("backend", "compact serialization failed".into()))
+        })
+    }
+
     /// Dispatch one `history.*` method.
     fn handle_history(&self, method: &str, params: &Value) -> Result<Value, IpcError> {
         match method {
+            "history.compact" => self.handle_compact(params),
+            "history.compact.cancel" => self.handle_compact_cancel(params),
             "history.list" => {
                 let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(100);
                 let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
@@ -2503,7 +2654,7 @@ impl DaemonState {
                     .store_read()?
                     .as_ref()
                     .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
-                    .get_clip(found.id)
+                    .get_clip(found)
                 {
                     Ok(Some((clip, _))) => Ok(serde_json::json!({"clip": clip})),
                     Ok(None) => Ok(serde_json::json!({"clip": null})),
@@ -2516,7 +2667,7 @@ impl DaemonState {
                     .store_read()?
                     .as_ref()
                     .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
-                    .soft_delete(found.id)
+                    .soft_delete(found)
                     .map_err(|e| IpcError::new("backend", e.to_string()))
                     .map(|()| serde_json::json!({"deleted": true})),
                 None => Ok(serde_json::json!({"deleted": false})),
@@ -2533,7 +2684,7 @@ impl DaemonState {
                         .ok_or_else(|| {
                             IpcError::new("unavailable", "store unavailable".to_string())
                         })?
-                        .get_clip(found.id)
+                        .get_clip(found)
                     {
                         Ok(Some((mut clip, payloads))) => {
                             clip.pinned = pinned;
@@ -2568,10 +2719,14 @@ impl DaemonState {
         }
     }
 
-    pub fn thumbnail_context_handler(state: std::sync::Arc<Self>) -> clipmonger_ipc::server::ContextHandler {
+    pub fn thumbnail_context_handler(
+        state: std::sync::Arc<Self>,
+    ) -> clipmonger_ipc::server::ContextHandler {
         clipmonger_ipc::server::ContextHandler {
             method: "history.thumbnail".to_string(),
-            handler: std::sync::Arc::new(move |params, cancel| state.handle_history_thumbnail_with_cancel(&params, Some(cancel))),
+            handler: std::sync::Arc::new(move |params, cancel| {
+                state.handle_history_thumbnail_with_cancel(&params, Some(cancel))
+            }),
         }
     }
 
@@ -2579,60 +2734,100 @@ impl DaemonState {
         self.handle_history_thumbnail_with_cancel(params, None)
     }
 
-    fn handle_history_thumbnail_with_cancel(&self, params: &Value, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> Result<Value, IpcError> {
+    fn handle_history_thumbnail_with_cancel(
+        &self,
+        params: &Value,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Value, IpcError> {
         let check_cancel = || {
-            if cancel.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
-                Err(IpcError::new("cancelled", "thumbnail cancelled".to_string()))
+            if cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                Err(IpcError::new(
+                    "cancelled",
+                    "thumbnail cancelled".to_string(),
+                ))
             } else {
                 Ok(())
             }
         };
         use crate::thumbnail::{DEFAULT_MAX_PX, MAX_INPUT_BYTES, MAX_PX, MIN_PX};
         // --- validation before admission ---
-        let clip_val = params.get("clip").ok_or_else(|| IpcError::new("invalid_params", "clip required".to_string()))?;
-        let clip_str = clip_val.as_str().ok_or_else(|| IpcError::new("invalid_params", "clip must be a string".to_string()))?;
-        let clip_id = clip_str.parse::<uuid::Uuid>().map_err(|_| IpcError::new("invalid_params", "invalid clip".to_string()))?;
+        let clip_val = params
+            .get("clip")
+            .ok_or_else(|| IpcError::new("invalid_params", "clip required".to_string()))?;
+        let clip_str = clip_val
+            .as_str()
+            .ok_or_else(|| IpcError::new("invalid_params", "clip must be a string".to_string()))?;
+        let clip_id = clip_str
+            .parse::<uuid::Uuid>()
+            .map_err(|_| IpcError::new("invalid_params", "invalid clip".to_string()))?;
         let max_px = match params.get("max_px") {
             None => DEFAULT_MAX_PX,
             Some(v) => {
-                let n = v.as_u64().ok_or_else(|| IpcError::new("invalid_params", "max_px must be an integer".to_string()))?;
-                if !(MIN_PX as u64 ..= MAX_PX as u64).contains(&n) {
-                    return Err(IpcError::new("invalid_params", "max_px out of range".to_string()));
+                let n = v.as_u64().ok_or_else(|| {
+                    IpcError::new("invalid_params", "max_px must be an integer".to_string())
+                })?;
+                if !(MIN_PX as u64..=MAX_PX as u64).contains(&n) {
+                    return Err(IpcError::new(
+                        "invalid_params",
+                        "max_px out of range".to_string(),
+                    ));
                 }
                 n as u32
             }
         };
         if let Some(mime_val) = params.get("mime") {
-            let mime_str = mime_val.as_str().ok_or_else(|| IpcError::new("invalid_params", "mime must be a string".to_string()))?;
+            let mime_str = mime_val.as_str().ok_or_else(|| {
+                IpcError::new("invalid_params", "mime must be a string".to_string())
+            })?;
             if mime_str != "image/png" {
-                return Err(IpcError::new("invalid_params", "mime must be image/png".to_string()));
+                return Err(IpcError::new(
+                    "invalid_params",
+                    "mime must be image/png".to_string(),
+                ));
             }
         }
         check_cancel()?;
         // --- admission before store allocation ---
         let permit = self.thumbnail.try_admit().map_err(|e| match e {
-            crate::thumbnail::ThumbnailError::Busy => IpcError::new("busy", "thumbnail busy".to_string()),
-            crate::thumbnail::ThumbnailError::Shutdown => IpcError::new("shutdown", "thumbnail shutdown".to_string()),
-            crate::thumbnail::ThumbnailError::SpawnFailed(_) => IpcError::new("unavailable", "thumbnail unavailable".to_string()),
+            crate::thumbnail::ThumbnailError::Busy => {
+                IpcError::new("busy", "thumbnail busy".to_string())
+            }
+            crate::thumbnail::ThumbnailError::Shutdown => {
+                IpcError::new("shutdown", "thumbnail shutdown".to_string())
+            }
+            crate::thumbnail::ThumbnailError::SpawnFailed(_) => {
+                IpcError::new("unavailable", "thumbnail unavailable".to_string())
+            }
             _ => IpcError::new(e.code(), "thumbnail unavailable".to_string()),
         })?;
         check_cancel()?;
         // --- snapshot within with_store then release guard before child ---
         let snapshot_opt = {
-            let result: Result<Option<clipmonger_core::PayloadSnapshot>, IpcError> = self.with_store(|store| {
-                #[cfg(test)]
-                {
-                    let hook = self.thumbnail_snapshot_hook.lock().ok().and_then(|slot| slot.clone());
-                    if let Some(hook) = hook { hook(); }
-                }
-                check_cancel()?;
-                #[cfg(test)]
-                self.thumbnail_payload_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                match store.get_payload(clip_id, "image/png", MAX_INPUT_BYTES) {
-                    Ok(opt) => Ok(opt),
-                    Err(e) => Err(IpcError::new(e.code(), "store error".to_string())),
-                }
-            });
+            let result: Result<Option<clipmonger_core::PayloadSnapshot>, IpcError> = self
+                .with_store(|store| {
+                    #[cfg(test)]
+                    {
+                        let hook = self
+                            .thumbnail_snapshot_hook
+                            .lock()
+                            .ok()
+                            .and_then(|slot| slot.clone());
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
+                    check_cancel()?;
+                    #[cfg(test)]
+                    self.thumbnail_payload_reads
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    match store.get_payload(clip_id, "image/png", MAX_INPUT_BYTES) {
+                        Ok(opt) => Ok(opt),
+                        Err(e) => Err(IpcError::new(e.code(), "store error".to_string())),
+                    }
+                });
             result?
         };
         check_cancel()?;
@@ -2640,13 +2835,23 @@ impl DaemonState {
             None => return Ok(serde_json::json!({"thumbnail": null})),
             Some(s) => s,
         };
-        let output = permit.decode_with_cancel(&snapshot.data, max_px, cancel).map_err(|e| match e {
-            crate::thumbnail::ThumbnailError::Busy => IpcError::new("busy", "thumbnail busy".to_string()),
-            crate::thumbnail::ThumbnailError::Shutdown => IpcError::new("shutdown", "thumbnail shutdown".to_string()),
-            crate::thumbnail::ThumbnailError::Timeout => IpcError::new("timeout", "thumbnail timeout".to_string()),
-            crate::thumbnail::ThumbnailError::Cancelled => IpcError::new("cancelled", "thumbnail cancelled".to_string()),
-            _ => IpcError::new(e.code(), "thumbnail decode failed".to_string()),
-        })?;
+        let output = permit
+            .decode_with_cancel(&snapshot.data, max_px, cancel)
+            .map_err(|e| match e {
+                crate::thumbnail::ThumbnailError::Busy => {
+                    IpcError::new("busy", "thumbnail busy".to_string())
+                }
+                crate::thumbnail::ThumbnailError::Shutdown => {
+                    IpcError::new("shutdown", "thumbnail shutdown".to_string())
+                }
+                crate::thumbnail::ThumbnailError::Timeout => {
+                    IpcError::new("timeout", "thumbnail timeout".to_string())
+                }
+                crate::thumbnail::ThumbnailError::Cancelled => {
+                    IpcError::new("cancelled", "thumbnail cancelled".to_string())
+                }
+                _ => IpcError::new(e.code(), "thumbnail decode failed".to_string()),
+            })?;
         let b64 = encode_thumbnail_png(&output.png);
         Ok(serde_json::json!({
             "thumbnail": {
@@ -3225,12 +3430,12 @@ impl DaemonState {
                 .store_read()?
                 .as_ref()
                 .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
-                .get_clip(found.id)
+                .get_clip(found)
                 .map_err(|e| IpcError::new("backend", e.to_string()))?
                 .map(|(_, payloads)| payloads)
                 .unwrap_or_default();
             self.paste_payloads(
-                clipmonger_platform::types::ClipRef(found.id),
+                clipmonger_platform::types::ClipRef(found),
                 &payloads,
                 params,
             )
@@ -3856,6 +4061,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = clipmonger_core::Store::open(&dir).expect("store");
         (dir, DaemonState::new(store))
+    }
+
+    #[test]
+    fn compact_maintenance_prepares_replaced_store_and_joins() {
+        let (dir, state) = fresh_state("compact-maintenance");
+        let state = std::sync::Arc::new(state);
+        let worker = super::CompactMaintenance::start(&state);
+        let wait_for_index = |state: &DaemonState| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            loop {
+                let guard = state.store.read().unwrap();
+                if let Ok(token) = guard.as_ref().unwrap().begin_compact_scan(1, "") {
+                    guard
+                        .as_ref()
+                        .unwrap()
+                        .cancel_compact_scan(1, token)
+                        .unwrap();
+                    break;
+                }
+                drop(guard);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "maintenance did not prepare index"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        wait_for_index(&state);
+        let replacement_dir = dir.join("replacement");
+        let replacement = clipmonger_core::Store::open(&replacement_dir).unwrap();
+        *state.store.write().unwrap() = Some(replacement);
+        wait_for_index(&state);
+        drop(worker);
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
