@@ -2,9 +2,12 @@
 """Build or validate deterministic portable archives from prepared release inputs."""
 import argparse
 import hashlib
+import os
 from pathlib import Path
 import re
 import stat
+import subprocess
+import tempfile
 import sys
 import zipfile
 from notice_provenance import verified_notices
@@ -13,7 +16,34 @@ ROOT = Path(__file__).resolve().parent.parent
 FONTS = ('Hack-Regular.txt', 'OFL.txt', 'README.md', 'UFL.txt', 'egui-icons.txt', 'emoji-icon-font-mit-license.txt')
 BINS = ('clipmonger', 'clipmonger-daemon', 'clipmonger-cli')
 EXTENSION = tuple(name + '.js' for name in ('capture', 'codec', 'config', 'extension', 'hotkeys', 'ipc', 'paste', 'polddiff', 'prefs', 'relay', 'report', 'sha256')) + ('metadata.json', 'stylesheet.css', 'schemas/org.gnome.shell.extensions.clipmonger.gschema.xml')
+SCHEMA_XML = 'schemas/org.gnome.shell.extensions.clipmonger.gschema.xml'
+SCHEMA_COMPILED = 'schemas/gschemas.compiled'
+SCHEMA_ID = 'org.gnome.shell.extensions.clipmonger'
 README = b'Extract to a writable directory and run clipmonger. Data is stored beside the binaries.\n'
+
+
+def compile_schema(xml):
+    # Compile only the supplied XML in a private directory; do not alter dist.
+    with tempfile.TemporaryDirectory(prefix='clipmonger-schema-') as temp:
+        directory = Path(temp)
+        (directory / Path(SCHEMA_XML).name).write_bytes(xml)
+        result = subprocess.run(['glib-compile-schemas', '--strict', str(directory)], capture_output=True, text=True)
+        if result.returncode:
+            raise ValueError(f'GNOME schema compilation failed: {result.stderr.strip()}')
+        return (directory / 'gschemas.compiled').read_bytes()
+
+
+def validate_schema(xml, compiled):
+    if compiled != compile_schema(xml):
+        raise ValueError('compiled GNOME schema differs from its XML')
+    with tempfile.TemporaryDirectory(prefix='clipmonger-schema-check-') as temp:
+        directory = Path(temp)
+        (directory / 'gschemas.compiled').write_bytes(compiled)
+        env = os.environ.copy()
+        env.update(GSETTINGS_BACKEND='memory', XDG_DATA_HOME=str(directory), XDG_DATA_DIRS=str(directory))
+        result = subprocess.run(['gsettings', '--schemadir', str(directory), 'list-keys', SCHEMA_ID], env=env, capture_output=True, text=True)
+        if result.returncode or set(result.stdout.splitlines()) != {'denylist', 'popup', 'profile-dir'}:
+            raise ValueError(f'compiled GNOME schema cannot be loaded: {result.stderr.strip()}')
 
 
 def contents(platform, bins, notices, extension=None):
@@ -44,6 +74,7 @@ def contents(platform, bins, notices, extension=None):
             result['gnome-extension/' + name] = path.read_bytes()
             if not result['gnome-extension/' + name]:
                 raise ValueError(f'extension file empty: {name}')
+        result['gnome-extension/' + SCHEMA_COMPILED] = compile_schema(result['gnome-extension/' + SCHEMA_XML])
     return result
 
 
@@ -53,7 +84,7 @@ def validate(path, platform):
     license_files = {f'licenses/{p.relative_to(license_root).as_posix()}' for p in license_root.rglob('*') if p.is_file() and not p.is_symlink()}
     required = {name + suffix for name in BINS} | license_files | {f'licenses/fonts/{name}' for name in FONTS} | {'licenses/RUST-NOTICES.txt', 'portable.marker', 'README.txt'}
     if platform == 'linux':
-        required |= {'gnome-extension/' + name for name in EXTENSION}
+        required |= {'gnome-extension/' + name for name in EXTENSION} | {'gnome-extension/' + SCHEMA_COMPILED}
     with zipfile.ZipFile(path) as archive:
         infos = archive.infolist()
         names = [i.filename for i in infos]
@@ -76,6 +107,8 @@ def validate(path, platform):
                 raise ValueError(f'license differs from source: {name}')
         if archive.read('portable.marker'):
             raise ValueError('portable.marker must be empty')
+        if platform == 'linux':
+            validate_schema(archive.read('gnome-extension/' + SCHEMA_XML), archive.read('gnome-extension/' + SCHEMA_COMPILED))
         bad = archive.testzip()
         if bad:
             raise ValueError(f'corrupt archive entry: {bad}')

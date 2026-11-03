@@ -2,6 +2,7 @@
 """Exercise portable packaging against synthetic payloads; never builds the app."""
 import argparse
 import hashlib
+import os
 import shutil
 from pathlib import Path
 import subprocess
@@ -30,7 +31,10 @@ ext = root / 'extension'
 for name in tuple(name + '.js' for name in ('capture', 'codec', 'config', 'extension', 'hotkeys', 'ipc', 'paste', 'polddiff', 'prefs', 'relay', 'report', 'sha256')) + ('metadata.json', 'stylesheet.css', 'schemas/org.gnome.shell.extensions.clipmonger.gschema.xml'):
     path = ext / name
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('synthetic extension\n')
+    if name.endswith('.gschema.xml'):
+        shutil.copyfile(script.parent.parent / 'gnome-ext' / name, path)
+    else:
+        path.write_text('synthetic extension\n')
 
 
 def run(*argv, ok=True):
@@ -64,6 +68,24 @@ for platform in ('windows', 'linux'):
                 if name != missing:
                     target.writestr(name, data)
         run('check', '--platform', platform, bad, ok=False)
+    if platform == 'linux':
+        schema_name = 'gnome-extension/schemas/gschemas.compiled'
+        assert schema_name in payload and payload[schema_name]
+        for kind in ('missing', 'corrupt'):
+            bad_schema = root / ('linux-schema-' + kind + '.zip')
+            with zipfile.ZipFile(bad_schema, 'w') as target:
+                for name, data in payload.items():
+                    if name == schema_name and kind == 'missing':
+                        continue
+                    target.writestr(name, b'corrupt schema' if name == schema_name else data)
+            run('check', '--platform', platform, bad_schema, ok=False)
+        schema_dir = root / 'packaged-schema'
+        schema_dir.mkdir()
+        (schema_dir / 'gschemas.compiled').write_bytes(payload[schema_name])
+        env = os.environ.copy()
+        env.update(GSETTINGS_BACKEND='memory', XDG_DATA_DIRS=str(schema_dir), XDG_DATA_HOME=str(schema_dir))
+        loaded = subprocess.run(['gsettings', '--schemadir', str(schema_dir), 'list-keys', 'org.gnome.shell.extensions.clipmonger'], env=env, capture_output=True, text=True, check=True)
+        assert set(loaded.stdout.splitlines()) == {'denylist', 'popup', 'profile-dir'}
     bad = root / (platform + '-unsafe.zip')
     with zipfile.ZipFile(bad, 'w') as target:
         for name, data in payload.items():

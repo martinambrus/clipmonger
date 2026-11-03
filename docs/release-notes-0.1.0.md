@@ -10,7 +10,9 @@ for this draft (R-F4); the user reviews artifacts and notes first.
   the windows-gnu target; not a native-runner build (seg-12 §2).
 - `clipmonger-0.1.0-linux-x86_64.zip` — `clipmonger-daemon`,
   `clipmonger-cli`, `clipmonger` (UI), built GNOME extension under
-  `gnome-extension/`.
+  `gnome-extension/`, including its compiled GSettings schema. Copy that
+  directory to the GNOME Shell extensions directory under the UUID from
+  `metadata.json` before enabling it.
 - Both portable ZIPs contain `portable.marker`, portable-use instructions,
   and the complete `licenses/` directory, including font notices and their
   README, upstream license texts, and generated `RUST-NOTICES.txt`.
@@ -24,6 +26,10 @@ for this draft (R-F4); the user reviews artifacts and notes first.
 
 The brief-named artifact files use the `-x86_64` suffix; they correspond
 to the `linux-x64` / `windows-x64` naming in the release analysis.
+
+Linux package builds and payload checks require `glib-compile-schemas` and
+`gsettings` from GLib. Use the same GLib toolchain to build and verify a
+package: the checker recompiles its XML and compares the compiled bytes.
 
 ## Unsigned-warning (seg-12 §5)
 
