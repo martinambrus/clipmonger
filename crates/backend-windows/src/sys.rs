@@ -37,6 +37,35 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_MESSAGE, MSG, WM_CLIPBOARDUPDATE,
     WM_CLOSE, WM_CREATE, WM_DESTROY, WNDCLASSEXW,
 };
+
+/// Wait for modifier keys to be released without injecting key-up events.
+///
+/// # Errors
+/// Returns an error if the modifiers remain held until the deadline.
+#[cfg(windows)]
+pub fn wait_modifiers_released(
+    timeout: std::time::Duration,
+) -> clipmonger_platform::types::Result<()> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    let deadline = std::time::Instant::now() + timeout;
+    // Shift, Control, Alt, left/right Windows keys.
+    let keys = [0x10, 0x11, 0x12, 0x5b, 0x5c];
+    loop {
+        // Safety: GetAsyncKeyState accepts each of these virtual-key codes.
+        if keys
+            .iter()
+            .all(|key| unsafe { GetAsyncKeyState(*key) } >= 0)
+        {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(clipmonger_platform::types::Error::Denied(
+                "modifiers remained held".into(),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, SetForegroundWindow,

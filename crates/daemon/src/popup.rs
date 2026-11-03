@@ -234,6 +234,10 @@ impl PopupChord {
 /// Own a popup hotkey manager through factory, registration and poll
 /// failures. Every replacement starts with fresh chord-registration state.
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep the single owner and recovery loop together"
+)]
 pub fn run_hotkeys<H: HotkeyManager>(
     mut hotkeys: Option<H>,
     shutdown: &std::sync::atomic::AtomicBool,
@@ -243,6 +247,8 @@ pub fn run_hotkeys<H: HotkeyManager>(
     mut publish: impl FnMut(ChordStatus),
     mut press: impl FnMut(),
     mut sleep: impl FnMut(Duration),
+    permanents: Option<&DaemonState>,
+    mut permanent_press: impl FnMut(uuid::Uuid, &str, &mut dyn FnMut() -> bool),
 ) {
     use std::sync::atomic::Ordering;
     let mut chord = PopupChord::default();
@@ -250,6 +256,8 @@ pub fn run_hotkeys<H: HotkeyManager>(
     let mut registration = None;
     let mut last_working: Option<String> = None;
     let mut delay = Duration::from_millis(100);
+    let mut permanent_chords = PermanentChords::default();
+    let mut last_bindings: Option<(String, Vec<(uuid::Uuid, String)>)> = None;
     while !shutdown.load(Ordering::Relaxed) {
         let mut report = |status: ChordStatus| {
             if last_status.as_ref() != Some(&status) {
@@ -267,7 +275,20 @@ pub fn run_hotkeys<H: HotkeyManager>(
                     // working chord. Re-register that fallback on the new
                     // manager before trying the current configuration.
                     let fallback = last_working.clone();
+                    if permanents.is_some() && last_bindings.is_some() {
+                        // Drain the Windows process-wide event channel before
+                        // binding any chord to a new logical owner. X11's new
+                        // connection has its own empty event queue.
+                        if let Err(error) = replacement.discard_pending() {
+                            report(ChordStatus::Refused(error.to_string()));
+                            drop(replacement);
+                            sleep(delay);
+                            delay = (delay * 2).min(Duration::from_secs(2));
+                            continue;
+                        }
+                    }
                     chord = PopupChord::default();
+                    permanent_chords = PermanentChords::default();
                     registration = fallback
                         .and_then(|held| chord.sync(&mut replacement, &held, Instant::now()));
                     hotkeys = Some(replacement);
@@ -289,10 +310,30 @@ pub fn run_hotkeys<H: HotkeyManager>(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+        let popup_wanted = wanted();
+        let current = permanents.map(DaemonState::permanent_hotkeys);
+        if current.as_ref().is_some_and(Result::is_err) {
+            report(ChordStatus::Refused(
+                "permanent hotkey list unavailable".into(),
+            ));
+            drop(hotkeys.take());
+            sleep(delay);
+            delay = (delay * 2).min(Duration::from_secs(2));
+            continue;
+        }
+        if let Some(Ok(rows)) = &current {
+            let bindings = (popup_wanted.clone(), rows.clone());
+            if last_bindings.as_ref().is_some_and(|old| old != &bindings) {
+                last_bindings = Some(bindings);
+                drop(hotkeys.take());
+                continue;
+            }
+            last_bindings = Some(bindings);
+        }
         let Some(manager) = hotkeys.as_mut() else {
             continue;
         };
-        if let Some(status) = chord.sync(manager, &wanted(), Instant::now()) {
+        if let Some(status) = chord.sync(manager, &popup_wanted, Instant::now()) {
             if matches!(&status, ChordStatus::Refused(_)) {
                 report(status.clone());
             }
@@ -301,8 +342,18 @@ pub fn run_hotkeys<H: HotkeyManager>(
         if let Some(held) = &chord.held {
             last_working = Some(held.clone());
         }
+        let mut permanent_status = None;
+        if let Some(current) = &current {
+            permanent_status = Some(permanent_chords.sync(
+                manager,
+                current.as_deref(),
+                chord.held.as_deref(),
+                &popup_wanted,
+                Instant::now(),
+            ));
+        }
         ready();
-        if chord.held.is_none() {
+        if chord.held.is_none() && permanent_chords.held.is_empty() {
             // An initially refused registration is retried with a new owner;
             // a refused change keeps the previous working chord instead.
             drop(hotkeys.take());
@@ -319,11 +370,64 @@ pub fn run_hotkeys<H: HotkeyManager>(
                     break;
                 }
                 if let Some(status) = &registration {
-                    report(status.clone());
+                    if matches!(status, ChordStatus::Refused(_)) {
+                        report(status.clone());
+                    } else if let Some(status) = &permanent_status {
+                        report(status.clone());
+                    } else {
+                        report(status.clone());
+                    }
                 }
                 delay = Duration::from_millis(100);
+                let mut dispatched = false;
+                let mut drain_error = None;
                 if ids.contains(&HotkeyId(1)) {
                     press();
+                    dispatched = permanents.is_some();
+                }
+                if !dispatched {
+                    if let Some(state) = permanents {
+                        for id in ids {
+                            if let Some((clip, wanted)) = permanent_chords.held.get(&id) {
+                                if state.permanent_hotkeys().is_ok_and(|rows| {
+                                    rows.iter().any(|row| row.0 == *clip && row.1 == *wanted)
+                                }) {
+                                    let mut pause = || {
+                                        let Some(mut owner) = hotkeys.take() else {
+                                            return false;
+                                        };
+                                        let result = owner.discard_pending();
+                                        drop(owner);
+                                        if let Err(error) = result {
+                                            drain_error = Some(error);
+                                            false
+                                        } else {
+                                            true
+                                        }
+                                    };
+                                    permanent_press(*clip, wanted, &mut pause);
+                                    dispatched = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if dispatched {
+                    // Delivery can block while the foreground changes. Drop
+                    // the rest of this batch and all events accumulated by
+                    // this owner, then re-create it before accepting presses.
+                    if let Some(mut owner) = hotkeys.take() {
+                        if let Err(error) = owner.discard_pending() {
+                            drain_error = Some(error);
+                        }
+                        drop(owner);
+                    }
+                    if let Some(error) = drain_error {
+                        report(ChordStatus::Refused(error.to_string()));
+                        sleep(delay);
+                        delay = (delay * 2).min(Duration::from_secs(2));
+                    }
                 }
             }
             Err(error) => {
@@ -342,6 +446,107 @@ pub fn run_hotkeys<H: HotkeyManager>(
                 sleep(delay);
                 delay = (delay * 2).min(Duration::from_secs(2));
             }
+        }
+    }
+}
+
+#[derive(Default)]
+struct PermanentChords {
+    held: std::collections::HashMap<HotkeyId, (uuid::Uuid, String)>,
+    next: u32,
+    failures: std::collections::HashMap<uuid::Uuid, Instant>,
+}
+
+fn chord_key(chord: &str) -> Option<(Vec<String>, String)> {
+    let mut parsed = clipmonger_platform::chord::parse(chord).ok()?;
+    parsed.mods.sort();
+    Some((parsed.mods, parsed.key))
+}
+
+impl PermanentChords {
+    fn sync<H: HotkeyManager>(
+        &mut self,
+        manager: &mut H,
+        wanted: Result<&[(uuid::Uuid, String)], &clipmonger_ipc::proto::IpcError>,
+        popup: Option<&str>,
+        popup_wanted: &str,
+        now: Instant,
+    ) -> ChordStatus {
+        let Ok(wanted) = wanted else {
+            for id in self.held.keys().copied().collect::<Vec<_>>() {
+                let _ = manager.unregister(id);
+            }
+            self.held.clear();
+            return ChordStatus::Refused("permanent hotkey list unavailable".into());
+        };
+        let mut reserved = std::collections::HashSet::new();
+        if let Some(key) = popup.and_then(chord_key) {
+            reserved.insert(key);
+        }
+        if let Some(key) = chord_key(popup_wanted) {
+            reserved.insert(key);
+        }
+        let mut selected = Vec::new();
+        let mut failed = false;
+        for (clip, chord) in wanted {
+            if let Some(key) = chord_key(chord) {
+                if reserved.insert(key) {
+                    selected.push((*clip, chord.clone()));
+                    continue;
+                }
+            }
+            failed = true;
+        }
+        let removed: Vec<_> = self
+            .held
+            .iter()
+            .filter(|(_, entry)| !selected.contains(entry))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in removed {
+            if manager.unregister(id).is_err() {
+                failed = true;
+            }
+            self.held.remove(&id);
+        }
+        self.failures
+            .retain(|id, _| selected.iter().any(|entry| entry.0 == *id));
+        for (clip, chord) in selected {
+            if self
+                .held
+                .values()
+                .any(|entry| entry.0 == clip && entry.1 == chord)
+            {
+                continue;
+            }
+            if self
+                .failures
+                .get(&clip)
+                .is_some_and(|at| now.duration_since(*at) < CHORD_RETRY)
+            {
+                failed = true;
+                continue;
+            }
+            let Some(next) = self.next.checked_add(1) else {
+                failed = true;
+                continue;
+            };
+            self.next = next.max(2);
+            let id = HotkeyId(self.next);
+            if manager.register(id, &chord).is_ok() {
+                self.held.insert(id, (clip, chord));
+                self.failures.remove(&clip);
+            } else {
+                self.failures.insert(clip, now);
+                failed = true;
+            }
+        }
+        if failed {
+            ChordStatus::Refused(
+                "permanent hotkey conflict, invalid chord, or registration failure".into(),
+            )
+        } else {
+            ChordStatus::Held
         }
     }
 }
@@ -654,7 +859,7 @@ mod chord_tests {
     use clipmonger_platform::traits::HotkeyManager;
     use clipmonger_platform::types::{Affinity, Error, HotkeyId, Result};
 
-    use super::{ChordStatus, PopupChord, CHORD_RETRY};
+    use super::{ChordStatus, PermanentChords, PopupChord, CHORD_RETRY};
 
     /// Chords in `taken` belong to another app; a refused change keeps the
     /// held chord, like the Windows manager.
@@ -735,6 +940,67 @@ mod chord_tests {
             "a released chord is picked up on retry"
         );
         assert_eq!(keys.held[&HotkeyId(1)], "ctrl+alt+x");
+    }
+
+    #[test]
+    fn permanent_registration_conflicts_retry_and_removal() {
+        let mut keys = Keys::default();
+        keys.taken.insert("ctrl+alt+j".into());
+        let mut chords = PermanentChords::default();
+        let a = uuid::Uuid::from_u128(1);
+        let b = uuid::Uuid::from_u128(2);
+        let now = Instant::now();
+        let desired = vec![(a, "ctrl+alt+j".to_string()), (b, "ALT+CTRL+h".to_string())];
+        assert!(matches!(
+            chords.sync(
+                &mut keys,
+                Ok(&desired),
+                Some("ctrl+alt+h"),
+                "ctrl+alt+h",
+                now
+            ),
+            ChordStatus::Refused(_)
+        ));
+        assert!(
+            chords.held.is_empty(),
+            "failed and popup-conflicting chords cannot fire"
+        );
+        assert_eq!(keys.calls, 1);
+        keys.taken.clear();
+        chords.sync(
+            &mut keys,
+            Ok(&desired),
+            Some("ctrl+alt+h"),
+            "ctrl+alt+h",
+            now + CHORD_RETRY,
+        );
+        assert_eq!(chords.held.len(), 1);
+        let old = *chords.held.keys().next().unwrap();
+        assert_eq!(chords.held[&old].0, a);
+        assert_eq!(keys.held.len(), 1);
+        assert!(matches!(
+            chords.sync(
+                &mut keys,
+                Ok(&[]),
+                Some("ctrl+alt+h"),
+                "ctrl+alt+h",
+                now + CHORD_RETRY
+            ),
+            ChordStatus::Held
+        ));
+        assert!(keys.held.is_empty());
+        assert!(chords.held.is_empty());
+        chords.sync(
+            &mut keys,
+            Ok(&desired[..1]),
+            Some("ctrl+alt+h"),
+            "ctrl+alt+h",
+            now + CHORD_RETRY,
+        );
+        assert!(
+            !chords.held.contains_key(&old),
+            "retired IDs must not be reused"
+        );
     }
 }
 
@@ -904,6 +1170,8 @@ mod hotkey_recovery_tests {
                 stop.store(true, Ordering::Relaxed);
             },
             |d| waits.push(d.as_millis()),
+            None,
+            |_, _, _| {},
         );
         assert_eq!(presses, 1);
         assert_eq!(registered.load(Ordering::SeqCst), 2);
@@ -976,6 +1244,8 @@ mod hotkey_recovery_tests {
             |_| {},
             || stop.store(true, Ordering::Relaxed),
             |_| {},
+            None,
+            |_, _, _| {},
         );
         assert_eq!(attempts, 2);
         assert_eq!(
@@ -1006,6 +1276,8 @@ mod hotkey_recovery_tests {
                     stop.store(true, Ordering::Relaxed);
                 });
             },
+            None,
+            |_, _, _| {},
         );
         assert_eq!(attempts, 1);
         assert_eq!(slices, [Duration::from_millis(20)]);

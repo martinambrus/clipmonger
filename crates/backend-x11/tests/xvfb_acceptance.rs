@@ -135,10 +135,59 @@ impl Xvfb {
     fn addr(&self) -> &str {
         &self.display
     }
+
+    /// Ask this still-owned child to clean up its socket and lock, then reap it.
+    #[allow(unsafe_code)] // SIGTERM for the owned, unreaped child only.
+    fn stop_gracefully(&mut self) -> Result<(), String> {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        if self
+            .child
+            .try_wait()
+            .map_err(|e| format!("Xvfb status: {e}"))?
+            .is_some()
+        {
+            return Err("owned Xvfb exited before termination".into());
+        }
+        let pid = i32::try_from(self.child.id()).map_err(|_| "invalid Xvfb pid")?;
+        if pid <= 0 {
+            return Err("invalid Xvfb pid".into());
+        }
+        // Safety: this positive PID belongs to our unreaped Child, so it
+        // cannot be reused even if it exits between try_wait and kill.
+        if unsafe { kill(pid, 15) } != 0 {
+            return Err(format!(
+                "Xvfb SIGTERM failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if self
+                .child
+                .try_wait()
+                .map_err(|e| format!("Xvfb reap: {e}"))?
+                .is_some()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("Xvfb did not stop after SIGTERM".into());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 impl Drop for Xvfb {
     fn drop(&mut self) {
+        // A gracefully stopped child has already been reaped; do not signal a
+        // PID that could now belong to a different process.
+        match self.child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {}
+        }
         let _ = self.child.kill();
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -1882,6 +1931,395 @@ fn t506_hotkey_conflict() {
 // ---------------------------------------------------------------------------
 // t507: paste into a scratch window (transfer + restore halves)
 // ---------------------------------------------------------------------------
+
+// Preparation only: run these ignored probes solely under the separately
+// reviewed isolated-Xvfb launcher. The fixture owns the display and the
+// scratch window; all key and clipboard traffic stays on that display.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep the isolated probe lifecycle together"
+)]
+fn permanent_hotkey_paste_probe(chord: Option<&str>, held_alt: bool) {
+    let Some((_guard, xvfb)) = fixture("permanent_hotkey_paste_probe") else {
+        assert!(
+            std::env::var_os("CLIPMONGER_XVFB_REQUIRED").is_none(),
+            "required isolated Xvfb fixture did not start"
+        );
+        return;
+    };
+    let display = xvfb.addr().to_string();
+    assert!(has_xtest(&display), "probe requires XTEST");
+    let (scratch_conn, scratch) = make_scratch(&display).expect("scratch");
+    scratch_conn
+        .change_window_attributes(
+            scratch,
+            &xproto::ChangeWindowAttributesAux::new()
+                .event_mask(EventMask::KEY_PRESS | EventMask::KEY_RELEASE),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    scratch_conn
+        .set_input_focus(xproto::InputFocus::PARENT, scratch, x11rb::CURRENT_TIME)
+        .unwrap()
+        .check()
+        .unwrap();
+    scratch_conn.flush().unwrap();
+    let mut hotkeys = chord.map(|chord| {
+        let mut hotkeys = X11Hotkeys::connect(Some(&display)).expect("hotkeys");
+        hotkeys.register(HotkeyId(7), chord).expect("register");
+        hotkeys
+    });
+    let (input, screen) = x11rb::connect(Some(&display)).expect("input connection");
+    let root = input.setup().roots[screen].root;
+    let ctrl = keysym_to_keycode(&input, 0xffe3).unwrap();
+    let alt = keysym_to_keycode(&input, 0xffe9).unwrap();
+    let key = keysym_to_keycode(
+        &input,
+        if held_alt {
+            u32::from(b'j')
+        } else {
+            u32::from(b'v')
+        },
+    )
+    .unwrap();
+    let inject = |code, down| {
+        xtest::fake_input(
+            &input,
+            if down {
+                xproto::KEY_PRESS_EVENT
+            } else {
+                xproto::KEY_RELEASE_EVENT
+            },
+            code,
+            x11rb::CURRENT_TIME,
+            root,
+            0,
+            0,
+            0,
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    };
+    if let Some(hotkeys) = hotkeys.as_mut() {
+        inject(ctrl, true);
+        if held_alt {
+            inject(alt, true);
+        }
+        inject(key, true);
+        inject(key, false);
+        input.flush().unwrap();
+        let trigger = poll_until(Duration::from_secs(3), || {
+            hotkeys
+                .poll(Duration::from_millis(100))
+                .ok()
+                .and_then(|ids| ids.into_iter().find(|id| *id == HotkeyId(7)))
+        });
+        assert!(trigger.is_some(), "the intended trigger must fire once");
+    } else {
+        // The positive control uses no registered hotkey and checks both
+        // sides of every common modifier before starting the paste.
+        let keymap = input.query_keymap().unwrap().reply().unwrap().keys;
+        for sym in [
+            0xffe1, 0xffe2, 0xffe3, 0xffe4, 0xffe9, 0xffea, 0xffeb, 0xffec,
+        ] {
+            let code = keysym_to_keycode(&input, sym).expect("modifier keycode");
+            assert_eq!(
+                keymap[usize::from(code / 8)] & (1 << (code % 8)),
+                0,
+                "modifier {sym:#x} must be up"
+            );
+        }
+    }
+    let target = PasteTarget {
+        app: AppId {
+            exe: "xvfb-probe".into(),
+            title_hash: 0,
+        },
+        window_title_hash: 0,
+        handle: PlatformHandle::X11Window(u64::from(scratch)),
+        captured_ms: now_ms(),
+    };
+    if let Some(mut owner) = hotkeys.take() {
+        owner.discard_pending().expect("pause owner queue");
+        drop(owner);
+        // Model the user releasing the trigger modifiers shortly after the
+        // press. The production path waits; it never injects these key-ups.
+        let release_display = display.clone();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let (conn, screen) = x11rb::connect(Some(&release_display)).unwrap();
+            let root = conn.setup().roots[screen].root;
+            for code in if held_alt {
+                vec![ctrl, alt]
+            } else {
+                vec![ctrl]
+            } {
+                xtest::fake_input(
+                    &conn,
+                    xproto::KEY_RELEASE_EVENT,
+                    code,
+                    x11rb::CURRENT_TIME,
+                    root,
+                    0,
+                    0,
+                    0,
+                )
+                .unwrap()
+                .check()
+                .unwrap();
+            }
+            conn.flush().unwrap();
+        });
+        clipmonger_backend_x11::paste::wait_modifiers_released(
+            Some(&display),
+            Duration::from_millis(750),
+        )
+        .expect("user releases modifiers");
+        release.join().unwrap();
+    }
+    let paste_display = display.clone();
+    let paster = thread::spawn(move || {
+        X11Paste::connect(Some(&paste_display))
+            .unwrap()
+            .paste_payloads(
+                &target,
+                &ClipRef(uuid::Uuid::now_v7()),
+                &[("text/plain;charset=utf-8".into(), b"probe-payload".to_vec())],
+            )
+    });
+    let v = keysym_to_keycode(&scratch_conn, u32::from(b'v')).unwrap();
+    let transfer = X11Transfer::connect(Some(&display)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut finished_at = None;
+    let mut target_pastes = 0;
+    let mut payload_seen = false;
+    let mut events_seen = 0;
+    let mut v_events = 0;
+    while Instant::now() < deadline {
+        if paster.is_finished() && finished_at.is_none() {
+            finished_at = Some(Instant::now());
+        }
+        if finished_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(300)) {
+            break;
+        }
+        let event = scratch_conn.poll_for_event().unwrap();
+        if let Some(Event::KeyPress(event) | Event::KeyRelease(event)) = event {
+            events_seen += 1;
+            assert!(events_seen <= 128, "bounded event diagnostic overflow");
+            let syms = scratch_conn
+                .get_keyboard_mapping(event.detail, 1)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .keysyms;
+            let state = u16::from(event.state);
+            let is_press = event.response_type & 0x7f == xproto::KEY_PRESS_EVENT;
+            let is_v = event.detail == v
+                || syms.contains(&u32::from(b'v'))
+                || syms.contains(&u32::from(b'V'));
+            if is_v {
+                v_events += 1;
+            }
+            eprintln!("probe-key: press={is_press} keycode={} keysyms={syms:?} state={state:#06x} v={is_v}", event.detail);
+            if is_press && is_v && state & 0x04 != 0 && state & 0x08 == 0 {
+                target_pastes += 1;
+                if !paster.is_finished() {
+                    assert_eq!(
+                        transfer.read("text/plain;charset=utf-8", 1024).unwrap(),
+                        b"probe-payload"
+                    );
+                    payload_seen = true;
+                }
+            }
+        } else {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(
+        paster.is_finished(),
+        "paste must complete within the owned probe deadline"
+    );
+    paster.join().unwrap().unwrap();
+    let follow_on = if let Some(chord) = chord {
+        let mut replacement = X11Hotkeys::connect(Some(&display)).unwrap();
+        replacement.discard_pending().unwrap();
+        replacement.register(HotkeyId(7), chord).unwrap();
+        replacement.poll(Duration::from_millis(500)).unwrap()
+    } else {
+        Vec::new()
+    };
+    eprintln!("probe-summary: key_events={events_seen} v_events={v_events} qualifying_presses={target_pastes} payload_seen={payload_seen} follow_on={}", follow_on.len());
+    assert_eq!(
+        target_pastes, 1,
+        "one unmodified Ctrl+V must reach the target with the payload"
+    );
+    assert!(
+        payload_seen,
+        "the target must observe the known payload during the paste"
+    );
+    assert!(
+        follow_on.is_empty(),
+        "synthetic paste must not generate a follow-on hotkey"
+    );
+}
+
+#[test]
+#[ignore = "isolated Xvfb probe requires separate safety review"]
+fn t508_permanent_ctrl_v_feedback_probe() {
+    permanent_hotkey_paste_probe(Some("ctrl+v"), false);
+}
+
+#[test]
+#[ignore = "isolated Xvfb probe requires separate safety review"]
+fn t509_permanent_held_alt_paste_probe() {
+    permanent_hotkey_paste_probe(Some("ctrl+alt+j"), true);
+}
+
+#[test]
+#[ignore = "isolated Xvfb probe requires separate safety review"]
+fn t510_plain_paste_positive_control() {
+    permanent_hotkey_paste_probe(None, false);
+}
+
+#[test]
+#[ignore = "isolated Xvfb probe requires separate safety review"]
+fn t511_held_modifier_cancels_before_clipboard_change() {
+    let Some((_guard, xvfb)) = fixture("held_modifier_cancels") else {
+        assert!(
+            std::env::var_os("CLIPMONGER_XVFB_REQUIRED").is_none(),
+            "required isolated Xvfb fixture did not start"
+        );
+        return;
+    };
+    let display = xvfb.addr();
+    assert!(has_xtest(display), "probe requires XTEST");
+    let transfer = X11Transfer::connect(Some(display)).unwrap();
+    transfer
+        .write(&[(
+            "text/plain;charset=utf-8".into(),
+            b"original-probe".to_vec(),
+        )])
+        .unwrap();
+    let (input, screen) = x11rb::connect(Some(display)).unwrap();
+    let root = input.setup().roots[screen].root;
+    let alt = keysym_to_keycode(&input, 0xffe9).unwrap();
+    xtest::fake_input(
+        &input,
+        xproto::KEY_PRESS_EVENT,
+        alt,
+        x11rb::CURRENT_TIME,
+        root,
+        0,
+        0,
+        0,
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    input.flush().unwrap();
+    let result = clipmonger_backend_x11::paste::wait_modifiers_released(
+        Some(display),
+        Duration::from_millis(250),
+    );
+    xtest::fake_input(
+        &input,
+        xproto::KEY_RELEASE_EVENT,
+        alt,
+        x11rb::CURRENT_TIME,
+        root,
+        0,
+        0,
+        0,
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    input.flush().unwrap();
+    assert!(
+        matches!(
+            &result,
+            Err(clipmonger_platform::types::Error::Denied(message))
+                if message == "modifiers remained held"
+        ),
+        "expected held-modifier deadline rejection, got {result:?}"
+    );
+    assert_eq!(
+        transfer.read("text/plain;charset=utf-8", 1024).unwrap(),
+        b"original-probe"
+    );
+}
+
+#[test]
+#[ignore = "isolated Xvfb restart probe requires separate safety review"]
+fn t512_serving_health_restart_and_worker_cleanup() {
+    let Some((_guard, mut xvfb)) = fixture("serving_health_restart") else {
+        assert!(
+            std::env::var_os("CLIPMONGER_XVFB_REQUIRED").is_none(),
+            "required isolated Xvfb fixture did not start"
+        );
+        return;
+    };
+    let display = xvfb.addr().to_string();
+    let baseline = std::fs::read_dir("/proc/self/task").unwrap().count();
+    for generation in 0..3 {
+        let mut owner = X11Transfer::connect(Some(&display)).expect("owned transfer");
+        let payload = format!("probe-generation-{generation}").into_bytes();
+        owner
+            .write(&[("text/plain;charset=utf-8".into(), payload.clone())])
+            .unwrap();
+        assert!(owner.serving_health().unwrap());
+        assert!(
+            owner.close_dead_serving().is_err(),
+            "a healthy selection owner cannot be discarded"
+        );
+        assert_eq!(
+            owner.read("text/plain;charset=utf-8", 1024).unwrap(),
+            payload,
+            "healthy owner must still serve the selection"
+        );
+        xvfb.stop_gracefully().expect("stop and reap owned Xvfb");
+        let dead = poll_until(Duration::from_secs(5), || {
+            matches!(owner.serving_health(), Ok(false)).then_some(())
+        });
+        assert!(
+            dead.is_some(),
+            "the retained serving connection must report confirmed death"
+        );
+        owner
+            .close_dead_serving()
+            .expect("join confirmed-dead worker");
+        drop(owner);
+        assert!(
+            std::fs::read_dir("/proc/self/task").unwrap().count() <= baseline,
+            "dead worker must not be parked"
+        );
+        if generation < 2 {
+            let socket = format!("/tmp/.X11-unix/X{}", xvfb.display_no);
+            assert!(
+                poll_until(Duration::from_secs(5), || (!Path::new(&socket).exists())
+                    .then_some(()))
+                .is_some(),
+                "old socket must disappear"
+            );
+            let lock = format!("/tmp/.X{}-lock", xvfb.display_no);
+            assert!(
+                poll_until(Duration::from_secs(5), || (!Path::new(&lock).exists())
+                    .then_some(()))
+                .is_some(),
+                "old X lock must disappear"
+            );
+            drop(xvfb);
+            xvfb = Xvfb::start().expect("restart owned Xvfb");
+            assert_eq!(
+                xvfb.addr(),
+                display,
+                "restart must use the same isolated display"
+            );
+        }
+    }
+}
 
 #[test]
 fn t507_paste_into_scratch() {
