@@ -158,3 +158,67 @@ fn t208_dead_target() {
     let captured = target("a.exe", PlatformHandle::Opaque("x".to_string()));
     assert!(validate_target(&captured, None).is_err());
 }
+
+#[test]
+fn failed_equal_write_must_not_cancel_other_expectation() {
+    let mut reg = SuppressionRegistry::new();
+    let failed = reg.register_tracked("same".into(), None, 1000);
+    reg.register_tracked("same".into(), None, 1000);
+    reg.cancel_tracked(failed);
+    assert!(reg.should_suppress("same", None, 1001));
+    assert!(!reg.should_suppress("same", None, 1001));
+}
+
+#[test]
+fn pending_write_matches_only_its_final_sequence() {
+    let mut reg = SuppressionRegistry::new();
+    let id = reg.register_pending("same".into(), 1000);
+    assert!(!reg.should_suppress("same", Some("42"), 1001));
+    reg.finalize_pending(id, "42".into());
+    assert!(!reg.should_suppress("same", Some("41"), 1002));
+    assert!(!reg.should_suppress("different", Some("42"), 1002));
+    assert!(reg.should_suppress("same", Some("42"), 1002));
+    assert!(!reg.should_suppress("same", Some("42"), 1002));
+}
+
+#[test]
+fn bridged_write_drops_one_other_backend_observation() {
+    for (first, other) in [("x11", "wayland"), ("wayland", "x11")] {
+        let mut reg = SuppressionRegistry::new();
+        reg.register_bridged("whole".into(), 1000);
+        assert!(reg.should_suppress_from("whole", None, 1001, Some(first)));
+        assert!(reg.should_suppress_from("whole", None, 1002, Some(other)));
+        assert!(!reg.should_suppress_from("whole", None, 1003, Some(other)));
+        assert_eq!(reg.suppressed_count(), 2);
+    }
+}
+
+#[test]
+fn bridged_distinct_full_representations_work_in_both_orders() {
+    for (first_origin, first_hash, second_origin, second_hash) in
+        [("x11", "x", "wayland", "w"), ("wayland", "w", "x11", "x")]
+    {
+        let mut reg = SuppressionRegistry::new();
+        reg.register_bridged_variants("x".into(), Some("w".into()), 1000);
+        assert!(reg.should_suppress_from(first_hash, None, 1001, Some(first_origin)));
+        assert!(reg.should_suppress_from(second_hash, None, 1002, Some(second_origin)));
+    }
+}
+
+#[test]
+fn bridged_companion_does_not_hide_a_new_copy_or_survive_failure() {
+    let mut reg = SuppressionRegistry::new();
+    let id = reg.register_bridged("whole".into(), 1000);
+    assert!(reg.should_suppress_from("whole", None, 1001, Some("x11")));
+    assert!(!reg.should_suppress_from("whole", None, 1002, Some("x11")));
+    assert!(!reg.should_suppress_from("whole", None, 1003, Some("wayland")));
+    let id2 = reg.register_bridged("whole".into(), 1010);
+    assert!(reg.should_suppress_from("whole", None, 1011, Some("x11")));
+    reg.cancel_tracked(id2);
+    assert!(!reg.should_suppress_from("whole", None, 1012, Some("wayland")));
+    reg.cancel_tracked(id);
+    reg.register_bridged("whole".into(), 1020);
+    assert!(reg.should_suppress_from("whole", None, 1021, Some("x11")));
+    assert!(!reg.should_suppress_from("different", None, 1022, Some("wayland")));
+    assert!(!reg.should_suppress_from("whole", None, 1023, Some("wayland")));
+}

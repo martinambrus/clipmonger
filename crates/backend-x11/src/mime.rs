@@ -35,6 +35,26 @@ pub fn x11_to_canonical(name: &str) -> Option<String> {
     }
 }
 
+/// Resolve bytes served for a target, including the advertised text alias.
+#[must_use]
+pub fn served_target<'a>(
+    name: &str,
+    payloads: &'a [(String, Vec<u8>)],
+) -> Option<(&'a str, &'a [u8])> {
+    let canonical = x11_to_canonical(name)?;
+    let exact = payloads.iter().find(|(mime, _)| *mime == canonical);
+    let entry = exact.or_else(|| {
+        matches!(name, "STRING" | "TEXT")
+            .then(|| {
+                payloads
+                    .iter()
+                    .find(|(mime, _)| mime == "text/plain;charset=utf-8")
+            })
+            .flatten()
+    })?;
+    Some((entry.0.as_str(), entry.1.as_slice()))
+}
+
 /// Report whether `name` is a passthrough target (served/stored as
 /// `x-os/*`, never mapped to a canonical row).
 #[must_use]
