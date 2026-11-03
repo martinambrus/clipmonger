@@ -60,6 +60,12 @@ default-true results below retain their original scope.
 Guided Windows QA on a1dc017 confirmed that the selected item remains on the
 clipboard for a normal text paste; further native cases remain open.
 
+Guided testing now has an unresolved popup Alt+Tab destination defect: the
+popup closes but returns to Notepad instead of the previous ordinary app. The
+transient style change alone did not solve it. #19 therefore still needs a fix,
+then native verification. The user will resume testing in a fresh conversation
+and may reboot; follow the continuation's process/file/profile recovery steps.
+
 The combined candidate also batches selected clipboard metadata reads; local
 release calibration reduced 10k-search p95 from 192.49 ms to 45.83 ms against
 the initial 50 ms target. Exact results and limits are in the continuation.
