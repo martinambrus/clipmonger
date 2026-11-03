@@ -17,13 +17,13 @@ alone as sufficient to publish.
 
 ## Source and artifacts
 
-- Delivered main before this documentation update: a20af896e24976a5266cb1bd921b84ee88a8e1f5.
-- Combined application candidate: a1dc01796d945b1457a7b5db117d29557503be47 on packaging-qa-20261103,
+- Delivered main before this documentation update: 0af3e0cfbe4038ca665bbdd96cddf59c2878bcaa.
+- Combined application source checkpoint: 9d1e15a7c1894b0f0cc6420ab93cb79bf36d1ffa on packaging-qa-20261103,
   [draft PR #41](https://github.com/martinambrus/clipmonger/pull/41).
 - It includes the helper-registration work from [draft PR #37](https://github.com/martinambrus/clipmonger/pull/37)
   and failed-paste work from [draft PR #39](https://github.com/martinambrus/clipmonger/pull/39).
   Those drafts are not separately delivered or native-accepted.
-- Windows test packet: C:\Temp\clipmonger-review-a1dc017-697134a7. Use the files named in its SHA256SUMS
+- Windows test packet: C:\Temp\clipmonger-review-65b2b2a-9f0460cb. Use the files named in its SHA256SUMS
   and the build-specific WINDOWS-TESTING.md. This is a local draft, not a release.
 - The packet contains Windows and Linux portable ZIPs and an unsigned Windows
   NSIS setup. Portable ZIPs carry a portable marker and full license notices;
@@ -33,11 +33,16 @@ alone as sufficient to publish.
 
 ## Completed software QA and limits
 
-For the combined candidate above, the complete Linux workspace/all-targets/all-features
-run recorded **1,461 passes, zero failures and 11 ignored tests**. Formatting,
-Linux and Windows GNU workspace checks and strict Clippy, and dependency policy
-also passed. The final candidate has a clean independent review, a clean
-exact-head automated PR review, and all five CI checks succeeded.
+For application build 65b2b2a9b8c78cbea179a8fcd9dbf4fba2b2c33f, the complete
+Linux workspace/all-targets/all-features run recorded **1,461 passes, zero failures
+and 11 ignored tests**. Formatting, Linux and Windows GNU workspace checks and
+strict Clippy, and dependency policy passed, with fresh independent reviews.
+The later 9d1e15a checkpoint changes only the generated Linux portable instructions
+and release notes; Rust, dependencies and all six release binaries are unchanged.
+That correction passed independent review, synthetic package controls and actual
+regenerated Linux/bundle checks. Its exact-head automated review is clean; query
+live CI before delivery. CodeQL neutral or an in-progress Rust analysis is not
+an all-five-checks pass. The application PR remains draft.
 
 The GNOME extension build and 34 tests passed on unchanged extension/dependency
 inputs; a later core-only search correction did not rerun that unchanged build.
@@ -75,7 +80,7 @@ A delivered source change does not close a native gate.
 
 | ID | Remaining acceptance |
 | --- | --- |
-| #19 | Unified UI: tray, focus, popup lifecycle and real display behavior. |
+| #19 | Coding still required for the observed Alt+Tab destination defect; then tray, focus, popup lifecycle and real display acceptance. |
 | #22 | Installed autostart enable/disable, canonical executable path and logon/reboot; portable writes no Run value. |
 | #26 | Installer/uninstaller, default-preserving profile UI, recovery, interoperability, manual matrix and release record. |
 | #41 | Real X11/Wayland/GNOME: live hotkey changes, portal rebind, extension/push and activation behavior. |
@@ -88,6 +93,38 @@ A delivered source change does not close a native gate.
 | #72 | Real privacy-marker/fingerprint behavior and bounded wide-image handling. |
 | #74 | Same-user UAC registration, cancellation/alternate-account refusal, ACL/pinning/task readback, cleanup and logon/helper lifecycle. |
 
+## Resume point and possible reboot
+
+Interactive testing stopped at the user's request for a fresh conversation.
+**The popup Alt+Tab destination is still failing.** On build 65b2b2a, chat A →
+Notepad B → Ctrl+Alt+H → one Alt+Tab returns to Notepad B. Without opening the
+popup, the same A → B → Alt+Tab sequence returns to chat A. The persistent
+TOOLWINDOW change passes its native style/repeated-show/Settings checks, but
+that does not prove the requested destination. Do not mark Step 10 complete.
+
+An isolated three-window diagnostic compared a posted native switch command
+with hiding before forwarding it. The baseline stayed on its popup; hiding
+returned to B only. Both completed, but neither proved the requested switch or
+physical Alt+Tab message delivery. No second production destination fix exists.
+The next investigation is a bounded real-key message trace before choosing a
+fix; do not repeat an app build on the strength of style assertions alone.
+
+The PC may reboot before testing resumes. Treat all prior PIDs, running apps,
+WSL sessions and temporary directories as historical. Recheck Git status and
+actual process paths; never stop a reused PID. Verify packet files and binary
+hashes, restore missing owned test files or rebuild if needed, and relaunch the
+same dedicated profile. Do not assume C:\Temp survived cleanup. Preserve test
+history and restored Notepad tabs; have the user copy fresh disposable text
+before startup capture. The agent handles build/start/restart while the user
+performs visible checks. No background diagnostic needs to remain running.
+
+Local operational handoff: `/home/zathrus/clipmonger-work/continuation/REBOOT-HANDOFF.md`
+and `CURRENT.md`. Exact observations are in
+`packaging-qa/windows-guided-acceptance-1/session-state.json`; source, packages,
+reviews and diagnostics are under `packaging-qa/popup-alt-tab-1` within the same
+persistent work directory. Recheck the 5 GB backing-drive and 4 GiB memory
+reserves before new heavy checks; old measurements are not reboot evidence.
+
 ## Windows operator handoff
 
 The user performs the visible Windows checks while the agent handles builds,
@@ -98,8 +135,9 @@ The exact candidate and evidence must accompany every result.
 
 The active guided session reuses its dedicated profile at
 C:\Temp\clipmonger-review-9635310-b879a2ee\profile-portable-qa with the current
-candidate binaries. It has autostart disabled and no explicit restore setting,
-so the new default is exercised. Preserve that test history when restarting;
+65b2b2a binaries, which are unchanged by the later documentation correction.
+Autostart is disabled and `popup.restore_clipboard = false` is now explicitly
+saved after testing both choices. Preserve that test history when restarting;
 do not substitute the working user profile.
 
 Guided Windows checks on the preceding 9635310 build passed tray presence, hotkey
@@ -110,8 +148,12 @@ the current rebuilt candidate.
 
 On a1dc017, the operator confirmed the new default in a standard Notepad window:
 pasting an older selected entry and then Ctrl+V produced that selected entry
-again. This proves the normal text path only; opt-in persistence, elevated helper,
-failure rollback and rich clipboard fidelity remain separate checks.
+again. The initial checkbox was unchecked. The user then applied restore=true
+and verified normal restoration, restarted, reset it to false and verified the
+normal keep-selected behavior. The intermediate checked state after restart was
+not separately quoted. These results cover normal text only; explicit restart
+presentation, elevated helper, failure rollback and rich clipboard fidelity
+remain separate checks.
 
 Current Windows acceptance criterion (user decision, 2026-11-03): default
 `clipboard_restore` delivery keeps the selected clip on the clipboard, replacing
