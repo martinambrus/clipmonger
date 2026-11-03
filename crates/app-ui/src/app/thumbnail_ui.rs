@@ -134,6 +134,7 @@ impl Thumbnails {
         self.textures
             .retain(|key, _| unique.contains(key) && self.cache.pixels(key).is_some());
         let now = Instant::now();
+        let mut retry_deadline = None;
         for key in keys {
             let state = self.cache.state(&key, now);
             if state == CacheState::Ready
@@ -143,6 +144,11 @@ impl Thumbnails {
                 ctx.request_repaint();
             }
             if state == CacheState::Cooldown {
+                if let Some(deadline) = self.cache.retry_deadline(&key, now) {
+                    retry_deadline = Some(
+                        retry_deadline.map_or(deadline, |earliest: Instant| earliest.min(deadline)),
+                    );
+                }
                 continue;
             }
             if let Some(request) = self.cache.begin(&key, now) {
@@ -158,6 +164,9 @@ impl Thumbnails {
                     Admission::Obsolete | Admission::Closed => self.cache.abandon(&request),
                 }
             }
+        }
+        if let Some(deadline) = retry_deadline {
+            ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
         }
     }
 }
@@ -1033,6 +1042,126 @@ mod tests {
         stop.0.take().unwrap().send(()).unwrap();
         drop(app);
         peer.join();
+    }
+    #[test]
+    fn visible_cooldown_schedules_repaint_and_admits_retry() {
+        use crate::thumbnail_worker::{Completion, Failure};
+
+        let profile = Profile::new();
+        let worker = Worker::start(profile.0.clone(), Arc::new(|| {})).unwrap();
+        worker.diagnostic_enable();
+        let mut thumbs = Thumbnails::new(worker);
+        let ctx = egui::Context::default();
+        // Settle egui's initial repaint requests before measuring this frame.
+        for _ in 0..3 {
+            ctx.run_ui(egui::RawInput::default(), |_| {})
+                .textures_delta
+                .clear();
+        }
+        let key = thumbs
+            .key(uuid::Uuid::from_u128(1), Some(&"a".repeat(64)))
+            .unwrap();
+        thumbs.cache.set_visible([key.clone()]);
+        let now = Instant::now();
+        let request = thumbs.cache.begin(&key, now).unwrap();
+        assert!(thumbs.cache.accept(
+            Completion {
+                request,
+                result: Err(Failure::Retryable)
+            },
+            now
+        ));
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            thumbs.update(ui.ctx(), vec![key.clone()]);
+        });
+        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        output.textures_delta.clear();
+        assert!(
+            delay > Duration::from_secs(1) && delay <= Duration::from_secs(2),
+            "unexpected retry repaint delay: {delay:?}"
+        );
+        std::thread::sleep(delay + Duration::from_millis(20));
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            thumbs.update(ui.ctx(), vec![key.clone()]);
+        })
+        .textures_delta
+        .clear();
+        assert!(thumbs
+            .worker
+            .diagnostic_snapshot()
+            .iter()
+            .any(|event| event.event == "admitted" && event.id == key.clip));
+    }
+    #[test]
+    fn retry_wake_uses_earliest_visible_deadline_and_ignores_terminal_entries() {
+        use crate::thumbnail_worker::{Completion, Failure};
+
+        let profile = Profile::new();
+        let worker = Worker::start(profile.0.clone(), Arc::new(|| {})).unwrap();
+        worker.diagnostic_enable();
+        let mut thumbs = Thumbnails::new(worker);
+        let keys: Vec<_> = (1..=4)
+            .map(|id| {
+                thumbs
+                    .key(uuid::Uuid::from_u128(id), Some(&"a".repeat(64)))
+                    .unwrap()
+            })
+            .collect();
+        thumbs.cache.set_visible(keys.clone());
+        let now = Instant::now();
+        for (index, key) in keys.iter().enumerate() {
+            let request = thumbs.cache.begin(key, now).unwrap();
+            let failure = if index == 3 {
+                Failure::Invalid
+            } else {
+                Failure::Retryable
+            };
+            let accepted_at = if index == 1 || index == 2 {
+                now.checked_sub(Duration::from_secs(1)).unwrap()
+            } else {
+                now
+            };
+            assert!(thumbs.cache.accept(
+                Completion {
+                    request,
+                    result: Err(failure)
+                },
+                accepted_at
+            ));
+        }
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            ctx.run_ui(egui::RawInput::default(), |_| {})
+                .textures_delta
+                .clear();
+        }
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            thumbs.update(
+                ui.ctx(),
+                vec![keys[0].clone(), keys[1].clone(), keys[3].clone()],
+            );
+        });
+        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        output.textures_delta.clear();
+        assert!(
+            delay > Duration::from_millis(500) && delay <= Duration::from_secs(1),
+            "earliest visible delay: {delay:?}"
+        );
+        // The remaining retry entry is hidden, and the visible invalid entry is terminal.
+        let other = egui::Context::default();
+        for _ in 0..3 {
+            other
+                .run_ui(egui::RawInput::default(), |_| {})
+                .textures_delta
+                .clear();
+        }
+        let mut output = other.run_ui(egui::RawInput::default(), |ui| {
+            thumbs.update(ui.ctx(), vec![keys[3].clone()]);
+        });
+        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        output.textures_delta.clear();
+        assert_eq!(delay, Duration::MAX);
+        assert!(thumbs.worker.diagnostic_snapshot().is_empty());
     }
     #[test]
     fn missing_peer_renders_fixed_placeholder() {

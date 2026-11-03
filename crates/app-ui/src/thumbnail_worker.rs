@@ -580,6 +580,17 @@ impl Cache {
             Entry::Retry { .. } => CacheState::Missing,
         }
     }
+    /// Return the retry deadline only for a visible key still cooling down.
+    #[must_use]
+    pub fn retry_deadline(&self, key: &Key, now: Instant) -> Option<Instant> {
+        if !self.visible.contains(key) {
+            return None;
+        }
+        match &self.entries.get(key)?.entry {
+            Entry::Retry { until, .. } if now < *until => Some(*until),
+            _ => None,
+        }
+    }
     /// Issue or coalesce a request epoch for a visible, retryable key.
     /// Abandon the returned request if the worker reports Deferred, Obsolete or Closed.
     pub fn begin(&mut self, key: &Key, now: Instant) -> Option<Request> {
