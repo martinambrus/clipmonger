@@ -836,3 +836,80 @@ fn windows_capture_exclusions_combine_live_config_lists() {
         ["ignored.exe", "secret.exe"]
     );
 }
+
+fn assert_short_plain_with_rich_is_skipped(rich_mime: &'static str) {
+    let mut cfg = config(1024);
+    cfg.monitor.min_len = 3;
+    let fixture = Fixture::new(cfg);
+    let transfer = Transfer::new([
+        ("text/plain", Read::Bytes("é".as_bytes().to_vec())),
+        (rich_mime, Read::Bytes(b"rich representation".to_vec())),
+    ]);
+    assert!(!capture(
+        &fixture,
+        &event(&[("text/plain", None), (rich_mime, None)], false),
+        &transfer
+    ));
+    fixture.assert_empty(0);
+}
+
+#[test]
+fn windows_min_len_drops_short_plain_with_html() {
+    assert_short_plain_with_rich_is_skipped("text/html");
+}
+
+#[test]
+fn windows_min_len_drops_short_plain_with_rtf() {
+    assert_short_plain_with_rich_is_skipped("text/rtf");
+}
+
+#[test]
+fn windows_min_len_keeps_rich_with_boundary_plain_or_nontext() {
+    let mut cfg = config(1024);
+    cfg.monitor.min_len = 3;
+    for plain in [b"abc".as_slice(), b"abcd".as_slice()] {
+        let fixture = Fixture::new(cfg.clone());
+        let transfer = Transfer::new([
+            ("text/plain", Read::Bytes(plain.to_vec())),
+            ("text/html", Read::Bytes(b"<b>abc</b>".to_vec())),
+        ]);
+        assert!(capture(
+            &fixture,
+            &event(&[("text/plain", None), ("text/html", None)], false),
+            &transfer
+        ));
+        let history = fixture.history();
+        let formats = history[0]["formats"].as_array().unwrap();
+        assert!(formats.contains(&json!("text/plain")));
+        assert!(formats.contains(&json!("text/html")));
+    }
+
+    for nontext in ["image/png", "text/uri-list"] {
+        let fixture = Fixture::new(cfg.clone());
+        let transfer = Transfer::new([
+            ("text/plain", Read::Bytes(b"a".to_vec())),
+            ("text/html", Read::Bytes(b"<b>a</b>".to_vec())),
+            (nontext, Read::Bytes(b"content".to_vec())),
+        ]);
+        assert!(capture(
+            &fixture,
+            &event(
+                &[("text/plain", None), ("text/html", None), (nontext, None)],
+                false
+            ),
+            &transfer
+        ));
+        let history = fixture.history();
+        let formats = history[0]["formats"].as_array().unwrap();
+        assert!(formats.contains(&json!(nontext)));
+        assert!(formats.contains(&json!("text/plain")));
+        assert!(formats.contains(&json!("text/html")));
+    }
+
+    for rich in ["text/html", "text/rtf"] {
+        let fixture = Fixture::new(cfg.clone());
+        let transfer = Transfer::new([(rich, Read::Bytes(b"markup".to_vec()))]);
+        assert!(capture(&fixture, &event(&[(rich, None)], false), &transfer));
+        assert_eq!(fixture.history()[0]["formats"], json!([rich]));
+    }
+}

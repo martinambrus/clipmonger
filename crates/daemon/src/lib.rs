@@ -1200,7 +1200,11 @@ fn short_windows_capture(origin: &str, min_len: u64, payloads: &[(String, Vec<u8
         .iter()
         .filter(|(mime, _)| capture::plain_text(mime))
         .all(|(_, bytes)| (bytes.len() as u64) < min_len);
-    has_text && short_text && payloads.iter().all(|(mime, _)| capture::plain_text(mime))
+    has_text
+        && short_text
+        && payloads.iter().all(|(mime, _)| {
+            capture::plain_text(mime) || matches!(mime.as_str(), "text/html" | "text/rtf")
+        })
 }
 
 fn report_source_ignored(app: Option<&str>, cfg: &clipmonger_core::Config) -> bool {
