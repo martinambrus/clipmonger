@@ -78,6 +78,23 @@ else
     gate "GATE 5 changelog+upgrade-notes: FAIL (files missing)"
     FAILURES=$((FAILURES + 1))
 fi
+# Portable ZIP content and checksums can be checked once a draft release
+# directory and verified notice-scan evidence exist. Native installation remains manual.
+if [ -n "${CLIPMONGER_RELEASE_DIR:-}" ] || [ -n "${CLIPMONGER_RELEASE_VERSION:-}" ] || [ -n "${CLIPMONGER_SCAN_DATA:-}" ] || [ -n "${CLIPMONGER_SCAN_RECEIPT:-}" ] || [ -n "${CLIPMONGER_SCAN_TOOL:-}" ]; then
+    if [ -n "${CLIPMONGER_RELEASE_DIR:-}" ] && [ -n "${CLIPMONGER_RELEASE_VERSION:-}" ] && [ -n "${CLIPMONGER_SCAN_DATA:-}" ] && [ -n "${CLIPMONGER_SCAN_RECEIPT:-}" ] && [ -n "${CLIPMONGER_SCAN_TOOL:-}" ] &&
+        run_step "release-artifacts" 120 python3 scripts/check-release-artifacts.py --version "$CLIPMONGER_RELEASE_VERSION" "$CLIPMONGER_RELEASE_DIR" --scan-data "$CLIPMONGER_SCAN_DATA" --scan-receipt "$CLIPMONGER_SCAN_RECEIPT" --scan-tool "$CLIPMONGER_SCAN_TOOL"; then
+        gate "GATE 5 artifact-contents+checksums: PASS"
+    else
+        if [ -z "${CLIPMONGER_RELEASE_DIR:-}" ] || [ -z "${CLIPMONGER_RELEASE_VERSION:-}" ] || [ -z "${CLIPMONGER_SCAN_DATA:-}" ] || [ -z "${CLIPMONGER_SCAN_RECEIPT:-}" ] || [ -z "${CLIPMONGER_SCAN_TOOL:-}" ]; then
+            note "FAIL release-artifacts: release directory, version, scan data, receipt and tool are required"
+            FAILURES=$((FAILURES + 1))
+        fi
+        gate "GATE 5 artifact-contents+checksums: FAIL"
+    fi
+else
+    gate "SKIP-MANUAL gate5-artifact-contents: set release directory, version, scan data and receipt to check draft artifacts"
+fi
+gate "SKIP-MANUAL gate5-installer-native: Windows execution requires separate verification"
 gate "SKIP-MANUAL gate5-signoff-record: two-signature signoff is a user action"
 case "$DENY_STATE" in
     PASS) gate "GATE 6 dependency-review: PASS" ;;

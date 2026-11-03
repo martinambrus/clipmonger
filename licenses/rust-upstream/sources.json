@@ -1,0 +1,220 @@
+[
+  {
+    "repo": "emilk/egui",
+    "commit": "3c6eb8261c3293ad9c7ea1ed58487e038860ebef",
+    "license": "MIT",
+    "crates": [
+      "egui_system_font_provider@0.37.0"
+    ],
+    "url": "https://raw.githubusercontent.com/emilk/egui/3c6eb8261c3293ad9c7ea1ed58487e038860ebef/LICENSE-MIT",
+    "sha256": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c",
+    "file": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c.txt"
+  },
+  {
+    "repo": "aclysma/profiling",
+    "commit": "8271551172eb6fa4cba47369aedd93790c623df9",
+    "license": "MIT",
+    "crates": [
+      "profiling@1.0.18"
+    ],
+    "url": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT",
+    "sha256": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333",
+    "file": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333.txt"
+  },
+  {
+    "repo": "microsoft/windows-rs",
+    "commit": "50009500b686f542530515aedba8334dc5b617b0",
+    "license": "MIT",
+    "crates": [
+      "windows-collections@0.2.0"
+    ],
+    "url": "https://raw.githubusercontent.com/microsoft/windows-rs/50009500b686f542530515aedba8334dc5b617b0/license-mit",
+    "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383",
+    "file": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383.txt"
+  },
+  {
+    "repo": "microsoft/windows-rs",
+    "commit": "32c3144490c016fe496a0aed769bce60987a2e9d",
+    "license": "MIT",
+    "crates": [
+      "windows-collections@0.3.2",
+      "windows-core@0.62.2",
+      "windows-future@0.3.2",
+      "windows-implement@0.60.2",
+      "windows-interface@0.59.3",
+      "windows-numerics@0.3.1",
+      "windows-result@0.4.1",
+      "windows-strings@0.5.1",
+      "windows-sys@0.61.2",
+      "windows@0.62.2"
+    ],
+    "url": "https://raw.githubusercontent.com/microsoft/windows-rs/32c3144490c016fe496a0aed769bce60987a2e9d/license-mit",
+    "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383",
+    "file": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383.txt"
+  },
+  {
+    "repo": "microsoft/windows-rs",
+    "commit": "49e5d37ef31838d027c41ee28d696e046d04c27f",
+    "license": "MIT",
+    "crates": [
+      "windows-core@0.61.2",
+      "windows-result@0.3.4",
+      "windows-strings@0.4.2"
+    ],
+    "url": "https://raw.githubusercontent.com/microsoft/windows-rs/49e5d37ef31838d027c41ee28d696e046d04c27f/license-mit",
+    "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383",
+    "file": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383.txt"
+  },
+  {
+    "repo": "microsoft/windows-rs",
+    "commit": "c65ac17e5c714104dff156578ca54b3c4f92d76c",
+    "license": "MIT",
+    "crates": [
+      "windows-future@0.2.1",
+      "windows-threading@0.1.0"
+    ],
+    "url": "https://raw.githubusercontent.com/microsoft/windows-rs/c65ac17e5c714104dff156578ca54b3c4f92d76c/license-mit",
+    "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383",
+    "file": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383.txt"
+  },
+  {
+    "repo": "microsoft/windows-rs",
+    "commit": "4b8893b307719ec23cce698269ca572ef301dc5c",
+    "license": "MIT",
+    "crates": [
+      "windows-link@0.1.3",
+      "windows@0.61.3"
+    ],
+    "url": "https://raw.githubusercontent.com/microsoft/windows-rs/4b8893b307719ec23cce698269ca572ef301dc5c/license-mit",
+    "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383",
+    "file": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383.txt"
+  },
+  {
+    "repo": "microsoft/windows-rs",
+    "commit": "d468916ac27a36fb8a12bafc1bf5c0ec2fe92238",
+    "license": "MIT",
+    "crates": [
+      "windows-link@0.2.1",
+      "windows-threading@0.2.1"
+    ],
+    "url": "https://raw.githubusercontent.com/microsoft/windows-rs/d468916ac27a36fb8a12bafc1bf5c0ec2fe92238/license-mit",
+    "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383",
+    "file": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383.txt"
+  },
+  {
+    "repo": "microsoft/windows-rs",
+    "commit": "79c2c3917cac805aeb0d000ae9e32e719b514ff4",
+    "license": "MIT",
+    "crates": [
+      "windows-numerics@0.2.0"
+    ],
+    "url": "https://raw.githubusercontent.com/microsoft/windows-rs/79c2c3917cac805aeb0d000ae9e32e719b514ff4/license-mit",
+    "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383",
+    "file": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383.txt"
+  },
+  {
+    "repo": "microsoft/windows-rs",
+    "commit": "3a605cba064b26f2a198ac58085f8c8836f47c38",
+    "license": "MIT",
+    "crates": [
+      "windows-sys@0.52.0"
+    ],
+    "url": "https://raw.githubusercontent.com/microsoft/windows-rs/3a605cba064b26f2a198ac58085f8c8836f47c38/license-mit",
+    "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383",
+    "file": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383.txt"
+  },
+  {
+    "repo": "microsoft/windows-rs",
+    "commit": "308e08ec259027ebbef11b8ef838923626bf821e",
+    "license": "MIT",
+    "crates": [
+      "windows-sys@0.59.0"
+    ],
+    "url": "https://raw.githubusercontent.com/microsoft/windows-rs/308e08ec259027ebbef11b8ef838923626bf821e/license-mit",
+    "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383",
+    "file": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383.txt"
+  },
+  {
+    "repo": "microsoft/windows-rs",
+    "commit": "db06b51c2ebb743efb544d40e3064efa49f28d38",
+    "license": "MIT",
+    "crates": [
+      "windows-targets@0.52.6",
+      "windows_x86_64_gnu@0.52.6"
+    ],
+    "url": "https://raw.githubusercontent.com/microsoft/windows-rs/db06b51c2ebb743efb544d40e3064efa49f28d38/license-mit",
+    "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383",
+    "file": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383.txt"
+  },
+  {
+    "repo": "DoumanAsh/clipboard-win",
+    "commit": "ed27008ae5d1f10cfbb266de039f0fb35fd05a56",
+    "license": "BSL-1.0",
+    "crates": [
+      "clipboard-win@5.4.3"
+    ],
+    "url": "https://raw.githubusercontent.com/DoumanAsh/clipboard-win/ed27008ae5d1f10cfbb266de039f0fb35fd05a56/LICENSE",
+    "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566",
+    "file": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566.txt"
+  },
+  {
+    "repo": "AccessKit/accesskit",
+    "commit": "f3026222559c7f5f46d8f25cb7404de68eb149f0",
+    "license": "MIT",
+    "crates": [
+      "accesskit@0.25.2"
+    ],
+    "url": "https://raw.githubusercontent.com/AccessKit/accesskit/f3026222559c7f5f46d8f25cb7404de68eb149f0/LICENSE-MIT",
+    "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+    "file": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3.txt"
+  },
+  {
+    "repo": "DGriffin91/egui_software_backend",
+    "commit": "d17cbcdb2bf4e853543c4c7db61c9d4e2f2233a4",
+    "license": "MIT",
+    "crates": [
+      "constify@0.0.1"
+    ],
+    "url": "https://raw.githubusercontent.com/DGriffin91/egui_software_backend/d17cbcdb2bf4e853543c4c7db61c9d4e2f2233a4/LICENSE-MIT",
+    "sha256": "508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1",
+    "file": "508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1.txt"
+  },
+  {
+    "repo": "rust-windowing/winit",
+    "commit": "587ade844dfb0eada3696ba1cb263c66eea80581",
+    "license": "MIT",
+    "crates": [
+      "dpi@0.1.2"
+    ],
+    "url": "https://raw.githubusercontent.com/rust-windowing/winit/587ade844dfb0eada3696ba1cb263c66eea80581/dpi/LICENSE-LIBM-MIT",
+    "sha256": "9eff396a99bafd208e7126602420d6864f6066c08b84485a5b032320a9c01997",
+    "file": "9eff396a99bafd208e7126602420d6864f6066c08b84485a5b032320a9c01997.txt"
+  },
+  {
+    "repo": "tauri-apps/libappindicator-rs",
+    "commit": "eafd1e3682a1247f595410266091e9684021cb6f",
+    "license": "MIT",
+    "crates": [
+      "libappindicator-sys@0.9.0"
+    ],
+    "url": "https://github.com/tauri-apps/libappindicator-rs/blob/eafd1e3682a1247f595410266091e9684021cb6f/LICENSE-MIT",
+    "sha256": "eb227437252b2a7a9c1fc342c93ade1f3d7ce38cc6dd754f613db07d53ceff0b",
+    "file": "eb227437252b2a7a9c1fc342c93ade1f3d7ce38cc6dd754f613db07d53ceff0b.txt",
+    "manifest_git_blob": "8cc6e196b2eef71bedbc00bf5b51ac2770d21353"
+  },
+  {
+    "repo": "retep998/winapi-rs",
+    "commit": "30ed8e3b86f4a8a55e68865843c19800f57bcd7f",
+    "license": "MIT",
+    "crates": [
+      "winapi-x86_64-pc-windows-gnu@0.4.0"
+    ],
+    "url": "https://github.com/retep998/winapi-rs/blob/30ed8e3b86f4a8a55e68865843c19800f57bcd7f/LICENSE-MIT",
+    "sha256": "5b19674a1db628a475850a131956ed49521b744e3dda8f5a94141f9aba681219",
+    "file": "5b19674a1db628a475850a131956ed49521b744e3dda8f5a94141f9aba681219.txt",
+    "archive_sha256": "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f",
+    "binding": "whole-published-payload-match",
+    "matching_payload_files": 1418,
+    "manifest_difference": "published version 0.4.0 versus source 0.3.2; other original manifest bytes match"
+  }
+]

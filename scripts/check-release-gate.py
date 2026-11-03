@@ -22,6 +22,8 @@ argv = sys.argv[1:]
 with open(os.environ['SPY_LOG'], 'a') as log:
     log.write(json.dumps([name, *argv]) + '\\n')
 mode = os.environ['SPY_MODE']
+if name == 'python3' and mode == 'artifacts-fail':
+    sys.exit(25)
 if name == 'cargo' and argv[:1] == ['clippy'] and '--target' in argv and mode == 'windows-clippy-fails':
     sys.exit(23)
 if name == 'cargo' and argv[:2] == ['deny', 'check'] and mode == 'deny-fails':
@@ -36,7 +38,7 @@ def executable(path, data):
 
 
 failures = []
-for mode in ['all-pass', 'windows-clippy-fails', 'deny-fails', 'audit-only', 'no-audit-tools']:
+for mode in ['all-pass', 'windows-clippy-fails', 'deny-fails', 'audit-only', 'no-audit-tools', 'artifacts-pass', 'artifacts-fail']:
     root = args.fixture_dir / mode
     bin_dir = root / 'bin'
     bin_dir.mkdir(parents=True)
@@ -48,7 +50,7 @@ for mode in ['all-pass', 'windows-clippy-fails', 'deny-fails', 'audit-only', 'no
     (root / 'docs/release-notes-0.1.0.md').write_text('fixture\n')
     for command in ['bash', 'dirname', 'timeout']:
         (bin_dir / command).symlink_to(shutil.which(command))
-    for command in ['cargo', 'npm']:
+    for command in ['cargo', 'npm', 'python3']:
         executable(bin_dir / command, spy)
     if mode not in ['audit-only', 'no-audit-tools']:
         executable(bin_dir / 'cargo-deny', spy)
@@ -56,6 +58,8 @@ for mode in ['all-pass', 'windows-clippy-fails', 'deny-fails', 'audit-only', 'no
         executable(bin_dir / 'cargo-audit', spy)
     log = root / 'argv.jsonl'
     env = os.environ | {'PATH': str(bin_dir.resolve()), 'SPY_LOG': str(log.resolve()), 'SPY_MODE': mode}
+    if mode.startswith('artifacts-'):
+        env |= {'CLIPMONGER_RELEASE_DIR': '/draft artifacts', 'CLIPMONGER_RELEASE_VERSION': '0.1.0', 'CLIPMONGER_SCAN_DATA': '/scan.json', 'CLIPMONGER_SCAN_RECEIPT': '/receipt.json', 'CLIPMONGER_SCAN_TOOL': '/tool'}
     result = subprocess.run([str(bin_dir.resolve() / 'bash'), str(root.resolve() / 'scripts/release-gate.sh')],
                             env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     (root / 'stdout.log').write_text(result.stdout)
@@ -70,10 +74,13 @@ for mode in ['all-pass', 'windows-clippy-fails', 'deny-fails', 'audit-only', 'no
         'host-clippy-argv': ['cargo', 'clippy', '--workspace', '--all-targets', '--all-features', '--', '-D', 'warnings'] in calls,
         'npm-build-and-test': ['npm', 'run', 'build'] in calls and ['npm', 'test'] in calls,
         'manual-boundaries': 'SKIP-MANUAL gate1-windows-session-suite:' in result.stdout and 'SKIP-MANUAL gate1-gnome-legs:' in result.stdout,
-        'direct-status': result.returncode == (0 if mode == 'all-pass' else 1),
+        'direct-status': result.returncode == (0 if mode in ['all-pass', 'artifacts-pass'] else 1),
         'gate1-status': ('GATE 1 full-pyramid-matrix: ' + ('FAIL' if mode == 'windows-clippy-fails' else 'PASS')) in result.stdout,
         'gate6-status': ('GATE 6 dependency-review: ' + ('FAIL' if mode in ['deny-fails', 'audit-only', 'no-audit-tools'] else 'PASS')) in result.stdout,
     }
+    if mode.startswith('artifacts-'):
+        checks['artifact-argv'] = ['python3', 'scripts/check-release-artifacts.py', '--version', '0.1.0', '/draft artifacts', '--scan-data', '/scan.json', '--scan-receipt', '/receipt.json', '--scan-tool', '/tool'] in calls
+        checks['artifact-result'] = ('GATE 5 artifact-contents+checksums: ' + ('PASS' if mode == 'artifacts-pass' else 'FAIL')) in result.stdout
     if mode == 'windows-clippy-fails':
         checks['clippy-failure-propagated'] = 'FAIL windows-gnu-clippy (exit 23)' in result.stdout
     if mode == 'audit-only':

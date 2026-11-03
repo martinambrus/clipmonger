@@ -1,7 +1,7 @@
 # Bundled font licenses
 
 These notices are copied verbatim from `epaint_default_fonts` 0.37.0.
-The fonts are compiled into the Clipmonger binaries; these notices ship in every release archive and installer.
+The fonts are bundled by the UI dependency; some are included only with optional features. Release archives and installers must include these notices.
 
 | Font file | License | Notice |
 | --- | --- | --- |
