@@ -202,8 +202,8 @@ MUST NOT be promised in v1.
   | autostart.enabled | bool | false | General | v1 |
   | updates.check | bool | true (+first-run notice) | General | v1 (M-16) |
   | logging.level | enum | INFO | General | v1 |
-  | popup.delivery | enum | clipboard_restore | Popup | v1 (clipboard_restore = write+Ctrl+V with guarded restore; unicode_inject = synthetic keystrokes; elevated route follows the same choice via clipboard write + helper chord) |
-  | popup.restore_clipboard | bool | true | Popup | v1 (false = the pasted clip stays on the clipboard after a clipboard_restore paste) |
+  | popup.delivery | enum | clipboard_restore | Popup | v1 (clipboard_restore = write+Ctrl+V with optional guarded restore; unicode_inject = synthetic keystrokes; elevated route follows the same choice via clipboard write + helper chord) |
+  | popup.restore_clipboard | bool | false | Popup | v1 (Windows: false keeps the pasted clip on the clipboard; true opts into guarded restoration after a clipboard_restore paste; existing explicit choices are preserved) |
   | ui.locale | string (BCP-47) | en | General | v2 (ADR-002) |
   | ui.fallback_locale | string (BCP-47) | en | General | v2 (ADR-002) |
   | plugins.enabled | bool | true | Plugins | v2 (ADR-001) |

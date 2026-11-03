@@ -14,6 +14,11 @@ Portable (user folder + `portable.marker`):
    - Expected: within about 1 s one question "Enable Clipmonger in admin windows?" (default button No); Yes → one UAC prompt → `audit.log` shows `connected`.
 3. Paste via the popup hotkey into the elevated app, the standard app, and the elevated app again.
    - Expected: every paste instant and into the window the hotkey was pressed in; `audit.log` `job` entries with single-digit `ms`.
+   - With default `clipboard_restore` delivery and `restore_clipboard = false`,
+     the selected clip stays on the clipboard on both routes. Repeat with
+     **Restore clipboard after paste** enabled: the previous clipboard returns
+     after the dwell if unchanged. These current criteria do not rewrite the
+     dated verdicts below.
 4. Leave everything idle for more than 8 minutes, then paste into the elevated app.
    - Expected: instant paste, no prompt.
 5. Open the popup from the tray icon and pick a clip; repeat with `clipmonger-cli show-popup`.
@@ -26,7 +31,7 @@ Portable (user folder + `portable.marker`):
 Installed (`C:\Program Files\Clipmonger`):
 
 8. Start the app, focus the elevated app, answer Yes and approve UAC.
-   - Expected: `ClipmongerHelper` task with the `(clipmonger-task ...)` marker, highest privileges, no battery stop, `PT0S` time limit, logon trigger for the current user; helper connected; pastes instant.
+   - Expected: `ClipmongerHelper` task registered via COM with verified SID principal/trigger, highest privileges, no battery stop, `PT0S` time limit, IgnoreNew, priority normal, exact protected command, quoted profile argument, empty working directory, restrictive SDDL; marker remains as optional description metadata only; helper connected; pastes instant.
 9. Exit and start the app again.
    - Expected: helper reconnects; no question, no UAC.
 10. Log off and on (or reboot), then start the app.
@@ -34,10 +39,45 @@ Installed (`C:\Program Files\Clipmonger`):
 
 Both:
 
-11. With an unmarked `ClipmongerHelper` task present (left by an older build), start any elevated helper.
-   - Expected: the unmarked task is deleted.
+11. With an unprotected/invalid `ClipmongerHelper` task present (left by an older build or forged marker with wrong command/profile/action), start any elevated helper.
+   - Expected: the unprotected/invalid task is deleted after inspecting actual action; valid protected tasks for other profiles are preserved; query failures are reported separately and not counted as safe.
 12. Inspect `<profile>/audit.log`.
    - Expected: metadata only (`connected`, `job` with `ms` and result, `disconnected`, refusals); no payload bytes.
+
+
+Registration hardening (pending interactive Windows acceptance):
+
+13. Approve consent with the original account, cancel it on another fresh start,
+    and try alternate-account credentials on another.
+    - Expected: same-account registration succeeds; cancel/failure never starts
+      the task and snoozes consent until restart; alternate credentials return a
+      clear refusal and never register a task for the administrator account.
+14. Inspect the actual task action, principal, single logon trigger, settings,
+    owner and DACL. Try changing its action, owner or DACL as the medium user.
+    - Expected: only System/Administrators can modify it; the original SID can
+      read/run. A copied description marker cannot authorize a different action;
+      removing the description from an otherwise correct definition is harmless.
+15. Exercise synthetic installed fixtures with requester-owned files/directories,
+    write/delete/WRITE_DAC rights, a replaceable parent, and reparse points.
+    - Expected: persistent registration refuses every mutable or unresolved path
+      before elevation; portable consent remains a per-run worker with no task.
+    - On an owned synthetic file and directory, check that write/delete access
+      succeeds before pinning, fails with sharing violation (32) while pinned,
+      and succeeds after dropping the pin. Existing write/delete handles must
+      also prevent the pin. Access-denied (5) alone does not prove sharing.
+16. Repeat with Unicode, ampersands, spaces and a trailing backslash in the profile.
+    - Expected: the exact arguments survive in-memory Unicode registration and
+      structured readback; no pre-UAC XML or other task-definition file is created.
+17. With isolated scheduler fixtures, exercise forged-marker wrong commands,
+    appended arguments, extra/non-Exec actions, working directories, other SIDs,
+    writable descriptors, and incorrect settings. Repeat cleanup with a correct
+    protected task for another profile and with a query failure.
+    - Expected: mismatches never run; proven unsafe legacy tasks are removed;
+      valid other-profile tasks and unknown query/protection results are preserved,
+      with unknown results reported separately.
+
+These new legs are **NOT RUN**. The dated verdicts below retain their original
+scope and do not validate the registration hardening or native ACL/UAC boundary.
 
 
 ## Evidence to attach
