@@ -1,32 +1,30 @@
 # UI/UX — popup, config (maximalist), bar, tray, keys (crate `app-ui`)
 
-Stack: egui/eframe 0.37 (docs inspected) + Win32 CPU fallback (unified).
-One process, multiple viewports on egui path: root (tray host) + popup +
-config + bar (v2). Renderer: `glow` pilot (U-F2), `Win32 GDI` CPU fallback
-on Windows when `glow` is unavailable (headless/RustDesk/virtual display —
-D-024, `fallback.rs`); `wgpu` deferred (upstream `windows` skew). NO tokio
-in `app-ui` (seg-02 §8): a dedicated thread owns IPC, UI polls a channel.
-Fallback reuses the same `PopupVm`/`ConfigDoc`/`Placement`/`IPC bridge`
-— `ArsClip`-style `Win32 GDI` (`CreateWindowExW`/`GDI`) for `popup` when
-`OpenGL` is absent (no `GPU` required; `RDP`/`RustDesk`/`Safe Mode` OK).
+Stack: egui 0.37, egui-winit and an owned winit runner with CPU rasterization
+and softbuffer presentation (ADR-005). Popup and Settings share the app model
+and have separate egui contexts. IPC work stays off the event loop.
+The eframe/glow and separate Win32 fallback paths are retired.
 
-## 1. Viewport recipes (verified `ViewportBuilder` surface)
+## 1. Native windows and lifecycle
 
-- Popup: `with_decorations(false)`, `with_window_level(TOP)`,
-  `with_position(p)`, `with_inner_size` + min/max, `with_resizable(false)`,
-  `with_taskbar(false)`, `with_active(true)` (focus on open; F-208
-  No-Focus mode inverts this in v2 — feasibility per OS = task §14.6).
-  `with_window_level` builder VERIFIED; exact TOP enum path (winit
-  re-export?) = VERIFY at implementation (task §14.1).
-- Config: decorated, resizable, taskbar icon, remembered geometry
-  (`persist_window`, verified field).
-- Bar (v2): frameless micro-strip, on-top, edge-docked per config.
-- Per-OS quirks (positioning, focus steal prevention, Wayland
-  xdg-positioner limits) MUST be recorded in code + manual-QA per OS.
-  Windows and X11 use physical cursor/monitor geometry for Cursor and Center.
-  Wayland leaves placement to the compositor for both modes; Settings remembers
-  size only there. Settings normal geometry is saved per profile on close and
-  exit; font zoom does not change its native size.
+The runner creates a frameless popup and a decorated, resizable Settings
+window. Windows and X11 use physical monitor/cursor geometry for Cursor and
+Center placement. Wayland delegates placement to the compositor and remembers
+Settings size only. Settings normal geometry persists on close and exit;
+font zoom does not change its native size.
+
+Logic runs while hidden or minimized; painting is limited to drawable windows.
+Hidden texture updates survive until the next draw. Minimized startup stays
+hidden. Windows and X11 retain the popup; Wayland recreates it for a show and
+applies an available activation token. X11 carries the input timestamp.
+
+A hotkey push replaces target and gesture. A request opens a hidden popup with
+empty context; an already-open request raises it with the current open context.
+Hiding clears context. Paste captures context before hiding; failure can reopen
+with an error and empty context. See ADR-004 and ADR-005.
+
+Native focus, placement, DPI, remote-display and compositor behavior remain
+subject to T-905 through T-908; compilation is not manual acceptance.
 
 ## 2. Popup (F-201–208)
 
@@ -123,17 +121,17 @@ reason (per-OS reserved lists = VERIFY at implementation).
 
 ## 9. Theming + fonts
 
-egui `Visuals` dark/light + manual toggle + font scale slider. Follow-OS
-theme: NO `NativeOptions` field found in inspected docs → VERIFY
-detection path at implementation, else manual-only in v1 (acceptable).
-Accent color picker. High-contrast = v3.
+egui Visuals provides dark/light themes and font scaling. Platform follow-OS
+detection is an application responsibility and requires native verification.
+Bundled and system font notices must accompany releases. Accent color and
+high-contrast expansion retain their planned scope.
 
 ## 10. Accessibility
 
 Hard requirement: 100% keyboard operable (every mouse action has a key).
-Screen readers: eframe AccessKit status = VERIFY (upstream notes it
-experimental); record the real level in About → Accessibility; do NOT
-claim what isn't proven. Focus-visible styling everywhere.
+Screen-reader integration for the owned runner remains unverified. Do not
+infer it from egui or the retired eframe path; record actual native results
+before claiming support. Focus-visible styling everywhere.
 
 ## 11. i18n design (English-only v1; translations from v2 — ADR-002/D-023)
 

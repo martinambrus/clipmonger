@@ -39,7 +39,24 @@ injection) is time-boxed as a spike with a specified honest fallback,
 and CANNOT block v1. Reuse-first throughout (seg-00 §4):
 verified-license dependency > port > reinvent; zero GPL ingestion.
 
-## Steps
+## Current implementation update (2026-11-03)
+
+The current UI is the single CPU-rendered egui runner in ADR-005. D-024's
+separate Win32 fallback and the eframe/glow path are retired. Historical steps
+below preserve the evidence recorded for their original builds.
+
+Phase 1 image/file-list storage, PNG/DIB conversion, retention and preview
+source are implemented, together with capture/storage hardening and daemon
+self-write suppression. Native platform acceptance and packaging/release
+signoff remain open. Windows capture controls include the default-off Scroll
+Lock toggle and UTF-8-byte minimum length. Settings currently has 29 rows.
+
+Use STATUS.md and the current manual scripts for remaining acceptance.
+Elevated-task and failed-paste drafts are not counted as shipped here.
+Installer profile deletion and Linux protocol-output licensing clearance
+remain open. No tag or published release is authorized by these notes.
+
+## Steps (historical records)
 
 - **0.1 Consistency repair (DONE in Codex fold, D-019).** GNOME=v1,
   macOS=v2, mobile dropped, refs/tests/macros fixed, GNOME 46–51 matrix,
@@ -141,7 +158,7 @@ verified-license dependency > port > reinvent; zero GPL ingestion.
   Open: T-410 Windows logon and reboot-persist legs remain unverified;
   autostart is applied at startup, on Settings changes, and after restore,
   with portable mode skipped. Also open:
-  explicit pipe DACL, PNG/DIB conversion.
+  explicit pipe DACL. PNG/DIB conversion was implemented in subsequent Phase 1 work.
 - **3. X11 backend. (DONE 2026-10-26, WSL Xvfb)** Seg-05 (XFixes + manager role, transfer+INCR,
   hotkeys, enigo paste, KSNI tray, .desktop autostart). Tests T-501…508
   (Xvfb headless).

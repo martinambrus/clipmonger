@@ -1,5 +1,37 @@
 # Docs status
 
+## Current implementation (2026-11-03)
+
+- One egui UI uses the owned CPU runner on Windows, X11 and Wayland
+  ([ADR-005](adr-005-cpu-renderer.md)). The eframe/glow and separate Win32
+  fallback are retired. No GPU renderer is required.
+- Source includes image/file-list storage and retention, bounded previews and
+  lazy file metadata, permanent hotkeys, capture recovery and oversized stubs,
+  bounded Windows popup activation, Linux activation metadata, Windows capture
+  preferences and daemon self-write suppression.
+- Backup/restore preserves raw config bytes with checksum and rollback checks;
+  storage verifies reused blobs and reports actual ingestion failures.
+- Software gates include Linux tests and Windows GNU compile/lint checks.
+  Native current-runner tray/focus/DPI/remote-display/multi-monitor behavior,
+  physical Scroll Lock, clipboard owner/sequence/opt-out/restore behavior,
+  and Linux compositor, portal and GNOME integration remain QA.
+- Autostart source is wired; Windows logon/reboot acceptance remains pending.
+  Elevated-task and failed-paste hardening are separate drafts awaiting gates;
+  this update does not mark them shipped.
+- Packaging, optional profile deletion, real artifact acceptance, Linux
+  blur-derived protocol licensing clearance and native install/uninstall checks
+  remain open. No release is published by this documentation update.
+- T-905 through T-908 must be repeated against the CPU runner. Earlier dated
+  fallback and GPU-path results retain their original scope.
+- GUI Rust 1.95 is required by the locked GUI dependencies; the foundation's
+  Rust 1.89 declaration is not the GUI compiler floor. GUI edition and license
+  values match the workspace.
+
+## Historical implementation records
+
+The dated records below describe their original builds and environments.
+They do not establish acceptance of the current runner or pending drafts.
+
 ## Implementation state (refreshed 2026-10-30, daemon-owned popup hotkey)
 
 Source of truth for step detail: `plan.md` Steps.
