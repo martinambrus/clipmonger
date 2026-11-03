@@ -12,7 +12,11 @@ for this draft (R-F4); the user reviews artifacts and notes first.
   `clipmonger-cli`, `clipmonger` (UI), built GNOME extension under
   `gnome-extension/`, including its compiled GSettings schema. Copy that
   directory to the GNOME Shell extensions directory under the UUID from
-  `metadata.json` before enabling it.
+  `metadata.json` before enabling it. Open the extension preferences with
+  `gnome-extensions prefs clipmonger@extensions.clipmonger.dev` and set
+  **Profile directory** (`profile-dir`) to the absolute extraction directory
+  containing `portable.marker`. If the app uses `--profile-dir`, enter that
+  directory instead. Leaving it blank selects the default user data profile.
 - Both portable ZIPs contain `portable.marker`, portable-use instructions,
   and the complete `licenses/` directory, including font notices and their
   README, upstream license texts, and generated `RUST-NOTICES.txt`.

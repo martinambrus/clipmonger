@@ -20,6 +20,12 @@ SCHEMA_XML = 'schemas/org.gnome.shell.extensions.clipmonger.gschema.xml'
 SCHEMA_COMPILED = 'schemas/gschemas.compiled'
 SCHEMA_ID = 'org.gnome.shell.extensions.clipmonger'
 README = b'Extract to a writable directory and run clipmonger. Data is stored beside the binaries.\n'
+LINUX_README = (
+    b'GNOME Wayland: copy gnome-extension/ to the Shell extensions directory under the UUID in metadata.json.\n'
+    b'Before enabling, open its preferences with: gnome-extensions prefs clipmonger@extensions.clipmonger.dev\n'
+    b'Set Profile directory (profile-dir) to the absolute extraction directory containing portable.marker.\n'
+    b'If launching with --profile-dir, use that profile directory instead; a blank preference uses the default user data profile.\n'
+)
 
 
 def compile_schema(xml):
@@ -65,6 +71,7 @@ def contents(platform, bins, notices, extension=None):
     result['portable.marker'] = b''
     result['README.txt'] = README
     if platform == 'linux':
+        result['README.txt'] += LINUX_README
         if extension is None:
             raise ValueError('Linux requires a built GNOME extension directory')
         for name in EXTENSION:
