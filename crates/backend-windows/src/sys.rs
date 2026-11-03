@@ -465,38 +465,55 @@ pub fn is_window(hwnd: HWND) -> bool {
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[cfg(windows)]
 pub fn activate_window(hwnd: HWND) -> bool {
+    activate_with(
+        || foreground_hwnd() == Some(hwnd),
+        // Safety: the handle is passed to the window manager without attaching queues.
+        || unsafe { SetForegroundWindow(hwnd) != 0 },
+        || confirm_foreground_message(hwnd),
+    )
+}
+
+#[cfg(windows)]
+fn request_foreground(hwnd: HWND) -> bool {
+    // Safety: a handle value is passed to the window manager without
+    // attaching input queues.
+    foreground_hwnd() == Some(hwnd) || unsafe { SetForegroundWindow(hwnd) != 0 }
+}
+
+#[cfg(windows)]
+fn confirm_foreground_message(hwnd: HWND) -> bool {
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL,
     };
-    activate_with(
-        || foreground_hwnd() == Some(hwnd),
-        // Safety: a handle value is passed to the window manager without
-        // attaching input queues.
-        || unsafe { SetForegroundWindow(hwnd) != 0 },
-        || {
-            // Safety: the result slot is valid; the message carries no pointers.
-            unsafe {
-                let thread = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
-                if thread == 0 {
-                    return false;
-                }
-                if thread == GetCurrentThreadId() {
-                    return true;
-                }
-                let mut result = 0;
-                SendMessageTimeoutW(
-                    hwnd,
-                    WM_NULL,
-                    0,
-                    0,
-                    SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                    100,
-                    &raw mut result,
-                ) != 0
+    // Safety: the result slot is valid; the message carries no pointers.
+    unsafe {
+        let thread = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
+        if thread == 0 {
+            return false;
+        }
+        if thread != GetCurrentThreadId() {
+            let mut result = 0;
+            if SendMessageTimeoutW(
+                hwnd,
+                WM_NULL,
+                0,
+                0,
+                SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                100,
+                &raw mut result,
+            ) == 0
+            {
+                return false;
             }
-        },
-    )
+        }
+        true
+    }
+}
+
+#[cfg(windows)]
+fn confirm_foreground(hwnd: HWND) -> bool {
+    confirm_foreground_message(hwnd) && foreground_hwnd() == Some(hwnd)
 }
 
 /// Server process id of a connected named-pipe client handle, or `None`
@@ -535,8 +552,7 @@ pub fn show_owned_window(hwnd: i64, owner_pid: u32) -> bool {
     };
     let window = hwnd as HWND;
     show_owned_with(
-        window_pid(window),
-        owner_pid,
+        || window_pid(window) == Some(owner_pid),
         || {
             // Safety: the window manager accepts a handle and show command;
             // the asynchronous request does not wait for the UI's thread.
@@ -549,6 +565,7 @@ pub fn show_owned_window(hwnd: i64, owner_pid: u32) -> bool {
                 ShowWindowAsync(window, command) != 0
             }
         },
+        || request_foreground(window),
         || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
             loop {
@@ -565,7 +582,7 @@ pub fn show_owned_window(hwnd: i64, owner_pid: u32) -> bool {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         },
-        || window_pid(window) == Some(owner_pid) && activate_window(window),
+        || confirm_foreground(window),
     )
 }
 
@@ -1378,13 +1395,13 @@ fn activate_with(
 
 #[cfg(any(windows, test))]
 fn show_owned_with(
-    owner: Option<u32>,
-    expected: u32,
+    mut owned: impl FnMut() -> bool,
     mut show: impl FnMut() -> bool,
+    mut request: impl FnMut() -> bool,
     mut shown: impl FnMut() -> bool,
-    mut activate: impl FnMut() -> bool,
+    mut confirm: impl FnMut() -> bool,
 ) -> bool {
-    owner == Some(expected) && show() && shown() && activate()
+    owned() && show() && owned() && request() && shown() && owned() && confirm() && owned()
 }
 
 #[cfg(test)]
@@ -1437,30 +1454,123 @@ mod popup_activation_controls {
     }
 
     #[test]
+    fn popup_requests_foreground_before_visibility_loses_permission() {
+        use std::cell::Cell;
+        let permission = Cell::new(true);
+        let requested = Cell::new(false);
+        let visible = Cell::new(false);
+        let ok = show_owned_with(
+            || true,
+            || true,
+            || {
+                requested.set(permission.get());
+                requested.get()
+            },
+            || {
+                permission.set(false);
+                visible.set(true);
+                true
+            },
+            || visible.get() && requested.get(),
+        );
+        assert!(
+            ok,
+            "foreground must be requested before visibility wait loses permission"
+        );
+        assert!(requested.get() && visible.get());
+    }
+
+    #[test]
     fn ownership_and_failures_stop_before_later_operations() {
-        for (owner, requested, shown, active, expected, calls) in [
-            (None, true, true, true, false, ""),
-            (Some(2), true, true, true, false, ""),
-            (Some(1), false, true, true, false, "show"),
-            (Some(1), true, false, true, false, "show shown"),
-            (Some(1), true, true, false, false, "show shown activate"),
-            (Some(1), true, true, true, true, "show shown activate"),
+        for (owners, show, request, shown, confirm, expected, calls) in [
+            (vec![false], true, true, true, true, false, "owner"),
+            (
+                vec![true, false],
+                true,
+                true,
+                true,
+                true,
+                false,
+                "owner show owner",
+            ),
+            (vec![true], false, true, true, true, false, "owner show"),
+            (
+                vec![true, true],
+                true,
+                false,
+                true,
+                true,
+                false,
+                "owner show owner request",
+            ),
+            (
+                vec![true, true],
+                true,
+                true,
+                false,
+                true,
+                false,
+                "owner show owner request shown",
+            ),
+            (
+                vec![true, true, false],
+                true,
+                true,
+                true,
+                true,
+                false,
+                "owner show owner request shown owner",
+            ),
+            (
+                vec![true, true, true],
+                true,
+                true,
+                true,
+                false,
+                false,
+                "owner show owner request shown owner confirm",
+            ),
+            (
+                vec![true, true, true, false],
+                true,
+                true,
+                true,
+                true,
+                false,
+                "owner show owner request shown owner confirm owner",
+            ),
+            (
+                vec![true, true, true, true],
+                true,
+                true,
+                true,
+                true,
+                true,
+                "owner show owner request shown owner confirm owner",
+            ),
         ] {
             let trace = RefCell::new(Vec::new());
+            let mut owners = owners.into_iter();
             let result = show_owned_with(
-                owner,
-                1,
+                || {
+                    trace.borrow_mut().push("owner");
+                    owners.next().unwrap()
+                },
                 || {
                     trace.borrow_mut().push("show");
-                    requested
+                    show
+                },
+                || {
+                    trace.borrow_mut().push("request");
+                    request
                 },
                 || {
                     trace.borrow_mut().push("shown");
                     shown
                 },
                 || {
-                    trace.borrow_mut().push("activate");
-                    active
+                    trace.borrow_mut().push("confirm");
+                    confirm
                 },
             );
             assert_eq!(
