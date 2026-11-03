@@ -937,3 +937,155 @@ fn t313_fts_like_parity_at_multiple_preview_widths() {
     let _ = store.soft_delete(victim);
     assert!(search_ids(&store, "zebra").is_empty());
 }
+
+#[test]
+fn t76_blob_reuse_rejects_corruption_and_metadata_conflict() {
+    for case in [
+        "orphan_hash",
+        "orphan_size",
+        "referenced_hash",
+        "referenced_size",
+        "metadata",
+        "valid",
+    ] {
+        let profile = unique_dir(case);
+        let store = Store::open(&profile).unwrap();
+        let bytes = vec![42; KIB256 + 1];
+        let first = sample_clip(Uuid::now_v7(), "first", "first", 1);
+        store
+            .insert_clip(&first, &[("application/first".into(), bytes.clone())])
+            .unwrap();
+        let conn = rusqlite::Connection::open(db_path(&profile)).unwrap();
+        let key: String = conn
+            .query_row(
+                "SELECT blob_key FROM clip_payloads WHERE clip_id=?1",
+                [first.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if case.starts_with("orphan") {
+            conn.execute(
+                "DELETE FROM clip_payloads WHERE clip_id=?1",
+                [first.id.to_string()],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM clip_blobs WHERE blob_key=?1", [&key])
+                .unwrap();
+        }
+        let blob = profile.join("blobs").join(&key);
+        if case.ends_with("hash") {
+            let mut bad = bytes.clone();
+            bad[0] ^= 1;
+            std::fs::write(&blob, bad).unwrap();
+        }
+        if case.ends_with("size") {
+            std::fs::write(&blob, &bytes[..bytes.len() - 1]).unwrap();
+        }
+        if case == "metadata" {
+            conn.execute(
+                "UPDATE clip_blobs SET sha256=?1 WHERE blob_key=?2",
+                rusqlite::params!["wrong", key],
+            )
+            .unwrap();
+        }
+        let second = sample_clip(Uuid::now_v7(), "second", "second", 2);
+        let result = store.insert_clip(&second, &[("application/second".into(), bytes.clone())]);
+        if case == "valid" {
+            result.expect("valid shared blob");
+            assert_eq!(store.get_clip(second.id).unwrap().unwrap().1[0].1, bytes);
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM clip_blobs", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+        } else {
+            assert!(result.is_err(), "{case} must fail");
+            for table in ["clips", "clip_payloads", "clips_fts"] {
+                let col = if table == "clips" { "id" } else { "clip_id" };
+                let count: i64 = conn
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE {col}=?1"),
+                        [second.id.to_string()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0, "{case}: {table}");
+            }
+        }
+    }
+}
+
+#[test]
+fn t76_retention_pinned_overage_preserves_prior_purges() {
+    let profile = unique_dir("t76-retention");
+    let store = Store::open(&profile).unwrap();
+    let bytes = vec![7; KIB256 + 1];
+    let mut pinned = sample_clip(Uuid::now_v7(), "pinned", "pinned", 1);
+    pinned.pinned = true;
+    pinned.bytes_total = bytes.len() as u64;
+    store
+        .insert_clip(&pinned, &[("application/pinned".into(), bytes.clone())])
+        .unwrap();
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let c = sample_clip(
+            Uuid::now_v7(),
+            &format!("item{i}"),
+            &format!("item{i}"),
+            2 + i,
+        );
+        store
+            .insert_clip(&c, &text_payloads(&format!("item{i}")))
+            .unwrap();
+        ids.push(c.id);
+    }
+    let limits = Limits {
+        max_items: 2,
+        max_store_bytes: 10,
+        max_age_days: 0,
+    };
+    assert_eq!(store.enforce_retention(&limits).unwrap(), 3);
+    assert_eq!(store.enforce_retention(&limits).unwrap(), 0);
+    assert_eq!(store.get_clip(pinned.id).unwrap().unwrap().1[0].1, bytes);
+    let conn = rusqlite::Connection::open(db_path(&profile)).unwrap();
+    for id in ids {
+        for table in ["clips", "clip_payloads", "clips_fts"] {
+            let col = if table == "clips" { "id" } else { "clip_id" };
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {col}=?1"),
+                    [id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "{table}");
+        }
+    }
+}
+
+#[test]
+fn t76_retention_byte_cap_stops_oldest_first() {
+    let profile = unique_dir("t76-byte-order");
+    let store = Store::open(&profile).unwrap();
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let mut c = sample_clip(Uuid::now_v7(), &format!("item{i}"), &format!("item{i}"), i);
+        c.bytes_total = 10;
+        store
+            .insert_clip(&c, &text_payloads(&format!("item{i}")))
+            .unwrap();
+        ids.push(c.id);
+    }
+    assert_eq!(
+        store
+            .enforce_retention(&Limits {
+                max_items: 10,
+                max_store_bytes: 20,
+                max_age_days: 0
+            })
+            .unwrap(),
+        1
+    );
+    let remaining = history_ids(&store);
+    assert!(!remaining.contains(&ids[0]));
+    assert!(remaining.contains(&ids[1]) && remaining.contains(&ids[2]));
+}

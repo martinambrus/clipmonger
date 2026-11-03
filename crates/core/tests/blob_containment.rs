@@ -1425,8 +1425,20 @@ fn local_read_and_dedupe_reject_invalid_candidate_metadata() {
         let err = store.get_clip(id.parse().unwrap()).unwrap_err();
         assert!(matches!(err, CoreError::Corrupt { .. }), "{mutation}: {err:?}");
         let next = sample_clip(Uuid::now_v7(), "dedupe-candidate", 1_700_000_000_100);
-        let outcome = store.insert_clip(&next, &[("application/octet-stream".into(), data)]).unwrap();
-        assert_eq!(outcome, clipmonger_core::store::InsertOutcome::Inserted(next.id), "invalid candidate must be skipped: {mutation}");
+        let outcome = store.insert_clip(&next, &[("application/octet-stream".into(), data)]);
+        if mutation.starts_with("UPDATE clip_blobs") {
+            assert!(matches!(outcome, Err(CoreError::Corrupt { .. })), "{mutation}: {outcome:?}");
+            for table in ["clips", "clip_payloads", "clips_fts"] {
+                let column = if table == "clips" { "id" } else { "clip_id" };
+                let count: i64 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column}=?1"),
+                    [next.id.to_string()], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(count, 0, "{mutation}: {table}");
+            }
+        } else {
+            assert_eq!(outcome.unwrap(), clipmonger_core::store::InsertOutcome::Inserted(next.id), "invalid candidate must be skipped: {mutation}");
+        }
     }
 }
 
