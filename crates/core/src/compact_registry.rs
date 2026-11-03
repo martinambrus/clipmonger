@@ -167,6 +167,8 @@ impl Store {
         query: &str,
         scan: bool,
     ) -> Result<SnapshotToken, SnapshotError> {
+        let uri_epoch = self.uri_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let uri_incomplete = self.uri_search_incomplete();
         if query.len() > MAX_QUERY_BYTES {
             return Err(SnapshotError::QueryTooLong);
         }
@@ -215,7 +217,10 @@ impl Store {
                 Err(super::compact_index::CheckError::Sql(e)) => return Err(SnapshotError::Sql(e)),
             }
         }
-        let state = scan.then(|| super::compact_scan::ScanState::new(query));
+        let uri_incomplete = uri_incomplete
+            || self.uri_search_incomplete()
+            || uri_epoch != self.uri_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let state = scan.then(|| super::compact_scan::ScanState::new(query, uri_incomplete));
         let token = SnapshotToken { nonce, sequence };
         registry.entries.push(Snapshot {
             token,

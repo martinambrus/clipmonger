@@ -7,6 +7,7 @@ const ENTRIES: &[(&str, &str)] = &[
     ("popup.loading", "Loading history…"),
     ("popup.history_error", "History is unavailable. Refresh to try again."),
     ("popup.history_preparing", "History is getting ready. Refresh to try again."),
+    ("popup.file_search_incomplete", "File search may be incomplete; some files may need repair."),
     ("popup.history_metadata", "An item has too much format information to display history."),
     ("popup.first_page", "First page"),
     ("popup.next_page", "Next page"),
@@ -150,6 +151,7 @@ pub const IDS: &[&str] = &[
     "popup.loading",
     "popup.history_error",
     "popup.history_preparing",
+    "popup.file_search_incomplete",
     "popup.history_metadata",
     "popup.first_page",
     "popup.next_page",
@@ -294,4 +296,14 @@ pub fn text(id: &str) -> &str {
         }
     }
     id
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn file_search_status_does_not_promise_background_progress() {
+        let message = super::text("popup.file_search_incomplete").to_lowercase();
+        assert!(message.contains("incomplete") && message.contains("repair"));
+        assert!(!message.contains("continues"));
+    }
 }

@@ -85,6 +85,7 @@ pub struct ScanChunk {
     pub bytes_read: usize,
     pub candidates: usize,
     pub done: bool,
+    pub uri_search_incomplete: bool,
 }
 
 pub(super) struct ScanState {
@@ -92,6 +93,7 @@ pub(super) struct ScanState {
     last: Option<(i64, String)>,
     partial: Option<PartialRow>,
     pending: Option<CompactHit>,
+    uri_search_incomplete: bool,
 }
 struct PartialRow {
     rowid: i64,
@@ -103,20 +105,25 @@ struct PartialRow {
     phase: Phase,
     cursor: TextCursor,
     matcher: SubstringMatcher,
+    original_match: bool,
+    uri_label: bool,
 }
 #[derive(PartialEq)]
 enum Phase {
     Id,
     Search,
     Preview,
+    UriNames,
+    Done,
 }
 impl ScanState {
-    pub(super) fn new(query: &str) -> Self {
+    pub(super) fn new(query: &str, uri_search_incomplete: bool) -> Self {
         Self {
             query: query.to_owned(),
             last: None,
             partial: None,
             pending: None,
+            uri_search_incomplete,
         }
     }
 }
@@ -198,6 +205,7 @@ impl ScanState {
             bytes_read: 0,
             candidates: 0,
             done: false,
+            uri_search_incomplete: self.uri_search_incomplete,
         };
         if let Some(hit) = self.pending.take() {
             chunk.rows.push(hit);
@@ -225,6 +233,8 @@ impl ScanState {
                     phase: Phase::Id,
                     cursor: TextCursor::new(conn, rowid, TextColumn::Id)?,
                     matcher: SubstringMatcher::new(&self.query),
+                    original_match: false,
+                    uri_label: false,
                 });
             }
             chunk.candidates += 1;
@@ -257,6 +267,17 @@ impl ScanState {
                                         }
                                     }
                                 }
+                                Phase::UriNames => {
+                                    row.matcher.feed(c);
+                                    if row.uri_label && !row.truncated {
+                                        if row.preview.len() + c.len_utf8() <= PREVIEW_BYTES {
+                                            row.preview.push(c);
+                                        } else {
+                                            row.truncated = true;
+                                        }
+                                    }
+                                }
+                                Phase::Done => unreachable!(),
                             }
                         })?;
                 if invalid_id {
@@ -281,21 +302,38 @@ impl ScanState {
                         row.phase = Phase::Preview;
                         row.cursor = TextCursor::new(conn, row.rowid, TextColumn::Preview)?;
                     }
-                    Phase::Preview => break,
+                    Phase::Preview => {
+                        row.original_match =
+                            std::mem::replace(&mut row.matcher, SubstringMatcher::new(&self.query))
+                                .finish();
+                        row.uri_label = row.preview.is_empty() && !row.truncated;
+                        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='uri_search')", [], |r| r.get(0))?;
+                        let uri_row = if exists {
+                            conn.query_row("SELECT rowid FROM uri_search WHERE clip_id=?1 AND parser_version=3", params![row.id], |r| r.get(0)).optional()?
+                        } else {
+                            None
+                        };
+                        if let Some(uri_row) = uri_row {
+                            row.phase = Phase::UriNames;
+                            row.cursor = TextCursor::new(conn, uri_row, TextColumn::UriNames)?;
+                        } else {
+                            row.phase = Phase::Done;
+                            break;
+                        }
+                    }
+                    Phase::UriNames => {
+                        row.phase = Phase::Done;
+                        break;
+                    }
+                    Phase::Done => unreachable!(),
                 }
             }
-            if row.phase != Phase::Preview {
+            if row.phase != Phase::Done {
                 continue;
             }
-            // An unfinished preview may have consumed the entire budget.
-            if chunk.bytes_read == bytes {
-                continue;
-            }
-            // A zero-budget-free EOF probe is unnecessary: the last step's EOF
-            // must be remembered even when it ends exactly at the budget boundary.
             let row = self.partial.take().unwrap();
             self.last = Some((row.time, row.id.clone()));
-            if row.matcher.finish() {
+            if row.original_match || row.matcher.finish() {
                 let (kind, thumbnail_hash) = project_metadata(conn, row.rowid, &row.id)?;
                 let hit = CompactHit {
                     id: row.id,
@@ -443,6 +481,44 @@ mod tests {
             }
         }
         (rows, empty)
+    }
+    #[test]
+    fn compact_uri_names_use_snapshot_and_display_label() {
+        let (_s, db) = setup();
+        for n in 1..=120 {
+            insert(&db, n, n as i64, "", "", false);
+        }
+        db.lock()
+            .execute(
+                "INSERT INTO clip_payloads(clip_id,mime,data) VALUES(?1,'text/uri-list',?2)",
+                params![id(1), b"file:///tmp/needle%20name.txt".as_slice()],
+            )
+            .unwrap();
+        for _ in 0..122 {
+            db.maintain_uri_search().unwrap();
+        }
+        let token = db.begin_compact_scan(1, "needle name").unwrap();
+        // The snapshot is pinned before a later replacement.
+        db.lock()
+            .execute(
+                "UPDATE clip_payloads SET data=?2 WHERE clip_id=?1 AND mime='text/uri-list'",
+                params![id(1), b"file:///tmp/new.txt".as_slice()],
+            )
+            .unwrap();
+        let (rows, _) = collect(&db, token, 1024, 16, 50);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id(1));
+        assert_eq!(rows[0].preview, "needle name.txt");
+    }
+    #[test]
+    fn compact_missing_derived_table_is_honestly_incomplete() {
+        let (_s, db) = setup();
+        insert(&db, 1, 1, "plain", "plain", false);
+        db.lock().execute_batch("DROP TABLE uri_search").unwrap();
+        let token = db.begin_compact_scan(1, "plain").unwrap();
+        let chunk = db.step_compact_scan(1, token, MAX_BYTES, 32, 50).unwrap();
+        assert!(chunk.uri_search_incomplete);
+        assert_eq!(chunk.rows.len(), 1);
     }
     #[test]
     fn compact_projection_rejects_oversized_mime() {

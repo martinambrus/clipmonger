@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
@@ -25,8 +25,8 @@ pub use compact_index::IndexStatus as CompactIndexStatus;
 
 #[path = "compact_scan.rs"]
 mod compact_scan;
-pub use compact_scan::{CompactHit, CompactKind, ScanChunk, ScanError};
 pub use crate::sql_text_stream::TextStreamError;
+pub use compact_scan::{CompactHit, CompactKind, ScanChunk, ScanError};
 #[path = "compact_registry.rs"]
 mod compact_registry;
 pub use compact_registry::{SnapshotError, SnapshotToken};
@@ -68,6 +68,11 @@ const SCHEMA_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS clip_blobs(
   blob_key TEXT PRIMARY KEY, sha256 TEXT NOT NULL, bytes INTEGER NOT NULL,
   codec TEXT NOT NULL DEFAULT 'raw', created_ms INTEGER NOT NULL);",
+    "CREATE TABLE IF NOT EXISTS uri_payload_versions(clip_id TEXT PRIMARY KEY, version INTEGER NOT NULL);",
+    "CREATE TABLE IF NOT EXISTS uri_search(clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE, version INTEGER NOT NULL, parser_version INTEGER NOT NULL, names TEXT NOT NULL);",
+    "CREATE TRIGGER IF NOT EXISTS uri_payload_insert AFTER INSERT ON clip_payloads WHEN NEW.mime='text/uri-list' BEGIN INSERT INTO uri_payload_versions VALUES(NEW.clip_id,1) ON CONFLICT(clip_id) DO UPDATE SET version=version+1; DELETE FROM uri_search WHERE clip_id=NEW.clip_id; END;",
+    "CREATE TRIGGER IF NOT EXISTS uri_payload_delete AFTER DELETE ON clip_payloads WHEN OLD.mime='text/uri-list' BEGIN INSERT INTO uri_payload_versions VALUES(OLD.clip_id,1) ON CONFLICT(clip_id) DO UPDATE SET version=version+1; DELETE FROM uri_search WHERE clip_id=OLD.clip_id; END;",
+    "CREATE TRIGGER IF NOT EXISTS uri_payload_update AFTER UPDATE ON clip_payloads WHEN OLD.mime='text/uri-list' OR NEW.mime='text/uri-list' BEGIN INSERT INTO uri_payload_versions VALUES(OLD.clip_id,1) ON CONFLICT(clip_id) DO UPDATE SET version=version+1; DELETE FROM uri_search WHERE clip_id=OLD.clip_id; END;",
     "CREATE TABLE IF NOT EXISTS perm_groups(name TEXT PRIMARY KEY, system INTEGER NOT NULL DEFAULT 0);",
     "CREATE TABLE IF NOT EXISTS permanents(
   id TEXT PRIMARY KEY, grp TEXT NOT NULL REFERENCES perm_groups(name),
@@ -278,6 +283,16 @@ pub struct Store {
     read_only: bool,
     /// Owned read snapshots; no connection escapes this registry.
     compact_snapshots: Mutex<compact_registry::Registry>,
+    uri_epoch: AtomicU64,
+    uri_incomplete: std::sync::atomic::AtomicBool,
+    uri_maintenance: Mutex<UriMaintenance>,
+}
+
+#[derive(Debug, Default)]
+struct UriMaintenance {
+    after: Option<i64>,
+    failed: bool,
+    epoch: u64,
 }
 
 /// Wrap a `rusqlite` failure as a backend error.
@@ -1727,6 +1742,9 @@ impl Store {
             fts,
             read_only,
             compact_snapshots: Mutex::new(compact_registry::Registry::default()),
+            uri_epoch: AtomicU64::new(0),
+            uri_incomplete: std::sync::atomic::AtomicBool::new(true),
+            uri_maintenance: Mutex::new(UriMaintenance::default()),
         })
     }
 
@@ -1778,6 +1796,9 @@ impl Store {
             fts,
             read_only,
             compact_snapshots,
+            uri_epoch,
+            uri_incomplete,
+            uri_maintenance,
         } = self;
         let connection = conn
             .into_inner()
@@ -1791,6 +1812,9 @@ impl Store {
                     fts,
                     read_only,
                     compact_snapshots,
+                    uri_epoch,
+                    uri_incomplete,
+                    uri_maintenance,
                 },
                 db_err(&error),
             )
@@ -1954,6 +1978,10 @@ impl Store {
             return Err(readonly_err());
         }
         let incoming = content_hash(payloads);
+        let uri_names = payloads
+            .iter()
+            .find(|(mime, _)| mime == "text/uri-list")
+            .and_then(|(_, bytes)| crate::uri_search::basenames(bytes).ok());
         if !payloads.is_empty() {
             if let Some(hit) = self.dedupe_hit(&incoming, &clip.id)? {
                 self.lock()
@@ -1976,6 +2004,8 @@ impl Store {
             }
         }
         let mut conn = self.lock();
+        self.uri_epoch.fetch_add(1, Ordering::SeqCst);
+        self.uri_incomplete.store(true, Ordering::SeqCst);
         let tx = conn.transaction().map_err(|e| db_err(&e))?;
         let inserted = tx.execute(
             "INSERT INTO clips(id, created_ms, source_app, source_os, pinned, removed, \
@@ -2028,6 +2058,9 @@ impl Store {
                     params![clip.id.to_string(), mime, key, native],
                 ).map_err(|e| db_err(&e))?;
             }
+        }
+        if let Some(names) = &uri_names {
+            tx.execute("INSERT INTO uri_search(clip_id, version, parser_version, names) VALUES(?1, COALESCE((SELECT version FROM uri_payload_versions WHERE clip_id=?1),0), 3, ?2)", params![clip.id.to_string(), names]).map_err(|e| db_err(&e))?;
         }
         tx.execute(
             "DELETE FROM clips_fts WHERE clip_id=?1",
@@ -2144,6 +2177,114 @@ impl Store {
         self.get_payload_with_interleave(id, mime, cap, || {})
     }
 
+    /// Attempt one URI-list backfill. The caller owns the cursor and wraps it
+    /// to None when the end is reached, ensuring failed entries are revisited.
+    /// Errors never include clipboard content.
+    fn backfill_uri_step(
+        &self,
+        after: Option<i64>,
+    ) -> Result<Option<(i64, bool, bool)>, CoreError> {
+        self.backfill_uri_step_with_hook(after, || {})
+    }
+
+    fn backfill_uri_step_with_hook<F: FnOnce()>(
+        &self,
+        after: Option<i64>,
+        hook: F,
+    ) -> Result<Option<(i64, bool, bool)>, CoreError> {
+        if self.read_only {
+            return Err(readonly_err());
+        }
+        let candidate: Option<(i64, Option<String>, i64, bool, bool)> = {
+            let conn = self.lock();
+            conn.query_row("SELECT c.rowid, CASE WHEN length(CAST(c.id AS BLOB)) <= 36 THEN c.id END, COALESCE(v.version,0), EXISTS(SELECT 1 FROM clip_payloads p WHERE p.clip_id=c.id AND p.mime='text/uri-list'), EXISTS(SELECT 1 FROM uri_search s WHERE s.clip_id=c.id AND s.version=COALESCE(v.version,0) AND s.parser_version=3) FROM clips c LEFT JOIN uri_payload_versions v ON v.clip_id=c.id WHERE c.rowid>?1 ORDER BY c.rowid LIMIT 1", params![after.unwrap_or(i64::MIN)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional().map_err(|e| db_err(&e))?
+        };
+        let Some((rowid, id, version, has_uri, indexed)) = candidate else {
+            return Ok(None);
+        };
+        if !has_uri || indexed {
+            return Ok(Some((rowid, true, false)));
+        }
+        let Some(id) = id else {
+            return Ok(Some((rowid, false, true)));
+        };
+        let uuid = match Uuid::parse_str(&id) {
+            Ok(value) => value,
+            Err(_) => return Ok(Some((rowid, false, true))),
+        };
+        let payload = match self.get_payload_internal(
+            uuid,
+            "text/uri-list",
+            crate::uri_search::URI_PAYLOAD_LIMIT,
+            true,
+            || {},
+        ) {
+            Ok(Some(payload)) => payload,
+            _ => return Ok(Some((rowid, false, true))),
+        };
+        let names = match crate::uri_search::basenames(&payload.data) {
+            Ok(names) => names,
+            Err(_) => return Ok(Some((rowid, false, true))),
+        };
+        hook();
+        let mut conn = self.lock();
+        let committed = (|| -> Result<bool, CoreError> {
+            let tx = conn.transaction().map_err(|e| db_err(&e))?;
+            let current: Option<(i64,i64)> = tx.query_row("SELECT c.rowid, COALESCE(v.version,0) FROM clip_payloads p JOIN clips c ON c.id=p.clip_id LEFT JOIN uri_payload_versions v ON v.clip_id=p.clip_id WHERE p.clip_id=?1 AND p.mime='text/uri-list'", params![id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e| db_err(&e))?;
+            if current == Some((rowid,version)) {
+            tx.execute("INSERT INTO uri_search(clip_id,version,parser_version,names) VALUES(?1,?2,3,?3) ON CONFLICT(clip_id) DO UPDATE SET version=excluded.version,parser_version=excluded.parser_version,names=excluded.names", params![id, version, names]).map_err(|e| db_err(&e))?;
+            }
+            tx.commit().map_err(|e| db_err(&e))?;
+            Ok(current == Some((rowid,version)))
+        })().unwrap_or(false);
+        Ok(Some((rowid, committed, true)))
+    }
+
+    /// Coverage is conservative until a complete sweep has observed no failures.
+    pub fn uri_search_incomplete(&self) -> bool {
+        self.uri_incomplete.load(Ordering::SeqCst)
+    }
+
+    /// Perform one bounded attempt and retain a fair sweep cursor per store.
+    pub fn maintain_uri_search(&self) -> Result<(), CoreError> {
+        if self.read_only {
+            return Err(readonly_err());
+        }
+        let mut state = self
+            .uri_maintenance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for _ in 0..32 {
+            let next = match self.backfill_uri_step(state.after) {
+                Ok(next) => next,
+                Err(error) => {
+                    self.uri_incomplete.store(true, Ordering::SeqCst);
+                    return Err(error);
+                }
+            };
+            match next {
+                Some((id, success, attempted)) => {
+                    state.after = Some(id);
+                    state.failed |= !success;
+                    if attempted {
+                        break;
+                    }
+                }
+                None => {
+                    let _conn = self.lock();
+                    let epoch = self.uri_epoch.load(Ordering::SeqCst);
+                    self.uri_incomplete
+                        .store(state.failed || state.epoch != epoch, Ordering::SeqCst);
+                    state.after = None;
+                    state.failed = false;
+                    state.epoch = epoch;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     // The callback lets the in-module control interleave a second real connection
     // after the first read. Production always supplies a no-op.
     fn get_payload_with_interleave<F: FnOnce()>(
@@ -2151,6 +2292,17 @@ impl Store {
         id: Uuid,
         mime: &str,
         cap: usize,
+        interleave: F,
+    ) -> Result<Option<PayloadSnapshot>, CoreError> {
+        self.get_payload_internal(id, mime, cap, false, interleave)
+    }
+
+    fn get_payload_internal<F: FnOnce()>(
+        &self,
+        id: Uuid,
+        mime: &str,
+        cap: usize,
+        include_removed: bool,
         interleave: F,
     ) -> Result<Option<PayloadSnapshot>, CoreError> {
         let _cap_plus_one = cap.checked_add(1).ok_or_else(|| CoreError::Backend {
@@ -2166,7 +2318,7 @@ impl Store {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(|e| db_err(&e))?;
         let mut stmt = tx
-            .prepare("SELECT content_hash, removed FROM clips WHERE id=?1")
+            .prepare(if include_removed { "SELECT CASE WHEN length(CAST(content_hash AS BLOB)) <= 128 THEN content_hash ELSE '' END, removed FROM clips WHERE id=?1" } else { "SELECT content_hash, removed FROM clips WHERE id=?1" })
             .map_err(|e| db_err(&e))?;
         let mut rows = stmt
             .query_map(params![id.to_string()], |r| {
@@ -2179,7 +2331,7 @@ impl Store {
         let (content_hash, removed) = row.map_err(|e| db_err(&e))?;
         drop(rows);
         drop(stmt);
-        if removed != 0 {
+        if removed != 0 && !include_removed {
             return Ok(None);
         }
         interleave();
@@ -2218,6 +2370,11 @@ impl Store {
                 }
                 // The established reader maps SQL NULL inline payloads to empty bytes.
                 if data_type == "null" {
+                    if include_removed && mime == "text/uri-list" {
+                        return Err(CoreError::Corrupt {
+                            message: "missing URI payload".to_string(),
+                        });
+                    }
                     return Ok(Some(PayloadSnapshot {
                         clip_id: id,
                         mime: mime.to_string(),
@@ -2719,22 +2876,39 @@ impl Store {
             return Ok(Vec::new());
         }
         let conn = self.lock();
+        let uri_ready = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='uri_search' AND type='table')", [], |r| r.get::<_,bool>(0)).unwrap_or(false);
         if self.fts {
+            if uri_ready {
+                if let Some(mut clips) = fts_search_with_uri(&conn, &tokens) {
+                    for clip in &mut clips {
+                        clip.formats = mime_list(&conn, &clip.id.to_string())?;
+                    }
+                    return Ok(clips);
+                }
+            }
             let match_q = tokens
                 .iter()
                 .map(|t| format!("\"{t}\""))
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            if let Some(mut clips) = fts_search(&conn, &match_q) {
-                for c in &mut clips {
-                    c.formats = mime_list(&conn, &c.id.to_string())?;
+            if !uri_ready {
+                if let Some(mut clips) = fts_search(&conn, &match_q) {
+                    for c in &mut clips {
+                        c.formats = mime_list(&conn, &c.id.to_string())?;
+                    }
+                    return Ok(clips);
                 }
-                return Ok(clips);
             }
         }
         let mut sql = format!("SELECT {CLIP_COLS} FROM clips WHERE removed=0");
-        for _ in &tokens {
-            sql.push_str(" AND LOWER(search_text) LIKE ? ESCAPE '\\'");
+        for index in 1..=tokens.len() {
+            if uri_ready {
+                sql.push_str(&format!(" AND (LOWER(search_text) LIKE ?{index} ESCAPE '\\' OR EXISTS (SELECT 1 FROM uri_search s LEFT JOIN uri_payload_versions v ON v.clip_id=s.clip_id WHERE s.clip_id=clips.id AND s.parser_version=3 AND s.version=COALESCE(v.version,0) AND LOWER(s.names) LIKE ?{index} ESCAPE '\\'))"));
+            } else {
+                sql.push_str(&format!(
+                    " AND LOWER(search_text) LIKE ?{index} ESCAPE '\\'"
+                ));
+            }
         }
         sql.push_str(" ORDER BY last_used_ms DESC");
         let mut stmt = conn.prepare(&sql).map_err(|e| db_err(&e))?;
@@ -3503,6 +3677,93 @@ fn is_symlink_entry<R: std::io::Read + std::io::Seek>(e: &zip::read::ZipFile<'_,
 }
 
 /// FTS5 search; `None` on any failure so callers fall back to LIKE.
+/// Legacy search may scan all indexed URI rows. Each bounded name document is
+/// evaluated in its own fresh in-memory FTS5 database, so SQLite supplies the
+/// exact tokenizer without accumulating a persistent URI index or merge work.
+/// Original FTS contributes only clip IDs; original text is fetched only for
+/// clips that match the final query, as required by the existing return type.
+fn fts_search_with_uri(conn: &Connection, tokens: &[String]) -> Option<Vec<Clip>> {
+    let queries: Vec<String> = tokens.iter().map(|token| format!("\"{token}\"")).collect();
+    let mut hits: Vec<HashSet<Uuid>> = Vec::with_capacity(queries.len());
+    for query in &queries {
+        let mut stmt = conn.prepare("SELECT CASE WHEN length(CAST(clip_id AS BLOB)) <= 36 THEN clip_id END FROM clips_fts WHERE clips_fts MATCH ?1").ok()?;
+        let rows = stmt
+            .query_map([query], |r| r.get::<_, Option<String>>(0))
+            .ok()?;
+        let mut ids = HashSet::new();
+        for row in rows {
+            if let Some(id) = row.ok()? {
+                if let Ok(uuid) = Uuid::parse_str(&id) {
+                    ids.insert(uuid);
+                }
+            }
+        }
+        hits.push(ids);
+    }
+    let mut stmt = conn.prepare("SELECT s.rowid, s.clip_id FROM uri_search s JOIN clips c ON c.id=s.clip_id LEFT JOIN uri_payload_versions v ON v.clip_id=s.clip_id WHERE c.removed=0 AND s.parser_version=3 AND s.version=COALESCE(v.version,0) AND length(CAST(s.clip_id AS BLOB))<=36 AND typeof(s.names)='text'").ok()?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .ok()?;
+    for row in rows {
+        let (rowid, id) = row.ok()?;
+        let Ok(id) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        let blob = conn
+            .blob_open(rusqlite::MAIN_DB, "uri_search", "names", rowid, true)
+            .ok()?;
+        if blob.len() > crate::uri_search::URI_SEARCH_LIMIT {
+            return None;
+        }
+        drop(blob);
+        let names: String = conn
+            .query_row(
+                "SELECT names FROM uri_search WHERE rowid=?1",
+                [rowid],
+                |r| r.get(0),
+            )
+            .ok()?;
+        if names.len() > crate::uri_search::URI_SEARCH_LIMIT {
+            return None;
+        }
+        let temp = Connection::open_in_memory().ok()?;
+        temp.execute_batch("CREATE VIRTUAL TABLE names_fts USING fts5(text)")
+            .ok()?;
+        temp.execute("INSERT INTO names_fts(text) VALUES(?1)", [&names])
+            .ok()?;
+        for (index, query) in queries.iter().enumerate() {
+            let matched: bool = temp
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM names_fts WHERE names_fts MATCH ?1)",
+                    [query],
+                    |r| r.get(0),
+                )
+                .ok()?;
+            if matched {
+                hits[index].insert(id);
+            }
+        }
+    }
+    let mut intersection = hits.into_iter();
+    let mut matched = intersection.next()?;
+    for ids in intersection {
+        matched.retain(|id| ids.contains(id));
+    }
+    let sql = format!("SELECT {CLIP_COLS} FROM clips WHERE id=?1 AND removed=0");
+    let mut clips = Vec::new();
+    for id in matched {
+        if let Some(clip) = conn
+            .query_row(&sql, [id.to_string()], clip_of)
+            .optional()
+            .ok()?
+        {
+            clips.push(clip);
+        }
+    }
+    clips.sort_by(|a, b| b.last_used_ms.cmp(&a.last_used_ms));
+    Some(clips)
+}
+
 fn fts_search(conn: &Connection, match_q: &str) -> Option<Vec<Clip>> {
     let sql = format!(
         "SELECT {CLIP_COLS} FROM clips JOIN clips_fts ON clips_fts.clip_id=clips.id \
@@ -3720,6 +3981,631 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Barrier;
     use uuid::Uuid;
+
+    #[test]
+    fn uri_backfill_upgrades_prototype_markers() {
+        let profile = unique_dir("uri-prototype-upgrade");
+        let store = Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let clip = sample_clip(id, "", "base", 19);
+        store
+            .insert_clip(
+                &clip,
+                &[("text/uri-list".into(), b"file:///current.txt".to_vec())],
+            )
+            .unwrap();
+        for version in [1, 2] {
+            store
+                .lock()
+                .execute(
+                    "UPDATE uri_search SET parser_version=?2, names='obsolete' WHERE clip_id=?1",
+                    rusqlite::params![id.to_string(), version],
+                )
+                .unwrap();
+            assert!(store.search("obsolete").unwrap().is_empty());
+            for _ in 0..3 {
+                store.maintain_uri_search().unwrap();
+            }
+            let row: (i64, String) = store
+                .lock()
+                .query_row(
+                    "SELECT parser_version,names FROM uri_search WHERE clip_id=?1",
+                    [id.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(row, (3, "current.txt".into()));
+            assert!(store
+                .search("current")
+                .unwrap()
+                .iter()
+                .any(|clip| clip.id == id));
+        }
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_capture_and_purge_leave_prototype_global_fts_untouched() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let profile = unique_dir("uri-no-global-writes");
+        let store = Store::open(&profile).unwrap();
+        store.lock().execute_batch("CREATE VIRTUAL TABLE uri_fts USING fts5(text); INSERT INTO uri_fts(text) VALUES('sentinel')").unwrap();
+        let attempts = std::sync::Arc::new(AtomicU64::new(0));
+        let seen = attempts.clone();
+        store
+            .lock()
+            .authorizer(Some(move |ctx: AuthContext<'_>| {
+                let denied = match ctx.action {
+                    AuthAction::Delete { table_name }
+                    | AuthAction::Insert { table_name }
+                    | AuthAction::Update { table_name, .. }
+                    | AuthAction::CreateVtable { table_name, .. } => {
+                        table_name.starts_with("uri_fts")
+                    }
+                    _ => false,
+                };
+                if denied {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }))
+            .unwrap();
+        let id = Uuid::now_v7();
+        let clip = sample_clip(id, "", "base", 19);
+        store
+            .insert_clip(
+                &clip,
+                &[("text/uri-list".into(), b"file:///name.txt".to_vec())],
+            )
+            .unwrap();
+        store.soft_delete(id).unwrap();
+        assert_eq!(store.purge_removed(), 1);
+        store
+            .lock()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT count(*) FROM uri_fts WHERE uri_fts MATCH 'sentinel'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_search_uses_sqlite_tokenizer_and_preserves_mixed_queries() {
+        let profile = unique_dir("uri-tokenizer");
+        let mut store = Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let clip = sample_clip(id, "", "memo", 19);
+        store
+            .insert_clip(
+                &clip,
+                &[(
+                    "text/uri-list".into(),
+                    "file:///tmp/R%C3%A9sum%C3%A9-Payroll.pdf"
+                        .as_bytes()
+                        .to_vec(),
+                )],
+            )
+            .unwrap();
+        assert!(store.search("resume").unwrap().iter().any(|c| c.id == id));
+        assert!(store
+            .search("memo payroll")
+            .unwrap()
+            .iter()
+            .any(|c| c.id == id));
+        assert!(store.search("sum").unwrap().iter().all(|c| c.id != id));
+        assert!(store
+            .search("memo nonexistent")
+            .unwrap()
+            .iter()
+            .all(|c| c.id != id));
+        store.fts = false;
+        assert!(store
+            .search("memo payroll")
+            .unwrap()
+            .iter()
+            .any(|c| c.id == id));
+        assert!(store
+            .search("memo nonexistent")
+            .unwrap()
+            .iter()
+            .all(|c| c.id != id));
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_inline_null_stays_pending_until_repaired() {
+        let profile = unique_dir("uri-null");
+        let store = Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let mut clip = sample_clip(id, "", "keep", 19);
+        clip.removed = true;
+        store.insert_metadata_capture(&clip).unwrap();
+        store
+            .lock()
+            .execute(
+                "INSERT INTO clip_payloads(clip_id,mime,data) VALUES(?1,'text/uri-list',NULL)",
+                [id.to_string()],
+            )
+            .unwrap();
+        let empty = Uuid::now_v7();
+        store
+            .insert_metadata_capture(&sample_clip(empty, "", "empty", 20))
+            .unwrap();
+        store
+            .lock()
+            .execute(
+                "INSERT INTO clip_payloads(clip_id,mime,data) VALUES(?1,'text/uri-list',?2)",
+                rusqlite::params![empty.to_string(), b"".as_slice()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get_payload(empty, "text/uri-list", 8)
+                .unwrap()
+                .unwrap()
+                .data,
+            b""
+        );
+        for _ in 0..3 {
+            store.maintain_uri_search().unwrap();
+        }
+        assert!(store.uri_search_incomplete());
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT count(*) FROM uri_search WHERE clip_id=?1",
+                    [id.to_string()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT names FROM uri_search WHERE clip_id=?1",
+                    [empty.to_string()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            ""
+        );
+        store
+            .lock()
+            .execute(
+                "UPDATE clip_payloads SET data=?2 WHERE clip_id=?1 AND mime='text/uri-list'",
+                rusqlite::params![id.to_string(), b"file:///repaired.txt".as_slice()],
+            )
+            .unwrap();
+        for _ in 0..4 {
+            store.maintain_uri_search().unwrap();
+        }
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT names FROM uri_search WHERE clip_id=?1",
+                    [id.to_string()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "repaired.txt"
+        );
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_backfill_fts_work_does_not_scale_with_history_or_base_text() {
+        let profile = unique_dir("uri-fts-bound");
+        let store = Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let clip = sample_clip(id, "", "initial", 19);
+        store
+            .insert_clip(
+                &clip,
+                &[("text/uri-list".into(), b"file:///bounded.txt".to_vec())],
+            )
+            .unwrap();
+        store.maintain_uri_search().unwrap();
+        {
+            let conn = store.lock();
+            conn.execute(
+                "UPDATE uri_search SET parser_version=1,names='obsolete'",
+                [],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM clips_fts WHERE clip_id=?1", [id.to_string()])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO clips_fts(rowid,clip_id,text) VALUES(90000,?1,'original')",
+                [id.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE clips SET search_text=?2 WHERE id=?1",
+                rusqlite::params![id.to_string(), "x".repeat(2 * 1024 * 1024)],
+            )
+            .unwrap();
+            for n in 1..=5000 {
+                conn.execute(
+                    "INSERT INTO clips_fts(clip_id,text) VALUES(?1,'other')",
+                    [format!("unrelated-{n}")],
+                )
+                .unwrap();
+            }
+        }
+        assert!(store
+            .search("original")
+            .unwrap()
+            .iter()
+            .any(|clip| clip.id == id));
+        assert!(store
+            .search("bounded")
+            .unwrap()
+            .iter()
+            .all(|clip| clip.id != id));
+        let calls = std::sync::Arc::new(AtomicU64::new(0));
+        let progress = calls.clone();
+        let forbidden = std::sync::Arc::new(AtomicU64::new(0));
+        let seen = forbidden.clone();
+        store
+            .lock()
+            .authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                use rusqlite::hooks::{AuthAction, Authorization};
+                let blocked = match ctx.action {
+                    AuthAction::Delete { table_name }
+                    | AuthAction::Insert { table_name }
+                    | AuthAction::Update { table_name, .. }
+                    | AuthAction::CreateVtable { table_name, .. } => {
+                        table_name == "clips_fts" || table_name.starts_with("uri_fts")
+                    }
+                    AuthAction::Read {
+                        table_name,
+                        column_name,
+                    } => table_name == "clips" && column_name == "search_text",
+                    _ => false,
+                };
+                if blocked {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }))
+            .unwrap();
+        store
+            .lock()
+            .progress_handler(
+                1,
+                Some(move || progress.fetch_add(1, Ordering::SeqCst) > 10000),
+            )
+            .unwrap();
+        store.maintain_uri_search().unwrap();
+        store.maintain_uri_search().unwrap();
+        store
+            .lock()
+            .progress_handler(0, None::<fn() -> bool>)
+            .unwrap();
+        store
+            .lock()
+            .authorizer(
+                None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+            )
+            .unwrap();
+        assert_eq!(
+            forbidden.load(Ordering::SeqCst),
+            0,
+            "backfill accessed global FTS or base text"
+        );
+        eprintln!(
+            "bounded URI maintenance SQLite VM callbacks: {}",
+            calls.load(Ordering::SeqCst)
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) < 10000,
+            "URI maintenance exceeded VM work bound"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT names FROM uri_search WHERE clip_id=?1",
+                    [id.to_string()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "bounded.txt"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .query_row("SELECT text FROM clips_fts WHERE rowid=90000", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+            "original"
+        );
+        assert!(store
+            .search("bounded")
+            .unwrap()
+            .iter()
+            .any(|clip| clip.id == id));
+        assert!(store
+            .search("original bounded")
+            .unwrap()
+            .iter()
+            .any(|clip| clip.id == id));
+        let original_reads = std::sync::Arc::new(AtomicU64::new(0));
+        let seen_reads = original_reads.clone();
+        store
+            .lock()
+            .authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                use rusqlite::hooks::{AuthAction, Authorization};
+                if matches!(
+                    ctx.action,
+                    AuthAction::Read {
+                        table_name: "clips",
+                        column_name: "search_text"
+                    }
+                ) {
+                    seen_reads.fetch_add(1, Ordering::SeqCst);
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }))
+            .unwrap();
+        assert!(store.search("unmatchedtoken").unwrap().is_empty());
+        store
+            .lock()
+            .authorizer(
+                None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+            )
+            .unwrap();
+        assert_eq!(
+            original_reads.load(Ordering::SeqCst),
+            0,
+            "URI matching fetched unrestricted original text"
+        );
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_backfill_retries_fairly_and_preserves_metadata() {
+        let profile = unique_dir("uri-backfill");
+        let store = Store::open(&profile).unwrap();
+        let bad = Uuid::now_v7();
+        let good = Uuid::now_v7();
+        for (id, bytes) in [
+            (bad, b"https://unsupported/example".as_slice()),
+            (good, b"file:///tmp/caf%C3%A9.txt".as_slice()),
+        ] {
+            let mut clip = sample_clip(id, "", "original text", 17);
+            clip.removed = id == good;
+            store
+                .insert_clip(&clip, &[("text/uri-list".into(), bytes.to_vec())])
+                .unwrap();
+        }
+        // Simulate legacy history without touching payloads or user metadata.
+        store.lock().execute("DELETE FROM uri_search", []).unwrap();
+        store
+            .lock()
+            .execute(
+                "UPDATE clips SET pinned=1, preview='edited', rev_ctr=42 WHERE id=?1",
+                [good.to_string()],
+            )
+            .unwrap();
+        let before: (String, i64, i64, i64) = store
+            .lock()
+            .query_row(
+                "SELECT preview,pinned,rev_ctr,last_used_ms FROM clips WHERE id=?1",
+                [good.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        for _ in 0..8 {
+            store.maintain_uri_search().unwrap();
+        }
+        assert!(store.uri_search_incomplete());
+        let names: String = store
+            .lock()
+            .query_row(
+                "SELECT names FROM uri_search WHERE clip_id=?1",
+                [good.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(names, "café.txt");
+        let after: (String, i64, i64, i64) = store
+            .lock()
+            .query_row(
+                "SELECT preview,pinned,rev_ctr,last_used_ms FROM clips WHERE id=?1",
+                [good.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            store
+                .get_payload_internal(good, "text/uri-list", 100, true, || {})
+                .unwrap()
+                .unwrap()
+                .data,
+            b"file:///tmp/caf%C3%A9.txt"
+        );
+        assert!(store
+            .lock()
+            .query_row(
+                "SELECT names FROM uri_search WHERE clip_id=?1",
+                [good.to_string()],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap()
+            .contains("café.txt"));
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_backfill_discards_replaced_payload_without_losing_edits() {
+        let profile = unique_dir("uri-race");
+        let store = Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let clip = sample_clip(id, "", "original", 19);
+        store
+            .insert_clip(
+                &clip,
+                &[("text/uri-list".into(), b"file:///old.txt".to_vec())],
+            )
+            .unwrap();
+        store.lock().execute("DELETE FROM uri_search", []).unwrap();
+        let result = store
+            .backfill_uri_step_with_hook(None, || {
+                let conn = store.lock();
+                conn.execute(
+                    "UPDATE clip_payloads SET data=?2 WHERE clip_id=?1 AND mime='text/uri-list'",
+                    rusqlite::params![id.to_string(), b"file:///new.txt".as_slice()],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE clips SET pinned=1, preview='edited', rev_ctr=8 WHERE id=?1",
+                    [id.to_string()],
+                )
+                .unwrap();
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!result.1);
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT count(*) FROM uri_search WHERE clip_id=?1",
+                    [id.to_string()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        for _ in 0..3 {
+            store.maintain_uri_search().unwrap();
+        }
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT names FROM uri_search WHERE clip_id=?1",
+                    [id.to_string()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "new.txt"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT (pinned, preview, rev_ctr) = (1, 'edited', 8) FROM clips WHERE id=?1",
+                    [id.to_string()],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap(),
+            true
+        );
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_backfill_rolls_back_marker_on_write_failure_and_retries() {
+        let profile = unique_dir("uri-rollback");
+        let store = Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let clip = sample_clip(id, "", "original", 19);
+        store
+            .insert_clip(
+                &clip,
+                &[("text/uri-list".into(), b"file:///name.txt".to_vec())],
+            )
+            .unwrap();
+        store
+            .lock()
+            .execute_batch("DELETE FROM uri_search; CREATE TRIGGER uri_fail BEFORE INSERT ON uri_search BEGIN SELECT RAISE(ABORT,'failure'); END;")
+            .unwrap();
+        store.maintain_uri_search().unwrap();
+        assert_eq!(
+            store
+                .lock()
+                .query_row("SELECT count(*) FROM uri_search", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        store.lock().execute_batch("DROP TRIGGER uri_fail").unwrap();
+        for _ in 0..3 {
+            store.maintain_uri_search().unwrap();
+        }
+        let text: String = store
+            .lock()
+            .query_row(
+                "SELECT names FROM uri_search WHERE clip_id=?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(text, "name.txt");
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_backfill_large_and_missing_blobs_remain_pending() {
+        let profile = unique_dir("uri-pending");
+        let store = Store::open(&profile).unwrap();
+        let large = Uuid::now_v7();
+        let missing = Uuid::now_v7();
+        for id in [large, missing] {
+            let clip = sample_clip(id, "", "untouched", 19);
+            store.insert_metadata_capture(&clip).unwrap();
+        }
+        store.lock().execute("INSERT INTO clip_payloads(clip_id,mime,data) VALUES(?1,'text/uri-list',zeroblob(?2))", rusqlite::params![large.to_string(), (crate::uri_search::URI_PAYLOAD_LIMIT + 1) as i64]).unwrap();
+        store.lock().execute("INSERT INTO clip_payloads(clip_id,mime,external,blob_key) VALUES(?1,'text/uri-list',1,'missing')", [missing.to_string()]).unwrap();
+        for _ in 0..6 {
+            store.maintain_uri_search().unwrap();
+        }
+        assert!(store.uri_search_incomplete());
+        assert_eq!(
+            store
+                .lock()
+                .query_row("SELECT count(*) FROM uri_search", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT count(*) FROM clips WHERE search_text='untouched'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(profile);
+    }
 
     #[test]
     fn bounded_read_counts_consumed_bytes() {

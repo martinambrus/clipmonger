@@ -18,6 +18,7 @@ pub(crate) enum TextColumn {
     Id,
     Mime,
     ContentHash,
+    UriNames,
 }
 
 impl TextColumn {
@@ -28,11 +29,13 @@ impl TextColumn {
             Self::Id => "id",
             Self::Mime => "mime",
             Self::ContentHash => "content_hash",
+            Self::UriNames => "names",
         }
     }
     fn table(self) -> &'static str {
         match self {
             Self::Mime => "clip_payloads",
+            Self::UriNames => "uri_search",
             _ => "clips",
         }
     }
@@ -43,6 +46,7 @@ impl TextColumn {
             Self::Id => "SELECT typeof(id) FROM main.clips WHERE rowid = ?1",
             Self::Mime => "SELECT typeof(mime) FROM main.clip_payloads WHERE rowid = ?1",
             Self::ContentHash => "SELECT typeof(content_hash) FROM main.clips WHERE rowid = ?1",
+            Self::UriNames => "SELECT typeof(names) FROM main.uri_search WHERE rowid = ?1",
         }
     }
 }

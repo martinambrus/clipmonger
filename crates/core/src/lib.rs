@@ -11,6 +11,7 @@ pub mod runtime_log;
 mod sql_text_stream;
 pub mod store;
 pub(crate) mod substring_matcher;
+pub mod uri_search;
 
 pub use config::{AppPaths, Config, PasteDelivery};
 pub use error::{BackendKind, CoreError};

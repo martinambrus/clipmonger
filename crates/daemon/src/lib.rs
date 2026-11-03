@@ -1521,6 +1521,13 @@ fn store_payloads(
     let preview = text
         .as_deref()
         .map(|t| t.chars().take(200).collect::<String>())
+        .or_else(|| {
+            payloads
+                .iter()
+                .find(|(mime, _)| mime == "text/uri-list")
+                .and_then(|(_, bytes)| clipmonger_core::uri_search::basenames(bytes).ok())
+                .map(|names| names.chars().take(200).collect())
+        })
         .unwrap_or_default();
     let formats: Vec<String> = payloads.iter().map(|(mime, _)| mime.clone()).collect();
     let bytes_total: u64 = payloads.iter().map(|(_, bytes)| bytes.len() as u64).sum();
@@ -1761,6 +1768,7 @@ impl CompactMaintenance {
                             std::time::Duration::from_secs(2),
                             std::sync::Arc::clone(&stop),
                         );
+                        let _ = store.maintain_uri_search();
                     }
                 }
                 drop(state);
@@ -2596,6 +2604,7 @@ impl DaemonState {
                 done: chunk.done,
                 bytes_read: chunk.bytes_read,
                 candidates: chunk.candidates,
+                uri_search_incomplete: chunk.uri_search_incomplete || store.uri_search_incomplete(),
             };
             serde_json::to_value(result)
                 .map_err(|_| IpcError::new("backend", "compact serialization failed".into()))
@@ -4064,6 +4073,40 @@ mod tests {
     }
 
     #[test]
+    fn uri_capture_preserves_plain_text_and_labels_file_only() {
+        let (dir, state) = fresh_state("uri-capture");
+        let guard = state.store.read().unwrap();
+        let store = guard.as_ref().unwrap();
+        let uri = (
+            "text/uri-list".to_string(),
+            b"file:///tmp/caf%C3%A9.txt".to_vec(),
+        );
+        let (result, error) = super::store_payloads(store, "test", false, &[uri.clone()], 1);
+        assert!(matches!(result, super::StoreDecision::Stored));
+        assert!(error.is_none());
+        assert_eq!(
+            store.list_history(10, 0, false).unwrap()[0].preview,
+            "café.txt"
+        );
+        let (result, error) = super::store_payloads(
+            store,
+            "test",
+            false,
+            &[("text/plain".into(), b"plain".to_vec()), uri],
+            2,
+        );
+        assert!(matches!(result, super::StoreDecision::Stored));
+        assert!(error.is_none());
+        let rows = store.list_history(10, 0, false).unwrap();
+        assert!(rows
+            .iter()
+            .any(|row| row.preview == "plain" && row.search_text == "plain"));
+        drop(guard);
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn compact_maintenance_prepares_replaced_store_and_joins() {
         let (dir, state) = fresh_state("compact-maintenance");
         let state = std::sync::Arc::new(state);
@@ -4091,8 +4134,41 @@ mod tests {
         wait_for_index(&state);
         let replacement_dir = dir.join("replacement");
         let replacement = clipmonger_core::Store::open(&replacement_dir).unwrap();
+        let (decision, failure) = super::store_payloads(
+            &replacement,
+            "test",
+            false,
+            &[("text/uri-list".into(), b"file:///restored.txt".to_vec())],
+            3,
+        );
+        assert!(matches!(decision, super::StoreDecision::Stored));
+        assert!(failure.is_none());
+        let connection =
+            rusqlite::Connection::open(replacement_dir.join("clipstore.sqlite3")).unwrap();
+        connection.execute("DELETE FROM uri_search", []).unwrap();
+        drop(connection);
         *state.store.write().unwrap() = Some(replacement);
         wait_for_index(&state);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let connection =
+                rusqlite::Connection::open(replacement_dir.join("clipstore.sqlite3")).unwrap();
+            let count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM uri_search WHERE names='restored.txt'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if count == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replacement was not indexed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         drop(worker);
         drop(state);
         let _ = std::fs::remove_dir_all(dir);

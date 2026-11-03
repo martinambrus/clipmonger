@@ -74,6 +74,11 @@ pub struct HistoryCompactResult {
     pub done: bool,
     pub bytes_read: usize,
     pub candidates: usize,
+    #[serde(default = "uri_search_unknown")]
+    pub uri_search_incomplete: bool,
+}
+fn uri_search_unknown() -> bool {
+    true
 }
 /// Cancel a session's current query cursor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

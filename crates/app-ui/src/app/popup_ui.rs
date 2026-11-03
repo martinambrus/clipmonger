@@ -445,6 +445,9 @@ impl PopupApp {
                     });
             } else {
                 let count = self.vm.visible().len();
+                if self.compact.uri_search_incomplete {
+                    ui.label(strings::text("popup.file_search_incomplete"));
+                }
                 if self.compact.loading {
                     ui.label(strings::text("popup.loading"));
                 } else if self.compact.error {

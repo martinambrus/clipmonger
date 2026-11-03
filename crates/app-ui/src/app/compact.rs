@@ -19,6 +19,7 @@ pub(super) struct Compact {
     pub done: bool,
     pub error: bool,
     pub error_code: Option<String>,
+    pub uri_search_incomplete: bool,
 }
 impl Compact {
     pub fn new() -> Self {
@@ -36,6 +37,7 @@ impl Compact {
             done: false,
             error: false,
             error_code: None,
+            uri_search_incomplete: true,
         }
     }
     fn cancel(&self, cursor: String, query: String, generation: u64) -> Option<UiCmd> {
@@ -196,6 +198,7 @@ impl Compact {
             );
         };
         self.cursor = parsed.cursor;
+        self.uri_search_incomplete = parsed.uri_search_incomplete;
         self.done = parsed.done;
         self.loading = rows.is_empty() && !self.done;
         self.wanted = self.loading;
