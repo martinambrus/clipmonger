@@ -19,6 +19,9 @@ use crate::hash::content_hash;
 use crate::model::{Clip, PermanentClip, PermanentKind, Rev};
 use crate::policy::{self, DedupeCandidate, Limits};
 
+#[path = "compact_index.rs"]
+mod compact_index;
+
 #[path = "compact_registry.rs"]
 pub(crate) mod compact_registry;
 
