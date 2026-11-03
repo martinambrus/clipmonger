@@ -1,5 +1,6 @@
 //! Raw Win32 helpers: the primary unsafe FFI boundary. Additional direct
-//! calls in `elevated_task`, `helper`, and `hotkeys` have function-scoped allowances.
+//! calls in `helper` and `hotkeys` have function-scoped allowances. Task
+//! registration and consent FFI are contained in this module.
 //! Every unsafe operation requires its caller to uphold the documented contract.
 #![allow(unsafe_code)]
 
@@ -1577,6 +1578,1051 @@ mod popup_activation_controls {
                 (result, trace.into_inner().join(" ")),
                 (expected, calls.to_string())
             );
+        }
+    }
+}
+
+// Keep the actual native open specification available to host regression controls.
+#[cfg(any(windows, test))]
+mod installed_pin {
+    pub(super) struct OpenSpec {
+        pub access: u32,
+        pub share: u32,
+        pub disposition: u32,
+        pub flags: u32,
+    }
+
+    pub(super) const OPEN: OpenSpec = OpenSpec {
+        // FILE_READ_DATA / FILE_LIST_DIRECTORY (both 1) makes sharing checks
+        // participate; FILE_READ_ATTRIBUTES | READ_CONTROL alone does not.
+        access: 0x0001 | 0x0080 | 0x0002_0000,
+        share: 0x0001,                    // FILE_SHARE_READ only
+        disposition: 3,                   // OPEN_EXISTING
+        flags: 0x0200_0000 | 0x0020_0000, // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+    };
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn pin_open_requires_data_access_and_denies_write_delete_sharing() {
+            let spec = &super::OPEN;
+            assert_ne!(spec.access & 1, 0, "pin must request data/list access");
+            assert_eq!(spec.access, 0x0002_0081);
+            assert_eq!(spec.share, 1, "only read sharing is permitted");
+            assert_eq!(spec.share & (2 | 4), 0);
+            assert_eq!(spec.disposition, 3);
+            assert_eq!(spec.flags, 0x0220_0000);
+        }
+    }
+}
+
+/// Native boundary for persistent helper registration. No caller supplies task XML or commands.
+#[cfg(windows)]
+pub(crate) mod task {
+    use super::{last_error, to_wide};
+    use crate::elevated_task::{self, InstallTaskArgs, RegistrarExit, TaskSnapshot};
+    use std::ffi::c_void;
+    use std::path::{Path, PathBuf};
+    use windows::core::{Interface, BSTR};
+    use windows::Win32::Foundation::VARIANT_BOOL;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::System::TaskScheduler::{
+        IExecAction, ILogonTrigger, IRegisteredTask, ITaskDefinition, ITaskFolder, ITaskService,
+        TaskScheduler, TASK_ACTION_EXEC, TASK_ACTION_TYPE, TASK_CREATE_OR_UPDATE,
+        TASK_DONT_ADD_PRINCIPAL_ACE, TASK_INSTANCES_POLICY, TASK_LOGON_INTERACTIVE_TOKEN,
+        TASK_LOGON_TYPE, TASK_RUNLEVEL_HIGHEST, TASK_RUNLEVEL_TYPE, TASK_TRIGGER_LOGON,
+        TASK_TRIGGER_TYPE2,
+    };
+    use windows::Win32::System::Variant::VARIANT;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, LocalFree, ERROR_CANCELLED, HANDLE, INVALID_HANDLE_VALUE,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        GetSecurityInfo, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        AccessCheck, DuplicateToken, GetAce, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation,
+        IsTokenRestricted, MapGenericMask, SecurityImpersonation, TokenElevation,
+        TokenIntegrityLevel, TokenIsAppContainer, TokenLinkedToken, TokenUser, ACCESS_ALLOWED_ACE,
+        ACE_HEADER, DACL_SECURITY_INFORMATION, GENERIC_MAPPING, GROUP_SECURITY_INFORMATION,
+        INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SE_DACL_PROTECTED, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE, TOKEN_ELEVATION,
+        TOKEN_INFORMATION_CLASS, TOKEN_LINKED_TOKEN, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, SYNCHRONIZE,
+        VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
+        QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    const NAME: &str = "ClipmongerHelper";
+    const MUTATE: u32 = DELETE | WRITE_DAC | WRITE_OWNER;
+    const SECURITY_PARTS: u32 =
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+
+    struct Handle(HANDLE);
+    impl Handle {
+        fn new(raw: HANDLE) -> Result<Self, String> {
+            if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+                Err(last_error())
+            } else {
+                Ok(Self(raw))
+            }
+        }
+    }
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            // Safety: this wrapper owns exactly one real, valid handle.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn pin_component(path: &Path) -> Result<Handle, std::io::Error> {
+        let wide = wide_path(path).map_err(std::io::Error::other)?;
+        let spec = &super::installed_pin::OPEN;
+        // Safety: data/list and metadata/security access, no write/delete sharing;
+        // the returned owned handle keeps this reservation until Drop.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                spec.access,
+                spec.share,
+                std::ptr::null(),
+                spec.disposition,
+                spec.flags,
+                std::ptr::null_mut(),
+            )
+        };
+        if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(Handle(raw))
+        }
+    }
+
+    struct LocalMemory(*mut c_void);
+    impl Drop for LocalMemory {
+        fn drop(&mut self) {
+            // Safety: allocated by the Win32 local allocator, owned exactly once.
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+
+    fn win_ok(ok: i32) -> Result<(), String> {
+        if ok == 0 {
+            Err(last_error())
+        } else {
+            Ok(())
+        }
+    }
+    fn native<T>(result: windows::core::Result<T>) -> Result<T, String> {
+        result.map_err(|e| e.to_string())
+    }
+    fn wide_path(path: &Path) -> Result<Vec<u16>, String> {
+        Ok(to_wide(elevated_task::path_text(path)?))
+    }
+    fn bstr(value: &BSTR) -> Result<String, String> {
+        let text = String::from_utf16(value).map_err(|_| "non-Unicode scheduler property")?;
+        if text.contains('\0') {
+            return Err("NUL in scheduler property".into());
+        }
+        Ok(text)
+    }
+    fn sid_text(sid: PSID) -> Result<String, String> {
+        let mut pointer = std::ptr::null_mut();
+        // Safety: caller provides a SID from a validated OS security descriptor/token.
+        win_ok(unsafe { ConvertSidToStringSidW(sid, &raw mut pointer) })?;
+        let _memory = LocalMemory(pointer.cast());
+        let mut length = 0;
+        // Safety: successful conversion returns an allocated, NUL-terminated UTF-16 buffer.
+        unsafe {
+            while *pointer.add(length) != 0 {
+                length += 1;
+            }
+        }
+        // Safety: length was bounded by the returned SID string terminator.
+        String::from_utf16(unsafe { std::slice::from_raw_parts(pointer, length) })
+            .map_err(|_| "non-Unicode SID".into())
+    }
+    fn process_token(process: HANDLE) -> Result<Handle, String> {
+        let mut token = std::ptr::null_mut();
+        // Safety: valid process handle and initialized out-pointer; the returned token is owned.
+        win_ok(unsafe {
+            OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &raw mut token)
+        })?;
+        Handle::new(token)
+    }
+    fn token_value<T: Default>(
+        token: &Handle,
+        class: TOKEN_INFORMATION_CLASS,
+    ) -> Result<T, String> {
+        let mut value = T::default();
+        let mut size = 0;
+        // Safety: class-specific callers select T to match the documented output structure.
+        win_ok(unsafe {
+            GetTokenInformation(
+                token.0,
+                class,
+                (&raw mut value).cast(),
+                u32::try_from(std::mem::size_of::<T>()).map_err(|_| "token size")?,
+                &raw mut size,
+            )
+        })?;
+        Ok(value)
+    }
+    fn token_sid(token: &Handle) -> Result<String, String> {
+        token_sid_class(token, TokenUser)
+    }
+    fn token_sid_class(token: &Handle, class: TOKEN_INFORMATION_CLASS) -> Result<String, String> {
+        let mut length = 0;
+        // Safety: zero-sized first call obtains the required buffer size.
+        unsafe {
+            GetTokenInformation(token.0, class, std::ptr::null_mut(), 0, &raw mut length);
+        }
+        if length == 0 {
+            return Err(last_error());
+        }
+        let mut buffer = vec![0usize; (length as usize).div_ceil(std::mem::size_of::<usize>())];
+        // Safety: aligned buffer has at least the requested size; its SID lives through conversion.
+        win_ok(unsafe {
+            GetTokenInformation(
+                token.0,
+                class,
+                buffer.as_mut_ptr().cast(),
+                length,
+                &raw mut length,
+            )
+        })?;
+        // Safety: TokenUser and TokenIntegrityLevel both start with SID_AND_ATTRIBUTES in the aligned buffer.
+        sid_text(unsafe { (*(buffer.as_ptr().cast::<SID_AND_ATTRIBUTES>())).Sid })
+    }
+    fn medium_token(token: &Handle) -> Result<(), String> {
+        let integrity = token_sid_class(token, TokenIntegrityLevel)?;
+        let level = integrity
+            .strip_prefix("S-1-16-")
+            .and_then(|level| level.parse::<u32>().ok());
+        if !level.is_some_and(|level| (0x2000..0x3000).contains(&level))
+            || token_value::<TOKEN_ELEVATION>(token, TokenElevation)?.TokenIsElevated != 0
+            || token_value::<u32>(token, TokenIsAppContainer)? != 0
+            // Safety: query the still-owned token; no impersonation or mutation.
+            || unsafe { IsTokenRestricted(token.0) } != 0
+        {
+            return Err(
+                "requester must be the original unrestricted medium-integrity daemon".into(),
+            );
+        }
+        Ok(())
+    }
+    fn impersonation_token(token: &Handle) -> Result<Handle, String> {
+        let mut raw = std::ptr::null_mut();
+        // Safety: duplicate the pinned requester token solely for AccessCheck, never impersonate it.
+        win_ok(unsafe { DuplicateToken(token.0, SecurityImpersonation, &raw mut raw) })?;
+        Handle::new(raw)
+    }
+    fn owner(sd: PSECURITY_DESCRIPTOR) -> Result<String, String> {
+        let mut sid = std::ptr::null_mut();
+        let mut defaulted = 0;
+        // Safety: sd is a valid descriptor returned by GetSecurityInfo or SDDL conversion.
+        win_ok(unsafe { GetSecurityDescriptorOwner(sd, &raw mut sid, &raw mut defaulted) })?;
+        sid_text(sid)
+    }
+    fn granted_access(sd: PSECURITY_DESCRIPTOR, token: &Handle) -> Result<u32, String> {
+        let mapping = GENERIC_MAPPING {
+            GenericRead: FILE_GENERIC_READ,
+            GenericWrite: FILE_GENERIC_WRITE,
+            GenericExecute: FILE_GENERIC_EXECUTE,
+            GenericAll: FILE_ALL_ACCESS,
+        };
+        let mut privileges = [0u64; 128];
+        let mut length = u32::try_from(std::mem::size_of_val(&privileges))
+            .map_err(|_| "privilege buffer size")?;
+        let mut granted = 0;
+        let mut status = 0;
+        // Safety: valid descriptor, impersonation token, generic mapping, aligned writable privilege buffer and outputs.
+        win_ok(unsafe {
+            AccessCheck(
+                sd,
+                token.0,
+                0x0200_0000,
+                &raw const mapping,
+                privileges.as_mut_ptr().cast(),
+                &raw mut length,
+                &raw mut granted,
+                &raw mut status,
+            )
+        })?;
+        if status == 0 {
+            return Err("effective access query denied".into());
+        }
+        Ok(granted)
+    }
+    fn allowed_writes(sd: PSECURITY_DESCRIPTOR) -> Result<Vec<(String, u32)>, String> {
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut acl = std::ptr::null_mut();
+        // Safety: valid pinned object's descriptor and initialized DACL outputs.
+        win_ok(unsafe {
+            GetSecurityDescriptorDacl(sd, &raw mut present, &raw mut acl, &raw mut defaulted)
+        })?;
+        if present == 0 || acl.is_null() {
+            return Err("installed object has no DACL".into());
+        }
+        let mut grants = Vec::new();
+        // Safety: ACL belongs to the still-owned valid descriptor.
+        for index in 0..u32::from(unsafe { (*acl).AceCount }) {
+            let mut pointer = std::ptr::null_mut();
+            // Safety: index is in the valid ACL's advertised range.
+            win_ok(unsafe { GetAce(acl, index, &raw mut pointer) })?;
+            // Safety: GetAce returns a valid ACE header.
+            let header = unsafe { &*pointer.cast::<ACE_HEADER>() };
+            if u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0 || header.AceType == 1 {
+                continue;
+            }
+            if header.AceType != 0
+                || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+            {
+                return Err("unsupported installed permission entry".into());
+            }
+            // Safety: the checked ACE is a plain allow entry containing a mask and valid SID.
+            let ace = unsafe { &*pointer.cast::<ACCESS_ALLOWED_ACE>() };
+            let mut mask = ace.Mask;
+            let mapping = GENERIC_MAPPING {
+                GenericRead: FILE_GENERIC_READ,
+                GenericWrite: FILE_GENERIC_WRITE,
+                GenericExecute: FILE_GENERIC_EXECUTE,
+                GenericAll: FILE_ALL_ACCESS,
+            };
+            // Safety: initialized access mask and immutable file-rights mapping.
+            unsafe {
+                MapGenericMask(&raw mut mask, &raw const mapping);
+            }
+            grants.push((sid_text((&raw const ace.SidStart).cast_mut().cast())?, mask));
+        }
+        Ok(grants)
+    }
+    fn descriptor(handle: &Handle) -> Result<LocalMemory, String> {
+        let mut sd = std::ptr::null_mut();
+        // Safety: query the descriptor of the pinned object, not a separately reopened path.
+        let status = unsafe {
+            GetSecurityInfo(
+                handle.0,
+                SE_FILE_OBJECT,
+                SECURITY_PARTS,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut sd,
+            )
+        };
+        if status != 0 || sd.is_null() {
+            return Err(format!("file security query failed: {status}"));
+        }
+        Ok(LocalMemory(sd))
+    }
+    fn final_path(handle: &Handle) -> Result<PathBuf, String> {
+        let mut buffer = vec![0u16; 32768];
+        // Safety: valid pinned file/directory and a sized writable UTF-16 buffer.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(handle.0, buffer.as_mut_ptr(), 32768, VOLUME_NAME_DOS)
+        };
+        if length == 0 || length >= 32768 {
+            return Err(last_error());
+        }
+        let path = String::from_utf16(&buffer[..length as usize])
+            .map_err(|_| "non-Unicode installed path")?;
+        let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
+        Ok(PathBuf::from(path))
+    }
+
+    pub(crate) struct TrustedInstall {
+        pub path: PathBuf,
+        pub sid: String,
+        _pins: Vec<Handle>,
+    }
+    enum ProtectionError {
+        Unsafe(String),
+        Unknown(String),
+    }
+    impl From<String> for ProtectionError {
+        fn from(error: String) -> Self {
+            Self::Unknown(error)
+        }
+    }
+    impl From<ProtectionError> for String {
+        fn from(error: ProtectionError) -> Self {
+            match error {
+                ProtectionError::Unsafe(message) | ProtectionError::Unknown(message) => message,
+            }
+        }
+    }
+    fn protected_install(path: &Path, token: &Handle) -> Result<TrustedInstall, ProtectionError> {
+        let sid = token_sid(token)?;
+        let access_token = impersonation_token(token)?;
+        let input = elevated_task::path_text(path)?;
+        let input = input.strip_prefix(r"\\?\").unwrap_or(input);
+        if !elevated_task::valid_profile(input) {
+            return Err(ProtectionError::Unsafe("unsupported installed path".into()));
+        }
+        let path = PathBuf::from(input);
+        let program_files = super::program_files_dir();
+        elevated_task::path_text(&program_files)?;
+        if !crate::helper::protected_path_ok(&path, &program_files) {
+            return Err(ProtectionError::Unsafe(
+                "persistent helper requires a protected Program Files installation".into(),
+            ));
+        }
+        let ancestors: Vec<_> = path.ancestors().collect();
+        let mut pins = Vec::new();
+        for candidate in ancestors.iter().rev() {
+            // Ancestors remain pinned before descendants are opened. A conflicting
+            // writer/deleter, including a pre-existing handle, must fail closed.
+            let pin = pin_component(candidate).map_err(|error| error.to_string())?;
+            let mut info = BY_HANDLE_FILE_INFORMATION::default();
+            // Safety: valid file/directory handle and sized output.
+            win_ok(unsafe { GetFileInformationByHandle(pin.0, &raw mut info) })?;
+            elevated_task::verify_component_path(
+                candidate,
+                &final_path(&pin)?,
+                info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+            )
+            .map_err(ProtectionError::Unsafe)?;
+            let sd = descriptor(&pin)?;
+            if owner(sd.0)? == sid {
+                return Err(ProtectionError::Unsafe(
+                    "requester owns installed path and can reset its permissions".into(),
+                ));
+            }
+            let dangerous = if **candidate == path || Some(*candidate) == path.parent() {
+                MUTATE
+                    | FILE_WRITE_DATA
+                    | FILE_APPEND_DATA
+                    | FILE_WRITE_EA
+                    | FILE_WRITE_ATTRIBUTES
+                    | FILE_DELETE_CHILD
+            } else {
+                MUTATE | FILE_DELETE_CHILD
+            };
+            let grants = allowed_writes(sd.0)?;
+            if !elevated_task::installed_acl_writers_trusted(&owner(sd.0)?, &grants, dangerous)
+                || granted_access(sd.0, &access_token)? & dangerous != 0
+            {
+                return Err(ProtectionError::Unsafe(
+                    "requester can modify or replace installed path".into(),
+                ));
+            }
+            pins.push(pin);
+        }
+        Ok(TrustedInstall {
+            path,
+            sid,
+            _pins: pins,
+        })
+    }
+    pub(crate) fn trust_current() -> Result<TrustedInstall, String> {
+        // Safety: pseudo-handle is borrowed, never placed in an owning Handle.
+        let token = process_token(unsafe { GetCurrentProcess() })?;
+        medium_token(&token)?;
+        protected_install(&std::env::current_exe().map_err(|e| e.to_string())?, &token)
+            .map_err(String::from)
+    }
+    struct Requester {
+        process: Handle,
+        token: Handle,
+    }
+    impl Requester {
+        fn open(pid: u32) -> Result<Self, String> {
+            // Safety: request only query/synchronize access and keep this same process handle until registration completes.
+            let process = Handle::new(unsafe {
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid)
+            })?;
+            let token = process_token(process.0)?;
+            medium_token(&token)?;
+            let requester = Self { process, token };
+            requester.alive()?;
+            Ok(requester)
+        }
+        fn alive(&self) -> Result<(), String> {
+            // Safety: pinned process handle; zero timeout never blocks.
+            if unsafe { WaitForSingleObject(self.process.0, 0) } == WAIT_TIMEOUT {
+                Ok(())
+            } else {
+                Err("original requester has exited or cannot be queried".into())
+            }
+        }
+        fn image(&self) -> Result<PathBuf, String> {
+            let mut buffer = vec![0u16; 32768];
+            let mut size = 32768;
+            // Safety: same pinned process handle, sized output; no PID reopen/reuse race.
+            win_ok(unsafe {
+                QueryFullProcessImageNameW(self.process.0, 0, buffer.as_mut_ptr(), &raw mut size)
+            })?;
+            Ok(PathBuf::from(
+                String::from_utf16(&buffer[..size as usize])
+                    .map_err(|_| "non-Unicode requester image")?,
+            ))
+        }
+    }
+
+    struct ComApartment;
+    impl ComApartment {
+        fn new() -> Result<Self, String> {
+            // Safety: initialize this thread; S_OK/S_FALSE both require one balanced uninitialize, errors require none.
+            native(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok() })?;
+            Ok(Self)
+        }
+    }
+    impl Drop for ComApartment {
+        fn drop(&mut self) {
+            // Safety: exactly one successful initialization, after every local interface has dropped.
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
+    fn with_folder<T>(
+        operation: impl FnOnce(&ITaskFolder) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _apartment = ComApartment::new()?;
+        // Safety: initialized COM thread, fixed local scheduler class, no aggregation.
+        let service: ITaskService =
+            native(unsafe { CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER) })?;
+        let empty = VARIANT::default();
+        // Safety: empty variants select the local service and current security context.
+        native(unsafe { service.Connect(&empty, &empty, &empty, &empty) })?;
+        // Safety: fixed root scheduler folder.
+        let folder = native(unsafe { service.GetFolder(&BSTR::from("\\")) })?;
+        operation(&folder)
+    }
+    fn task_descriptor(sddl: &str, sid: Option<&str>) -> Result<bool, String> {
+        let wide = to_wide(sddl);
+        let mut raw = std::ptr::null_mut();
+        // Safety: validated Unicode input and descriptor out-pointer; LocalFree owns returned memory.
+        win_ok(unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                1,
+                &raw mut raw,
+                std::ptr::null_mut(),
+            )
+        })?;
+        let sd = LocalMemory(raw);
+        let mut control = 0;
+        let mut revision = 0;
+        // Safety: converted valid descriptor and initialized control/revision outputs.
+        win_ok(unsafe { GetSecurityDescriptorControl(sd.0, &raw mut control, &raw mut revision) })?;
+        if control & SE_DACL_PROTECTED == 0 {
+            return Ok(false);
+        }
+        if !matches!(owner(sd.0)?.as_str(), "S-1-5-18" | "S-1-5-32-544") {
+            return Ok(false);
+        }
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut acl = std::ptr::null_mut();
+        // Safety: converted valid descriptor and initialized outputs.
+        win_ok(unsafe {
+            GetSecurityDescriptorDacl(sd.0, &raw mut present, &raw mut acl, &raw mut defaulted)
+        })?;
+        if present == 0 || acl.is_null() {
+            return Ok(false);
+        }
+        // Safety: DACL is part of the still-owned valid descriptor.
+        if unsafe { (*acl).AceCount } != 3 {
+            return Ok(false);
+        }
+        let mut trustees = Vec::new();
+        for index in 0..3 {
+            let mut pointer = std::ptr::null_mut();
+            // Safety: index is within the validated ACL count.
+            win_ok(unsafe { GetAce(acl, index, &raw mut pointer) })?;
+            // Safety: pointer references an ACE header; reject every shape except a plain allow ACE.
+            let header = unsafe { &*pointer.cast::<ACE_HEADER>() };
+            if header.AceType != 0
+                || header.AceFlags != 0
+                || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+            {
+                return Ok(false);
+            }
+            // Safety: a plain allow ACE with sufficient size contains the documented mask and SID.
+            let ace = unsafe { &*pointer.cast::<ACCESS_ALLOWED_ACE>() };
+            let trustee = sid_text((&raw const ace.SidStart).cast_mut().cast())?;
+            let valid = if trustee == "S-1-5-18" || trustee == "S-1-5-32-544" {
+                ace.Mask == FILE_ALL_ACCESS || ace.Mask == 0x1000_0000
+            } else {
+                sid.is_none_or(|sid| trustee == sid)
+                    && (ace.Mask == 0xa000_0000
+                        || ace.Mask == (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE))
+            };
+            if !valid || trustees.contains(&trustee) {
+                return Ok(false);
+            }
+            trustees.push(trustee);
+        }
+        Ok(sid.is_none_or(|sid| trustees.iter().any(|s| s == sid))
+            && trustees.iter().any(|s| s == "S-1-5-18")
+            && trustees.iter().any(|s| s == "S-1-5-32-544"))
+    }
+    fn scheduler_descriptor(task: &IRegisteredTask) -> Result<String, String> {
+        // Safety: valid local scheduler interface; read owner/group/DACL as Unicode SDDL.
+        bstr(&native(unsafe {
+            task.GetSecurityDescriptor(i32::try_from(SECURITY_PARTS).map_err(|_| "security flags")?)
+        })?)
+    }
+    fn principal_snapshot(
+        definition: &ITaskDefinition,
+    ) -> Result<elevated_task::TaskPrincipal, String> {
+        // Safety: valid scheduler definition; every getter result is checked.
+        unsafe {
+            let principal = native(definition.Principal())?;
+            let mut user = BSTR::new();
+            let mut logon = TASK_LOGON_TYPE::default();
+            let mut level = TASK_RUNLEVEL_TYPE::default();
+            native(principal.UserId(&raw mut user))?;
+            native(principal.LogonType(&raw mut logon))?;
+            native(principal.RunLevel(&raw mut level))?;
+            Ok(elevated_task::TaskPrincipal {
+                sid: bstr(&user)?,
+                interactive: logon == TASK_LOGON_INTERACTIVE_TOKEN,
+                highest: level == TASK_RUNLEVEL_HIGHEST,
+            })
+        }
+    }
+    fn snapshot(task: &IRegisteredTask, _sid: &str) -> Result<TaskSnapshot, String> {
+        // Safety: live scheduler interface; every getter HRESULT is checked before inspecting its output.
+        unsafe {
+            let initial_descriptor = scheduler_descriptor(task)?;
+            // Establish a read/run-only administrative descriptor before trusting
+            // a definition from a task that may previously have been writable.
+            let initially_protected = task_descriptor(&initial_descriptor, None)?;
+            let definition = native(task.Definition())?;
+            let actions = native(definition.Actions())?;
+            let mut action_count = 0;
+            native(actions.Count(&raw mut action_count))?;
+            let mut command = BSTR::new();
+            let mut arguments = BSTR::new();
+            let mut directory = BSTR::new();
+            let mut exec_type = false;
+            if action_count == 1 {
+                let action = native(actions.get_Item(1))?;
+                let mut action_type = TASK_ACTION_TYPE::default();
+                native(action.Type(&raw mut action_type))?;
+                exec_type = action_type == TASK_ACTION_EXEC;
+                if exec_type {
+                    let exec: IExecAction = native(action.cast())?;
+                    native(exec.Path(&raw mut command))?;
+                    native(exec.Arguments(&raw mut arguments))?;
+                    native(exec.WorkingDirectory(&raw mut directory))?;
+                }
+            }
+            let principal = principal_snapshot(&definition)?;
+            let triggers = native(definition.Triggers())?;
+            let mut trigger_count = 0;
+            native(triggers.Count(&raw mut trigger_count))?;
+            let mut trigger_user = BSTR::new();
+            let mut trigger_logon = false;
+            let mut trigger_enabled = VARIANT_BOOL::default();
+            if trigger_count == 1 {
+                let trigger = native(triggers.get_Item(1))?;
+                let mut kind = TASK_TRIGGER_TYPE2::default();
+                native(trigger.Type(&raw mut kind))?;
+                trigger_logon = kind == TASK_TRIGGER_LOGON;
+                native(trigger.Enabled(&raw mut trigger_enabled))?;
+                if trigger_logon {
+                    let logon: ILogonTrigger = native(trigger.cast())?;
+                    native(logon.UserId(&raw mut trigger_user))?;
+                }
+            }
+            let settings = native(definition.Settings())?;
+            let mut disallow = VARIANT_BOOL::default();
+            let mut stop = VARIANT_BOOL::default();
+            let mut enabled = VARIANT_BOOL::default();
+            let mut limit = BSTR::new();
+            let mut policy = TASK_INSTANCES_POLICY::default();
+            let mut priority = 0;
+            native(settings.DisallowStartIfOnBatteries(&raw mut disallow))?;
+            native(settings.StopIfGoingOnBatteries(&raw mut stop))?;
+            native(settings.Enabled(&raw mut enabled))?;
+            native(settings.ExecutionTimeLimit(&raw mut limit))?;
+            native(settings.MultipleInstances(&raw mut policy))?;
+            native(settings.Priority(&raw mut priority))?;
+            let info = native(definition.RegistrationInfo())?;
+            let mut description = BSTR::new();
+            native(info.Description(&raw mut description))?;
+            let sddl = scheduler_descriptor(task)?;
+            if sddl != initial_descriptor {
+                return Err(
+                    "task descriptor changed during readback; definition is unknown".into(),
+                );
+            }
+            let descriptor_protected =
+                initially_protected && task_descriptor(&sddl, Some(&principal.sid))?;
+            Ok(TaskSnapshot {
+                action: elevated_task::TaskAction {
+                    command: bstr(&command)?,
+                    arguments: bstr(&arguments)?,
+                    working_directory: bstr(&directory)?,
+                    count: action_count,
+                    is_exec: exec_type,
+                },
+                principal,
+                trigger: elevated_task::TaskTrigger {
+                    count: trigger_count,
+                    sid: bstr(&trigger_user)?,
+                    is_logon: trigger_logon,
+                    enabled: trigger_enabled.as_bool(),
+                },
+                settings: elevated_task::TaskSettings {
+                    enabled: enabled.as_bool(),
+                    disallow_battery: disallow.as_bool(),
+                    stop_battery: stop.as_bool(),
+                    execution_time_limit: bstr(&limit)?,
+                    multiple_instances: policy.0,
+                    priority,
+                },
+                descriptor_protected,
+                description: bstr(&description)?,
+            })
+        }
+    }
+    pub(crate) fn read_snapshot(sid: &str) -> Result<TaskSnapshot, String> {
+        with_folder(|folder| {
+            // Safety: fixed task name on a connected local service.
+            let task = native(unsafe { folder.GetTask(&BSTR::from(NAME)) })?;
+            snapshot(&task, sid)
+        })
+    }
+    pub(crate) fn register(args: &InstallTaskArgs) -> Result<(), elevated_task::RegistrarError> {
+        // Safety: borrowed current-process pseudo-handle; only the separately opened token is owned.
+        let own_token = process_token(unsafe { GetCurrentProcess() })?;
+        if token_value::<TOKEN_ELEVATION>(&own_token, TokenElevation)?.TokenIsElevated == 0 {
+            return Err(elevated_task::RegistrarError::Other(
+                "helper registrar requires elevation".into(),
+            ));
+        }
+        let requester = Requester::open(args.requester_pid)?;
+        let requester_sid = token_sid(&requester.token)?;
+        elevated_task::verify_registrar_identity(
+            &args.requester_sid,
+            &requester_sid,
+            &token_sid(&own_token)?,
+        )?;
+        let trusted = protected_install(
+            &std::env::current_exe().map_err(|e| e.to_string())?,
+            &requester.token,
+        )
+        .map_err(String::from)?;
+        let peer_install =
+            protected_install(&requester.image()?, &requester.token).map_err(String::from)?;
+        if !elevated_task::path_text(&trusted.path)?
+            .eq_ignore_ascii_case(elevated_task::path_text(&peer_install.path)?)
+        {
+            return Err(elevated_task::RegistrarError::Other(
+                "requester executable differs from registrar".into(),
+            ));
+        }
+        let xml = elevated_task::task_definition(&trusted.path, &args.profile_dir, &requester_sid)?;
+        let sddl = format!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;{requester_sid})");
+        with_folder(|folder| {
+            requester.alive()?;
+            let empty = VARIANT::default();
+            // Safety: fixed XML built after elevation, verified token SID, empty password and SDDL in the actual final SDDL parameter.
+            let task = native(unsafe {
+                folder.RegisterTask(
+                    &BSTR::from(NAME),
+                    &BSTR::from(xml.as_str()),
+                    TASK_CREATE_OR_UPDATE.0 | TASK_DONT_ADD_PRINCIPAL_ACE.0,
+                    &VARIANT::from(BSTR::from(requester_sid.as_str())),
+                    &empty,
+                    TASK_LOGON_INTERACTIVE_TOKEN,
+                    &VARIANT::from(BSTR::from(sddl.as_str())),
+                )
+            })?;
+            let expected =
+                elevated_task::expected_snapshot(&trusted.path, &args.profile_dir, &requester_sid)?;
+            if !elevated_task::snapshot_matches(&expected, &snapshot(&task, &requester_sid)?) {
+                return Err("registered task security/action readback mismatch".into());
+            }
+            requester.alive()?;
+            Ok(())
+        })
+        .map_err(Into::into)
+    }
+    pub(crate) fn launch(exe: &Path, arguments: &str) -> RegistrarExit {
+        use windows_sys::Win32::UI::Shell::{
+            ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+        let Ok(file) = wide_path(exe) else {
+            return RegistrarExit::LaunchFailed;
+        };
+        let verb = to_wide("runas");
+        let arguments = to_wide(arguments);
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: u32::try_from(std::mem::size_of::<SHELLEXECUTEINFOW>()).unwrap_or(u32::MAX),
+            fMask: SEE_MASK_NOCLOSEPROCESS,
+            lpVerb: verb.as_ptr(),
+            lpFile: file.as_ptr(),
+            lpParameters: arguments.as_ptr(),
+            nShow: SW_HIDE,
+            ..Default::default()
+        };
+        // Safety: stable NUL-terminated inputs, initialized structure and requested owned process handle.
+        let launched = unsafe { ShellExecuteExW(&raw mut info) };
+        // Safety: capture the launch error before owning/closing any returned handle.
+        let launch_error = if launched == 0 {
+            unsafe { GetLastError() }
+        } else {
+            0
+        };
+        let handle = Handle::new(info.hProcess);
+        if launched == 0 {
+            return if launch_error == ERROR_CANCELLED {
+                RegistrarExit::Cancelled
+            } else {
+                RegistrarExit::LaunchFailed
+            };
+        }
+        let Ok(handle) = handle else {
+            return RegistrarExit::MissingHandle;
+        };
+        // Safety: owned process handle, bounded wait. The handle closes on every outcome.
+        match unsafe { WaitForSingleObject(handle.0, 30_000) } {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => return RegistrarExit::Timeout,
+            _ => return RegistrarExit::WaitFailed,
+        }
+        let mut exit = 0;
+        // Safety: live process handle with query rights and initialized output.
+        if unsafe { GetExitCodeProcess(handle.0, &raw mut exit) } == 0 {
+            return RegistrarExit::ExitQueryFailed;
+        }
+        RegistrarExit::Exited(exit)
+    }
+    pub(crate) fn cleanup(is_safe: fn(&TaskSnapshot, bool) -> bool) -> Result<(), String> {
+        // Safety: borrowed current-process pseudo-handle; owned token below.
+        let token = process_token(unsafe { GetCurrentProcess() })?;
+        if token_value::<TOKEN_ELEVATION>(&token, TokenElevation)?.TokenIsElevated == 0 {
+            return Err("cleanup requires elevation".into());
+        }
+        // Effective protection is evaluated against the linked original medium token.
+        let linked =
+            Handle::new(token_value::<TOKEN_LINKED_TOKEN>(&token, TokenLinkedToken)?.LinkedToken)?;
+        medium_token(&linked)?;
+        let sid = token_sid(&linked)?;
+        with_folder(|folder| {
+            // Safety: fixed local task name. Missing tasks are normal; every other query failure is reported.
+            let task = match unsafe { folder.GetTask(&BSTR::from(NAME)) } {
+                Ok(task) => task,
+                Err(e) if e.code().0 == -2_147_024_894 => return Ok(()),
+                Err(e) => return Err(e.to_string()),
+            };
+            let actual = snapshot(&task, &sid)?;
+            let program_files = super::program_files_dir();
+            if program_files.as_os_str().is_empty() {
+                return Err("legacy protection unknown: Program Files unavailable".into());
+            }
+            elevated_task::path_text(&program_files)?;
+            let structurally_valid = is_safe(&actual, true);
+            let installed =
+                crate::helper::protected_path_ok(Path::new(&actual.action.command), &program_files);
+            if structurally_valid && installed && actual.principal.sid != sid {
+                return Err(
+                    "cannot evaluate legacy protection for another account; task preserved".into(),
+                );
+            }
+            let protection = if structurally_valid && installed {
+                protected_install(Path::new(&actual.action.command), &linked)
+            } else {
+                Err(ProtectionError::Unsafe(
+                    "invalid legacy action, settings or descriptor".into(),
+                ))
+            };
+            let protected = match &protection {
+                Ok(_) => true,
+                Err(ProtectionError::Unsafe(_)) => false,
+                Err(ProtectionError::Unknown(message)) => {
+                    return Err(format!(
+                        "legacy protection unknown; task preserved: {message}"
+                    ));
+                }
+            };
+            if !is_safe(&actual, protected) {
+                // Safety: explicitly classified unsafe task, fixed name; no path/PATH executable resolution.
+                native(unsafe { folder.DeleteTask(&BSTR::from(NAME), 0) })?;
+            }
+            Ok(())
+        })
+    }
+    pub(crate) fn run() -> Result<(), String> {
+        with_folder(|folder| {
+            // Safety: fixed local task and empty optional runtime parameters.
+            let task = native(unsafe { folder.GetTask(&BSTR::from(NAME)) })?;
+            native(unsafe { task.Run(&VARIANT::default()) })?;
+            Ok(())
+        })
+    }
+    pub(crate) fn delete() -> Result<(), String> {
+        with_folder(|folder| {
+            // Safety: fixed local task name, no shell or executable lookup.
+            native(unsafe { folder.DeleteTask(&BSTR::from(NAME), 0) })
+        })
+    }
+    pub(crate) fn prompt(installed: bool) -> bool {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, MB_DEFBUTTON2, MB_ICONQUESTION, MB_SETFOREGROUND, MB_SYSTEMMODAL,
+            MB_TOPMOST, MB_YESNO,
+        };
+        let text = if installed {
+            "Enable Clipmonger in admin windows?\n\nYes = one-time Windows UAC prompt to install the admin helper; it then starts silently at logon.\nNo = ask again next time Clipmonger starts."
+        } else {
+            "Enable Clipmonger in admin windows?\n\nYes = Windows UAC prompt to start the admin helper until Clipmonger exits (portable mode: nothing is installed).\nNo = ask again next time Clipmonger starts."
+        };
+        let text = to_wide(text);
+        let caption = to_wide("Clipmonger");
+        // Safety: fixed NUL-terminated message strings, no owner window; return IDYES only.
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                caption.as_ptr(),
+                MB_YESNO
+                    | MB_DEFBUTTON2
+                    | MB_ICONQUESTION
+                    | MB_SYSTEMMODAL
+                    | MB_SETFOREGROUND
+                    | MB_TOPMOST,
+            ) == 6
+        }
+    }
+
+    #[cfg(test)]
+    mod pin_tests {
+        use super::{pin_component, wide_path, Handle};
+        use std::path::{Path, PathBuf};
+        use windows_sys::Win32::Foundation::{ERROR_SHARING_VIOLATION, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, OPEN_EXISTING, READ_CONTROL,
+        };
+
+        struct Fixture {
+            directory: PathBuf,
+            file: PathBuf,
+        }
+        impl Fixture {
+            fn new() -> Self {
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos();
+                let directory = std::env::temp_dir()
+                    .join(format!("clipmonger-pin-{}-{nonce}", std::process::id()));
+                // Exclusive creation establishes ownership; never reuse an existing tree.
+                std::fs::create_dir(&directory).expect("exclusive fixture directory");
+                let file = directory.join("component.exe");
+                let fixture = Self { directory, file };
+                drop(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&fixture.file)
+                        .expect("exclusive fixture file"),
+                );
+                fixture
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // Only the two objects exclusively created by this fixture.
+                let _ = std::fs::remove_file(&self.file);
+                let _ = std::fs::remove_dir(&self.directory);
+            }
+        }
+
+        fn mutation_handle(path: &Path, access: u32) -> Result<Handle, std::io::Error> {
+            let wide = wide_path(path).map_err(std::io::Error::other)?;
+            // Safety: open only this owned fixture, with no write or delete-on-close
+            // operation. Share all access so rejection must come from the held pin.
+            let raw = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    access,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut(),
+                )
+            };
+            if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(Handle(raw))
+            }
+        }
+
+        #[test]
+        fn synthetic_file_and_directory_pins_exclude_write_delete_until_drop() {
+            let spec = &super::super::installed_pin::OPEN;
+            assert_eq!(FILE_READ_DATA, FILE_LIST_DIRECTORY);
+            assert_eq!(
+                spec.access,
+                FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL
+            );
+            assert_eq!(spec.share, FILE_SHARE_READ);
+            assert_eq!(spec.disposition, OPEN_EXISTING);
+            assert_eq!(
+                spec.flags,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+            );
+
+            let fixture = Fixture::new();
+            for path in [&fixture.file, &fixture.directory] {
+                for access in [FILE_WRITE_DATA, DELETE] {
+                    let existing = mutation_handle(path, access)
+                        .expect("fixture mutation access must succeed before pin");
+                    let error = pin_component(path)
+                        .err()
+                        .expect("existing mutation must block pin");
+                    assert_eq!(
+                        error.raw_os_error(),
+                        Some(ERROR_SHARING_VIOLATION.cast_signed())
+                    );
+                    drop(existing);
+                }
+                let pin = pin_component(path).expect("pin owned fixture");
+                for access in [FILE_WRITE_DATA, DELETE] {
+                    let error = mutation_handle(path, access)
+                        .err()
+                        .expect("pin must block mutation access");
+                    assert_eq!(
+                        error.raw_os_error(),
+                        Some(ERROR_SHARING_VIOLATION.cast_signed())
+                    );
+                }
+                drop(pin);
+                for access in [FILE_WRITE_DATA, DELETE] {
+                    drop(mutation_handle(path, access).expect("Drop must release sharing pin"));
+                }
+            }
         }
     }
 }
