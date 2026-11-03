@@ -2,30 +2,32 @@
 
 ## Current implementation (2026-11-03)
 
-- One egui UI uses the owned CPU runner on Windows, X11 and Wayland
-  ([ADR-005](adr-005-cpu-renderer.md)). The eframe/glow and separate Win32
-  fallback are retired. No GPU renderer is required.
-- Source includes image/file-list storage and retention, bounded previews and
-  lazy file metadata, permanent hotkeys, capture recovery and oversized stubs,
-  bounded Windows popup activation, Linux activation metadata, Windows capture
-  preferences and daemon self-write suppression.
-- Backup/restore preserves raw config bytes with checksum and rollback checks;
-  storage verifies reused blobs and reports actual ingestion failures.
-- Software gates include Linux tests and Windows GNU compile/lint checks.
-  Native current-runner tray/focus/DPI/remote-display/multi-monitor behavior,
-  physical Scroll Lock, clipboard owner/sequence/opt-out/restore behavior,
-  and Linux compositor, portal and GNOME integration remain QA.
-- Autostart source is wired; Windows logon/reboot acceptance remains pending.
-  Elevated-task and failed-paste hardening are separate drafts awaiting gates;
-  this update does not mark them shipped.
-- Packaging, optional profile deletion, real artifact acceptance, Linux
-  blur-derived protocol licensing clearance and native install/uninstall checks
-  remain open. No release is published by this documentation update.
-- T-905 through T-908 must be repeated against the CPU runner. Earlier dated
-  fallback and GPU-path results retain their original scope.
-- GUI Rust 1.95 is required by the locked GUI dependencies; the foundation's
-  Rust 1.89 declaration is not the GUI compiler floor. GUI edition and license
-  values match the workspace.
+Start at [v1 continuation](v1-continuation.md) for exact candidate identity,
+software evidence, outstanding task IDs, test packet and the next-agent procedure.
+The recovered batch has 65 tasks: 53 completed and 12 partial. Phase 1 is
+implemented; Phase 7 packaging/QA and native acceptance remain open.
+
+- The single CPU-rendered egui runner (ADR-005) replaces eframe/glow and the
+  separate Win32 fallback. Settings has 29 rows; GUI builds require Rust 1.95
+  or newer for the locked dependencies.
+- The combined draft includes image/file-list storage, backup/restore safety,
+  capture/storage hardening, helper-registration and failed-paste fixes. Source
+  inclusion is not native acceptance or delivery to main.
+- Normal automated checks, GNOME tests, release builds and package payload checks
+  are recorded in the continuation. The additional performance results retain
+  their actual measurements and initial target; no timing miss is waived.
+- The user takes over Windows UI/clipboard/installer/UAC testing. Current CPU-runner
+  T-905 through T-908, capture fault paths, T-409 hardening and T-410 logon/reboot
+  need actual results. Historical dated passes remain scoped to their old builds.
+- Real Linux X11/Wayland/GNOME acceptance and blur-derived generated-protocol
+  licensing remain open. Artifact checks do not settle either boundary.
+- [Feature-to-test index](v1-qa-traceability.md) maps the v1 slices and explicit
+  evidence gaps. The wider release program still needs the 24-hour soak,
+  million-case fuzzing, coverage calibration, per-box caps goldens, applicable
+  integration matrix, signed manuals and the final release audit. Seven passing
+  software checks are not all seven release gates.
+- No tag or published release exists for this candidate. No remaining task is
+  completed merely by this documentation refresh.
 
 ## Historical implementation records
 
