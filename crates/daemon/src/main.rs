@@ -855,17 +855,19 @@ fn serve_jobs(pipe: fs::File) -> bool {
 /// Run one job: revalidate and pin the target, then inject.
 #[cfg(all(windows, feature = "backend-windows"))]
 fn run_helper_job(job: &clipmonger_backend_windows::helper::Job) -> Result<(), String> {
-    use clipmonger_backend_windows::helper::JobOp;
     use clipmonger_backend_windows::paste::{worker_press_paste_chord, worker_send_input_batch};
 
-    let pinned = clipmonger_backend_windows::helper::pin_helper_target(job)?;
-    match job.op {
-        JobOp::SendInputBatch => worker_send_input_batch(&job.payload),
-        JobOp::PasteChord => worker_press_paste_chord(),
-    }
-    .map_err(|detail| format!("inject failed: {detail}"))?;
-    drop(pinned);
-    Ok(())
+    clipmonger_backend_windows::helper::run_pinned_job(
+        job,
+        clipmonger_backend_windows::helper::pin_helper_target,
+        || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        },
+        worker_send_input_batch,
+        worker_press_paste_chord,
+    )
 }
 
 fn main() {

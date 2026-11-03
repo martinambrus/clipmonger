@@ -459,41 +459,44 @@ pub fn is_window(hwnd: HWND) -> bool {
     }
 }
 
-/// Make `hwnd` the foreground window: attach to the current foreground
-/// thread's input state for the duration of the call (so the request is
-/// honored without our own foreground rights), raise, activate, detach.
-/// Returns whether `hwnd` is the foreground window afterwards.
+/// Request foreground without joining another thread's input queue. Windows
+/// may complete a cross-thread request asynchronously, so confirm it with a
+/// bounded message before checking the foreground.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[cfg(windows)]
 pub fn activate_window(hwnd: HWND) -> bool {
-    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{BringWindowToTop, IsHungAppWindow};
-    // Safety: plain window-manager calls on handle values; a failed attach
-    // or activation only leaves the foreground unchanged.
-    #[cfg(windows)]
-    unsafe {
-        // Activating a hung window, or sharing input state with a hung
-        // foreground thread, can block this thread indefinitely.
-        if IsHungAppWindow(hwnd) != 0 {
-            return false;
-        }
-        let foreground = GetForegroundWindow();
-        let fg_thread = if foreground.is_null() || IsHungAppWindow(foreground) != 0 {
-            0
-        } else {
-            GetWindowThreadProcessId(foreground, std::ptr::null_mut())
-        };
-        let own_thread = GetCurrentThreadId();
-        let attached = fg_thread != 0
-            && fg_thread != own_thread
-            && AttachThreadInput(own_thread, fg_thread, 1) != 0;
-        BringWindowToTop(hwnd);
-        SetForegroundWindow(hwnd);
-        if attached {
-            AttachThreadInput(own_thread, fg_thread, 0);
-        }
-        GetForegroundWindow() == hwnd
-    }
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL,
+    };
+    activate_with(
+        || foreground_hwnd() == Some(hwnd),
+        // Safety: a handle value is passed to the window manager without
+        // attaching input queues.
+        || unsafe { SetForegroundWindow(hwnd) != 0 },
+        || {
+            // Safety: the result slot is valid; the message carries no pointers.
+            unsafe {
+                let thread = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
+                if thread == 0 {
+                    return false;
+                }
+                if thread == GetCurrentThreadId() {
+                    return true;
+                }
+                let mut result = 0;
+                SendMessageTimeoutW(
+                    hwnd,
+                    WM_NULL,
+                    0,
+                    0,
+                    SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                    100,
+                    &raw mut result,
+                ) != 0
+            }
+        },
+    )
 }
 
 /// Server process id of a connected named-pipe client handle, or `None`
@@ -522,37 +525,48 @@ pub fn foreground_window_id() -> Option<i64> {
     foreground_hwnd().map(|hwnd| hwnd as i64)
 }
 
-/// Show `hwnd` and make it the foreground window, but only when it belongs
-/// to `owner_pid` (the verified UI's popup). A hung window is left alone and
-/// a minimized one is restored. Returns whether it is in front afterwards.
+/// Request that the verified UI popup be shown and made foreground. Returns
+/// true only when foreground is observed, not merely when a request is queued.
 #[must_use]
 #[cfg(windows)]
 pub fn show_owned_window(hwnd: i64, owner_pid: u32) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        IsHungAppWindow, IsIconic, ShowWindow, SW_RESTORE, SW_SHOW,
+        IsIconic, IsWindowVisible, ShowWindowAsync, SW_RESTORE, SW_SHOW,
     };
-    // i64 handle round-trips through HWND on 64-bit Windows.
     let window = hwnd as HWND;
-    if window_pid(window) != Some(owner_pid) {
-        return false;
-    }
-    // Safety: plain window-manager calls on a window of the UI process.
-    #[cfg(windows)]
-    unsafe {
-        // ShowWindow waits for the window's thread, so a hung window would
-        // block the caller (the daemon's hotkey thread).
-        if IsHungAppWindow(window) != 0 {
-            return false;
-        }
-        // SW_SHOW leaves a minimized window minimized.
-        let command = if IsIconic(window) == 0 {
-            SW_SHOW
-        } else {
-            SW_RESTORE
-        };
-        ShowWindow(window, command);
-    }
-    activate_window(window)
+    show_owned_with(
+        window_pid(window),
+        owner_pid,
+        || {
+            // Safety: the window manager accepts a handle and show command;
+            // the asynchronous request does not wait for the UI's thread.
+            unsafe {
+                let command = if IsIconic(window) == 0 {
+                    SW_SHOW
+                } else {
+                    SW_RESTORE
+                };
+                ShowWindowAsync(window, command) != 0
+            }
+        },
+        || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            loop {
+                if window_pid(window) != Some(owner_pid) {
+                    return false;
+                }
+                // Safety: both calls inspect the window manager's state only.
+                if unsafe { IsWindowVisible(window) != 0 && IsIconic(window) == 0 } {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        },
+        || window_pid(window) == Some(owner_pid) && activate_window(window),
+    )
 }
 
 /// Pass this process's right to set the foreground window on to `pid`.
@@ -1350,5 +1364,109 @@ mod tests {
             window_title_hash_units(&emoji_units),
             clipmonger_core::hash::fnv1a64("😀".as_bytes())
         );
+    }
+}
+
+#[cfg(any(windows, test))]
+fn activate_with(
+    mut is_foreground: impl FnMut() -> bool,
+    mut request: impl FnMut() -> bool,
+    mut confirm: impl FnMut() -> bool,
+) -> bool {
+    (is_foreground() || request()) && confirm() && is_foreground()
+}
+
+#[cfg(any(windows, test))]
+fn show_owned_with(
+    owner: Option<u32>,
+    expected: u32,
+    mut show: impl FnMut() -> bool,
+    mut shown: impl FnMut() -> bool,
+    mut activate: impl FnMut() -> bool,
+) -> bool {
+    owner == Some(expected) && show() && shown() && activate()
+}
+
+#[cfg(test)]
+mod popup_activation_controls {
+    use super::{activate_with, show_owned_with};
+    use std::cell::RefCell;
+
+    #[test]
+    fn activation_confirms_accepted_request_before_reporting_success() {
+        for (request, confirm, foreground_after, expected, calls) in [
+            (false, true, true, false, "foreground request"),
+            (true, false, true, false, "foreground request confirm"),
+            (
+                true,
+                true,
+                false,
+                false,
+                "foreground request confirm foreground",
+            ),
+            (
+                true,
+                true,
+                true,
+                true,
+                "foreground request confirm foreground",
+            ),
+        ] {
+            let trace = RefCell::new(Vec::new());
+            let count = std::cell::Cell::new(0);
+            let result = activate_with(
+                || {
+                    trace.borrow_mut().push("foreground");
+                    count.set(count.get() + 1);
+                    count.get() > 1 && foreground_after
+                },
+                || {
+                    trace.borrow_mut().push("request");
+                    request
+                },
+                || {
+                    trace.borrow_mut().push("confirm");
+                    confirm
+                },
+            );
+            assert_eq!(
+                (result, trace.into_inner().join(" ")),
+                (expected, calls.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn ownership_and_failures_stop_before_later_operations() {
+        for (owner, requested, shown, active, expected, calls) in [
+            (None, true, true, true, false, ""),
+            (Some(2), true, true, true, false, ""),
+            (Some(1), false, true, true, false, "show"),
+            (Some(1), true, false, true, false, "show shown"),
+            (Some(1), true, true, false, false, "show shown activate"),
+            (Some(1), true, true, true, true, "show shown activate"),
+        ] {
+            let trace = RefCell::new(Vec::new());
+            let result = show_owned_with(
+                owner,
+                1,
+                || {
+                    trace.borrow_mut().push("show");
+                    requested
+                },
+                || {
+                    trace.borrow_mut().push("shown");
+                    shown
+                },
+                || {
+                    trace.borrow_mut().push("activate");
+                    active
+                },
+            );
+            assert_eq!(
+                (result, trace.into_inner().join(" ")),
+                (expected, calls.to_string())
+            );
+        }
     }
 }
