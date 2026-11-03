@@ -21,6 +21,10 @@ const DWELL_MS: u64 = 1200;
 /// Canonical text MIME preferred for save/restore comparisons.
 const TEXT_MIME: &str = "text/plain;charset=utf-8";
 
+/// Hook invoked around each clipboard write in a paste operation.
+pub type ClipboardWriteHook<'a> =
+    dyn FnMut(&[(String, Vec<u8>)], &mut dyn FnMut() -> Result<()>) -> Result<()> + 'a;
+
 /// Wait for physically held modifiers to be released without synthesizing key releases.
 ///
 /// # Errors
@@ -130,6 +134,20 @@ impl X11Paste {
         clip: &ClipRef,
         payloads: &[(String, Vec<u8>)],
     ) -> Result<()> {
+        self.paste_payloads_with(target, clip, payloads, &mut |_, write| write())
+    }
+
+    /// Paste with a hook around each clipboard write, including guarded restore.
+    ///
+    /// # Errors
+    /// Returns an error when the target, transfer, or write hook fails.
+    pub fn paste_payloads_with(
+        &self,
+        target: &PasteTarget,
+        clip: &ClipRef,
+        payloads: &[(String, Vec<u8>)],
+        write: &mut ClipboardWriteHook<'_>,
+    ) -> Result<()> {
         let _ = clip;
         if payloads.is_empty() {
             return Err(Error::Unsupported("nothing to paste".to_string()));
@@ -157,7 +175,7 @@ impl X11Paste {
             .read(TEXT_MIME, 64 << 20)
             .ok()
             .map(|bytes| (TEXT_MIME.to_string(), bytes));
-        self.transfer.write(payloads)?;
+        write(payloads, &mut || self.transfer.write(payloads))?;
         let written = self.transfer.unchanged_indicator();
         let written_bytes = payload_bytes(payloads).unwrap_or_default();
 
@@ -171,7 +189,8 @@ impl X11Paste {
         let hash_same = current_bytes.as_deref() == Some(written_bytes.as_slice());
         if guarded_restore_decision(indicator_same, hash_same) {
             if let Some(original) = saved {
-                self.transfer.write(std::slice::from_ref(&original))?;
+                let payload = std::slice::from_ref(&original);
+                write(payload, &mut || self.transfer.write(payload))?;
             }
         }
         Ok(())

@@ -53,10 +53,44 @@ Helper and channel:
 - The popup UI owns the popup hotkey on Windows (`RegisterHotKey` keeps
   firing while an elevated window is focused); the daemon registers no
   popup chord. Picking a clip mints the gesture token (`hotkey.fired`).
-- Every task created here carries an ASCII identity marker (hash of binary
-  and arguments) in its description, so matching never depends on the
-  console code page of `schtasks` output. A task without the marker is
-  treated as legacy and deleted by the elevated helper when it starts.
+- Task registration runs the daemon's own protected executable as a narrow
+  elevated registrar. Strict OS arguments are checked before profile or store
+  access. No XML file crosses UAC: the registrar builds its fixed Unicode task
+  definition in memory and submits it through Task Scheduler COM.
+- The normal daemon captures its token SID before UAC. The registrar pins the
+  still-running requester process and verifies its token SID and protected
+  executable. Its own SID must match; alternate-account credentials are refused
+  with a clear error. Neither side takes identity from environment variables.
+- Registration verifies the executable and every ancestor through pinned handles,
+  rejects reparse/final-path changes, and evaluates effective access using the
+  original medium token. Requester ownership, permission changes, file writes,
+  deletion and parent replacement rights are refused. Mutation grants and owners
+  must also belong to System, Administrators or TrustedInstaller, preventing a
+  restricted requester token from concealing another medium process's rights.
+  Executable handles request data-read access and ancestor handles request the
+  equivalent directory-list access, with only read sharing. These handles remain
+  held during launch and registration; conflicting write/delete handles must
+  prevent the pin, including handles opened before the ACL was secured.
+- The fixed task has one SID-specific logon trigger and interactive principal,
+  highest privileges, IgnoreNew, both battery flags false, no time limit, normal
+  priority, the exact protected command, quoted profile arguments and an empty
+  working directory. Its protected DACL and administrator/system owner give
+  System/Administrators full access and only the verified user read/execute.
+  Registration supplies that descriptor on replacement and prevents scheduler
+  principal ACE additions. The profile contents are never read by the registrar.
+- A bounded, checked registrar process wait must finish successfully. Both the
+  registrar and parent verify actual action, trigger, principal, settings and
+  descriptor before starting the task. Description markers are metadata; a valid
+  action without a marker passes. Forged markers, appended arguments, additional
+  actions, other commands/profiles and writable descriptors fail matching.
+- Elevated legacy cleanup inspects the actual action, preserves valid protected
+  tasks for other profiles, and removes proven unsafe tasks. Unknown queries or
+  protection checks are reported and preserved; they never count as safe.
+
+Registration hardening acceptance is pending on Windows. The historical hands-on
+verdict above covers the earlier helper behavior, not the new native ACL,
+requester, COM descriptor or UAC checks. Host software controls and Windows
+cross-compilation cannot establish those native properties.
 
 ## Reason
 
@@ -87,5 +121,6 @@ installed mode), §11 (meaning of T-403, T-409, T-413, T-414).
 - T-414: the protected-path rule now selects the mode (logon task vs
   per-run helper) instead of making portable elevated paste Unavailable.
 - T-409: matrix rewritten for both modes (`tests/manual/T-409-uac-matrix.md`).
-- Migration: legacy `ClipmongerHelper` tasks (no marker) are deleted by the
-  elevated helper; installed users answer the question once more.
+- Migration: unsafe legacy `ClipmongerHelper` actions are removed. A missing
+  marker alone does not trigger deletion; installed users consent again when
+  their actual definition or task protection does not match.

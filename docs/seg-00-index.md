@@ -45,6 +45,7 @@ ADR-004 + D-026 accepted 2026-10-30, Windows hands-on QA passed
 | `adr-002-i18n.md` | ADR: string ids + community catalogs (D-023) | Final |
 | `adr-003-elevated-helper.md` | ADR: elevated helper per install mode, pipe liveness, paste deadlines (D-025) | Final |
 | `adr-004-daemon-popup-hotkey.md` | ADR: daemon-owned popup hotkey, `ui.show_popup` push, press-bound gestures, one UI per profile (D-026) | Final (Linux open items) |
+| [adr-005-cpu-renderer.md](adr-005-cpu-renderer.md) | ADR: one CPU-rendered egui UI and owned native-window lifecycle (D-027) | Implemented; native QA pending |
 
 ## 3. Decision log
 
@@ -53,7 +54,7 @@ ADR-004 + D-026 accepted 2026-10-30, Windows hands-on QA passed
 | D-001 | Full-spec scope = ArsClip parity; build in v1/v2/v3 slices | DECIDED (user) | seg-01 |
 | D-002 | Linux scope = full everywhere incl. a GNOME Shell-extension component | DECIDED (user, Q1=b) | Mutter NEWS has no data-control entry 48–51; St.Clipboard source inspected |
 | D-003 | Language = Rust; Go is reserve; Zig is out for now | DECIDED (delegated to planner; user veto at final review) | Inspected: tray-icon, global-hotkey, egui/eframe, wl-clipboard-rs, golang-design/clipboard, systray, Fyne; Zig pieces exist but no maintained story |
-| D-004 | UI = egui/eframe primary; Slint documented alternative; Tauri and iced out | DECIDED (delegated to planner; user veto at final review) | egui: pure Rust, eframe native Win/Mac/Linux; Slint permitted but would GPL-encumber MIT distribution; smaller agent corpus anyway; Tauri too heavy for a resident daemon; iced self-describes as experimental |
+| D-004 | UI uses egui with an owned winit CPU runner | AMENDED by D-027 | ADR-005 retires eframe and the separate D-024 fallback |
 | D-005 | Architecture = shared core + per-OS backends (CopyQ pattern) | DECIDED (delegated to planner; user veto at final review) | CopyQ `PlatformClipboard` + per-OS backends inspected |
 | D-006 | Reuse-first: verified-license dependency > port > reinvent; GPL projects are behavior references only, no GPL code ingestion | DECIDED (user policy) | License table below |
 | D-007 | Project license = MIT | DECIDED (user) | Compatible with every reuse-map dependency (all MIT/Apache-2.0); no GPL ingestion per N-003 |
@@ -74,6 +75,8 @@ ADR-004 + D-026 accepted 2026-10-30, Windows hands-on QA passed
 | D-023 | i18n = stable string ids + versioned community catalogs; English-only v1, translations from v2 (Slovak first, user-supplied, non-blocking). | DECIDED (user 2026-10-25) | adr-002 |
 | D-025 | Elevated helper (amends D-011): consent on first admin-window focus; installed builds = one UAC, then a logon task starts the helper silently; portable builds = one UAC per run, never a scheduled task; per-profile pipe with mutual binary checks, liveness from the pipe, per-job target window + 2 s deadline; the popup UI owns the Windows popup hotkey (superseded by D-026). | DECIDED (user 2026-10-30) | adr-003 |
 | D-026 | Popup hotkey + push (supersedes the D-025 popup-hotkey line): the daemon owns the popup hotkey on every OS and pushes `ui.show_popup` to the one UI per profile (`ui.lock`); a press captures the paste target and mints the only gesture that allows an admin-window paste; `popup.open` never mints, nor does `hotkey.fired` on Windows; Windows applies a changed chord without a restart. | DECIDED (user 2026-10-30) | adr-004 |
+| D-024 | Historical Win32 CPU fallback | RETIRED by D-027 | ADR-005; dated test records retain their original scope |
+| D-027 | One egui UI on an owned winit CPU renderer | IMPLEMENTED | [ADR-005](adr-005-cpu-renderer.md); native T-905 through T-908 pending |
 
 ### Past decision sessions (Q1–Q9; review L-04)
 
@@ -98,7 +101,7 @@ ADR-004 + D-026 accepted 2026-10-30, Windows hands-on QA passed
 | Watch semantics, Sensitive flag, auto backend selection | golang-design/clipboard | MIT | PORT design to Rust (no Go toolchain in build) |
 | Tray icon + menu (Win/Mac/Linux incl. pure-D-Bus KSNI) | tray-icon (Tauri) | MIT OR Apache-2.0 | DEPENDENCY |
 | Global hotkeys (Win/Mac/X11) | global-hotkey (Tauri) | MIT OR Apache-2.0 | DEPENDENCY; Wayland needs portal/extension/compositor fallbacks (seg-06/07) |
-| UI framework | egui/eframe | MIT OR Apache-2.0 | DEPENDENCY |
+| UI framework | egui + egui-winit + winit | MIT OR Apache-2.0 | DEPENDENCY; owned CPU runner, ADR-005 |
 | Backend-split pattern, monitor/quirks knowledge | CopyQ | GPL-3.0-or-later | REFERENCE ONLY (D-006) |
 | Minimal Wayland-history pattern, store/CLI split, caps/dedupe | cliphist | GPL (LICENSE file present) | REFERENCE ONLY (D-006) |
 | `wl-paste --watch` capture pattern | wl-clipboard | GPL-3.0-or-later | REFERENCE ONLY (D-006) |

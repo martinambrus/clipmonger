@@ -27,7 +27,7 @@ Four cooperating programs, one data owner:
   OS file locking). A second daemon MUST attach as a client or exit with
   a clear message, never double-open the DB for writing.
 - **UI attach model**: `app-ui` windows (popup, config, clipboard bar) run
-  in one egui/eframe process in v1 (simpler single-binary story); the IPC
+  in one egui/winit CPU-rendered process in v1 (ADR-005) (simpler single-binary story); the IPC
   protocol MUST still be used between UI and daemon (no in-process
   shortcuts), so headless-daemon + remote-UI keeps working.
   Amended by ADR-004 (D-026): one UI per profile (`<profile>/ui.lock`); a
@@ -95,7 +95,7 @@ clipmonger/                       # D-021; APP_IDENTITY = `clipmonger`
     backend-windows/ backend-x11/ backend-wayland/ backend-macos/
     daemon/      # tokio runtime, monitor supervisor, jobs, single lock,
                  # plugin supervisor (v2; ADR-001)
-    app-ui/      # eframe: popup + config + bar + tray (via tray-icon),
+    app-ui/      # owned CPU runner: popup + config + bar + tray,
                  # plugin management UI (v2; ADR-001)
     app-cli/     # clap CLI over ipc client
     macrolib/    # (v2) [VAR] expansion + rquickjs engine + [RUN] runner
@@ -129,7 +129,7 @@ infrastructure (ADR-002). v3 extends core/ipc (sync) + daemon (jobs).
 | wl-clipboard-rs 0.9 | MIT OR Apache-2.0 | Wayland copy/paste/**watch** | default |
 | tray-icon (Tauri) | MIT OR Apache-2.0 | Tray + menu | ksni on Linux (no GTK), default elsewhere |
 | global-hotkey (Tauri) | MIT OR Apache-2.0 | Hotkeys Win/macOS/X11 | default |
-| egui + eframe | MIT OR Apache-2.0 | All windows | wgpu default; glow fallback where needed |
+| egui + egui-winit + winit | MIT OR Apache-2.0 | All windows | Owned event loop, CPU rasterizer and softbuffer (ADR-005) |
 
 Pending selection (review M-11 — verify license+maintenance BEFORE use;
 criteria: maintained, MIT/Apache/BSD/CC0, MSRV-compatible): ZIP read/write
@@ -244,14 +244,19 @@ metadata only (seg-15 logging rules; review O-02).
   via backend capabilities → audit entry.
 - **Extension (v1)**: ext pushes `capture.event`, pulls `history.list`;
   daemon pushes `config.changed`; heartbeats detect Shell restarts.
-- **Self-write suppression (review finding 8):** every daemon-initiated
-  clipboard write registers an expectation FIRST: content hashes +
-  backend pre-state (Win sequence number, macOS changeCount, X11 owner
-  + serial, Wayland offer token), TTL 2 s. The monitor consults the
-  registry on each event: exact match → suppress once + consume; anything
-  else (including a genuine user copy racing our write) is captured
-  normally. The registry lives in core so dual X11+Wayland monitors share
-  it. Suppression events are counted (not stored) for diagnostics.
+- **Self-write suppression:** the daemon shares one platform registry across
+  capture backends. Paste and restore writers register before writing; failure
+  cancels only that write's expectation. Windows binds a pending entry to the
+  post-write sequence while the clipboard is still open. An unrelated pre-write
+  sequence is not an event identity. Entries expire after two seconds.
+  Matching a complete capture projection consumes once; Linux may also suppress
+  one matching companion from the other backend. Same-backend repeats remain
+  captures. Privacy, pause, size, stale-read and minimum-length checks precede
+  matching. status.suppressed_self_writes counts discarded observations without
+  storing history entries. X11 and Wayland lack native event provenance:
+  identical user copies within the hash-only window can be indistinguishable.
+  Unknown or unrepresentable selected formats and unmodeled bridge shapes fail
+  open. Software checks do not prove native sequence or compositor behavior.
 - **Guarded restore (review finding 9):** after a ClipboardRestore paste,
   restore the saved clipboard ONLY if it still equals our temporary
   value (backend unchanged-indicator AND content-hash match). If the user
@@ -298,7 +303,7 @@ worker threads EXCEPT main-thread services:
 
 | Service | Affinity | Loop |
 |---|---|---|
-| Tray + all windows | app-ui MAIN thread | eframe/winit loop (tray-icon rule) |
+| Tray + all windows | app-ui MAIN thread | owned winit loop (native tray affinity rules; ADR-005) |
 | macOS hotkeys | daemon MAIN thread | minimal CFRunLoop pump (global-hotkey rule) |
 | Win monitor window + hotkeys | daemon pump thread (any) | message pump (works off-main) |
 | X11/Wayland monitors | daemon worker threads | socket poll |
@@ -418,9 +423,9 @@ later (verify toolchain if pursued); Linux→macOS cross explicitly OUT.
    no custom formats, no atomic multi-write) → DROPPED entirely.
    Direct OS transfer (Win32 seg-04 §2, AppKit seg-08 §2) + custom
    monitors per backend (Wayland via wl-clipboard-rs Watcher).
-2. PARTIALLY RESOLVED (eframe/egui 0.37 docs inspected): viewport
-   builders verified (decorations/level/position/size/taskbar/focus…);
-   REMAINS: TOP enum path + per-OS behaviors → seg-09 §14.1 + T-905.
+2. RESOLVED in source by ADR-005: the owned runner manages popup and Settings
+   windows directly. Native focus, geometry, scaling and compositor acceptance
+   remain in T-905 and the per-platform manual legs.
 3. RESOLVED (review C-07): transports are tokio built-ins (server)
    + std (clients) — no selection needed. D-Bus binding is a SEPARATE
    selection owned by seg-06 §11.2.

@@ -635,6 +635,7 @@ dependencies = [
  "image",
  "serde",
  "serde_json",
+ "windows 0.61.3",
  "windows-sys 0.61.2",
 ]
 

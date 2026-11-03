@@ -405,7 +405,7 @@ fn admin_consent_loop(
             continue;
         }
         let launched = if installed {
-            elevated_task::install_via_uac(&exe, profile).and_then(|()| elevated_task::run_task())
+            elevated_task::install_via_uac(&exe, profile)
         } else {
             clipmonger_backend_windows::spawn_elevated_worker(&exe.to_string_lossy(), profile)
         };
@@ -871,6 +871,19 @@ fn run_helper_job(job: &clipmonger_backend_windows::helper::Job) -> Result<(), S
 }
 
 fn main() {
+    #[cfg(feature = "backend-windows")]
+    if let Some(request) = clipmonger_backend_windows::elevated_task::parse_registrar_invocation(
+        &std::env::args_os().skip(1).collect::<Vec<_>>(),
+    ) {
+        use clipmonger_backend_windows::elevated_task::{registrar_exit_code, RegistrarError};
+        let result = request.map_err(RegistrarError::from).and_then(|args| {
+            clipmonger_backend_windows::elevated_task::register_from_request(&args)
+        });
+        if let Err(error) = &result {
+            eprintln!("elevated helper registration failed: {error}");
+        }
+        std::process::exit(registrar_exit_code(&result));
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("__thumbnail-decode") {
         if args.len() != 1 {

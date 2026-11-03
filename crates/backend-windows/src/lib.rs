@@ -8,9 +8,10 @@
 //!
 //! Unsafe policy (WIN-F1): `unsafe` is isolated to the Windows FFI boundary,
 //! primarily in `sys.rs` (Win32 wrappers); minimal additional `unsafe` blocks
-//! live in `elevated_task.rs`, `helper.rs`, and `hotkeys.rs` for direct Win32
-//! calls. These direct Win32 calls are `cfg(windows)`-gated; other modules
-//! use safe Rust.
+//! live in `helper.rs` and `hotkeys.rs` for direct Win32 calls. Task
+//! registration and consent FFI live in `sys.rs`; `elevated_task.rs` uses safe
+//! Rust. These direct Win32 calls are `cfg(windows)`-gated; other modules use
+//! safe Rust.
 
 pub mod autostart;
 pub mod autostart_logic;
