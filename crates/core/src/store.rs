@@ -2621,6 +2621,30 @@ impl Store {
         rows.into_iter().next().map(perm_from_row).transpose()
     }
 
+    /// List only the identifiers and chords needed by the hotkey owner.
+    ///
+    /// # Errors
+    /// Returns a backend error or corrupt identifier when the query fails.
+    pub fn permanent_hotkeys(&self) -> Result<Vec<(Uuid, String)>, CoreError> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id, hotkey FROM permanents WHERE kind='Paste' AND hotkey IS NOT NULL ORDER BY id")
+            .map_err(|e| db_err(&e))?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| db_err(&e))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| db_err(&e))?;
+        rows.into_iter()
+            .map(|(id, chord)| {
+                let id = Uuid::parse_str(&id).map_err(|e| CoreError::Corrupt {
+                    message: format!("bad permanent id: {e}"),
+                })?;
+                Ok((id, chord))
+            })
+            .collect()
+    }
+
     /// List permanents ordered by group, name, id; optionally one group.
     ///
     /// # Errors

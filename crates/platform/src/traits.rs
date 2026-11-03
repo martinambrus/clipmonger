@@ -83,6 +83,16 @@ pub trait HotkeyManager: Send {
     ///
     /// Returns [`crate::types::Error`] when the backend fails.
     fn poll(&mut self, timeout: Duration) -> Result<Vec<HotkeyId>>;
+
+    /// Discard queued events before assigning newly registered chords.
+    ///
+    /// # Errors
+    /// Returns an error when the backend cannot establish a fresh queue.
+    fn discard_pending(&mut self) -> Result<()> {
+        Err(crate::types::Error::Unsupported(
+            "hotkey queue drain unavailable".into(),
+        ))
+    }
 }
 
 /// Paste delivery into a revalidated target.

@@ -2,7 +2,7 @@
 //! send Ctrl+V over synthetic input, then restore the saved value only
 //! when it is still ours (guarded restore — user copies always win).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clipmonger_platform::paste_policy::{check_target, guarded_restore_decision};
 use clipmonger_platform::traits::{ClipboardTransfer as _, PasteEngine};
@@ -14,12 +14,62 @@ use crate::foreground::X11Foreground;
 use crate::session;
 use crate::transfer::{window_exists, X11Transfer};
 use x11rb14::connection::Connection as _;
-use x11rb14::protocol::xproto::{self, EventMask};
+use x11rb14::protocol::xproto::{self, ConnectionExt as _, EventMask};
 
 /// Dwell holding the clip on the clipboard before the guarded restore.
 const DWELL_MS: u64 = 1200;
 /// Canonical text MIME preferred for save/restore comparisons.
 const TEXT_MIME: &str = "text/plain;charset=utf-8";
+
+/// Wait for physically held modifiers to be released without synthesizing key releases.
+///
+/// # Errors
+/// Returns an error if the X server cannot be queried or the deadline expires.
+pub fn wait_modifiers_released(display: Option<&str>, timeout: Duration) -> Result<()> {
+    let (conn, _) = session::connect(display)?;
+    // Use the server's modifier map rather than assumed keysyms: this also
+    // covers layouts with AltGr or remapped modifier keys.
+    let reply = conn
+        .get_modifier_mapping()
+        .map_err(|e| Error::Io(format!("modifier keymap: {e}")))?
+        .reply()
+        .map_err(|e| Error::Io(format!("modifier keymap: {e}")))?;
+    let codes: Vec<u8> = reply
+        .keycodes
+        .into_iter()
+        .filter(|code| *code != 0)
+        .collect();
+    if codes.is_empty() {
+        return Err(Error::Unavailable("modifier keymap unavailable".into()));
+    }
+    wait_modifier_state(timeout, || {
+        let keys = conn
+            .query_keymap()
+            .map_err(|e| Error::Io(format!("modifier state: {e}")))?
+            .reply()
+            .map_err(|e| Error::Io(format!("modifier state: {e}")))?
+            .keys;
+        Ok(codes
+            .iter()
+            .all(|code| keys[usize::from(*code / 8)] & (1 << (*code % 8)) == 0))
+    })
+}
+
+fn wait_modifier_state(
+    timeout: Duration,
+    mut released: impl FnMut() -> Result<bool>,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if released()? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Denied("modifiers remained held".into()));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 /// X11 paste engine (`ClipboardRestore` only).
 pub struct X11Paste {
@@ -206,5 +256,27 @@ fn send_ctrl_v() -> Result<()> {
             .map_err(|e| Error::Io(format!("synthetic Ctrl release failed: {e}")))?;
         chord.map_err(|e| Error::Io(format!("synthetic paste chord failed: {e}")))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod modifier_wait_tests {
+    use super::*;
+    #[test]
+    fn waits_until_released_and_refuses_timeout_or_query_failure() {
+        let mut reads = 0;
+        assert!(wait_modifier_state(Duration::from_secs(1), || {
+            reads += 1;
+            Ok(reads == 2)
+        })
+        .is_ok());
+        assert_eq!(reads, 2);
+        assert!(wait_modifier_state(Duration::ZERO, || Ok(false)).is_err());
+        assert!(
+            wait_modifier_state(Duration::from_secs(1), || Err(Error::Unavailable(
+                "query".into()
+            )))
+            .is_err()
+        );
     }
 }

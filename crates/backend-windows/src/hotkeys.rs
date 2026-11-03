@@ -83,6 +83,11 @@ fn pump_thread_messages() {
     }
 }
 
+#[cfg(any(windows, test))]
+fn discard_events(mut receive: impl FnMut() -> bool) {
+    while receive() {}
+}
+
 /// Map canonical modifiers to `global-hotkey` modifiers.
 #[cfg(windows)]
 fn ghk_mods(mods: &[String]) -> Result<global_hotkey::hotkey::Modifiers> {
@@ -324,5 +329,53 @@ impl HotkeyManager for WinHotkeys {
                 "global hotkeys need a Windows session".to_string(),
             ))
         }
+    }
+
+    fn discard_pending(&mut self) -> Result<()> {
+        #[cfg(windows)]
+        {
+            self.manager.as_ref().ok_or_else(unavailable)?;
+            // The old manager has been dropped and the replacement has no
+            // registrations. Drain both the thread queue and the process-wide
+            // channel completely before mapping a native chord ID again.
+            pump_thread_messages();
+            discard_events(|| {
+                global_hotkey::GlobalHotKeyEvent::receiver()
+                    .try_recv()
+                    .is_ok()
+            });
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            Err(Error::Unavailable(
+                "global hotkeys need a Windows session".to_string(),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::discard_events;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn old_native_chord_ids_are_drained_before_mapping_to_a_new_clip() {
+        let native_id = (0x2_u32 << 16) | 0x25;
+        let mut queued = VecDeque::from(vec![native_id; 10_000]);
+        discard_events(|| queued.pop_front().is_some());
+        let new_mapping = (native_id, "new-clip");
+        assert!(
+            queued.pop_front().is_none(),
+            "an old native event must not map to {}",
+            new_mapping.1
+        );
+        queued.push_back(native_id);
+        assert_eq!(
+            queued.pop_front(),
+            Some(new_mapping.0),
+            "a subsequent press still maps normally"
+        );
     }
 }

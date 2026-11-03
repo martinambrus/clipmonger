@@ -31,6 +31,10 @@ struct Grab {
     mods: Vec<String>,
 }
 
+fn grab_matches(grab: &Grab, keycode: u8, modifiers: u32) -> bool {
+    grab.keycode == keycode && grab.combos.contains(&(modifiers & 0xff))
+}
+
 /// X11 hotkey manager.
 pub struct X11Hotkeys {
     conn: Option<RustConnection>,
@@ -41,9 +45,9 @@ pub struct X11Hotkeys {
     /// `SwitchScreen`, which the server consumes before grabs); they are
     /// only a fallback — a recent grab fire suppresses the raw echo.
     raw_ok: bool,
-    last_grab: HashMap<u8, Instant>,
-    last_raw: Option<(u8, u32)>,
-    last_raw_at: HashMap<u8, Instant>,
+    last_grab: HashMap<HotkeyId, Instant>,
+    last_raw: HashMap<HotkeyId, u32>,
+    last_raw_at: HashMap<HotkeyId, Instant>,
     /// Keycodes down per the raw stream (reconstructed press/release
     /// order; the live keymap is already past back-to-back synthesis).
     raw_down: HashSet<u8>,
@@ -78,7 +82,7 @@ impl X11Hotkeys {
                 by_id: HashMap::new(),
                 raw_ok,
                 last_grab: HashMap::new(),
-                last_raw: None,
+                last_raw: HashMap::new(),
                 last_raw_at: HashMap::new(),
                 raw_down: HashSet::new(),
             })
@@ -92,49 +96,64 @@ impl X11Hotkeys {
     /// synthesis) with the live keymap as backup. Multi-device echoes
     /// share one timestamp, and a recent grab or raw fire suppresses.
     fn on_raw_press(&mut self, keycode: u8, time: u32, fired: &mut Vec<HotkeyId>) {
-        if self.last_raw == Some((keycode, time)) {
-            return;
-        }
-        if self
-            .last_raw_at
-            .get(&keycode)
-            .is_some_and(|at| at.elapsed() < Duration::from_millis(300))
-        {
-            return;
-        }
-        let mut matches: Vec<HotkeyId> = self
+        let keymap = self.live_keymap();
+        let matches: Vec<HotkeyId> = self
             .by_id
             .iter()
-            .filter(|(_, grab)| grab.keycode == keycode)
+            .filter(|(_, grab)| {
+                grab.keycode == keycode
+                    && ["ctrl", "alt", "shift", "super"].iter().all(|name| {
+                        let down = mod_keysyms(name)
+                            .iter()
+                            .filter_map(|keysym| self.keycode_for(*keysym).ok())
+                            .any(|code| self.raw_down.contains(&code) || key_is_down(keymap, code));
+                        down == grab.mods.iter().any(|wanted| wanted == name)
+                    })
+            })
             .map(|(id, _)| *id)
             .collect();
-        if matches.is_empty() {
-            return;
+        self.on_raw_candidates(keycode, time, matches, fired);
+    }
+
+    fn on_raw_candidates(
+        &mut self,
+        keycode: u8,
+        time: u32,
+        matches: Vec<HotkeyId>,
+        fired: &mut Vec<HotkeyId>,
+    ) {
+        let _ = keycode;
+        for id in matches {
+            if self.last_raw.get(&id) == Some(&time)
+                || self
+                    .last_raw_at
+                    .get(&id)
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(300))
+                || self
+                    .last_grab
+                    .get(&id)
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(300))
+            {
+                continue;
+            }
+            self.last_raw.insert(id, time);
+            self.last_raw_at.insert(id, Instant::now());
+            if !fired.contains(&id) {
+                fired.push(id);
+            }
         }
-        if self
-            .last_grab
-            .get(&keycode)
-            .is_some_and(|at| at.elapsed() < Duration::from_millis(300))
-        {
-            return;
-        }
-        let keymap = self.live_keymap();
-        matches.retain(|id| {
-            self.by_id.get(id).is_some_and(|grab| {
-                grab.mods.iter().all(|name| {
-                    mod_keysyms(name)
-                        .iter()
-                        .filter_map(|keysym| self.keycode_for(*keysym).ok())
-                        .any(|code| self.raw_down.contains(&code) || key_is_down(keymap, code))
-                })
-            })
-        });
-        if !matches.is_empty() {
-            self.last_raw = Some((keycode, time));
-            self.last_raw_at.insert(keycode, Instant::now());
-            for id in matches {
-                if !fired.contains(&id) {
-                    fired.push(id);
+    }
+
+    fn on_grab_press(&mut self, keycode: u8, modifiers: u32, fired: &mut Vec<HotkeyId>) {
+        for (id, grab) in &self.by_id {
+            if grab_matches(grab, keycode, modifiers) {
+                self.last_grab.insert(*id, Instant::now());
+                let raw_fired = self
+                    .last_raw_at
+                    .get(id)
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(300));
+                if !raw_fired && !fired.contains(id) {
+                    fired.push(*id);
                 }
             }
         }
@@ -237,8 +256,16 @@ impl HotkeyManager for X11Hotkeys {
         let base = base_mask(&parsed.mods)?;
         let keycode = self.keycode_for(keysym_for_key(&parsed.key)?)?;
         let combos = expand_lock_combos(base, &self.locks);
-        // Replace any previous registration under this id first.
-        let _ = self.unregister(id);
+        // Keep the previous grab until the new one succeeds, matching the
+        // popup owner's fallback contract.
+        if let Some(old) = self.by_id.get(&id) {
+            if old.keycode == keycode && old.combos == combos {
+                return Ok(());
+            }
+            if old.keycode == keycode && old.combos.iter().any(|mask| combos.contains(mask)) {
+                return Err(Error::Denied("new chord overlaps the held chord".into()));
+            }
+        }
         let conn = self.conn.as_ref().ok_or_else(closed)?;
         let mut grabbed = Vec::new();
         for combo in &combos {
@@ -282,6 +309,7 @@ impl HotkeyManager for X11Hotkeys {
             }
         }
         let _ = conn.flush();
+        self.unregister(id)?;
         self.by_id.insert(
             id,
             Grab {
@@ -326,17 +354,7 @@ impl HotkeyManager for X11Hotkeys {
             };
             match event {
                 Some(x11rb14::protocol::Event::KeyPress(press)) => {
-                    self.last_grab.insert(press.detail, Instant::now());
-                    // The XI2 raw path may have reported this press already.
-                    let raw_fired = self
-                        .last_raw_at
-                        .get(&press.detail)
-                        .is_some_and(|at| at.elapsed() < Duration::from_millis(300));
-                    for (id, grab) in &self.by_id {
-                        if grab.keycode == press.detail && !raw_fired && !fired.contains(id) {
-                            fired.push(*id);
-                        }
-                    }
+                    self.on_grab_press(press.detail, u32::from(u16::from(press.state)), &mut fired);
                 }
                 Some(x11rb14::protocol::Event::XinputRawKeyPress(raw)) => {
                     if self.raw_ok {
@@ -362,6 +380,17 @@ impl HotkeyManager for X11Hotkeys {
             }
         }
         Ok(fired)
+    }
+
+    fn discard_pending(&mut self) -> Result<()> {
+        let conn = self.conn.as_ref().ok_or_else(closed)?;
+        while conn
+            .poll_for_event()
+            .map_err(|e| Error::Io(format!("hotkey drain failed: {e}")))?
+            .is_some()
+        {}
+        self.raw_down.clear();
+        Ok(())
     }
 }
 
@@ -485,4 +514,103 @@ fn discover_locks(conn: &RustConnection) -> Vec<u32> {
         }
     }
     locks_from_map(num, caps, scroll)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{grab_matches, Grab, X11Hotkeys};
+    use clipmonger_platform::types::HotkeyId;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn raw_and_grab_echoes_do_not_suppress_distinct_same_key_chords() {
+        let ctrl = HotkeyId(1);
+        let shifted = HotkeyId(2);
+        let mut manager = X11Hotkeys {
+            conn: None,
+            root: 0,
+            locks: vec![],
+            by_id: HashMap::from([
+                (
+                    ctrl,
+                    Grab {
+                        keycode: 24,
+                        combos: vec![0x04],
+                        mods: vec!["ctrl".into()],
+                    },
+                ),
+                (
+                    shifted,
+                    Grab {
+                        keycode: 24,
+                        combos: vec![0x05],
+                        mods: vec!["ctrl".into(), "shift".into()],
+                    },
+                ),
+            ]),
+            raw_ok: true,
+            last_grab: HashMap::new(),
+            last_raw: HashMap::new(),
+            last_raw_at: HashMap::new(),
+            raw_down: HashSet::new(),
+        };
+        let mut fired = Vec::new();
+        manager.on_raw_candidates(24, 100, vec![ctrl], &mut fired);
+        assert_eq!(fired, [ctrl]);
+        fired.clear();
+        manager.on_grab_press(24, 0x04, &mut fired);
+        assert!(fired.is_empty(), "grab echo must not repeat the same chord");
+        manager.on_raw_candidates(24, 101, vec![shifted], &mut fired);
+        assert_eq!(
+            fired,
+            [shifted],
+            "a different chord on the same key must fire"
+        );
+        fired.clear();
+        manager.on_grab_press(24, 0x05, &mut fired);
+        assert!(
+            fired.is_empty(),
+            "the second chord's grab echo must be suppressed"
+        );
+        manager.on_raw_candidates(24, 101, vec![shifted], &mut fired);
+        assert!(
+            fired.is_empty(),
+            "same-timestamp multi-device echo must be suppressed"
+        );
+        manager.last_grab.clear();
+        manager.last_raw.clear();
+        manager.last_raw_at.clear();
+        manager.on_grab_press(24, 0x04, &mut fired);
+        assert_eq!(fired, [ctrl]);
+        fired.clear();
+        manager.on_raw_candidates(24, 200, vec![ctrl], &mut fired);
+        assert!(fired.is_empty(), "raw echo after a grab must be suppressed");
+        manager.on_raw_candidates(24, 201, vec![shifted], &mut fired);
+        assert_eq!(fired, [shifted]);
+        fired.clear();
+        manager.on_raw_candidates(24, 202, vec![shifted], &mut fired);
+        assert!(
+            fired.is_empty(),
+            "rapid repeats of one chord remain suppressed"
+        );
+    }
+
+    #[test]
+    fn same_key_distinguishes_modifiers_and_accepts_lock_variants() {
+        let ctrl = Grab {
+            keycode: 24,
+            combos: vec![0x04, 0x06],
+            mods: vec!["ctrl".into()],
+        };
+        let alt = Grab {
+            keycode: 24,
+            combos: vec![0x08, 0x0a],
+            mods: vec!["alt".into()],
+        };
+        assert!(grab_matches(&ctrl, 24, 0x06));
+        assert!(!grab_matches(&alt, 24, 0x06));
+        assert!(grab_matches(&alt, 24, 0x08));
+        assert!(!grab_matches(&ctrl, 24, 0x08));
+        assert!(!grab_matches(&ctrl, 25, 0x04));
+    }
 }

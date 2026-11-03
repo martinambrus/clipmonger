@@ -306,6 +306,8 @@ fn popup_chord_loop(
         |delay| {
             clipmonger_daemon::capture::sleep_interruptible(shutdown, delay, std::thread::sleep);
         },
+        Some(state),
+        |id, chord, pause| state.press_permanent(id, chord, "windows", pause),
     );
 }
 
@@ -509,13 +511,12 @@ fn setup_x11_backend(
     {
         let shutdown = Arc::clone(shutdown);
         let state = Arc::clone(state);
-        let popup_chord = config.popup.hotkey.clone();
         std::thread::spawn(move || {
             clipmonger_daemon::popup::run_hotkeys(
                 None,
                 &shutdown,
                 || X11Hotkeys::connect(None),
-                || popup_chord.clone(),
+                || state.popup_hotkey(),
                 || {},
                 |status| {
                     if let clipmonger_daemon::popup::ChordStatus::Refused(why) = &status {
@@ -535,6 +536,8 @@ fn setup_x11_backend(
                         std::thread::sleep,
                     );
                 },
+                Some(&state),
+                |id, chord, pause| state.press_permanent(id, chord, "x11", pause),
             );
         });
     }
