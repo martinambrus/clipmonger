@@ -42,6 +42,11 @@ struct Rig {
 }
 impl Rig {
     fn opened() -> Self {
+        let rig = Self::opened_with_pending();
+        let _ = rig.cmds();
+        rig
+    }
+    fn opened_with_pending() -> Self {
         let (cmd_tx, cmds) = mpsc::channel();
         let (events, event_rx) = mpsc::channel();
         let app = PopupApp::new(AppParts {
@@ -55,15 +60,13 @@ impl Rig {
             trace: None,
             allow_foreground: Box::new(|| {}),
         });
-        let rig = Self {
+        Self {
             app,
             ctx: egui::Context::default(),
             input: Vec::new(),
             cmds,
             events,
-        };
-        let _ = rig.cmds();
-        rig
+        }
     }
     fn push(&self, event: UiEvent) {
         self.events.send(event).expect("receiver");
@@ -252,7 +255,7 @@ fn preview_full_query_still_finds_original_and_activation_correct() {
     for width in [5, 20, 80] {
         for query in ["UNIQUE_TAIL_12345", "SEARCH_ONLY_10"] {
             assert!(!expected_truncate(&original.preview, width).contains(query));
-            let mut rig = Rig::opened();
+            let mut rig = Rig::opened_with_pending();
             rig.push(UiEvent::ShowPopup(ShowPopupEvent {
                 source: "hotkey".to_string(),
                 target: Some(77),
@@ -260,15 +263,29 @@ fn preview_full_query_still_finds_original_and_activation_correct() {
                 ..ShowPopupEvent::default()
             }));
             rig.tick();
-            rig.config_width(width);
-            rig.load(&[decoy.clone(), original.clone()]);
+            rig.push(UiEvent::Config(
+                json!({"config": {"popup": {"preview_width": width}}}),
+            ));
+            rig.tick();
+            let store = compact_store(&decoy, &original);
+            let original_stored = store.get_clip(original.id).unwrap().unwrap();
+            let decoy_stored = store.get_clip(decoy.id).unwrap().unwrap();
+            for (input, stored) in [(&original, &original_stored.0), (&decoy, &decoy_stored.0)] {
+                assert_eq!(stored.preview, input.preview);
+                assert_eq!(stored.search_text, input.search_text);
+                assert_eq!(stored.formats, input.formats);
+            }
+            serve_compact(&mut rig, &store, decoy.id);
             rig.show(); // Focus the search field before delivering text.
             rig.input.push(egui::Event::Text(query.to_string()));
             rig.show(); // TextEdit updates the query after this frame's rows.
+            serve_compact(&mut rig, &store, decoy.id);
             let filtered = rig.show();
             assert_eq!(rig.app.vm().query, query);
-            assert_eq!(rig.app.vm().visible(), vec![1]);
-            assert_eq!(rig.app.vm().clip_at(0), Some(&original));
+            let rows = rig.app.vm().compact_rows().expect("compact history");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, original.id);
+            assert_eq!(rows[0].preview, original.preview);
             assert!(filtered.painted(&expected_truncate(&original.preview, width)));
             assert_eq!(
                 filtered
@@ -279,8 +296,12 @@ fn preview_full_query_still_finds_original_and_activation_correct() {
                 1,
                 "the decoy remains only in Current Clipboard, never in filtered rows"
             );
-            assert_stored_unchanged(&rig, &original);
-            assert_stored_unchanged(&rig, &decoy);
+            assert_eq!(rig.app.vm().current(), Some(&decoy_stored.0));
+            assert_eq!(
+                store.get_clip(original.id).unwrap().unwrap(),
+                original_stored
+            );
+            assert_eq!(store.get_clip(decoy.id).unwrap().unwrap(), decoy_stored);
             assert!(rig.cmds().is_empty(), "typing must not paste");
 
             rig.input.push(egui::Event::Key {
@@ -315,12 +336,84 @@ fn preview_full_query_still_finds_original_and_activation_correct() {
                     "picked_ms": picked_ms,
                 })
             );
-            assert_stored_unchanged(&rig, &original);
-            assert_stored_unchanged(&rig, &decoy);
+            assert_eq!(
+                store.get_clip(original.id).unwrap().unwrap(),
+                original_stored
+            );
+            assert_eq!(store.get_clip(decoy.id).unwrap().unwrap(), decoy_stored);
             rig.tick();
             assert!(rig.cmds().is_empty(), "Enter must emit the paste only once");
         }
     }
+}
+
+fn compact_store(decoy: &Clip, original: &Clip) -> clipmonger_core::Store {
+    let profile = std::env::temp_dir().join(format!("preview-compact-{}", Uuid::now_v7()));
+    std::fs::create_dir(&profile).unwrap();
+    let store = clipmonger_core::Store::open(&profile).unwrap();
+    for clip in [decoy, original] {
+        store
+            .insert_clip(
+                clip,
+                &[
+                    (
+                        "text/plain".to_owned(),
+                        clip.search_text.as_bytes().to_vec(),
+                    ),
+                    (
+                        "text/html".to_owned(),
+                        format!("<p>{}</p>", clip.preview).into_bytes(),
+                    ),
+                ],
+            )
+            .unwrap();
+    }
+    store
+        .prepare_compact_history_index(
+            Duration::from_secs(5),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+    store
+}
+
+// Serve the commands actually emitted by the popup from a real compact scan.
+fn serve_compact(rig: &mut Rig, store: &clipmonger_core::Store, current: Uuid) {
+    for _ in 0..5 {
+        let commands = rig.cmds();
+        if commands.is_empty() {
+            return;
+        }
+        for cmd in commands {
+            match cmd {
+                UiCmd::CompactHistory(tag) => {
+                    assert!(tag.params.cursor.is_none(), "fixture fits in one scan step");
+                    let owner = tag.params.owner;
+                    let token = store.begin_compact_scan(owner, &tag.params.query).unwrap();
+                    let chunk = store
+                        .step_compact_scan(owner, token, 65536, 32, 50)
+                        .unwrap();
+                    assert!(chunk.done, "fixture fits in one scan step");
+                    rig.push(UiEvent::CompactHistory(
+                        tag.clone(),
+                        Ok(json!({
+                            "owner": owner, "generation": tag.params.generation,
+                            "rows": chunk.rows, "cursor": null, "done": chunk.done,
+                            "bytes_read": chunk.bytes_read, "candidates": chunk.candidates
+                        })),
+                    ));
+                }
+                UiCmd::CompactCurrent(tag) => {
+                    let clip = store.get_clip(current).unwrap().unwrap().0;
+                    rig.push(UiEvent::CompactCurrent(tag, Ok(json!({"clips": [clip]}))));
+                }
+                UiCmd::PasteClipTo(..) => panic!("typing must not paste"),
+                _ => {}
+            }
+        }
+        rig.tick();
+    }
+    panic!("compact fixture did not settle");
 }
 
 fn now_ms() -> i64 {

@@ -246,9 +246,32 @@ impl Rig {
 
     /// A rig with the start commands taken off the channel.
     fn with(setup: Setup) -> Self {
+        let open = setup.open;
         let rig = Self::raw(setup);
         let start = rig.cmds();
-        assert_eq!(start.len(), 5, "the start commands: {start:?}");
+        assert_eq!(
+            start.len(),
+            if open { 6 } else { 4 },
+            "the start commands: {start:?}"
+        );
+        if open {
+            let current = start
+                .iter()
+                .find_map(|cmd| match cmd {
+                    UiCmd::CompactCurrent(tag) => Some(*tag),
+                    _ => None,
+                })
+                .expect("initial current request");
+            rig.push(UiEvent::CompactCurrent(current, Ok(json!({"clips":[]}))));
+            let tag = start
+                .into_iter()
+                .find_map(|cmd| match cmd {
+                    UiCmd::CompactHistory(tag) => Some(tag),
+                    _ => None,
+                })
+                .expect("initial history request");
+            rig.push(UiEvent::CompactHistory(tag.clone(), Ok(json!({"owner":tag.params.owner,"generation":tag.params.generation,"rows":[],"cursor":null,"done":true,"bytes_read":0,"candidates":0}))));
+        }
         rig
     }
 
@@ -466,6 +489,18 @@ impl Rig {
         self.app.config().lock().expect("settings").error.clone()
     }
 
+    fn answer_compact(&self, commands: &[UiCmd], clips: &[Clip]) {
+        let tag = commands
+            .iter()
+            .find_map(|cmd| match cmd {
+                UiCmd::CompactHistory(tag) => Some(tag),
+                _ => None,
+            })
+            .expect("compact request");
+        let rows: Vec<_> = clips.iter().map(|clip| json!({"id":clip.id,"pinned":clip.pinned,"last_used_ms":clip.last_used_ms,"preview":clip.preview,"preview_truncated":false,"kind":"text","thumbnail_hash":null})).collect();
+        self.push(UiEvent::CompactHistory(tag.clone(), Ok(json!({"owner":tag.params.owner,"generation":tag.params.generation,"rows":rows,"cursor":null,"done":true,"bytes_read":0,"candidates":clips.len()}))));
+    }
+
     /// Give the popup the clips and forget the commands that caused.
     fn load(&mut self, clips: &[Clip]) {
         self.push(history(clips));
@@ -535,8 +570,17 @@ fn status(paused: bool, version: &str) -> UiEvent {
 }
 
 /// The commands a closed-to-open transition sends.
-fn open_commands() -> Vec<UiCmd> {
-    vec![UiCmd::ListHistory, UiCmd::ListPermanents, UiCmd::PermGroups]
+fn assert_open_commands(commands: &[UiCmd]) {
+    assert!(
+        matches!(commands, [UiCmd::CompactHistory(tag), UiCmd::CompactCurrent(_), UiCmd::ListPermanents, UiCmd::PermGroups] | [UiCmd::CompactHistory(tag), UiCmd::ListPermanents, UiCmd::PermGroups] if tag.params.query.is_empty() && tag.params.cursor.is_none() && tag.page == 0),
+        "open commands: {commands:?}"
+    );
+}
+fn assert_compact_begin(commands: &[UiCmd]) {
+    assert!(
+        matches!(commands, [UiCmd::CompactHistory(tag)] | [UiCmd::CompactHistory(tag), UiCmd::CompactCurrent(_)] if tag.params.cursor.is_none() && tag.page == 0),
+        "history refresh: {commands:?}"
+    );
 }
 
 /// The commands that open the Settings window send.
@@ -600,17 +644,22 @@ fn still_young(started: Instant, limit_ms: u64) -> bool {
 fn rule_start_sends_the_start_commands_in_order() {
     for open in [true, false] {
         let mut rig = Rig::raw(Setup::new(open));
-        assert_eq!(
-            rig.cmds(),
-            vec![
-                UiCmd::Status,
-                UiCmd::ConfigGet,
-                UiCmd::ListHistory,
-                UiCmd::ListPermanents,
-                UiCmd::PermGroups,
-            ],
-            "start commands with open = {open}"
-        );
+        let start = rig.cmds();
+        if open {
+            assert!(
+                matches!(start.as_slice(), [UiCmd::Status, UiCmd::ConfigGet, UiCmd::CompactHistory(tag), UiCmd::CompactCurrent(_), UiCmd::ListPermanents, UiCmd::PermGroups] if tag.params.cursor.is_none())
+            );
+        } else {
+            assert_eq!(
+                start,
+                vec![
+                    UiCmd::Status,
+                    UiCmd::ConfigGet,
+                    UiCmd::ListPermanents,
+                    UiCmd::PermGroups
+                ]
+            );
+        }
         rig.tick();
         rig.show();
         assert_eq!(
@@ -717,7 +766,10 @@ fn rule_start_open_focuses_the_search_box_at_the_first_render() {
     rig.show();
     assert_eq!(rig.app.vm().query, "abc");
     assert!(rig.is_open());
-    assert_eq!(rig.cmds(), vec![]);
+    let commands = rig.cmds();
+    assert!(
+        matches!(commands.as_slice(), [UiCmd::CompactHistory(tag)] if tag.params.query == "abc")
+    );
 }
 
 // rule 1: a start without open does not take the focus; the open that comes later does
@@ -796,7 +848,7 @@ fn rule_push_hotkey_opens_with_the_context() {
         }
     );
     assert_eq!(rig.trace(), vec![open_line("hotkey", true, true)]);
-    assert_eq!(rig.cmds(), open_commands());
+    assert_open_commands(&rig.cmds());
 }
 
 // rule 2: the Open line tells which parts of the context are set
@@ -835,7 +887,7 @@ fn rule_push_request_opens_with_an_empty_context() {
             vec![open_line("request", false, false)],
             "source {source}"
         );
-        assert_eq!(rig.cmds(), open_commands(), "source {source}");
+        assert_open_commands(&rig.cmds());
     }
 }
 
@@ -892,10 +944,9 @@ fn rule_push_hotkey_while_open_replaces_the_context() {
         vec![open_line("hotkey", true, true)],
         "open to open is no transition"
     );
-    assert_eq!(
-        rig.cmds(),
-        vec![UiCmd::ListHistory],
-        "an open that finds the popup open sends no permanents refresh"
+    assert!(
+        rig.cmds().is_empty(),
+        "the old in-flight request is coalesced"
     );
 }
 
@@ -928,7 +979,7 @@ fn rule_push_every_open_sends_history_then_permanents_then_groups() {
         let mut rig = Rig::closed();
         opener.open(&mut rig);
         assert!(rig.is_open(), "{opener:?}");
-        assert_eq!(rig.cmds(), open_commands(), "{opener:?}");
+        assert_open_commands(&rig.cmds());
         assert_eq!(rig.trace(), opener.lines(), "{opener:?}");
     }
 }
@@ -955,7 +1006,10 @@ fn rule_push_reopen_sends_the_commands_again() {
     for round in 0..3 {
         rig.push(request());
         rig.tick();
-        assert_eq!(rig.cmds(), open_commands(), "open number {round}");
+        let commands = rig.cmds();
+        assert_open_commands(&commands);
+        rig.answer_compact(&commands, &[]);
+        rig.tick();
         rig.push(toggle());
         rig.tick();
         assert!(!rig.is_open(), "hide number {round}");
@@ -995,36 +1049,38 @@ fn rule_cap_is_thirty_two() {
 #[test]
 fn rule_cap_forty_events_take_two_passes() {
     let mut rig = Rig::closed();
-    for _ in 0..40 {
-        rig.push(UiEvent::RestoreDone { warning: None });
+    for n in 0..40 {
+        rig.push(UiEvent::Error(format!("event {n}")));
     }
     rig.tick();
-    assert_eq!(rig.cmds().len(), 64, "the first pass");
+    assert_eq!(rig.error().as_deref(), Some("event 31"));
     rig.tick();
-    assert_eq!(rig.cmds().len(), 16, "the second pass");
+    assert_eq!(rig.error().as_deref(), Some("event 39"));
     rig.tick();
-    assert_eq!(rig.cmds(), vec![], "nothing is left");
+    assert_eq!(rig.error().as_deref(), Some("event 39"));
 }
 
 // rule 3: the cap is per pass, whatever the number of events
 #[test]
 fn rule_cap_table() {
-    for (queued, passes) in [
-        (0_usize, vec![0_usize]),
-        (1, vec![1]),
-        (31, vec![31]),
-        (32, vec![32, 0]),
-        (33, vec![32, 1, 0]),
-        (64, vec![32, 32, 0]),
-        (65, vec![32, 32, 1, 0]),
-    ] {
+    for queued in [0_usize, 1, 31, 32, 33, 64, 65] {
         let mut rig = Rig::closed();
-        for _ in 0..queued {
-            rig.push(UiEvent::RestoreDone { warning: None });
+        for n in 0..queued {
+            rig.push(UiEvent::Error(format!("event {n}")));
         }
-        for (n, expected) in passes.into_iter().enumerate() {
+        let mut processed = 0;
+        loop {
             rig.tick();
-            assert_eq!(rig.cmds().len(), expected * 2, "{queued} queued, pass {n}");
+            processed = (processed + DRAIN_CAP).min(queued);
+            let expected = (processed > 0).then(|| format!("event {}", processed - 1));
+            assert_eq!(
+                rig.error(),
+                expected,
+                "{queued} queued, {processed} processed"
+            );
+            if processed == queued {
+                break;
+            }
         }
     }
 }
@@ -1033,15 +1089,13 @@ fn rule_cap_table() {
 #[test]
 fn rule_cap_settings_passes_drain_nothing() {
     let mut rig = Rig::closed();
-    rig.push(UiEvent::RestoreDone { warning: None });
+    rig.push(UiEvent::Error("queued".into()));
     rig.tick_settings();
     rig.show_settings();
     assert_eq!(rig.cmds(), vec![], "a Settings pass leaves the queue alone");
+    assert_eq!(rig.error(), None);
     rig.tick();
-    assert_eq!(
-        rig.cmds(),
-        vec![UiCmd::ListHistory, UiCmd::ConfigGetAfterRestore]
-    );
+    assert_eq!(rig.error().as_deref(), Some("queued"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,10 +1369,7 @@ fn rule_bookkeeping_events_update_state_and_ask_for_refreshes() {
     rig.push(UiEvent::RestoreDone { warning: None });
     rig.tick();
     assert_eq!(rig.config_error(), strings::text("config.restore_done"));
-    assert_eq!(
-        rig.cmds(),
-        vec![UiCmd::ListHistory, UiCmd::ConfigGetAfterRestore]
-    );
+    assert_eq!(rig.cmds(), vec![UiCmd::ConfigGetAfterRestore]);
     rig.app.config().lock().expect("settings").perm_group_new = "Fresh".to_string();
     rig.push(UiEvent::PermGroupsChanged);
     rig.tick();
@@ -1467,7 +1518,7 @@ fn rule_keys_f5_asks_for_a_fresh_history() {
     let mut rig = Rig::opened();
     rig.key(egui::Key::F5);
     rig.show();
-    assert_eq!(rig.cmds(), vec![UiCmd::ListHistory]);
+    assert_compact_begin(&rig.cmds());
     assert!(rig.is_open());
 }
 
@@ -1641,7 +1692,11 @@ fn rule_keys_typing_filters_without_hiding() {
     rig.input(egui::Event::Text("et".to_string()));
     rig.show();
     assert_eq!(rig.app.vm().query, "et");
-    assert_eq!(rig.app.vm().visible(), vec![1]);
+    let commands = rig.cmds();
+    assert_compact_begin(&commands);
+    rig.answer_compact(&commands, &[clip(2, "beta")]);
+    rig.show();
+    assert_eq!(rig.app.vm().visible(), vec![0]);
     assert!(rig.is_open());
     assert_eq!(rig.cmds(), vec![]);
     assert_eq!(rig.trace(), vec![open_line("start", false, false)]);
@@ -1677,6 +1732,12 @@ fn rule_keys_an_open_clears_the_search_and_selects_the_first_row() {
     rig.load(&[clip(1, "alpha"), clip(2, "beta"), clip(3, "gamma")]);
     rig.show();
     rig.input(egui::Event::Text("a".to_string()));
+    rig.show();
+    let commands = rig.cmds();
+    rig.answer_compact(
+        &commands,
+        &[clip(1, "alpha"), clip(2, "beta"), clip(3, "gamma")],
+    );
     rig.show();
     rig.key(egui::Key::ArrowDown);
     rig.show();
@@ -2070,7 +2131,7 @@ fn rule_tray_toggle_opens_and_hides() {
     rig.tick();
     assert!(rig.is_open());
     assert_eq!(rig.trace(), vec![open_line("tray", false, false)]);
-    assert_eq!(rig.cmds(), open_commands());
+    assert_open_commands(&rig.cmds());
     assert_eq!(rig.context(), PasteContext::default());
     rig.tray(&[TrayAction::Toggle]);
     rig.tick();
@@ -2114,7 +2175,7 @@ fn rule_tray_open_popup_is_a_request_push() {
     assert!(rig.is_open());
     assert_eq!(rig.context(), PasteContext::default());
     assert_eq!(rig.trace(), vec![open_line("request", false, false)]);
-    assert_eq!(rig.cmds(), open_commands());
+    assert_open_commands(&rig.cmds());
 }
 
 // rule 10: OpenPopup on an open popup keeps its context and sends nothing
@@ -2492,7 +2553,18 @@ fn rule_config_scale_change_is_compared_by_bits() {
 // rule 11: popup.keys overrides reach the key bindings of the popup
 #[test]
 fn rule_config_key_override_reaches_the_popup_keys() {
-    let mut rig = Rig::opened();
+    let mut rig = Rig::raw(Setup::new(true));
+    let start = rig.cmds();
+    let tag = start
+        .into_iter()
+        .find_map(|cmd| match cmd {
+            UiCmd::CompactHistory(tag) => Some(tag),
+            _ => None,
+        })
+        .expect("initial compact history request");
+    rig.push(UiEvent::CompactHistory(tag.clone(), Ok(json!({"owner":tag.params.owner,"generation":tag.params.generation,"rows":[],"cursor":null,"done":true,"bytes_read":0,"candidates":0}))));
+    rig.tick();
+    let _ = rig.cmds();
     rig.push(config_reply(
         &json!({"popup": {"keys": {"refresh": "ctrl+End"}}}),
     ));
@@ -2503,7 +2575,11 @@ fn rule_config_key_override_reaches_the_popup_keys() {
     rig.input(egui::Event::ModifiersChanged(egui::Modifiers::CTRL));
     rig.input(key_event(egui::Key::End, true, egui::Modifiers::CTRL));
     rig.show();
-    assert_eq!(rig.cmds(), vec![UiCmd::ListHistory], "Ctrl+End refreshes");
+    let commands = rig.cmds();
+    assert!(
+        matches!(commands.as_slice(), [UiCmd::CompactHistory(tag)] if tag.params.query.is_empty() && tag.params.cursor.is_none()),
+        "Ctrl+End refreshes: {commands:?}"
+    );
 }
 
 // rule 11: a bad override is ignored: the default keys keep working
@@ -2516,14 +2592,17 @@ fn rule_config_bad_key_override_is_ignored() {
     rig.tick();
     rig.key(egui::Key::F5);
     rig.show();
-    assert_eq!(rig.cmds(), vec![UiCmd::ListHistory]);
+    let commands = rig.cmds();
+    assert_compact_begin(&commands);
+    rig.answer_compact(&commands, &[]);
+    rig.tick();
     rig.push(config_reply(
         &json!({"popup": {"keys": {"refresh": "not a chord"}}}),
     ));
     rig.tick();
     rig.key(egui::Key::F5);
     rig.show();
-    assert_eq!(rig.cmds(), vec![UiCmd::ListHistory]);
+    assert_compact_begin(&rig.cmds());
 }
 
 // rule 11: the Settings document is replaced and its edits are cleared
@@ -2658,7 +2737,7 @@ fn rule_paste_failed_while_closed_reopens_with_the_error() {
         rig.trace(),
         vec![open_line("paste_failed", false, false), error_line()]
     );
-    assert_eq!(rig.cmds(), open_commands());
+    assert_open_commands(&rig.cmds());
 }
 
 // rule 12: PasteFailed while open sets the error and nothing else
@@ -3441,11 +3520,7 @@ fn rule_order_hidden_confirmation_runs_before_a_new_open() {
     thread::sleep(Duration::from_millis(170));
     rig.tick();
     rig.tick();
-    assert_eq!(
-        rig.cmds(),
-        open_commands(),
-        "the open dropped the pending paste"
-    );
+    assert_open_commands(&rig.cmds());
 }
 
 // rule 11: a theme without a font scale keeps the scale that is stored
@@ -3485,7 +3560,7 @@ fn rule_config_empty_key_map_restores_the_defaults() {
     rig.tick();
     rig.key(egui::Key::F5);
     rig.show();
-    assert_eq!(rig.cmds(), vec![UiCmd::ListHistory], "defaults again");
+    assert_compact_begin(&rig.cmds());
 }
 
 // rule 4: the confirmed key "popup.keys" settles the staged "popup.keys.*" edit
@@ -3557,11 +3632,11 @@ fn fix_x4_capped_queue_requests_one_follow_up_without_losing_order() {
         "closed ConfigError still not in Settings"
     );
     assert!(rig.requests().iter().all(|r| !r.delay.is_zero()));
-    for _ in 0..DRAIN_CAP {
-        rig.push(UiEvent::RestoreDone { warning: None });
+    for n in 0..DRAIN_CAP {
+        rig.push(UiEvent::Error(format!("final {n}")));
     }
     rig.tick();
-    assert_eq!(rig.cmds().len(), DRAIN_CAP * 2);
+    assert_eq!(rig.error().as_deref(), Some("final 31"));
     assert!(rig.requests().iter().all(|r| !r.delay.is_zero()));
 }
 
@@ -3590,7 +3665,7 @@ fn fix_x7_single_and_double_tray_click_each_toggle_once() {
         rig.tray(&actions);
         rig.tick();
         assert!(rig.is_open(), "{sequence:?}");
-        assert_eq!(rig.cmds(), open_commands());
+        assert_open_commands(&rig.cmds());
     }
 }
 
@@ -3665,7 +3740,7 @@ fn fix_fc3_closed_settings_drops_late_replies_after_pending_apply() {
         );
         assert_eq!(
             rig.cmds(),
-            vec![UiCmd::ListHistory, UiCmd::ConfigGetAfterRestore],
+            vec![UiCmd::ConfigGetAfterRestore],
             "restore still refreshes history"
         );
         rig.push(UiEvent::ConfigError("late config error".to_string()));
@@ -4517,6 +4592,59 @@ fn click_popup_widget(rig: &mut Rig, label: &str) {
     );
 }
 
+#[test]
+fn history_row_context_menu_handles_text_and_thumbnail_clicks() {
+    for thumbnail in [false, true] {
+        for pin in [true, false] {
+            let mut rig = active_list_rig(false, 3);
+            // Resolve the actual clickable text child before aiming at it.
+            let child = popup_widget(&mut rig, "History row 2");
+            let pass = rig.show();
+            let text = pass
+                .bounds
+                .iter()
+                .find(|(label, _, _)| label == "History row 2")
+                .unwrap()
+                .1;
+            assert!(child.rect.contains(text.center()));
+            let position = if thumbnail {
+                egui::pos2(text.left() - 24.0, text.center().y)
+            } else {
+                text.center()
+            };
+            rig.input(egui::Event::PointerMoved(position));
+            rig.show();
+            for pressed in [true, false] {
+                rig.input(egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                rig.show();
+            }
+            let menu = rig.show();
+            assert!(menu.painted(strings::text("popup.pin")));
+            assert!(menu.painted(strings::text("popup.delete")));
+            assert!(
+                rig.cmds().is_empty(),
+                "opening a menu must not activate the row"
+            );
+            click_popup_widget(
+                &mut rig,
+                strings::text(if pin { "popup.pin" } else { "popup.delete" }),
+            );
+            let expected = if pin {
+                UiCmd::PinClip(id(2), true)
+            } else {
+                UiCmd::DeleteClip(id(2))
+            };
+            assert_eq!(rig.cmds(), vec![expected]);
+            assert!(rig.is_open());
+        }
+    }
+}
+
 fn finish_popup_pick(rig: &mut Rig) {
     assert!(!rig.is_open(), "pick must close popup before execution");
     rig.tick();
@@ -4811,6 +4939,8 @@ fn active_list_return_to_history_clamps_only_when_displayed() {
     rig.show();
     assert_eq!(rig.app.vm().selected, 2);
     click_popup_widget(&mut rig, strings::text("perm.tab_history"));
+    let commands = rig.cmds();
+    rig.answer_compact(&commands, &[clip(1, "History row 1")]);
     rig.show();
     assert_eq!(rig.app.vm().selected, 0);
     popup_widget(&mut rig, "History row 1");
@@ -4835,8 +4965,24 @@ fn query_edit_then_navigation_pick(permanent: bool) {
         rig.app.vm_mut().selected = 2;
     }
     rig.input(egui::Event::Text("row".into()));
-    rig.key(egui::Key::ArrowDown);
+    if permanent {
+        rig.key(egui::Key::ArrowDown);
+    }
     rig.show();
+    if !permanent {
+        let commands = rig.cmds();
+        rig.answer_compact(
+            &commands,
+            &[
+                clip(1, "History row 1"),
+                clip(2, "History row 2"),
+                clip(3, "History row 3"),
+            ],
+        );
+        rig.show();
+        rig.key(egui::Key::ArrowDown);
+        rig.show();
+    }
     assert_eq!(rig.app.vm().query, "row");
     if permanent {
         assert_eq!(rig.app.config().lock().expect("config").perm_vm.selected, 1);
@@ -4867,6 +5013,466 @@ fn active_list_query_edit_then_history_navigation_keeps_the_picked_row() {
 #[test]
 fn active_list_query_edit_then_permanent_navigation_keeps_the_picked_row() {
     query_edit_then_navigation_pick(true);
+}
+
+#[test]
+fn compact_search_edit_paths_send_full_query_and_keep_server_hits() {
+    let mut rig = Rig::raw(Setup::new(true));
+    let first = rig
+        .cmds()
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactHistory(t) => Some(t),
+            _ => None,
+        })
+        .unwrap();
+    rig.push(UiEvent::CompactHistory(first.clone(), Ok(json!({"owner":first.params.owner,"generation":first.params.generation,"rows":[],"cursor":null,"done":true,"bytes_read":0,"candidates":0}))));
+    rig.show();
+    let _ = rig.cmds();
+    rig.input(egui::Event::Text("needle".into()));
+    rig.show();
+    let search = rig
+        .cmds()
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactHistory(t) => Some(t),
+            _ => None,
+        })
+        .expect("text edit begins search");
+    assert_eq!(search.params.query, "needle");
+    let hit = json!({"id":id(1),"pinned":false,"last_used_ms":1,"preview":"short","preview_truncated":true,"kind":"text","thumbnail_hash":null});
+    rig.push(UiEvent::CompactHistory(search.clone(), Ok(json!({"owner":search.params.owner,"generation":search.params.generation,"rows":[hit],"cursor":null,"done":true,"bytes_read":0,"candidates":1}))));
+    let pass = rig.show();
+    assert!(
+        pass.painted("short"),
+        "server hit outside preview remains visible"
+    );
+    assert_eq!(rig.app.vm().visible(), vec![0]);
+    let button = popup_widget(&mut rig, strings::text("config.open_config"));
+    button.request_focus();
+    rig.key(egui::Key::A);
+    rig.show();
+    let keyboard = rig
+        .cmds()
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactHistory(t) => Some(t),
+            _ => None,
+        })
+        .expect("key handling begins search");
+    assert_eq!(keyboard.params.query, "needlea");
+}
+
+#[test]
+fn compact_page_buttons_advance_and_restart_and_restore_drops_old_reply() {
+    let mut rig = Rig::raw(Setup::new(true));
+    let first = rig
+        .cmds()
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactHistory(t) => Some(t),
+            _ => None,
+        })
+        .unwrap();
+    let row = |n, name| json!({"id":id(n),"pinned":false,"last_used_ms":1,"preview":name,"preview_truncated":false,"kind":"text","thumbnail_hash":null});
+    rig.push(UiEvent::CompactHistory(first.clone(), Ok(json!({"owner":first.params.owner,"generation":first.params.generation,"rows":[row(1,"first")],"cursor":"token","done":false,"bytes_read":0,"candidates":1}))));
+    assert!(rig.show().painted("first"));
+    let _ = rig.cmds();
+    click_popup_widget(&mut rig, strings::text("popup.next_page"));
+    let page = rig
+        .cmds()
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactHistory(t) => Some(t),
+            _ => None,
+        })
+        .expect("next page request");
+    assert_eq!(page.page, 1);
+    assert_eq!(page.params.cursor.as_deref(), Some("token"));
+    rig.push(UiEvent::CompactHistory(page.clone(), Ok(json!({"owner":page.params.owner,"generation":page.params.generation,"rows":[row(2,"second")],"cursor":"token","done":false,"bytes_read":0,"candidates":1}))));
+    assert!(rig.show().painted("second"));
+    click_popup_widget(&mut rig, strings::text("popup.first_page"));
+    let commands = rig.cmds();
+    assert!(commands
+        .iter()
+        .any(|c| matches!(c, UiCmd::CancelCompactHistory(p) if p.cursor == "token")));
+    let restart = commands
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactHistory(t) => Some(t),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(restart.page, 0);
+    assert!(restart.params.cursor.is_none());
+    rig.push(UiEvent::RestoreDone { warning: None });
+    rig.push(UiEvent::CompactHistory(
+        restart.clone(),
+        Err(clipmonger_ipc::proto::IpcError::new(
+            "unavailable",
+            "old failure".into(),
+        )),
+    ));
+    rig.show();
+    let restored = rig
+        .cmds()
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactHistory(t) => Some(t),
+            _ => None,
+        })
+        .expect("fresh scan after restore");
+    assert_ne!(restored.restore_epoch, restart.restore_epoch);
+    assert!(!rig.app.shell().offline());
+}
+
+#[test]
+fn compact_popup_sparse_scan_and_stale_query_reply() {
+    let mut rig = Rig::raw(Setup::new(true));
+    let first = rig
+        .cmds()
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactHistory(t) => Some(t),
+            _ => None,
+        })
+        .unwrap();
+    rig.push(UiEvent::CompactHistory(first.clone(), Ok(json!({"owner":first.params.owner,"generation":first.params.generation,"rows":[],"cursor":"sparse","done":false,"bytes_read":1,"candidates":1}))));
+    rig.show();
+    let progress = rig
+        .cmds()
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactHistory(t) => Some(t),
+            _ => None,
+        })
+        .expect("sparse chunk schedules continuation");
+    assert_eq!(progress.params.cursor.as_deref(), Some("sparse"));
+    rig.input(egui::Event::Text("new".into()));
+    rig.show();
+    let commands = rig.cmds();
+    assert!(commands
+        .iter()
+        .any(|c| matches!(c, UiCmd::CancelCompactHistory(p) if p.cursor == "sparse")));
+    rig.push(UiEvent::CompactHistory(progress.clone(), Ok(json!({"owner":progress.params.owner,"generation":progress.params.generation,"rows":[{"id":id(1),"pinned":false,"last_used_ms":1,"preview":"stale hit","preview_truncated":false,"kind":"text","thumbnail_hash":null}],"cursor":"sparse","done":false,"bytes_read":1,"candidates":1}))));
+    let pass = rig.show();
+    assert!(!pass.painted("stale hit"));
+    let fresh = rig
+        .cmds()
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactHistory(t) => Some(t),
+            _ => None,
+        })
+        .expect("latest query starts after old request completes");
+    assert_eq!(fresh.params.query, "new");
+    rig.push(UiEvent::CompactHistory(fresh.clone(), Ok(json!({"owner":fresh.params.owner,"generation":fresh.params.generation,"rows":[],"cursor":"next","done":false,"bytes_read":1,"candidates":1}))));
+    rig.show();
+    let next = rig
+        .cmds()
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactHistory(t) => Some(t),
+            _ => None,
+        })
+        .expect("fresh sparse scan continues");
+    rig.push(UiEvent::CompactHistory(next.clone(), Ok(json!({"owner":next.params.owner,"generation":next.params.generation,"rows":[{"id":id(2),"pinned":false,"last_used_ms":1,"preview":"later hit","preview_truncated":false,"kind":"text","thumbnail_hash":null}],"cursor":null,"done":true,"bytes_read":1,"candidates":1}))));
+    assert!(rig.show().painted("later hit"));
+}
+
+#[test]
+fn compact_current_reply_survives_search_change() {
+    let mut rig = Rig::raw(Setup::new(true));
+    let commands = rig.cmds();
+    let current = commands
+        .iter()
+        .find_map(|c| match c {
+            UiCmd::CompactCurrent(tag) => Some(*tag),
+            _ => None,
+        })
+        .expect("independent current fetch");
+    let first = commands
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactHistory(tag) => Some(tag),
+            _ => None,
+        })
+        .unwrap();
+    rig.input(egui::Event::Text("search".into()));
+    rig.show();
+    let item = clip(1, "current");
+    rig.push(UiEvent::CompactHistory(first.clone(), Ok(json!({"owner":first.params.owner,"generation":first.params.generation,"rows":[],"cursor":null,"done":true,"bytes_read":1,"candidates":0}))));
+    rig.push(UiEvent::CompactCurrent(
+        current,
+        Ok(json!({"clips":[item]})),
+    ));
+    rig.show();
+    assert_eq!(
+        rig.app.vm().current().map(|c| c.id),
+        Some(id(1)),
+        "typing before initial page must not discard current"
+    );
+}
+
+#[test]
+fn compact_current_refresh_and_restore_supersede_old_replies_during_search() {
+    let mut rig = Rig::raw(Setup::new(true));
+    let initial = rig
+        .cmds()
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactCurrent(tag) => Some(tag),
+            _ => None,
+        })
+        .unwrap();
+    rig.input(egui::Event::Text("search".into()));
+    rig.show();
+    rig.key(egui::Key::F5);
+    rig.show();
+    assert!(
+        !rig.cmds()
+            .iter()
+            .any(|c| matches!(c, UiCmd::CompactCurrent(_))),
+        "refresh coalesces while a lookup is pending"
+    );
+    rig.push(UiEvent::CompactCurrent(
+        initial,
+        Ok(json!({"clips":[clip(1, "old")]})),
+    ));
+    rig.show();
+    assert!(rig.app.vm().current().is_none());
+    let refresh = rig
+        .cmds()
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactCurrent(tag) => Some(tag),
+            _ => None,
+        })
+        .expect("refresh issues latest lookup");
+    rig.push(UiEvent::CompactCurrent(
+        refresh,
+        Ok(json!({"clips":[clip(2, "refreshed")]})),
+    ));
+    rig.show();
+    assert_eq!(rig.app.vm().current().map(|c| c.id), Some(id(2)));
+    rig.push(UiEvent::RestoreDone { warning: None });
+    rig.show();
+    let restore = rig
+        .cmds()
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactCurrent(tag) => Some(tag),
+            _ => None,
+        })
+        .expect("restore with a search requests current");
+    assert!(rig.app.vm().current().is_none());
+    rig.push(UiEvent::CompactCurrent(
+        refresh,
+        Ok(json!({"clips":[clip(1, "old")]})),
+    ));
+    rig.push(UiEvent::CompactCurrent(
+        restore,
+        Ok(json!({"clips":[clip(3, "restored")]})),
+    ));
+    rig.show();
+    assert_eq!(rig.app.vm().current().map(|c| c.id), Some(id(3)));
+    rig.push(UiEvent::CompactCurrent(
+        refresh,
+        Err(clipmonger_ipc::proto::IpcError::new(
+            "unavailable",
+            "late".into(),
+        )),
+    ));
+    rig.show();
+    assert_eq!(rig.app.vm().current().map(|c| c.id), Some(id(3)));
+}
+
+#[test]
+fn compact_current_after_page_survives_typing_and_reopen_rejects_old() {
+    let mut rig = Rig::raw(Setup::new(true));
+    let commands = rig.cmds();
+    let first = commands
+        .iter()
+        .find_map(|c| match c {
+            UiCmd::CompactHistory(t) => Some(t.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let current = commands
+        .iter()
+        .find_map(|c| match c {
+            UiCmd::CompactCurrent(t) => Some(*t),
+            _ => None,
+        })
+        .unwrap();
+    rig.push(UiEvent::CompactHistory(first.clone(), Ok(json!({"owner":first.params.owner,"generation":first.params.generation,"rows":[],"cursor":null,"done":true,"bytes_read":1,"candidates":0}))));
+    rig.show();
+    rig.input(egui::Event::Text("query".into()));
+    rig.show();
+    rig.push(UiEvent::CompactCurrent(
+        current,
+        Ok(json!({"clips":[clip(1, "current")]})),
+    ));
+    rig.show();
+    assert_eq!(rig.app.vm().current().map(|c| c.id), Some(id(1)));
+    rig.key(egui::Key::Escape);
+    rig.show();
+    rig.tray(&[TrayAction::OpenPopup]);
+    rig.tick();
+    let fresh = rig
+        .cmds()
+        .into_iter()
+        .find_map(|c| match c {
+            UiCmd::CompactCurrent(t) => Some(t),
+            _ => None,
+        })
+        .expect("reopen requests current");
+    rig.push(UiEvent::CompactCurrent(
+        current,
+        Ok(json!({"clips":[clip(2, "old")]})),
+    ));
+    rig.push(UiEvent::CompactCurrent(
+        fresh,
+        Ok(json!({"clips":[clip(3, "new")]})),
+    ));
+    rig.show();
+    assert_eq!(rig.app.vm().current().map(|c| c.id), Some(id(3)));
+}
+
+#[test]
+fn compact_transport_failure_enters_offline_and_recovers_both_views() {
+    for (fail_compact, fail_current) in [(true, false), (false, true), (true, true)] {
+        let mut rig = Rig::raw(Setup::new(true));
+        let commands = rig.cmds();
+        let scan = commands
+            .iter()
+            .find_map(|c| match c {
+                UiCmd::CompactHistory(t) => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let current = commands
+            .iter()
+            .find_map(|c| match c {
+                UiCmd::CompactCurrent(t) => Some(*t),
+                _ => None,
+            })
+            .unwrap();
+        rig.push(status(false, "1"));
+        rig.show();
+        assert!(!rig.app.shell().offline());
+        let failure = || clipmonger_ipc::proto::IpcError::new("unavailable", "lost link".into());
+        let scan_result = if fail_compact {
+            Err(failure())
+        } else {
+            Ok(
+                json!({"owner":scan.params.owner,"generation":scan.params.generation,"rows":[],"cursor":null,"done":true,"bytes_read":0,"candidates":0}),
+            )
+        };
+        let current_result = if fail_current {
+            Err(failure())
+        } else {
+            Ok(json!({"clips":[]}))
+        };
+        rig.push(UiEvent::CompactHistory(scan, scan_result));
+        rig.push(UiEvent::CompactCurrent(current, current_result));
+        rig.show();
+        assert!(
+            rig.app.shell().offline(),
+            "eligible transport error must enter offline, compact={fail_compact}, current={fail_current}"
+        );
+        rig.push(status(false, "1"));
+        rig.show();
+        assert!(!rig.app.shell().offline());
+        let commands = rig.cmds();
+        let fresh_scan = commands
+            .iter()
+            .find_map(|c| match c {
+                UiCmd::CompactHistory(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("recovery scan");
+        let fresh_current = commands
+            .iter()
+            .find_map(|c| match c {
+                UiCmd::CompactCurrent(t) => Some(*t),
+                _ => None,
+            })
+            .expect("recovery current");
+        rig.push(UiEvent::CompactHistory(fresh_scan.clone(), Ok(json!({"owner":fresh_scan.params.owner,"generation":fresh_scan.params.generation,"rows":[{"id":id(1),"pinned":false,"last_used_ms":1,"preview":"recovered","preview_truncated":false,"kind":"text","thumbnail_hash":null}],"cursor":null,"done":true,"bytes_read":1,"candidates":1}))));
+        rig.push(UiEvent::CompactCurrent(
+            fresh_current,
+            Ok(json!({"clips":[clip(1, "recovered")]})),
+        ));
+        assert!(rig.show().painted("recovered"));
+        assert_eq!(rig.app.vm().current().map(|c| c.id), Some(id(1)));
+    }
+}
+
+#[test]
+fn obsolete_transport_errors_do_not_mark_replacement_views_offline() {
+    for scenario in ["query", "restore", "reopen"] {
+        let mut rig = Rig::raw(Setup::new(true));
+        let commands = rig.cmds();
+        let scan = commands
+            .iter()
+            .find_map(|c| match c {
+                UiCmd::CompactHistory(t) => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let current = commands
+            .iter()
+            .find_map(|c| match c {
+                UiCmd::CompactCurrent(t) => Some(*t),
+                _ => None,
+            })
+            .unwrap();
+        rig.push(status(false, "1"));
+        rig.show();
+        if scenario == "restore" {
+            rig.push(UiEvent::RestoreDone { warning: None });
+            rig.show();
+        } else {
+            rig.input(egui::Event::Text("new query".into()));
+            rig.show();
+            if scenario == "reopen" {
+                rig.key(egui::Key::Escape);
+                rig.show();
+                rig.tray(&[TrayAction::OpenPopup]);
+                rig.tick();
+            }
+        }
+        let _ = rig.cmds();
+        let fail = || clipmonger_ipc::proto::IpcError::new("io_failed", "old outage".into());
+        rig.push(UiEvent::CompactHistory(scan, Err(fail())));
+        if scenario != "query" {
+            rig.push(UiEvent::CompactCurrent(current, Err(fail())));
+        }
+        rig.show();
+        assert!(
+            !rig.app.shell().offline(),
+            "obsolete error marked new view offline, scenario={scenario}"
+        );
+        let commands = rig.cmds();
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, UiCmd::CompactHistory(_))));
+        if scenario != "query" {
+            assert!(commands
+                .iter()
+                .any(|c| matches!(c, UiCmd::CompactCurrent(_))));
+        }
+        rig.push(status(false, "1"));
+        rig.show();
+        assert!(!rig.app.shell().offline());
+        assert!(
+            !rig.cmds()
+                .iter()
+                .any(|c| matches!(c, UiCmd::CompactHistory(_) | UiCmd::CompactCurrent(_))),
+            "status should not reset new view for obsolete errors"
+        );
+    }
 }
 
 #[test]
@@ -4937,10 +5543,7 @@ fn restore_blocks_stale_apply_until_refreshed_config_and_keeps_warning() {
         warning: Some(RestoreWarning::ApplyFailed),
     });
     rig.tick();
-    assert_eq!(
-        rig.cmds(),
-        vec![UiCmd::ListHistory, UiCmd::ConfigGetAfterRestore]
-    );
+    assert_eq!(rig.cmds(), vec![UiCmd::ConfigGetAfterRestore]);
     assert!(rig.app.config().lock().unwrap().restore_pending);
     for pressed in [true, false] {
         settings_frame(
@@ -5018,10 +5621,7 @@ fn restore_warning_with_closed_settings_reaches_shell_and_refreshes() {
     assert!(message.contains(strings::text("config.restore_done")));
     assert!(message.contains(strings::text("config.restore_warning_unknown")));
     assert_eq!(rig.config_error(), "");
-    assert_eq!(
-        rig.cmds(),
-        vec![UiCmd::ListHistory, UiCmd::ConfigGetAfterRestore]
-    );
+    assert_eq!(rig.cmds(), vec![UiCmd::ConfigGetAfterRestore]);
 }
 
 #[test]
@@ -5040,10 +5640,7 @@ fn restore_warning_survives_refresh_errors_in_settings_and_shell() {
                 warning: Some(RestoreWarning::ApplyFailed),
             });
             rig.tick();
-            assert_eq!(
-                rig.cmds(),
-                vec![UiCmd::ListHistory, UiCmd::ConfigGetAfterRestore]
-            );
+            assert_eq!(rig.cmds(), vec![UiCmd::ConfigGetAfterRestore]);
             let refresh_error = "refresh failed";
             if config_error {
                 rig.push(UiEvent::RestoredConfigError(refresh_error.into()));
@@ -5073,6 +5670,30 @@ fn restore_warning_survives_refresh_errors_in_settings_and_shell() {
                 assert!(!rig.app.config().lock().unwrap().restore_pending);
             }
         }
+    }
+}
+
+#[test]
+fn compact_backend_errors_do_not_mark_the_transport_offline() {
+    for code in ["not_ready", "stale_cursor", "metadata_too_large"] {
+        let mut rig = Rig::raw(Setup::new(true));
+        let scan = rig
+            .cmds()
+            .into_iter()
+            .find_map(|c| match c {
+                UiCmd::CompactHistory(t) => Some(t),
+                _ => None,
+            })
+            .unwrap();
+        rig.push(UiEvent::CompactHistory(
+            scan,
+            Err(clipmonger_ipc::proto::IpcError::new(code, "backend".into())),
+        ));
+        rig.show();
+        assert!(
+            !rig.app.shell().offline(),
+            "backend error {code} is not a lost link"
+        );
     }
 }
 

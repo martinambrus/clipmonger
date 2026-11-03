@@ -3,6 +3,7 @@
 //! Implements seg-03 S3/S4/S6 under driver freeze D-F1..F5, D-F9, D-F10.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -10,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
@@ -18,6 +19,18 @@ use crate::error::{BackendKind, CoreError};
 use crate::hash::content_hash;
 use crate::model::{Clip, PermanentClip, PermanentKind, Rev};
 use crate::policy::{self, DedupeCandidate, Limits};
+
+#[path = "compact_index.rs"]
+mod compact_index;
+pub use compact_index::IndexStatus as CompactIndexStatus;
+
+#[path = "compact_scan.rs"]
+mod compact_scan;
+pub use crate::sql_text_stream::TextStreamError;
+pub use compact_scan::{CompactHit, CompactKind, ScanChunk, ScanError};
+#[path = "compact_registry.rs"]
+mod compact_registry;
+pub use compact_registry::{SnapshotError, SnapshotToken};
 
 /// Schema version this code reads and writes (D-F1).
 const SCHEMA_VERSION: i64 = 1;
@@ -56,6 +69,11 @@ const SCHEMA_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS clip_blobs(
   blob_key TEXT PRIMARY KEY, sha256 TEXT NOT NULL, bytes INTEGER NOT NULL,
   codec TEXT NOT NULL DEFAULT 'raw', created_ms INTEGER NOT NULL);",
+    "CREATE TABLE IF NOT EXISTS uri_payload_versions(clip_id TEXT PRIMARY KEY, version INTEGER NOT NULL);",
+    "CREATE TABLE IF NOT EXISTS uri_search(clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE, version INTEGER NOT NULL, parser_version INTEGER NOT NULL, names TEXT NOT NULL);",
+    "CREATE TRIGGER IF NOT EXISTS uri_payload_insert AFTER INSERT ON clip_payloads WHEN NEW.mime='text/uri-list' BEGIN INSERT INTO uri_payload_versions VALUES(NEW.clip_id,1) ON CONFLICT(clip_id) DO UPDATE SET version=version+1; DELETE FROM uri_search WHERE clip_id=NEW.clip_id; END;",
+    "CREATE TRIGGER IF NOT EXISTS uri_payload_delete AFTER DELETE ON clip_payloads WHEN OLD.mime='text/uri-list' BEGIN INSERT INTO uri_payload_versions VALUES(OLD.clip_id,1) ON CONFLICT(clip_id) DO UPDATE SET version=version+1; DELETE FROM uri_search WHERE clip_id=OLD.clip_id; END;",
+    "CREATE TRIGGER IF NOT EXISTS uri_payload_update AFTER UPDATE ON clip_payloads WHEN OLD.mime='text/uri-list' OR NEW.mime='text/uri-list' BEGIN INSERT INTO uri_payload_versions VALUES(OLD.clip_id,1) ON CONFLICT(clip_id) DO UPDATE SET version=version+1; DELETE FROM uri_search WHERE clip_id=OLD.clip_id; END;",
     "CREATE TABLE IF NOT EXISTS perm_groups(name TEXT PRIMARY KEY, system INTEGER NOT NULL DEFAULT 0);",
     "CREATE TABLE IF NOT EXISTS permanents(
   id TEXT PRIMARY KEY, grp TEXT NOT NULL REFERENCES perm_groups(name),
@@ -89,6 +107,19 @@ pub enum InsertOutcome {
     MovedToTop(Uuid),
     /// Metadata-only stub (no payloads stored).
     Stubbed(Uuid),
+}
+
+/// Bounded single-MIME payload snapshot (P4 Task 20 Part 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadSnapshot {
+    /// Clip identity (v7 UUID).
+    pub clip_id: Uuid,
+    /// Stored content hash (hex SHA-256, local dedupe only).
+    pub content_hash: String,
+    /// Canonical MIME of the selected payload (exact match).
+    pub mime: String,
+    /// Raw payload bytes (bounded by caller cap).
+    pub data: Vec<u8>,
 }
 
 /// Result of [`Store::gc_blobs`].
@@ -251,6 +282,18 @@ pub struct Store {
     fts: bool,
     /// True for recovery handles: every write is refused.
     read_only: bool,
+    /// Owned read snapshots; no connection escapes this registry.
+    compact_snapshots: Mutex<compact_registry::Registry>,
+    uri_epoch: AtomicU64,
+    uri_incomplete: std::sync::atomic::AtomicBool,
+    uri_maintenance: Mutex<UriMaintenance>,
+}
+
+#[derive(Debug, Default)]
+struct UriMaintenance {
+    after: Option<i64>,
+    failed: bool,
+    epoch: u64,
 }
 
 /// Wrap a `rusqlite` failure as a backend error.
@@ -870,6 +913,143 @@ fn safe_blob_read(blobs: &Path, key: &str, expect_sha: &str) -> Result<Vec<u8>, 
     Ok(buf)
 }
 
+fn capped_read<R: std::io::Read>(reader: R, cap: usize) -> Result<Vec<u8>, CoreError> {
+    let cap_plus_one = cap.checked_add(1).ok_or_else(|| CoreError::Backend {
+        backend: "store".to_string(),
+        kind: BackendKind::Internal,
+        message: "cap overflow".to_string(),
+    })?;
+    let mut buf = Vec::new();
+    let n = reader
+        .take(cap_plus_one as u64)
+        .read_to_end(&mut buf)
+        .map_err(CoreError::Io)?;
+    if n > cap {
+        return Err(CoreError::TooLarge {
+            message: format!("read {n} > cap {cap}"),
+        });
+    }
+    Ok(buf)
+}
+
+// Keep path validation and the bounded read in one auditable operation.
+#[allow(clippy::too_many_lines)]
+fn safe_blob_read_capped(
+    blobs: &Path,
+    key: &str,
+    expect_sha: &str,
+    cap: usize,
+) -> Result<Vec<u8>, CoreError> {
+    let (prefix, size) = parse_blob_key(key).ok_or_else(|| CoreError::Corrupt {
+        message: "invalid blob key".to_string(),
+    })?;
+    let _ = prefix;
+    let cap_u64 = u64::try_from(cap).map_err(|_| CoreError::Backend {
+        backend: "store".to_string(),
+        kind: BackendKind::Internal,
+        message: "cap overflow u64".to_string(),
+    })?;
+    if size > cap_u64 {
+        return Err(CoreError::TooLarge {
+            message: format!("blob size {size} > cap {cap}"),
+        });
+    }
+    let path = safe_blob_path(blobs, key)?;
+    // Open the leaf itself without following a final symlink/reparse point. The
+    // subsequent checks apply to this handle, not to an earlier pathname check.
+    // Ancestor replacement remains the pre-existing blobs-root boundary.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NONBLOCK: i32 = 0x800;
+        const O_NOFOLLOW: i32 = 0x20000;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK | O_NOFOLLOW)
+            .open(&path)
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+    };
+    #[cfg(not(any(
+        windows,
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
+    let file: std::io::Result<fs::File> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "safe blob leaf open unsupported on this platform",
+    ));
+    let file = file.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::Unsupported {
+            CoreError::Unsupported {
+                message: "safe blob leaf open unsupported on this platform".to_string(),
+            }
+        } else {
+            CoreError::Corrupt {
+                message: "missing or unsafe external blob".to_string(),
+            }
+        }
+    })?;
+    let meta = file.metadata().map_err(CoreError::Io)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(CoreError::Corrupt {
+                message: "blob reparse point".to_string(),
+            });
+        }
+    }
+    if !meta.is_file() {
+        return Err(CoreError::Corrupt {
+            message: "blob not a regular file".to_string(),
+        });
+    }
+    let file_len = meta.len();
+    if file_len != size {
+        return Err(CoreError::Corrupt {
+            message: "external blob size mismatch".to_string(),
+        });
+    }
+    if file_len > cap_u64 {
+        return Err(CoreError::TooLarge {
+            message: format!("blob file {file_len} > cap {cap}"),
+        });
+    }
+    let buf = capped_read(file, cap)?;
+    if buf.len() as u64 != size {
+        if buf.len() as u64 > cap_u64 {
+            return Err(CoreError::TooLarge {
+                message: "external blob exceeds cap on read".to_string(),
+            });
+        }
+        return Err(CoreError::Corrupt {
+            message: "external blob size mismatch".to_string(),
+        });
+    }
+    let mut h = Sha256::new();
+    h.update(&buf);
+    if hex_of(&h.finalize()) != expect_sha {
+        return Err(CoreError::Corrupt {
+            message: "external blob failed verification".to_string(),
+        });
+    }
+    Ok(buf)
+}
+
 fn validate_db_keys(conn: &Connection) -> Result<(), CoreError> {
     validate_db_keys_opening(conn, None).map_err(|error| match error {
         TypedOpenError::Fatal(error) => error,
@@ -1395,6 +1575,20 @@ fn clip_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<Clip> {
 }
 
 impl Store {
+    /// Check an ID directly, including removed clips, without loading metadata or payloads.
+    ///
+    /// # Errors
+    /// Returns a database error if the lookup fails.
+    pub fn contains_clip_id(&self, id: Uuid) -> Result<bool, CoreError> {
+        self.lock()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM clips WHERE id=?1)",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .map_err(|e| db_err(&e))
+    }
+
     /// Open or create a store at `profile/clipstore.sqlite3`.
     ///
     /// # Errors
@@ -1553,6 +1747,10 @@ impl Store {
             conn: Mutex::new(conn),
             fts,
             read_only,
+            compact_snapshots: Mutex::new(compact_registry::Registry::default()),
+            uri_epoch: AtomicU64::new(0),
+            uri_incomplete: std::sync::atomic::AtomicBool::new(true),
+            uri_maintenance: Mutex::new(UriMaintenance::default()),
         })
     }
 
@@ -1589,6 +1787,7 @@ impl Store {
     /// Returns the original Store and the checkpoint or connection-close error.
     #[allow(clippy::result_large_err)]
     pub fn close(self) -> Result<(), (Self, CoreError)> {
+        self.drain_compact_snapshots();
         if let Err(error) = self.checkpoint() {
             return Err((self, error));
         }
@@ -1602,6 +1801,10 @@ impl Store {
             conn,
             fts,
             read_only,
+            compact_snapshots,
+            uri_epoch,
+            uri_incomplete,
+            uri_maintenance,
         } = self;
         let connection = conn
             .into_inner()
@@ -1614,6 +1817,10 @@ impl Store {
                     conn: Mutex::new(connection),
                     fts,
                     read_only,
+                    compact_snapshots,
+                    uri_epoch,
+                    uri_incomplete,
+                    uri_maintenance,
                 },
                 db_err(&error),
             )
@@ -1767,6 +1974,8 @@ impl Store {
         self.insert_clip_inner(clip, &[], true)
     }
 
+    // The insert transaction keeps all related writes together.
+    #[allow(clippy::too_many_lines)]
     fn insert_clip_inner(
         &self,
         clip: &Clip,
@@ -1777,6 +1986,10 @@ impl Store {
             return Err(readonly_err());
         }
         let incoming = content_hash(payloads);
+        let uri_names = payloads
+            .iter()
+            .find(|(mime, _)| mime == "text/uri-list")
+            .and_then(|(_, bytes)| crate::uri_search::basenames(bytes).ok());
         if !payloads.is_empty() {
             if let Some(hit) = self.dedupe_hit(&incoming, &clip.id)? {
                 self.lock()
@@ -1799,6 +2012,8 @@ impl Store {
             }
         }
         let mut conn = self.lock();
+        self.uri_epoch.fetch_add(1, Ordering::SeqCst);
+        self.uri_incomplete.store(true, Ordering::SeqCst);
         let tx = conn.transaction().map_err(|e| db_err(&e))?;
         let inserted = tx.execute(
             "INSERT INTO clips(id, created_ms, source_app, source_os, pinned, removed, \
@@ -1851,6 +2066,9 @@ impl Store {
                     params![clip.id.to_string(), mime, key, native],
                 ).map_err(|e| db_err(&e))?;
             }
+        }
+        if let Some(names) = &uri_names {
+            tx.execute("INSERT INTO uri_search(clip_id, version, parser_version, names) VALUES(?1, COALESCE((SELECT version FROM uri_payload_versions WHERE clip_id=?1),0), 3, ?2)", params![clip.id.to_string(), names]).map_err(|e| db_err(&e))?;
         }
         tx.execute(
             "DELETE FROM clips_fts WHERE clip_id=?1",
@@ -1937,6 +2155,334 @@ impl Store {
         let out = load_payload_rows(&self.blobs, rows)?;
         clip.formats = out.iter().map(|(m, _)| m.clone()).collect();
         Ok(Some((clip.clone(), out)))
+    }
+
+    /// Bounded single-MIME payload snapshot (P4 Task 20 Part 1).
+    ///
+    /// Direct UUID + exact MIME query with caller cap. Returns `None` for
+    /// absent, soft-deleted, missing MIME, or metadata-only (stub) clips.
+    /// Errors honestly for corrupt rows or I/O. Enforces cap with checked
+    /// `usize`/`u64` arithmetic before materializing inline SQLite BLOB or
+    /// allocating external bytes. SQL does not pull unbounded inline BLOB then
+    /// check Rust length: metadata + conditional bounded selection within the
+    /// coherent SQLite read transaction. Reuses `safe_blob_read` containment/hash/size
+    /// protections via `safe_blob_read_capped`. External preflight checks
+    /// recorded bytes vs cap, and actual file read uses `cap+1` to handle
+    /// growth, never bypassing cap on tampered `recorded_len`. Holds the
+    /// same store lock and a read transaction, no aux connection or
+    /// `get_clip` full-payload scan, preserving restore/publication semantics.
+    ///
+    /// Inline payloads are available on all targets. Opening an external
+    /// payload is supported on Windows and Linux `x86_64`/`aarch64`; on other
+    /// targets it returns [`CoreError::Unsupported`] after earlier metadata,
+    /// cap and pathname checks, which may themselves return another error.
+    ///
+    /// # Errors
+    /// Returns an error on invalid metadata, size, I/O, or database failure.
+    pub fn get_payload(
+        &self,
+        id: Uuid,
+        mime: &str,
+        cap: usize,
+    ) -> Result<Option<PayloadSnapshot>, CoreError> {
+        self.get_payload_with_interleave(id, mime, cap, || {})
+    }
+
+    /// Attempt one URI-list backfill. The caller owns the cursor and wraps it
+    /// to None when the end is reached, ensuring failed entries are revisited.
+    /// Errors never include clipboard content.
+    fn backfill_uri_step(
+        &self,
+        after: Option<i64>,
+    ) -> Result<Option<(i64, bool, bool)>, CoreError> {
+        self.backfill_uri_step_with_hook(after, || {})
+    }
+
+    fn backfill_uri_step_with_hook<F: FnOnce()>(
+        &self,
+        after: Option<i64>,
+        hook: F,
+    ) -> Result<Option<(i64, bool, bool)>, CoreError> {
+        if self.read_only {
+            return Err(readonly_err());
+        }
+        let candidate: Option<(i64, Option<String>, i64, bool, bool, String)> = {
+            let conn = self.lock();
+            conn.query_row("SELECT c.rowid, CASE WHEN length(CAST(c.id AS BLOB)) <= 36 THEN c.id END, COALESCE(v.version,0), EXISTS(SELECT 1 FROM clip_payloads p WHERE p.clip_id=c.id AND p.mime='text/uri-list'), EXISTS(SELECT 1 FROM uri_search s WHERE s.clip_id=c.id AND s.version=COALESCE(v.version,0) AND s.parser_version=3), COALESCE((SELECT v FROM meta WHERE k='uri_purge_generation'),'0') FROM clips c LEFT JOIN uri_payload_versions v ON v.clip_id=c.id WHERE c.rowid>?1 ORDER BY c.rowid LIMIT 1", params![after.unwrap_or(i64::MIN)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).optional().map_err(|e| db_err(&e))?
+        };
+        let Some((rowid, id, version, has_uri, indexed, purge_generation)) = candidate else {
+            return Ok(None);
+        };
+        if !has_uri || indexed {
+            return Ok(Some((rowid, true, false)));
+        }
+        let Some(id) = id else {
+            return Ok(Some((rowid, false, true)));
+        };
+        let Ok(uuid) = Uuid::parse_str(&id) else {
+            return Ok(Some((rowid, false, true)));
+        };
+        let Ok(Some(payload)) = self.get_payload_internal(
+            uuid,
+            "text/uri-list",
+            crate::uri_search::URI_PAYLOAD_LIMIT,
+            true,
+            || {},
+        ) else {
+            return Ok(Some((rowid, false, true)));
+        };
+        let Ok(names) = crate::uri_search::basenames(&payload.data) else {
+            return Ok(Some((rowid, false, true)));
+        };
+        hook();
+        let mut conn = self.lock();
+        let committed = (|| -> Result<bool, CoreError> {
+            let tx = conn.transaction().map_err(|e| db_err(&e))?;
+            let current: Option<(i64,i64,String)> = tx.query_row("SELECT c.rowid, COALESCE(v.version,0), COALESCE((SELECT v FROM meta WHERE k='uri_purge_generation'),'0') FROM clip_payloads p JOIN clips c ON c.id=p.clip_id LEFT JOIN uri_payload_versions v ON v.clip_id=p.clip_id WHERE p.clip_id=?1 AND p.mime='text/uri-list'", params![id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e| db_err(&e))?;
+            if current == Some((rowid,version,purge_generation.clone())) {
+            tx.execute("INSERT INTO uri_search(clip_id,version,parser_version,names) VALUES(?1,?2,3,?3) ON CONFLICT(clip_id) DO UPDATE SET version=excluded.version,parser_version=excluded.parser_version,names=excluded.names", params![id, version, names]).map_err(|e| db_err(&e))?;
+            }
+            tx.commit().map_err(|e| db_err(&e))?;
+            Ok(current == Some((rowid,version,purge_generation)))
+        })().unwrap_or(false);
+        Ok(Some((rowid, committed, true)))
+    }
+
+    /// Coverage is conservative until a complete sweep has observed no failures.
+    pub fn uri_search_incomplete(&self) -> bool {
+        self.uri_incomplete.load(Ordering::SeqCst)
+    }
+
+    /// Perform one bounded attempt and retain a fair sweep cursor per store.
+    ///
+    /// # Errors
+    /// Returns an error if the store is read-only or the database lookup fails.
+    pub fn maintain_uri_search(&self) -> Result<(), CoreError> {
+        if self.read_only {
+            return Err(readonly_err());
+        }
+        let mut state = self
+            .uri_maintenance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for _ in 0..32 {
+            let next = match self.backfill_uri_step(state.after) {
+                Ok(next) => next,
+                Err(error) => {
+                    self.uri_incomplete.store(true, Ordering::SeqCst);
+                    return Err(error);
+                }
+            };
+            if let Some((id, success, attempted)) = next {
+                state.after = Some(id);
+                state.failed |= !success;
+                if attempted {
+                    break;
+                }
+            } else {
+                let _conn = self.lock();
+                let epoch = self.uri_epoch.load(Ordering::SeqCst);
+                self.uri_incomplete
+                    .store(state.failed || state.epoch != epoch, Ordering::SeqCst);
+                state.after = None;
+                state.failed = false;
+                state.epoch = epoch;
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    // The callback lets the in-module control interleave a second real connection
+    // after the first read. Production always supplies a no-op.
+    fn get_payload_with_interleave<F: FnOnce()>(
+        &self,
+        id: Uuid,
+        mime: &str,
+        cap: usize,
+        interleave: F,
+    ) -> Result<Option<PayloadSnapshot>, CoreError> {
+        self.get_payload_internal(id, mime, cap, false, interleave)
+    }
+
+    // Metadata validation and bounded reads share one snapshot transaction.
+    #[allow(clippy::too_many_lines)]
+    fn get_payload_internal<F: FnOnce()>(
+        &self,
+        id: Uuid,
+        mime: &str,
+        cap: usize,
+        include_removed: bool,
+        interleave: F,
+    ) -> Result<Option<PayloadSnapshot>, CoreError> {
+        let _cap_plus_one = cap.checked_add(1).ok_or_else(|| CoreError::Backend {
+            backend: "store".to_string(),
+            kind: BackendKind::Internal,
+            message: "cap overflow".to_string(),
+        })?;
+        let cap_u64 = u64::try_from(cap).map_err(|_| CoreError::Backend {
+            backend: "store".to_string(),
+            kind: BackendKind::Internal,
+            message: "cap overflow u64".to_string(),
+        })?;
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|e| db_err(&e))?;
+        let mut stmt = tx
+            .prepare(if include_removed { "SELECT CASE WHEN length(CAST(content_hash AS BLOB)) <= 128 THEN content_hash ELSE '' END, removed FROM clips WHERE id=?1" } else { "SELECT content_hash, removed FROM clips WHERE id=?1" })
+            .map_err(|e| db_err(&e))?;
+        let mut rows = stmt
+            .query_map(params![id.to_string()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(|e| db_err(&e))?;
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        let (content_hash, removed) = row.map_err(|e| db_err(&e))?;
+        drop(rows);
+        drop(stmt);
+        if removed != 0 && !include_removed {
+            return Ok(None);
+        }
+        interleave();
+        let mut stmt = tx
+            .prepare(
+                "SELECT p.external, length(p.data), p.blob_key, b.sha256, b.bytes, typeof(p.data)                  FROM clip_payloads p LEFT JOIN clip_blobs b ON b.blob_key=p.blob_key                  WHERE p.clip_id=?1 AND p.mime=?2",
+            )
+            .map_err(|e| db_err(&e))?;
+        let mut rows = stmt
+            .query_map(params![id.to_string(), mime], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| db_err(&e))?;
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        let (external, len_opt, blob_key_opt, sha_opt, bytes_opt, data_type) =
+            row.map_err(|_| CoreError::Corrupt {
+                message: "invalid payload types".to_string(),
+            })?;
+        drop(rows);
+        drop(stmt);
+        match external {
+            0 => {
+                if blob_key_opt.is_some() {
+                    return Err(CoreError::Corrupt {
+                        message: "inline payload has blob_key".to_string(),
+                    });
+                }
+                // The established reader maps SQL NULL inline payloads to empty bytes.
+                if data_type == "null" {
+                    if include_removed && mime == "text/uri-list" {
+                        return Err(CoreError::Corrupt {
+                            message: "missing URI payload".to_string(),
+                        });
+                    }
+                    return Ok(Some(PayloadSnapshot {
+                        clip_id: id,
+                        mime: mime.to_string(),
+                        content_hash,
+                        data: Vec::new(),
+                    }));
+                }
+                if data_type != "blob" {
+                    return Err(CoreError::Corrupt {
+                        message: "invalid inline data".to_string(),
+                    });
+                }
+                let len_i64 = len_opt.ok_or_else(|| CoreError::Corrupt {
+                    message: "inline payload missing data".to_string(),
+                })?;
+                let length = u64::try_from(len_i64).map_err(|_| CoreError::Corrupt {
+                    message: "invalid inline length".to_string(),
+                })?;
+                if length > cap_u64 {
+                    return Err(CoreError::TooLarge {
+                        message: format!("inline payload {length} > cap {cap}"),
+                    });
+                }
+                let sql_cap = i64::try_from(cap_u64).unwrap_or(i64::MAX);
+                let mut stmt = tx
+                    .prepare("SELECT data FROM clip_payloads WHERE clip_id=?1 AND mime=?2 AND length(data) <= ?3")
+                    .map_err(|e| db_err(&e))?;
+                let mut rows = stmt
+                    .query_map(params![id.to_string(), mime, sql_cap], |r| {
+                        r.get::<_, Vec<u8>>(0)
+                    })
+                    .map_err(|e| db_err(&e))?;
+                let Some(data_row) = rows.next() else {
+                    return Err(CoreError::TooLarge {
+                        message: "inline payload exceeds cap on re-check".to_string(),
+                    });
+                };
+                let data = data_row.map_err(|_| CoreError::Corrupt {
+                    message: "invalid inline data".to_string(),
+                })?;
+                if data.len() as u64 != length {
+                    return Err(CoreError::Corrupt {
+                        message: "inline length mismatch".to_string(),
+                    });
+                }
+                if data.len() > cap {
+                    return Err(CoreError::TooLarge {
+                        message: "inline data exceeds cap after fetch".to_string(),
+                    });
+                }
+                Ok(Some(PayloadSnapshot {
+                    clip_id: id,
+                    mime: mime.to_string(),
+                    content_hash,
+                    data,
+                }))
+            }
+            1 => {
+                if data_type != "null" {
+                    return Err(CoreError::Corrupt {
+                        message: "external payload has inline data".to_string(),
+                    });
+                }
+                let blob_key = blob_key_opt.ok_or_else(|| CoreError::Corrupt {
+                    message: "missing external blob_key".to_string(),
+                })?;
+                let sha = sha_opt.ok_or_else(|| CoreError::Corrupt {
+                    message: "missing external sha".to_string(),
+                })?;
+                let bytes_i64 = bytes_opt.ok_or_else(|| CoreError::Corrupt {
+                    message: "missing external bytes".to_string(),
+                })?;
+                validate_blob_metadata(&blob_key, &sha, bytes_i64)?;
+                let length = u64::try_from(bytes_i64).map_err(|_| CoreError::Corrupt {
+                    message: "invalid blob bytes".to_string(),
+                })?;
+                if length > cap_u64 {
+                    return Err(CoreError::TooLarge {
+                        message: format!("external payload {length} > cap {cap}"),
+                    });
+                }
+                let data = safe_blob_read_capped(&self.blobs, &blob_key, &sha, cap)?;
+                if data.len() as u64 != length {
+                    return Err(CoreError::Corrupt {
+                        message: "external bytes length mismatch".to_string(),
+                    });
+                }
+                Ok(Some(PayloadSnapshot {
+                    clip_id: id,
+                    mime: mime.to_string(),
+                    content_hash,
+                    data,
+                }))
+            }
+            _ => Err(CoreError::Corrupt {
+                message: "invalid external flag".to_string(),
+            }),
+        }
     }
 
     /// Create a Paste permanent, minting its v7 id and implicit group.
@@ -2334,22 +2880,37 @@ impl Store {
             return Ok(Vec::new());
         }
         let conn = self.lock();
+        let uri_ready = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='uri_search' AND type='table')", [], |r| r.get::<_,bool>(0)).unwrap_or(false);
         if self.fts {
+            if uri_ready {
+                if let Some(mut clips) = fts_search_with_uri(&conn, &tokens) {
+                    for clip in &mut clips {
+                        clip.formats = mime_list(&conn, &clip.id.to_string())?;
+                    }
+                    return Ok(clips);
+                }
+            }
             let match_q = tokens
                 .iter()
                 .map(|t| format!("\"{t}\""))
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            if let Some(mut clips) = fts_search(&conn, &match_q) {
-                for c in &mut clips {
-                    c.formats = mime_list(&conn, &c.id.to_string())?;
+            if !uri_ready {
+                if let Some(mut clips) = fts_search(&conn, &match_q) {
+                    for c in &mut clips {
+                        c.formats = mime_list(&conn, &c.id.to_string())?;
+                    }
+                    return Ok(clips);
                 }
-                return Ok(clips);
             }
         }
         let mut sql = format!("SELECT {CLIP_COLS} FROM clips WHERE removed=0");
-        for _ in &tokens {
-            sql.push_str(" AND LOWER(search_text) LIKE ? ESCAPE '\\'");
+        for index in 1..=tokens.len() {
+            if uri_ready {
+                let _ = write!(sql, " AND (LOWER(search_text) LIKE ?{index} ESCAPE '\\' OR EXISTS (SELECT 1 FROM uri_search s LEFT JOIN uri_payload_versions v ON v.clip_id=s.clip_id WHERE s.clip_id=clips.id AND s.parser_version=3 AND s.version=COALESCE(v.version,0) AND LOWER(s.names) LIKE ?{index} ESCAPE '\\'))");
+            } else {
+                let _ = write!(sql, " AND LOWER(search_text) LIKE ?{index} ESCAPE '\\'");
+            }
         }
         sql.push_str(" ORDER BY last_used_ms DESC");
         let mut stmt = conn.prepare(&sql).map_err(|e| db_err(&e))?;
@@ -2590,7 +3151,6 @@ impl Store {
             blob_entries.join(",")
         );
         if let Some((_, cfg_len, cfg_sha)) = &config_data {
-            use std::fmt::Write as _;
             let _ = write!(
                 manifest,
                 "config_bytes = {cfg_len}\nconfig_sha256 = {cfg_sha:?}\n"
@@ -2956,11 +3516,28 @@ fn removed_ids(conn: &Connection) -> Result<Vec<String>, CoreError> {
 
 /// Delete clip and FTS rows; the caller sweeps after all SQL deletions.
 fn delete_clips(conn: &Connection, ids: &[String]) -> Result<(), CoreError> {
+    if !ids.is_empty() {
+        // Rowids and per-clip versions can both be reused after a purge. Keep
+        // in-flight URI backfills from accepting an earlier incarnation.
+        let changed = conn.execute("INSERT INTO meta(k,v) VALUES('uri_purge_generation','1') ON CONFLICT(k) DO UPDATE SET v=CAST(v AS INTEGER)+1 WHERE CAST(v AS INTEGER)<9223372036854775807", []).map_err(|e| db_err(&e))?;
+        if changed != 1 {
+            return Err(CoreError::Corrupt {
+                message: "URI purge generation exhausted".to_string(),
+            });
+        }
+    }
     for id in ids {
         conn.execute("DELETE FROM clips_fts WHERE clip_id=?1", params![id])
             .map_err(|e| db_err(&e))?;
         conn.execute("DELETE FROM clips WHERE id=?1", params![id])
             .map_err(|e| db_err(&e))?;
+        // The cascading payload delete increments the version, so remove it
+        // only after the clip and its payloads have been deleted.
+        conn.execute(
+            "DELETE FROM uri_payload_versions WHERE clip_id=?1",
+            params![id],
+        )
+        .map_err(|e| db_err(&e))?;
     }
     Ok(())
 }
@@ -3118,6 +3695,93 @@ fn is_symlink_entry<R: std::io::Read + std::io::Seek>(e: &zip::read::ZipFile<'_,
 }
 
 /// FTS5 search; `None` on any failure so callers fall back to LIKE.
+/// Legacy search may scan all indexed URI rows. Each bounded name document is
+/// evaluated in its own fresh in-memory FTS5 database, so SQLite supplies the
+/// exact tokenizer without accumulating a persistent URI index or merge work.
+/// Original FTS contributes only clip IDs; original text is fetched only for
+/// clips that match the final query, as required by the existing return type.
+fn fts_search_with_uri(conn: &Connection, tokens: &[String]) -> Option<Vec<Clip>> {
+    let queries: Vec<String> = tokens.iter().map(|token| format!("\"{token}\"")).collect();
+    let mut hits: Vec<HashSet<Uuid>> = Vec::with_capacity(queries.len());
+    for query in &queries {
+        let mut stmt = conn.prepare("SELECT CASE WHEN length(CAST(clip_id AS BLOB)) <= 36 THEN clip_id END FROM clips_fts WHERE clips_fts MATCH ?1").ok()?;
+        let rows = stmt
+            .query_map([query], |r| r.get::<_, Option<String>>(0))
+            .ok()?;
+        let mut ids = HashSet::new();
+        for row in rows {
+            if let Some(id) = row.ok()? {
+                if let Ok(uuid) = Uuid::parse_str(&id) {
+                    ids.insert(uuid);
+                }
+            }
+        }
+        hits.push(ids);
+    }
+    let mut stmt = conn.prepare("SELECT s.rowid, s.clip_id FROM uri_search s JOIN clips c ON c.id=s.clip_id LEFT JOIN uri_payload_versions v ON v.clip_id=s.clip_id WHERE c.removed=0 AND s.parser_version=3 AND s.version=COALESCE(v.version,0) AND length(CAST(s.clip_id AS BLOB))<=36 AND typeof(s.names)='text'").ok()?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .ok()?;
+    for row in rows {
+        let (rowid, id) = row.ok()?;
+        let Ok(id) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        let blob = conn
+            .blob_open(rusqlite::MAIN_DB, "uri_search", "names", rowid, true)
+            .ok()?;
+        if blob.len() > crate::uri_search::URI_SEARCH_LIMIT {
+            return None;
+        }
+        drop(blob);
+        let names: String = conn
+            .query_row(
+                "SELECT names FROM uri_search WHERE rowid=?1",
+                [rowid],
+                |r| r.get(0),
+            )
+            .ok()?;
+        if names.len() > crate::uri_search::URI_SEARCH_LIMIT {
+            return None;
+        }
+        let temp = Connection::open_in_memory().ok()?;
+        temp.execute_batch("CREATE VIRTUAL TABLE names_fts USING fts5(text)")
+            .ok()?;
+        temp.execute("INSERT INTO names_fts(text) VALUES(?1)", [&names])
+            .ok()?;
+        for (index, query) in queries.iter().enumerate() {
+            let matched: bool = temp
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM names_fts WHERE names_fts MATCH ?1)",
+                    [query],
+                    |r| r.get(0),
+                )
+                .ok()?;
+            if matched {
+                hits[index].insert(id);
+            }
+        }
+    }
+    let mut intersection = hits.into_iter();
+    let mut matched = intersection.next()?;
+    for ids in intersection {
+        matched.retain(|id| ids.contains(id));
+    }
+    let sql = format!("SELECT {CLIP_COLS} FROM clips WHERE id=?1 AND removed=0");
+    let mut clips = Vec::new();
+    for id in matched {
+        if let Some(clip) = conn
+            .query_row(&sql, [id.to_string()], clip_of)
+            .optional()
+            .ok()?
+        {
+            clips.push(clip);
+        }
+    }
+    clips.sort_by_key(|a| std::cmp::Reverse(a.last_used_ms));
+    Some(clips)
+}
+
 fn fts_search(conn: &Connection, match_q: &str) -> Option<Vec<Clip>> {
     let sql = format!(
         "SELECT {CLIP_COLS} FROM clips JOIN clips_fts ON clips_fts.clip_id=clips.id \
@@ -3335,6 +3999,830 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Barrier;
     use uuid::Uuid;
+
+    #[test]
+    fn uri_backfill_upgrades_prototype_markers() {
+        let profile = unique_dir("uri-prototype-upgrade");
+        let store = Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let clip = sample_clip(id, "", "base", 19);
+        store
+            .insert_clip(
+                &clip,
+                &[("text/uri-list".into(), b"file:///current.txt".to_vec())],
+            )
+            .unwrap();
+        for version in [1, 2] {
+            store
+                .lock()
+                .execute(
+                    "UPDATE uri_search SET parser_version=?2, names='obsolete' WHERE clip_id=?1",
+                    rusqlite::params![id.to_string(), version],
+                )
+                .unwrap();
+            assert_eq!(store.search("obsolete").unwrap().len(), 0);
+            for _ in 0..3 {
+                store.maintain_uri_search().unwrap();
+            }
+            let row: (i64, String) = store
+                .lock()
+                .query_row(
+                    "SELECT parser_version,names FROM uri_search WHERE clip_id=?1",
+                    [id.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(row, (3, "current.txt".into()));
+            assert!(store
+                .search("current")
+                .unwrap()
+                .iter()
+                .any(|clip| clip.id == id));
+        }
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_versions_follow_clip_lifecycle() {
+        use rusqlite::OptionalExtension;
+        let profile = unique_dir("uri-version-lifecycle");
+        let store = Store::open(&profile).unwrap();
+        let survivor = sample_clip(Uuid::now_v7(), "", "survivor", 100);
+        store
+            .insert_clip(
+                &survivor,
+                &[("text/uri-list".into(), b"file:///survivor".to_vec())],
+            )
+            .unwrap();
+        store.soft_delete(survivor.id).unwrap();
+        let version = |id: Uuid| -> Option<i64> {
+            store
+                .lock()
+                .query_row(
+                    "SELECT version FROM uri_payload_versions WHERE clip_id=?1",
+                    [id.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap()
+        };
+        let original = version(survivor.id).unwrap();
+        for i in 0..3 {
+            let clip = sample_clip(Uuid::now_v7(), "", "cycle", i);
+            store
+                .insert_clip(
+                    &clip,
+                    &[(
+                        "text/uri-list".into(),
+                        format!("file:///cycle{i}").into_bytes(),
+                    )],
+                )
+                .unwrap();
+            store.soft_delete(clip.id).unwrap();
+            // Restore the first clip logically while purging each cycle.
+            store
+                .lock()
+                .execute(
+                    "UPDATE clips SET removed=0 WHERE id=?1",
+                    [survivor.id.to_string()],
+                )
+                .unwrap();
+            assert_eq!(store.purge_removed(), 1);
+            assert_eq!(version(clip.id), None);
+            assert_eq!(version(survivor.id), Some(original));
+            store.soft_delete(survivor.id).unwrap();
+        }
+        store
+            .lock()
+            .execute(
+                "UPDATE clips SET removed=0 WHERE id=?1",
+                [survivor.id.to_string()],
+            )
+            .unwrap();
+        let old = sample_clip(Uuid::now_v7(), "", "old", 1);
+        store
+            .insert_clip(&old, &[("text/uri-list".into(), b"file:///old".to_vec())])
+            .unwrap();
+        let limits = Limits {
+            max_items: 1,
+            max_store_bytes: u64::MAX,
+            max_age_days: 0,
+        };
+        assert_eq!(store.enforce_retention(&limits).unwrap(), 1);
+        assert_eq!(version(old.id), None);
+        assert_eq!(version(survivor.id), Some(original));
+        let archive = profile.join("backup.zip");
+        store.backup_zip(&archive).unwrap();
+        let restored_profile = unique_dir("uri-version-restored");
+        Store::restore_zip(&archive, &restored_profile).unwrap();
+        let restored = Store::open(&restored_profile).unwrap();
+        assert_eq!(
+            restored
+                .lock()
+                .query_row(
+                    "SELECT version FROM uri_payload_versions WHERE clip_id=?1",
+                    [survivor.id.to_string()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            original
+        );
+        restored.soft_delete(survivor.id).unwrap();
+        assert_eq!(restored.purge_removed(), 1);
+        assert_eq!(
+            restored
+                .lock()
+                .query_row("SELECT count(*) FROM uri_payload_versions", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(restored_profile);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_backfill_discards_purged_and_reinserted_clip() {
+        let profile = unique_dir("uri-purge-race");
+        let store = Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let clip = sample_clip(id, "", "race", 19);
+        store
+            .insert_clip(
+                &clip,
+                &[("text/uri-list".into(), b"file:///old.txt".to_vec())],
+            )
+            .unwrap();
+        store.lock().execute("DELETE FROM uri_search", []).unwrap();
+        let initial: (i64, i64) = store.lock().query_row("SELECT c.rowid,v.version FROM clips c JOIN uri_payload_versions v ON c.id=v.clip_id WHERE c.id=?1", [id.to_string()], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        let result = store.backfill_uri_step_with_hook(None, || {
+            store.soft_delete(id).unwrap();
+            assert_eq!(store.purge_removed(), 1);
+            store.insert_clip(&clip, &[("text/uri-list".into(), b"file:///new.txt".to_vec())]).unwrap();
+            let replaced: (i64, i64) = store.lock().query_row("SELECT c.rowid,v.version FROM clips c JOIN uri_payload_versions v ON c.id=v.clip_id WHERE c.id=?1", [id.to_string()], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(replaced, initial);
+            store.lock().execute("DELETE FROM uri_search", []).unwrap();
+        }).unwrap().unwrap();
+        assert!(!result.1);
+        assert_eq!(
+            store
+                .lock()
+                .query_row("SELECT count(*) FROM uri_search", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_capture_and_purge_leave_prototype_global_fts_untouched() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let profile = unique_dir("uri-no-global-writes");
+        let store = Store::open(&profile).unwrap();
+        store.lock().execute_batch("CREATE VIRTUAL TABLE uri_fts USING fts5(text); INSERT INTO uri_fts(text) VALUES('sentinel')").unwrap();
+        let attempts = std::sync::Arc::new(AtomicU64::new(0));
+        let seen = attempts.clone();
+        store
+            .lock()
+            .authorizer(Some(move |ctx: AuthContext<'_>| {
+                let denied = match ctx.action {
+                    AuthAction::Delete { table_name }
+                    | AuthAction::Insert { table_name }
+                    | AuthAction::Update { table_name, .. }
+                    | AuthAction::CreateVtable { table_name, .. } => {
+                        table_name.starts_with("uri_fts")
+                    }
+                    _ => false,
+                };
+                if denied {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }))
+            .unwrap();
+        let id = Uuid::now_v7();
+        let clip = sample_clip(id, "", "base", 19);
+        store
+            .insert_clip(
+                &clip,
+                &[("text/uri-list".into(), b"file:///name.txt".to_vec())],
+            )
+            .unwrap();
+        store.soft_delete(id).unwrap();
+        assert_eq!(store.purge_removed(), 1);
+        store
+            .lock()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT count(*) FROM uri_fts WHERE uri_fts MATCH 'sentinel'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_search_uses_sqlite_tokenizer_and_preserves_mixed_queries() {
+        let profile = unique_dir("uri-tokenizer");
+        let mut store = Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let clip = sample_clip(id, "", "memo", 19);
+        store
+            .insert_clip(
+                &clip,
+                &[(
+                    "text/uri-list".into(),
+                    "file:///tmp/R%C3%A9sum%C3%A9-Payroll.pdf"
+                        .as_bytes()
+                        .to_vec(),
+                )],
+            )
+            .unwrap();
+        assert!(store.search("resume").unwrap().iter().any(|c| c.id == id));
+        assert!(store
+            .search("memo payroll")
+            .unwrap()
+            .iter()
+            .any(|c| c.id == id));
+        assert!(store.search("sum").unwrap().iter().all(|c| c.id != id));
+        assert!(store
+            .search("memo nonexistent")
+            .unwrap()
+            .iter()
+            .all(|c| c.id != id));
+        store.fts = false;
+        assert!(store
+            .search("memo payroll")
+            .unwrap()
+            .iter()
+            .any(|c| c.id == id));
+        assert!(store
+            .search("memo nonexistent")
+            .unwrap()
+            .iter()
+            .all(|c| c.id != id));
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_inline_null_stays_pending_until_repaired() {
+        let profile = unique_dir("uri-null");
+        let store = Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let mut clip = sample_clip(id, "", "keep", 19);
+        clip.removed = true;
+        store.insert_metadata_capture(&clip).unwrap();
+        store
+            .lock()
+            .execute(
+                "INSERT INTO clip_payloads(clip_id,mime,data) VALUES(?1,'text/uri-list',NULL)",
+                [id.to_string()],
+            )
+            .unwrap();
+        let empty = Uuid::now_v7();
+        store
+            .insert_metadata_capture(&sample_clip(empty, "", "empty", 20))
+            .unwrap();
+        store
+            .lock()
+            .execute(
+                "INSERT INTO clip_payloads(clip_id,mime,data) VALUES(?1,'text/uri-list',?2)",
+                rusqlite::params![empty.to_string(), b"".as_slice()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get_payload(empty, "text/uri-list", 8)
+                .unwrap()
+                .unwrap()
+                .data,
+            b""
+        );
+        for _ in 0..3 {
+            store.maintain_uri_search().unwrap();
+        }
+        assert!(store.uri_search_incomplete());
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT count(*) FROM uri_search WHERE clip_id=?1",
+                    [id.to_string()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT names FROM uri_search WHERE clip_id=?1",
+                    [empty.to_string()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            ""
+        );
+        store
+            .lock()
+            .execute(
+                "UPDATE clip_payloads SET data=?2 WHERE clip_id=?1 AND mime='text/uri-list'",
+                rusqlite::params![id.to_string(), b"file:///repaired.txt".as_slice()],
+            )
+            .unwrap();
+        for _ in 0..4 {
+            store.maintain_uri_search().unwrap();
+        }
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT names FROM uri_search WHERE clip_id=?1",
+                    [id.to_string()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "repaired.txt"
+        );
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One fixture compares multiple history sizes.
+    fn uri_backfill_fts_work_does_not_scale_with_history_or_base_text() {
+        let profile = unique_dir("uri-fts-bound");
+        let store = Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let clip = sample_clip(id, "", "initial", 19);
+        store
+            .insert_clip(
+                &clip,
+                &[("text/uri-list".into(), b"file:///bounded.txt".to_vec())],
+            )
+            .unwrap();
+        store.maintain_uri_search().unwrap();
+        {
+            let conn = store.lock();
+            conn.execute(
+                "UPDATE uri_search SET parser_version=1,names='obsolete'",
+                [],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM clips_fts WHERE clip_id=?1", [id.to_string()])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO clips_fts(rowid,clip_id,text) VALUES(90000,?1,'original')",
+                [id.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE clips SET search_text=?2 WHERE id=?1",
+                rusqlite::params![id.to_string(), "x".repeat(2 * 1024 * 1024)],
+            )
+            .unwrap();
+            for n in 1..=5000 {
+                conn.execute(
+                    "INSERT INTO clips_fts(clip_id,text) VALUES(?1,'other')",
+                    [format!("unrelated-{n}")],
+                )
+                .unwrap();
+            }
+        }
+        assert!(store
+            .search("original")
+            .unwrap()
+            .iter()
+            .any(|clip| clip.id == id));
+        assert!(store
+            .search("bounded")
+            .unwrap()
+            .iter()
+            .all(|clip| clip.id != id));
+        let calls = std::sync::Arc::new(AtomicU64::new(0));
+        let progress = calls.clone();
+        let forbidden = std::sync::Arc::new(AtomicU64::new(0));
+        let seen = forbidden.clone();
+        store
+            .lock()
+            .authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                use rusqlite::hooks::{AuthAction, Authorization};
+                let blocked = match ctx.action {
+                    AuthAction::Delete { table_name }
+                    | AuthAction::Insert { table_name }
+                    | AuthAction::Update { table_name, .. }
+                    | AuthAction::CreateVtable { table_name, .. } => {
+                        table_name == "clips_fts" || table_name.starts_with("uri_fts")
+                    }
+                    AuthAction::Read {
+                        table_name,
+                        column_name,
+                    } => table_name == "clips" && column_name == "search_text",
+                    _ => false,
+                };
+                if blocked {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }))
+            .unwrap();
+        store
+            .lock()
+            .progress_handler(
+                1,
+                Some(move || progress.fetch_add(1, Ordering::SeqCst) > 10000),
+            )
+            .unwrap();
+        store.maintain_uri_search().unwrap();
+        store.maintain_uri_search().unwrap();
+        store
+            .lock()
+            .progress_handler(0, None::<fn() -> bool>)
+            .unwrap();
+        store
+            .lock()
+            .authorizer(
+                None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+            )
+            .unwrap();
+        assert_eq!(
+            forbidden.load(Ordering::SeqCst),
+            0,
+            "backfill accessed global FTS or base text"
+        );
+        eprintln!(
+            "bounded URI maintenance SQLite VM callbacks: {}",
+            calls.load(Ordering::SeqCst)
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) < 10000,
+            "URI maintenance exceeded VM work bound"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT names FROM uri_search WHERE clip_id=?1",
+                    [id.to_string()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "bounded.txt"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .query_row("SELECT text FROM clips_fts WHERE rowid=90000", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+            "original"
+        );
+        assert!(store
+            .search("bounded")
+            .unwrap()
+            .iter()
+            .any(|clip| clip.id == id));
+        assert!(store
+            .search("original bounded")
+            .unwrap()
+            .iter()
+            .any(|clip| clip.id == id));
+        let original_reads = std::sync::Arc::new(AtomicU64::new(0));
+        let seen_reads = original_reads.clone();
+        store
+            .lock()
+            .authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                use rusqlite::hooks::{AuthAction, Authorization};
+                if matches!(
+                    ctx.action,
+                    AuthAction::Read {
+                        table_name: "clips",
+                        column_name: "search_text"
+                    }
+                ) {
+                    seen_reads.fetch_add(1, Ordering::SeqCst);
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }))
+            .unwrap();
+        assert_eq!(store.search("unmatchedtoken").unwrap().len(), 0);
+        store
+            .lock()
+            .authorizer(
+                None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+            )
+            .unwrap();
+        assert_eq!(
+            original_reads.load(Ordering::SeqCst),
+            0,
+            "URI matching fetched unrestricted original text"
+        );
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_backfill_retries_fairly_and_preserves_metadata() {
+        let profile = unique_dir("uri-backfill");
+        let store = Store::open(&profile).unwrap();
+        let bad = Uuid::now_v7();
+        let good = Uuid::now_v7();
+        for (id, bytes) in [
+            (bad, b"https://unsupported/example".as_slice()),
+            (good, b"file:///tmp/caf%C3%A9.txt".as_slice()),
+        ] {
+            let mut clip = sample_clip(id, "", "original text", 17);
+            clip.removed = id == good;
+            store
+                .insert_clip(&clip, &[("text/uri-list".into(), bytes.to_vec())])
+                .unwrap();
+        }
+        // Simulate legacy history without touching payloads or user metadata.
+        store.lock().execute("DELETE FROM uri_search", []).unwrap();
+        store
+            .lock()
+            .execute(
+                "UPDATE clips SET pinned=1, preview='edited', rev_ctr=42 WHERE id=?1",
+                [good.to_string()],
+            )
+            .unwrap();
+        let before: (String, i64, i64, i64) = store
+            .lock()
+            .query_row(
+                "SELECT preview,pinned,rev_ctr,last_used_ms FROM clips WHERE id=?1",
+                [good.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        for _ in 0..8 {
+            store.maintain_uri_search().unwrap();
+        }
+        assert!(store.uri_search_incomplete());
+        let names: String = store
+            .lock()
+            .query_row(
+                "SELECT names FROM uri_search WHERE clip_id=?1",
+                [good.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(names, "café.txt");
+        let after: (String, i64, i64, i64) = store
+            .lock()
+            .query_row(
+                "SELECT preview,pinned,rev_ctr,last_used_ms FROM clips WHERE id=?1",
+                [good.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            store
+                .get_payload_internal(good, "text/uri-list", 100, true, || {})
+                .unwrap()
+                .unwrap()
+                .data,
+            b"file:///tmp/caf%C3%A9.txt"
+        );
+        assert!(store
+            .lock()
+            .query_row(
+                "SELECT names FROM uri_search WHERE clip_id=?1",
+                [good.to_string()],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap()
+            .contains("café.txt"));
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_backfill_discards_replaced_payload_without_losing_edits() {
+        let profile = unique_dir("uri-race");
+        let store = Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let clip = sample_clip(id, "", "original", 19);
+        store
+            .insert_clip(
+                &clip,
+                &[("text/uri-list".into(), b"file:///old.txt".to_vec())],
+            )
+            .unwrap();
+        store.lock().execute("DELETE FROM uri_search", []).unwrap();
+        let result = store
+            .backfill_uri_step_with_hook(None, || {
+                let conn = store.lock();
+                conn.execute(
+                    "UPDATE clip_payloads SET data=?2 WHERE clip_id=?1 AND mime='text/uri-list'",
+                    rusqlite::params![id.to_string(), b"file:///new.txt".as_slice()],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE clips SET pinned=1, preview='edited', rev_ctr=8 WHERE id=?1",
+                    [id.to_string()],
+                )
+                .unwrap();
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!result.1);
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT count(*) FROM uri_search WHERE clip_id=?1",
+                    [id.to_string()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        for _ in 0..3 {
+            store.maintain_uri_search().unwrap();
+        }
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT names FROM uri_search WHERE clip_id=?1",
+                    [id.to_string()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "new.txt"
+        );
+        assert!(store
+            .lock()
+            .query_row(
+                "SELECT (pinned, preview, rev_ctr) = (1, 'edited', 8) FROM clips WHERE id=?1",
+                [id.to_string()],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap());
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_backfill_rolls_back_marker_on_write_failure_and_retries() {
+        let profile = unique_dir("uri-rollback");
+        let store = Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let clip = sample_clip(id, "", "original", 19);
+        store
+            .insert_clip(
+                &clip,
+                &[("text/uri-list".into(), b"file:///name.txt".to_vec())],
+            )
+            .unwrap();
+        store
+            .lock()
+            .execute_batch("DELETE FROM uri_search; CREATE TRIGGER uri_fail BEFORE INSERT ON uri_search BEGIN SELECT RAISE(ABORT,'failure'); END;")
+            .unwrap();
+        store.maintain_uri_search().unwrap();
+        assert_eq!(
+            store
+                .lock()
+                .query_row("SELECT count(*) FROM uri_search", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        store.lock().execute_batch("DROP TRIGGER uri_fail").unwrap();
+        for _ in 0..3 {
+            store.maintain_uri_search().unwrap();
+        }
+        let text: String = store
+            .lock()
+            .query_row(
+                "SELECT names FROM uri_search WHERE clip_id=?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(text, "name.txt");
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_backfill_large_and_missing_blobs_remain_pending() {
+        let profile = unique_dir("uri-pending");
+        let store = Store::open(&profile).unwrap();
+        let large = Uuid::now_v7();
+        let missing = Uuid::now_v7();
+        for id in [large, missing] {
+            let clip = sample_clip(id, "", "untouched", 19);
+            store.insert_metadata_capture(&clip).unwrap();
+        }
+        store.lock().execute("INSERT INTO clip_payloads(clip_id,mime,data) VALUES(?1,'text/uri-list',zeroblob(?2))", rusqlite::params![large.to_string(), i64::try_from(crate::uri_search::URI_PAYLOAD_LIMIT + 1).unwrap()]).unwrap();
+        store.lock().execute("INSERT INTO clip_payloads(clip_id,mime,external,blob_key) VALUES(?1,'text/uri-list',1,'missing')", [missing.to_string()]).unwrap();
+        for _ in 0..6 {
+            store.maintain_uri_search().unwrap();
+        }
+        assert!(store.uri_search_incomplete());
+        assert_eq!(
+            store
+                .lock()
+                .query_row("SELECT count(*) FROM uri_search", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT count(*) FROM clips WHERE search_text='untouched'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn bounded_read_counts_consumed_bytes() {
+        struct ReadSpy {
+            inner: std::io::Cursor<Vec<u8>>,
+            consumed: usize,
+        }
+        impl std::io::Read for ReadSpy {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = std::io::Read::read(&mut self.inner, buf)?;
+                self.consumed += n;
+                Ok(n)
+            }
+        }
+        let cap = 16;
+        let mut spy = ReadSpy {
+            inner: std::io::Cursor::new(vec![0xaa; cap + 8]),
+            consumed: 0,
+        };
+        assert!(matches!(
+            super::capped_read(&mut spy, cap),
+            Err(crate::CoreError::TooLarge { .. })
+        ));
+        assert!(spy.consumed <= cap + 1, "consumed {} bytes", spy.consumed);
+        assert_eq!(spy.consumed, cap + 1);
+        assert!(matches!(
+            super::capped_read(std::io::Cursor::new(Vec::<u8>::new()), usize::MAX),
+            Err(crate::CoreError::Backend { .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_snapshot_keeps_sqlite_view_across_other_connection_commit() {
+        let profile = unique_dir("payload-view");
+        let store = super::Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let mut clip = sample_clip(id, "view", "view", 7);
+        clip.content_hash = "old-hash".to_string();
+        let mime = "text/plain;charset=utf-8";
+        store.insert_clip(&clip, &text_payloads("old!")).unwrap();
+        let mut writer = rusqlite::Connection::open(db_path(&profile)).unwrap();
+        let old = store
+            .get_payload_with_interleave(id, mime, 4, || {
+                let tx = writer.transaction().unwrap();
+                tx.execute(
+                    "UPDATE clips SET content_hash=?1 WHERE id=?2",
+                    rusqlite::params!["new-hash", id.to_string()],
+                )
+                .unwrap();
+                tx.execute(
+                    "UPDATE clip_payloads SET data=?1 WHERE clip_id=?2 AND mime=?3",
+                    rusqlite::params![b"new!".as_slice(), id.to_string(), mime],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (old.content_hash.as_str(), old.data.as_slice()),
+            ("old-hash", b"old!".as_slice())
+        );
+        let new = store.get_payload(id, mime, 4).unwrap().unwrap();
+        assert_eq!(
+            (new.content_hash.as_str(), new.data.as_slice()),
+            ("new-hash", b"new!".as_slice())
+        );
+    }
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 

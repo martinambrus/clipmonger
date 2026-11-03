@@ -8,10 +8,13 @@ pub mod hash;
 pub mod model;
 pub mod policy;
 pub mod runtime_log;
+mod sql_text_stream;
 pub mod store;
+pub(crate) mod substring_matcher;
+pub mod uri_search;
 
 pub use config::{AppPaths, Config, PasteDelivery};
 pub use error::{BackendKind, CoreError};
-pub use store::{GcReport, InsertOutcome, PermGroup, Store};
+pub use store::{GcReport, InsertOutcome, PayloadSnapshot, PermGroup, Store};
 
 pub const APP_IDENTITY: &str = "clipmonger";

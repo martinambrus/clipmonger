@@ -620,7 +620,13 @@ impl Rig {
             sink: Arc::new(Mutex::new(SinkState::default())),
             foreground,
         };
-        let _ = rig.cmds();
+        let start = rig.cmds();
+        if let Some(tag) = start.into_iter().find_map(|cmd| match cmd {
+            UiCmd::CompactHistory(tag) => Some(tag),
+            _ => None,
+        }) {
+            rig.push(UiEvent::CompactHistory(tag.clone(), Ok(json!({"owner":tag.params.owner,"generation":tag.params.generation,"rows":[],"cursor":null,"done":true,"bytes_read":0,"candidates":0}))));
+        }
         rig
     }
 
@@ -1253,6 +1259,9 @@ fn rule_app_session_trace_in_order() {
     rig.show();
     rig.push(hotkey(Some(5), Some(6)));
     rig.tick();
+    let _ = rig.cmds();
+    rig.push(history(&[clip(1, "alpha")]));
+    rig.tick();
     rig.key(egui::Key::Enter);
     rig.show();
     rig.push(UiEvent::PasteFailed("window gone".to_string()));
@@ -1311,6 +1320,16 @@ fn fix_x1_settings_activation_does_not_pick_a_clip() {
         let mut rig = Rig::new(false);
         rig.push(hotkey(Some(7), Some(9)));
         rig.push(history(&[clip(1, "alpha")]));
+        rig.tick();
+        let commands = rig.cmds();
+        let tag = commands
+            .into_iter()
+            .find_map(|cmd| match cmd {
+                UiCmd::CompactHistory(tag) => Some(tag),
+                _ => None,
+            })
+            .unwrap();
+        rig.push(UiEvent::CompactHistory(tag.clone(), Ok(json!({"owner":tag.params.owner,"generation":tag.params.generation,"rows":[{"id":Uuid::from_u128(1),"pinned":false,"last_used_ms":1,"preview":"alpha","preview_truncated":false,"kind":"text","thumbnail_hash":null}],"cursor":null,"done":true,"bytes_read":1,"candidates":1}))));
         rig.tick();
         focus_widget(
             &mut rig,
@@ -1383,9 +1402,9 @@ fn permanent_failure_reopens(failure: UiEvent, message: &str) {
     rig.tick();
     assert!(rig.is_open(), "{message}: a failed exec reopens the popup");
     assert_eq!(rig.app.shell().error(), Some(message));
-    assert_eq!(
-        rig.cmds(),
-        vec![UiCmd::ListHistory, UiCmd::ListPermanents, UiCmd::PermGroups]
+    let commands = rig.cmds();
+    assert!(
+        matches!(commands.as_slice(), [UiCmd::CompactHistory(tag), UiCmd::ListPermanents, UiCmd::PermGroups] if tag.params.cursor.is_none())
     );
     rig.show().centre_of(message);
     let expected = vec![
@@ -1616,9 +1635,11 @@ fn fix_c3_clip_failure_does_not_hide_a_later_exec_failure() {
             assert_eq!(rig.app.shell().error(), Some(message));
             assert_eq!(rig.app.desired().settings_open, settings);
             assert_eq!(rig.app.config().lock().expect("settings").error, "");
+            let commands = rig.cmds();
             assert_eq!(
-                rig.cmds(),
-                vec![UiCmd::ListHistory, UiCmd::ListPermanents, UiCmd::PermGroups]
+                commands,
+                vec![UiCmd::ListPermanents, UiCmd::PermGroups],
+                "the in-flight history request is coalesced"
             );
             rig.show().centre_of(message);
             let mut expected = before;

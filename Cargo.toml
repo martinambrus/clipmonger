@@ -16,7 +16,7 @@ thiserror = "2.0"
 sha2 = "0.11"
 toml = "1.1"
 directories = "6.0"
-rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+rusqlite = { version = "0.40", features = ["bundled", "backup", "blob", "hooks"] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "signal", "process", "macros", "net", "io-util"] }
 wl-clipboard-rs = "0.9"
 wayland-client = "0.31"

@@ -410,3 +410,62 @@ fn rule_bridge_wake_thread_ends_with_the_commands() {
     assert_eq!(next_event(&events), popup_push("hotkey"));
     assert_eq!(wakes.count(), 1, "no wake without a reply");
 }
+
+#[test]
+fn compact_reply_and_error_keep_the_request_correlation_and_wake() {
+    use clipmonger_app_ui::ipc_bridge::CompactRequest;
+    use clipmonger_ipc::proto::methods::HistoryCompactParams;
+    let tag = CompactRequest {
+        params: HistoryCompactParams {
+            owner: 5,
+            generation: 9,
+            query: "late".into(),
+            cursor: Some("cursor".into()),
+            byte_budget: 65536,
+            candidate_budget: 32,
+            row_budget: 50,
+        },
+        page: 2,
+        request: 7,
+        restore_epoch: 3,
+    };
+    let (wake, wakes) = watch();
+    let (cmds, _, events) = Bridge::spawn_shared_with_wake(Box::new(Fake::ok()), wake);
+    cmds.send(UiCmd::CompactHistory(tag.clone())).unwrap();
+    wakes.next();
+    assert_eq!(
+        next_event(&events),
+        UiEvent::CompactHistory(tag.clone(), Ok(json!({"ok":true})))
+    );
+    let (wake, wakes) = watch();
+    let (cmds, _, events) = Bridge::spawn_shared_with_wake(
+        Box::new(Fake::new(failure("not_ready", "preparing"))),
+        wake,
+    );
+    cmds.send(UiCmd::CompactHistory(tag.clone())).unwrap();
+    wakes.next();
+    assert_eq!(
+        next_event(&events),
+        UiEvent::CompactHistory(tag, failure("not_ready", "preparing"))
+    );
+}
+
+#[test]
+fn current_lookup_is_bounded_and_preserves_tags_on_success_and_error() {
+    assert_eq!(
+        clipmonger_app_ui::ipc_bridge::method_for(&UiCmd::CompactCurrent(41)),
+        "history.list"
+    );
+    assert_eq!(
+        clipmonger_app_ui::ipc_bridge::params_for(&UiCmd::CompactCurrent(41)),
+        json!({"limit":1})
+    );
+    for outcome in [Ok(json!({"clips":[]})), failure("unavailable", "late")] {
+        let (wake, wakes) = watch();
+        let (cmds, _push, events) =
+            Bridge::spawn_shared_with_wake(Box::new(Fake::new(outcome.clone())), wake);
+        cmds.send(UiCmd::CompactCurrent(41)).unwrap();
+        wakes.next();
+        assert_eq!(next_event(&events), UiEvent::CompactCurrent(41, outcome));
+    }
+}

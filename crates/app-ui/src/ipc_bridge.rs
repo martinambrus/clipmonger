@@ -4,7 +4,9 @@ use std::sync::mpsc;
 use std::thread;
 
 use clipmonger_core::model::PermanentClip;
-use clipmonger_ipc::proto::methods::PermanentCreateParams;
+use clipmonger_ipc::proto::methods::{
+    HistoryCompactCancelParams, HistoryCompactParams, PermanentCreateParams,
+};
 use clipmonger_ipc::proto::IpcError;
 use serde_json::Value;
 use uuid::Uuid;
@@ -21,6 +23,16 @@ pub trait Transport: Send {
     fn call(&mut self, method: &str, params: &Value) -> Result<Value, IpcError>;
 }
 
+/// Local correlation captured with a compact request, including values that
+/// cannot be recovered from an error reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactRequest {
+    pub params: HistoryCompactParams,
+    pub page: u64,
+    pub request: u64,
+    pub restore_epoch: u64,
+}
+
 /// Command sent from the shell to the bridge thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCmd {
@@ -28,6 +40,12 @@ pub enum UiCmd {
     Status,
     /// Fetch one history page.
     ListHistory,
+    /// Scan one bounded chunk of compact history.
+    CompactHistory(CompactRequest),
+    /// Release a compact history cursor.
+    CancelCompactHistory(HistoryCompactCancelParams),
+    /// Fetch the newest full clip independently of the filtered view.
+    CompactCurrent(u64),
     /// Delete one clip.
     DeleteClip(Uuid),
     /// Pin or unpin one clip.
@@ -87,6 +105,12 @@ pub enum UiEvent {
     Status(Value),
     /// History-list reply body.
     History(Value),
+    /// Compact reply or error correlated with its original request.
+    CompactHistory(CompactRequest, Result<Value, IpcError>),
+    /// A cursor cancellation has completed.
+    CompactCancelled,
+    /// Newest full clip result correlated with its refresh.
+    CompactCurrent(u64, Result<Value, IpcError>),
     /// Server-confirmed delete.
     Deleted(Uuid),
     /// Server-confirmed pin with the stored flag.
@@ -235,7 +259,9 @@ pub enum RestoreWarning {
 pub fn method_for(cmd: &UiCmd) -> &'static str {
     match cmd {
         UiCmd::Status => "status",
-        UiCmd::ListHistory => "history.list",
+        UiCmd::ListHistory | UiCmd::CompactCurrent(_) => "history.list",
+        UiCmd::CompactHistory(_) => "history.compact",
+        UiCmd::CancelCompactHistory(_) => "history.compact.cancel",
         UiCmd::DeleteClip(_) => "history.delete",
         UiCmd::PinClip(_, _) => "history.pin",
         UiCmd::PasteClipTo(..) => "paste.execute",
@@ -273,6 +299,13 @@ pub fn params_for(cmd: &UiCmd) -> Value {
         | UiCmd::PurgeRemoved
         | UiCmd::ListPermanents
         | UiCmd::PermGroups => serde_json::json!({}),
+        UiCmd::CompactHistory(request) => {
+            serde_json::to_value(&request.params).unwrap_or(Value::Null)
+        }
+        UiCmd::CancelCompactHistory(request) => {
+            serde_json::to_value(request).unwrap_or(Value::Null)
+        }
+        UiCmd::CompactCurrent(_) => serde_json::json!({"limit": 1}),
         UiCmd::ConfigSet(key, value) => serde_json::json!({ "key": key, "value": value }),
         UiCmd::MonitorToggle => serde_json::json!({ "toggle": true }),
         UiCmd::HistoryGet(id) => serde_json::json!({ "clip": id.to_string() }),
@@ -314,6 +347,10 @@ pub fn params_for(cmd: &UiCmd) -> Value {
 /// Error codes of an absent or lost daemon link.
 const TRANSPORT_CODES: [&str; 3] = ["unavailable", "io_failed", "connection_closed"];
 
+pub(crate) fn is_transport_error(error: &IpcError) -> bool {
+    TRANSPORT_CODES.contains(&error.code.as_str())
+}
+
 /// Turn one transport outcome into shell events.
 #[allow(clippy::match_same_arms)]
 #[allow(clippy::too_many_lines)]
@@ -321,6 +358,9 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
     match (cmd, outcome) {
         (UiCmd::Status, Ok(body)) => UiEvent::Status(body),
         (UiCmd::ListHistory, Ok(body)) => UiEvent::History(body),
+        (UiCmd::CompactHistory(request), outcome) => UiEvent::CompactHistory(request, outcome),
+        (UiCmd::CancelCompactHistory(_), _) => UiEvent::CompactCancelled,
+        (UiCmd::CompactCurrent(tag), outcome) => UiEvent::CompactCurrent(tag, outcome),
         (UiCmd::DeleteClip(id), Ok(body)) => {
             if body.get("deleted").and_then(Value::as_bool) == Some(true) {
                 UiEvent::Deleted(id)
@@ -446,9 +486,7 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
             Err(error),
         ) => UiEvent::Error(error.message),
         (UiCmd::Stop, Err(error)) => UiEvent::StopFailed(error.message),
-        (UiCmd::Status | UiCmd::ListHistory, Err(error))
-            if TRANSPORT_CODES.contains(&error.code.as_str()) =>
-        {
+        (UiCmd::Status | UiCmd::ListHistory, Err(error)) if is_transport_error(&error) => {
             UiEvent::Offline(error.message)
         }
         (UiCmd::Status | UiCmd::ListHistory, Err(error)) => UiEvent::Error(error.message),

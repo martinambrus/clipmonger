@@ -2,8 +2,10 @@
 //! tray, the shell state machine and the two egui windows (popup and
 //! Settings). `logic` runs on every pass, hidden or not; `ui` only paints.
 
+mod compact;
 mod popup_ui;
 mod settings_ui;
+mod thumbnail_ui;
 pub mod trace;
 
 use std::any::Any;
@@ -99,6 +101,11 @@ pub struct PopupApp {
     pending_reveal: Option<(Option<String>, usize, uuid::Uuid)>,
     last_reveal: Option<(Option<String>, usize, uuid::Uuid)>,
     last_query: String,
+    thumbnails: Option<thumbnail_ui::Thumbnails>,
+    compact: compact::Compact,
+    current_generation: Option<u64>,
+    current_pending: Option<u64>,
+    current_wanted: bool,
 }
 
 impl PopupApp {
@@ -151,6 +158,11 @@ impl PopupApp {
             pending_reveal: None,
             last_reveal: None,
             last_query: String::new(),
+            thumbnails: None,
+            compact: compact::Compact::new(),
+            current_generation: Some(0),
+            current_pending: None,
+            current_wanted: false,
         };
         app.apply_effects(Shell::start());
         if open {
@@ -161,6 +173,11 @@ impl PopupApp {
             });
         }
         app
+    }
+
+    /// Attach the owned thumbnail worker to this popup.
+    pub fn attach_thumbnails(&mut self, worker: crate::thumbnail_worker::Worker) {
+        self.thumbnails = Some(thumbnail_ui::Thumbnails::new(worker));
     }
 
     /// The shell state machine.
@@ -261,6 +278,13 @@ impl PopupApp {
             self.send(UiCmd::PermGroups);
             self.seen_focus = false;
         } else if was_open && !is_open {
+            if let Some(thumbs) = &mut self.thumbnails {
+                thumbs.revoke_visibility();
+            }
+            if let Some(cancel) = self.compact.reset(self.vm.query.clone(), false, false) {
+                self.send(cancel);
+            }
+            self.invalidate_current();
             self.hide_unconfirmed = true;
             self.seen_focus = false;
         }
@@ -290,7 +314,14 @@ impl PopupApp {
                         }
                         _ => {}
                     }
-                    self.send(cmd);
+                    if matches!(cmd, UiCmd::ListHistory) {
+                        self.reset_compact(false);
+                        if self.shell.desired().popup_open {
+                            self.refresh_current();
+                        }
+                    } else {
+                        self.send(cmd);
+                    }
                 }
                 Effect::AllowForeground => (self.allow_foreground)(),
                 Effect::Hide => self.pending_activation = false,
@@ -313,6 +344,48 @@ impl PopupApp {
                     let _ = self.vm.apply_keys(&keys);
                 }
             }
+        }
+    }
+
+    fn invalidate_current(&mut self) {
+        self.current_generation = self.current_generation.and_then(|n| n.checked_add(1));
+        self.current_wanted = false;
+    }
+
+    fn refresh_current(&mut self) {
+        self.current_generation = self.current_generation.and_then(|n| n.checked_add(1));
+        self.current_wanted = self.current_generation.is_some();
+        self.send_current();
+    }
+
+    fn send_current(&mut self) {
+        if self.current_wanted && self.current_pending.is_none() {
+            let Some(tag) = self.current_generation else {
+                return;
+            };
+            self.current_pending = Some(tag);
+            self.current_wanted = false;
+            self.send(UiCmd::CompactCurrent(tag));
+        }
+    }
+
+    fn reset_compact(&mut self, restore: bool) {
+        if restore {
+            self.vm.set_current(None);
+        }
+        if let Some(thumbs) = &mut self.thumbnails {
+            thumbs.revoke_visibility();
+        }
+        self.vm.set_compact_rows(Vec::new());
+        if let Some(cancel) = self.compact.reset(
+            self.vm.query.clone(),
+            self.shell.desired().popup_open,
+            restore,
+        ) {
+            self.send(cancel);
+        }
+        if let Some(cmd) = self.compact.command() {
+            self.send(cmd);
         }
     }
 
@@ -354,6 +427,7 @@ impl PopupApp {
     fn on_bridge(&mut self, event: UiEvent) {
         match event {
             UiEvent::Status(body) => {
+                let recovering = self.shell.offline();
                 let paused = body
                     .get("monitoring_paused")
                     .and_then(Value::as_bool)
@@ -366,17 +440,81 @@ impl PopupApp {
                     }
                 }
                 self.feed(Event::Bridge(UiEvent::Status(body)));
+                if recovering && self.shell.desired().popup_open {
+                    self.reset_compact(false);
+                    self.refresh_current();
+                }
+            }
+            UiEvent::CompactHistory(tag, outcome) => {
+                let transport_error = self.shell.desired().popup_open
+                    && self.compact.accepts(&tag)
+                    && outcome
+                        .as_ref()
+                        .is_err_and(crate::ipc_bridge::is_transport_error);
+                let message = outcome.as_ref().err().map(|error| error.message.clone());
+                let (rows, cancel) = self.compact.result(tag, outcome);
+                if transport_error {
+                    self.feed(Event::Bridge(UiEvent::Offline(message.unwrap_or_default())));
+                }
+                if let Some(cancel) = cancel {
+                    self.send(cancel);
+                }
+                if let Some(rows) = rows {
+                    if let Some(thumbs) = &mut self.thumbnails {
+                        thumbs.revoke_visibility();
+                    }
+                    self.vm.set_compact_rows(rows);
+                }
+            }
+            UiEvent::CompactCurrent(tag, outcome) => {
+                if self.current_pending == Some(tag) {
+                    self.current_pending = None;
+                    if Some(tag) == self.current_generation && self.shell.desired().popup_open {
+                        if let Err(error) = &outcome {
+                            if crate::ipc_bridge::is_transport_error(error) {
+                                self.feed(Event::Bridge(UiEvent::Offline(error.message.clone())));
+                            }
+                        }
+                        if let Ok(body) = outcome {
+                            if let Some(clips) = body.get("clips").and_then(Value::as_array) {
+                                if clips.len() <= 1 {
+                                    if clips.is_empty() {
+                                        self.vm.set_current(None);
+                                    } else if let Ok(clip) =
+                                        serde_json::from_value::<clipmonger_core::model::Clip>(
+                                            clips[0].clone(),
+                                        )
+                                    {
+                                        self.vm.set_current(Some(clip));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.send_current();
+                }
             }
             UiEvent::History(body) => {
                 if self.vm.apply_history(&body) == popup::HistoryApply::Changed {
+                    if let Some(thumbs) = &mut self.thumbnails {
+                        thumbs.revoke_visibility();
+                    }
                     let current = self.vm.clips().first().cloned();
                     self.vm.set_current(current);
                 }
                 self.feed(Event::Bridge(UiEvent::History(body)));
             }
-            UiEvent::Deleted(id) => self.vm.remove_clip(id),
+            UiEvent::Deleted(id) => {
+                if let Some(thumbs) = &mut self.thumbnails {
+                    thumbs.reset();
+                }
+                self.vm.remove_clip(id);
+                if self.vm.current().is_some_and(|clip| clip.id == id) {
+                    self.vm.set_current(None);
+                }
+            }
             UiEvent::Pinned(id, pinned) => self.vm.apply_pin(id, pinned),
-            UiEvent::PasteDone(_) | UiEvent::Purged(_) => {}
+            UiEvent::CompactCancelled | UiEvent::PasteDone(_) | UiEvent::Purged(_) => {}
             UiEvent::HistoryClip(body) => {
                 let clip = body.get("clip").and_then(|value| {
                     serde_json::from_value::<clipmonger_core::model::Clip>(value.clone()).ok()
@@ -443,6 +581,13 @@ impl PopupApp {
                 }
             }
             UiEvent::RestoreDone { warning } => {
+                if let Some(thumbs) = &mut self.thumbnails {
+                    thumbs.reset();
+                }
+                self.reset_compact(true);
+                if self.shell.desired().popup_open {
+                    self.refresh_current();
+                }
                 let mut message = strings::text("config.restore_done").to_string();
                 if let Some(ref warning) = warning {
                     let id = match warning {
@@ -465,7 +610,6 @@ impl PopupApp {
                 if !self.shell.desired().settings_open {
                     self.feed(Event::Bridge(UiEvent::Error(message)));
                 }
-                self.send(UiCmd::ListHistory);
                 self.send(UiCmd::ConfigGetAfterRestore);
             }
             UiEvent::RestoreFailed(message) => {
@@ -773,7 +917,11 @@ impl PopupApp {
             Some((
                 None,
                 self.vm.selected,
-                self.vm.clip_at(self.vm.selected)?.id,
+                self.vm
+                    .compact_rows()
+                    .and_then(|rows| rows.get(self.vm.selected))
+                    .map(|row| row.id)
+                    .or_else(|| self.vm.clip_at(self.vm.selected).map(|clip| clip.id))?,
             ))
         }
     }
@@ -813,6 +961,9 @@ impl runner::App for PopupApp {
         });
         match kind {
             WindowKind::Popup => {
+                if let Some(thumbs) = &mut self.thumbnails {
+                    thumbs.context(ctx);
+                }
                 if std::mem::take(&mut self.hide_unconfirmed) {
                     self.feed(Event::Hidden);
                 }
@@ -828,6 +979,9 @@ impl runner::App for PopupApp {
                         break;
                     };
                     self.on_bridge(event);
+                }
+                if let Some(cmd) = self.compact.command() {
+                    self.send(cmd);
                 }
                 self.pending_event = self.events.try_recv().ok();
                 if self.pending_event.is_some() {
@@ -846,6 +1000,12 @@ impl runner::App for PopupApp {
                 if self.paused && self.pause_deadline.is_some_and(|at| Instant::now() >= at) {
                     self.pause_deadline = None;
                     self.send(UiCmd::MonitorToggle);
+                }
+                if let Some(thumbs) = &mut self.thumbnails {
+                    if !self.shell.desired().popup_open {
+                        thumbs.revoke_visibility();
+                    }
+                    thumbs.drain();
                 }
                 self.vm.set_offline(self.shell.offline());
                 self.apply_theme(ctx, kind);
@@ -876,6 +1036,9 @@ impl runner::App for PopupApp {
                 if self.shell.desired().popup_open {
                     self.render(ui);
                 } else {
+                    if let Some(thumbs) = &mut self.thumbnails {
+                        thumbs.revoke_visibility();
+                    }
                     egui::CentralPanel::default().show(ui, |_| {});
                 }
             }

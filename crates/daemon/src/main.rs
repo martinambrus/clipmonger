@@ -840,10 +840,15 @@ fn run_helper_job(job: &clipmonger_backend_windows::helper::Job) -> Result<(), S
     Ok(())
 }
 
-#[tokio::main]
-#[allow(clippy::too_many_lines)]
-async fn main() {
+fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("__thumbnail-decode") {
+        if args.len() != 1 {
+            eprintln!("thumbnail-decode: unexpected args");
+            std::process::exit(2);
+        }
+        std::process::exit(clipmonger_daemon::thumbnail::run_thumbnail_child());
+    }
     #[cfg(all(windows, feature = "backend-windows"))]
     if args.iter().any(|a| a == "__elevated-persistent") {
         let profile = profile_arg(&args);
@@ -854,6 +859,18 @@ async fn main() {
         let profile = profile_arg(&args);
         std::process::exit(serve_helper(&profile, false));
     }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("daemon: runtime build failed: {e}");
+            std::process::exit(1);
+        });
+    rt.block_on(async_main(args));
+}
+
+#[allow(clippy::too_many_lines)]
+async fn async_main(args: Vec<String>) {
     let profile = profile_arg(&args);
 
     if let Some(script) = flag_value(&args, "--script") {
@@ -942,6 +959,7 @@ async fn main() {
     });
 
     let state = Arc::new(DaemonState::new(store));
+    let _compact_maintenance = clipmonger_daemon::CompactMaintenance::start(&state);
     state.set_profile_dir(&profile);
     state.set_config(config.clone());
     state.set_paste_limits(config.popup.unicode_limit, config.popup.delivery_dwell_ms);
@@ -1020,9 +1038,11 @@ async fn main() {
         #[cfg(not(all(windows, feature = "backend-windows")))]
         pipe_peer_pid: None,
     };
+    let context = DaemonState::thumbnail_context_handler(Arc::clone(&state));
     #[cfg(unix)]
     if let Err(e) =
-        clipmonger_ipc::server::Server::bind_with(&socket, token, handler, options).await
+        clipmonger_ipc::server::Server::bind_with_context(&socket, token, handler, options, context)
+            .await
     {
         let _ = clipmonger_core::runtime_log::global_emit(
             clipmonger_core::runtime_log::Role::Daemon,
@@ -1038,11 +1058,12 @@ async fn main() {
         std::process::exit(1);
     }
     #[cfg(windows)]
-    if let Err(e) = clipmonger_ipc::server::Server::bind_pipe_with(
+    if let Err(e) = clipmonger_ipc::server::Server::bind_pipe_with_context(
         &socket.to_string_lossy(),
         token,
         handler,
         options,
+        context,
     ) {
         let _ = clipmonger_core::runtime_log::global_emit(
             clipmonger_core::runtime_log::Role::Daemon,
@@ -1068,6 +1089,9 @@ async fn main() {
             ],
         );
         eprintln!("daemon: rendezvous failed: {e}");
+        if !shutdown_thumbnails(&state).await {
+            eprintln!("daemon: thumbnail cleanup task failed");
+        }
         std::process::exit(1);
     }
     eprintln!(
@@ -1086,7 +1110,25 @@ async fn main() {
             }
         } => {}
     }
+    let cleanup_ok = shutdown_thumbnails(&state).await;
     let _ = fs::remove_file(profile.join("rendezvous.json"));
     #[cfg(unix)]
     let _ = fs::remove_file(&socket);
+    if !cleanup_ok {
+        eprintln!("daemon: thumbnail cleanup task failed");
+        std::process::exit(1);
+    }
+}
+
+async fn shutdown_thumbnails(state: &Arc<DaemonState>) -> bool {
+    let thumb_state = Arc::clone(state);
+    if let Err(error) =
+        tokio::task::spawn_blocking(move || thumb_state.thumbnail_shutdown_and_wait()).await
+    {
+        eprintln!("daemon: thumbnail cleanup join failed: {error}");
+        // Attempt cleanup again, but retain the failure status.
+        state.thumbnail_shutdown_and_wait();
+        return false;
+    }
+    true
 }

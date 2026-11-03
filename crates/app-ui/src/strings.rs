@@ -4,6 +4,14 @@ const ENTRIES: &[(&str, &str)] = &[
     ("popup.search_hint", "Type to filter"),
     ("popup.current", "Current item"),
     ("popup.empty", "Nothing here yet"),
+    ("popup.loading", "Loading history…"),
+    ("popup.history_error", "History is unavailable. Refresh to try again."),
+    ("popup.history_preparing", "History is getting ready. Refresh to try again."),
+    ("popup.file_search_incomplete", "File search may be incomplete; some files may need repair."),
+    ("popup.history_metadata", "An item has too much format information to display history."),
+    ("popup.first_page", "First page"),
+    ("popup.next_page", "Next page"),
+    ("popup.history_end", "End of history"),
     ("popup.count", "{count} items"),
     ("popup.paused", "Monitoring paused"),
     ("popup.degraded", "Some features limited"),
@@ -144,6 +152,14 @@ pub const IDS: &[&str] = &[
     "popup.search_hint",
     "popup.current",
     "popup.empty",
+    "popup.loading",
+    "popup.history_error",
+    "popup.history_preparing",
+    "popup.file_search_incomplete",
+    "popup.history_metadata",
+    "popup.first_page",
+    "popup.next_page",
+    "popup.history_end",
     "popup.count",
     "popup.paused",
     "popup.degraded",
@@ -288,4 +304,14 @@ pub fn text(id: &str) -> &str {
         }
     }
     id
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn file_search_status_does_not_promise_background_progress() {
+        let message = super::text("popup.file_search_incomplete").to_lowercase();
+        assert!(message.contains("incomplete") && message.contains("repair"));
+        assert!(!message.contains("continues"));
+    }
 }

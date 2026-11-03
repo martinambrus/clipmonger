@@ -32,6 +32,8 @@ softbuffer = { version = "0.4.8", optional = true, default-features = false, fea
 hdrshot-egui-backend = { version = "=0.2.0", optional = true }
 egui_system_font_provider = { version = "0.37", optional = true }
 bytemuck = { version = "1.25", optional = true }
+tokio = { workspace = true, optional = true }
+image = { version = "0.25.10", default-features = false, features = ["png"], optional = true }
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 tray-icon = "0.26"
@@ -45,7 +47,7 @@ windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsA
 
 [features]
 default = ["gui"]
-gui = ["dep:egui", "dep:winit", "dep:egui-winit", "dep:softbuffer", "dep:hdrshot-egui-backend", "dep:egui_system_font_provider", "dep:bytemuck", "dep:x11rb"]
+gui = ["dep:egui", "dep:winit", "dep:egui-winit", "dep:softbuffer", "dep:hdrshot-egui-backend", "dep:egui_system_font_provider", "dep:bytemuck", "dep:x11rb", "dep:tokio", "dep:image"]
 
 [dev-dependencies]
 # Live push-listener tests run a real IPC server.

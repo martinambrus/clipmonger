@@ -12,6 +12,7 @@ pub mod linux_tray;
 pub mod permanents;
 pub mod placement;
 pub mod popup;
+pub mod profile_connection;
 pub mod push;
 #[cfg(feature = "gui")]
 pub mod runner;
@@ -19,4 +20,8 @@ pub mod search;
 pub mod shell;
 pub mod strings;
 pub mod target_session;
+#[cfg(feature = "gui")]
+pub mod thumbnail_transport;
+#[cfg(feature = "gui")]
+pub mod thumbnail_worker;
 pub mod tray_logic;

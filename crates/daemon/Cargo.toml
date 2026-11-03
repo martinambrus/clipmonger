@@ -32,6 +32,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 rusqlite.workspace = true

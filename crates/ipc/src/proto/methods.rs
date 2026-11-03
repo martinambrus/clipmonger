@@ -48,6 +48,54 @@ pub struct HistoryListResult {
     #[serde(default)]
     pub clips: Vec<Clip>,
 }
+/// Bounded scan request; owner is a client session correlation, not authentication.
+/// `byte_budget` counts search/preview/ID bytes. Metadata has separate per-step
+/// bounds of 1,056 index entries and 266,240 raw bytes; oversized MIME count or
+/// MIME value returns `metadata_too_large`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryCompactParams {
+    pub owner: u64,
+    pub generation: u64,
+    pub query: String,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    pub byte_budget: usize,
+    pub candidate_budget: usize,
+    pub row_budget: usize,
+}
+/// Compact page; an empty page with a cursor is progress, not completion.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HistoryCompactResult {
+    pub owner: u64,
+    pub generation: u64,
+    pub rows: Vec<clipmonger_core::store::CompactHit>,
+    pub cursor: Option<String>,
+    pub done: bool,
+    pub bytes_read: usize,
+    pub candidates: usize,
+    #[serde(default = "uri_search_unknown")]
+    pub uri_search_incomplete: bool,
+}
+fn uri_search_unknown() -> bool {
+    true
+}
+/// Cancel a session's current query cursor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryCompactCancelParams {
+    pub owner: u64,
+    pub generation: u64,
+    pub query: String,
+    pub cursor: String,
+}
+/// Cancellation correlation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCompactCancelResult {
+    pub owner: u64,
+    pub generation: u64,
+    pub cancelled: bool,
+}
 /// Clip lookup for `history.get`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryGetParams {
@@ -418,4 +466,29 @@ pub struct HistoryPurgeRemovedParams {}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryPurgeRemovedResult {
     pub purged: u64,
+}
+/// Params for `history.thumbnail`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryThumbnailParams {
+    pub clip: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_px: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+}
+/// One thumbnail result for `history.thumbnail`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryThumbnail {
+    pub clip: Uuid,
+    pub content_hash: String,
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
+    pub png_base64: String,
+}
+/// Output for `history.thumbnail`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryThumbnailResult {
+    #[serde(default)]
+    pub thumbnail: Option<HistoryThumbnail>,
 }
