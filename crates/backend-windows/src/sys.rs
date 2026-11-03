@@ -113,8 +113,7 @@ impl Drop for ClipboardDataLock {
 }
 
 /// Inspect native bytes without first copying the entire clipboard handle.
-/// The caller must hold the exclusive clipboard session from `with_open` for
-/// the whole call. The callback cannot retain the borrowed memory. No handle
+/// The caller must hold an exclusive clipboard session for the whole call. The callback cannot retain the borrowed memory. No handle
 /// is freed: the clipboard owns it, and the lock guard only unlocks it.
 #[cfg(windows)]
 pub(crate) fn with_clipboard_bytes<T>(
@@ -122,8 +121,8 @@ pub(crate) fn with_clipboard_bytes<T>(
     inspect: impl FnOnce(&[u8]) -> clipmonger_platform::types::Result<T>,
 ) -> clipmonger_platform::types::Result<T> {
     use clipmonger_platform::types::Error;
-    // Safety: all callers run inside transfer::imp::with_open, which keeps
-    // the clipboard exclusively open while this handle is inspected.
+    // Safety: all callers hold an exclusive clipboard session while this
+    // handle is inspected.
     let handle = unsafe { windows_sys::Win32::System::DataExchange::GetClipboardData(id) };
     if handle.is_null() {
         return Err(Error::Unavailable(

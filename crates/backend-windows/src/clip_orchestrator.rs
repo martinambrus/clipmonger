@@ -154,6 +154,7 @@ pub(crate) trait ClipBackend {
     // Both publication and restoration receive native bytes, never MIME bytes.
     fn set(&mut self, id: u32, bytes: &[u8]) -> Result<()>;
     fn get(&mut self, id: u32, cap: u64) -> Result<Vec<u8>>;
+    fn guard_text_prefix(&mut self, cap: usize) -> Result<Vec<u8>>;
     fn text_available(&mut self) -> Result<bool>;
     fn enum_formats(&mut self) -> Result<Vec<u32>>;
     fn seq(&self) -> Option<String>;
@@ -228,6 +229,11 @@ impl ClipBackend for WinBackend {
             return Err(Error::Io("clipboard allocation changed during read".into()));
         }
         Ok(bytes)
+    }
+    fn guard_text_prefix(&mut self, cap: usize) -> Result<Vec<u8>> {
+        crate::sys::with_clipboard_bytes(crate::transfer::imp::CF_UNICODETEXT, |bytes| {
+            Ok(bytes[..bytes.len().min(cap)].to_vec())
+        })
     }
     fn text_available(&mut self) -> Result<bool> {
         // IsClipboardFormatAvailable is a typed availability query: FALSE
@@ -478,18 +484,28 @@ fn restore_observed<B: ClipBackend>(
     result
 }
 
-fn decode_text(bytes: &[u8]) -> Result<String> {
-    if !bytes.len().is_multiple_of(2) {
-        return Err(Error::Io("clipboard text has an odd byte count".into()));
-    }
-    let units = bytes
+fn decode_text(bytes: &[u8], max_bytes: u64) -> Result<String> {
+    let terminator = bytes
         .as_chunks::<2>()
         .0
         .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .take_while(|unit| *unit != 0)
-        .collect::<Vec<_>>();
-    String::from_utf16(&units).map_err(|_| Error::Io("clipboard text is not valid UTF-16".into()))
+        .position(|pair| *pair == [0, 0])
+        .ok_or_else(|| Error::Io("clipboard text has no terminator within guard limit".into()))?;
+    let units = bytes[..terminator * 2]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair));
+    let mut text = String::new();
+    for character in char::decode_utf16(units) {
+        let character =
+            character.map_err(|_| Error::Io("clipboard text is not valid UTF-16".into()))?;
+        if (text.len() as u64).saturating_add(character.len_utf8() as u64) > max_bytes {
+            return Err(Error::TooLarge("clipboard text over cap".into()));
+        }
+        text.push(character);
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -513,6 +529,8 @@ pub(crate) fn finish_transaction_observed<B: ClipBackend>(
     saved_file_list: Option<&[u8]>,
 ) -> bool {
     const GUARD_CAP: u64 = 4 * 1024 * 1024;
+    // ASCII is twice as large in UTF-16, plus its terminating NUL.
+    const NATIVE_GUARD_CAP: usize = 2 * 4 * 1024 * 1024 + 2;
     if !restore || matches!(saved, SnapshotKind::Disabled) {
         return false;
     }
@@ -529,8 +547,7 @@ pub(crate) fn finish_transaction_observed<B: ClipBackend>(
         let available = backend.text_available()?;
         let content_ok = match temp_text {
             Some(text) if available => {
-                decode_text(&backend.get(crate::transfer::imp::CF_UNICODETEXT, GUARD_CAP)?)?
-                    .as_bytes()
+                decode_text(&backend.guard_text_prefix(NATIVE_GUARD_CAP)?, GUARD_CAP)?.as_bytes()
                     == text
             }
             None => !available,
@@ -613,6 +630,40 @@ mod tests {
                 .set(self.sequence.get().map(|s| if s == 0 { 0 } else { s + 1 }));
         }
     }
+    impl Backend {
+        fn read_bytes(&mut self, id: u32, cap: u64, prefix: bool) -> Result<Vec<u8>> {
+            assert!(self.locked);
+            self.events.push("get");
+            self.caps.push(cap);
+            if self.attempt_writer_on_read {
+                self.foreign(true);
+            }
+            if self.read_bump {
+                self.bump();
+            }
+            if self.fail_get {
+                return Err(Error::Io("read: localized platform failure".into()));
+            }
+            if self.slow_read {
+                std::thread::sleep(Duration::from_millis(3));
+            }
+            if self.oversized_read {
+                return Ok(vec![0; 65]);
+            }
+            let bytes = &self
+                .data
+                .iter()
+                .find(|(key, _)| *key == id)
+                .ok_or_else(|| Error::Io("missing data despite read request".into()))?
+                .1;
+            if prefix {
+                Ok(bytes[..bytes.len().min(usize::try_from(cap).unwrap_or(usize::MAX))].to_vec())
+            } else {
+                check_size(bytes.len() as u64, cap)?;
+                Ok(bytes.clone())
+            }
+        }
+    }
     impl ClipBackend for Backend {
         fn open(&mut self) -> Result<()> {
             self.events.push("open");
@@ -675,33 +726,10 @@ mod tests {
             Ok(())
         }
         fn get(&mut self, id: u32, cap: u64) -> Result<Vec<u8>> {
-            assert!(self.locked);
-            self.events.push("get");
-            self.caps.push(cap);
-            if self.attempt_writer_on_read {
-                self.foreign(true);
-            }
-            if self.read_bump {
-                self.bump();
-            }
-            if self.fail_get {
-                return Err(Error::Io("read: localized platform failure".into()));
-            }
-            if self.slow_read {
-                std::thread::sleep(Duration::from_millis(3));
-            }
-            if self.oversized_read {
-                return Ok(vec![0; 65]);
-            }
-            let bytes = self
-                .data
-                .iter()
-                .find(|(key, _)| *key == id)
-                .ok_or_else(|| Error::Io("missing data despite read request".into()))?
-                .1
-                .clone();
-            check_size(bytes.len() as u64, cap)?;
-            Ok(bytes)
+            self.read_bytes(id, cap, false)
+        }
+        fn guard_text_prefix(&mut self, cap: usize) -> Result<Vec<u8>> {
+            self.read_bytes(CF_UNICODETEXT, cap as u64, true)
         }
         fn text_available(&mut self) -> Result<bool> {
             self.events.push("available");
@@ -958,6 +986,78 @@ mod tests {
             swap.temp_text.as_deref(),
             true,
         )
+    }
+
+    fn assert_decoded_guard(text: &str, should_restore: bool) {
+        let mut backend = Backend::original();
+        backend.data = vec![(CF_UNICODETEXT, native(text))];
+        let saved = SnapshotKind::Available(vec![(CF_UNICODETEXT, native("old"))]);
+        assert_eq!(
+            finish_transaction_observed(
+                &mut backend,
+                &saved,
+                Some("1"),
+                Some(text.as_bytes()),
+                true,
+                None,
+                None,
+            ),
+            should_restore
+        );
+        assert_eq!(
+            backend.data[0].1,
+            native(if should_restore { "old" } else { text })
+        );
+    }
+
+    #[test]
+    fn decoded_guard_restores_three_mib_ascii() {
+        assert_decoded_guard(&"a".repeat(3 * 1024 * 1024), true);
+    }
+
+    #[test]
+    fn decoded_guard_accepts_four_mib_ascii_and_rejects_above() {
+        assert_decoded_guard(&"a".repeat(4 * 1024 * 1024), true);
+        assert_decoded_guard(&"a".repeat(4 * 1024 * 1024 + 1), false);
+    }
+
+    #[test]
+    fn decoded_guard_rejects_utf8_expansion_over_limit() {
+        assert_decoded_guard(&"€".repeat((4 * 1024 * 1024 / 3) + 1), false);
+    }
+
+    fn finish_native_guard(raw: Vec<u8>, text: &str) -> bool {
+        let mut backend = Backend::original();
+        backend.data = vec![(CF_UNICODETEXT, raw)];
+        finish_transaction_observed(
+            &mut backend,
+            &SnapshotKind::Available(vec![(CF_UNICODETEXT, native("old"))]),
+            Some("1"),
+            Some(text.as_bytes()),
+            true,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn decoded_guard_accepts_terminated_exact_limit_with_odd_allocation_padding() {
+        let text = "a".repeat(4 * 1024 * 1024);
+        let mut raw = native(&text);
+        raw.extend([0x7f, 0x42, 0x31]);
+        assert!(finish_native_guard(raw, &text));
+    }
+
+    #[test]
+    fn decoded_guard_rejects_unterminated_or_truncated_content() {
+        let text = "short";
+        let mut raw = native(text);
+        raw.truncate(raw.len() - 2);
+        assert!(!finish_native_guard(raw, text));
+        let long = "a".repeat(4 * 1024 * 1024 + 1);
+        let mut raw = native(&long);
+        raw.extend([1, 2, 3]);
+        assert!(!finish_native_guard(raw, &long));
     }
 
     struct Chord {
@@ -1226,7 +1326,7 @@ mod tests {
                 6 => backend.data[0].1 = native("different"),
                 7 => backend.fail_get = true,
                 8 => backend.fail_availability = true,
-                9 => backend.data[0].1 = vec![0; 4 * 1024 * 1024 + 1],
+                9 => backend.data[0].1 = vec![0; 8 * 1024 * 1024 + 4],
                 _ => unreachable!(),
             }
             if fault == 4 {
@@ -1237,7 +1337,7 @@ mod tests {
             assert!(!finish(&mut backend, &swap), "fault {fault}");
             assert_eq!(backend.data, current);
             assert!(!backend.events.contains(&"empty"));
-            assert!(backend.caps.iter().all(|cap| *cap <= 4 * 1024 * 1024));
+            assert!(backend.caps.iter().all(|cap| *cap <= 8 * 1024 * 1024 + 2));
         }
     }
     #[test]
