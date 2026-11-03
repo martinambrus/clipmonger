@@ -128,6 +128,27 @@ fn t306_config_parse_and_env_override() {
 }
 
 #[test]
+fn t306_restore_clipboard_missing_file_and_saved_preferences() {
+    let dir = std::env::temp_dir().join(format!("cm-core-t306-restore-{}", Uuid::now_v7()));
+    let path = dir.join("clipmonger.toml");
+    let missing = config::Config::load(&path).unwrap();
+    assert!(!missing.popup.restore_clipboard);
+    assert!(!path.exists(), "loading defaults must not create a config");
+    for restore in [true, false] {
+        let cfg: config::Config = toml::from_str(&format!(
+            "[popup]\nrestore_clipboard = {restore}\nplacement = 'center'\nfuture_popup = 'keep-me'\n"
+        ))
+        .unwrap();
+        cfg.save(&path).unwrap();
+        let loaded = config::Config::load(&path).unwrap();
+        assert_eq!(loaded.popup.restore_clipboard, restore);
+        assert_eq!(loaded.popup.placement, "center");
+        assert_eq!(loaded.popup.extra["future_popup"].as_str(), Some("keep-me"));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn t306_portable_resolution() {
     let exe = std::env::temp_dir().join("cm-core-exe");
     let paths = config::Config::resolve_paths(true, &exe);

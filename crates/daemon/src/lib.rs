@@ -2594,7 +2594,7 @@ impl DaemonState {
                 65536,
                 1000,
                 clipmonger_core::PasteDelivery::ClipboardRestore,
-                true,
+                false,
             ),
             |settings| *settings,
         )
@@ -4830,6 +4830,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = clipmonger_core::Store::open(&dir).expect("store");
         (dir, DaemonState::new(store))
+    }
+
+    #[test]
+    fn paste_budget_poisoned_settings_keep_selected_clipboard() {
+        let (_dir, state) = fresh_state("paste-budget-poison");
+        let _ = std::panic::catch_unwind(|| {
+            let _settings = state.paste_limits.lock().unwrap();
+            panic!("poison paste settings");
+        });
+        assert!(state.paste_limits.is_poisoned());
+        assert_eq!(
+            state.paste_budget(),
+            (
+                65536,
+                1000,
+                clipmonger_core::PasteDelivery::ClipboardRestore,
+                false,
+            )
+        );
     }
 
     #[test]

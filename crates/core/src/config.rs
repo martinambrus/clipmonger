@@ -83,7 +83,7 @@ fn default_paste_chords() -> Vec<PasteChord> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PasteDelivery {
-    /// Write payloads to the clipboard, send Ctrl+V, then guarded-restore.
+    /// Write payloads to the clipboard, send Ctrl+V, optionally guarded-restore.
     #[default]
     ClipboardRestore,
     /// Type the text as synthetic Unicode keystrokes.
@@ -191,7 +191,7 @@ pub struct PopupConfig {
     pub delivery_dwell_ms: u64,
     #[serde(default)]
     pub delivery: PasteDelivery,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub restore_clipboard: bool,
     /// Unknown keys preserved for forward compatibility.
     #[serde(flatten)]
@@ -210,7 +210,7 @@ impl Default for PopupConfig {
             unicode_limit: default_unicode_limit(),
             delivery_dwell_ms: default_delivery_dwell_ms(),
             delivery: PasteDelivery::default(),
-            restore_clipboard: true,
+            restore_clipboard: false,
             extra: BTreeMap::new(),
         }
     }
@@ -564,6 +564,38 @@ mod tests {
         assert_eq!(PasteDelivery::default(), PasteDelivery::ClipboardRestore);
         let cfg: Config = toml::from_str("[popup]\n").unwrap();
         assert_eq!(cfg.popup.delivery, PasteDelivery::ClipboardRestore);
+    }
+
+    #[test]
+    fn restore_clipboard_defaults_off() {
+        assert!(!PopupConfig::default().restore_clipboard);
+        assert!(!Config::default().popup.restore_clipboard);
+    }
+
+    #[test]
+    fn restore_clipboard_missing_key_defaults_off() {
+        for text in ["", "[popup]\n", "[popup]\nhotkey = 'ctrl+shift+x'\n"] {
+            let cfg: Config = toml::from_str(text).unwrap();
+            assert!(!cfg.popup.restore_clipboard, "config: {text:?}");
+            assert_eq!(cfg.popup.delivery, PasteDelivery::ClipboardRestore);
+        }
+    }
+
+    #[test]
+    fn restore_clipboard_explicit_preference_roundtrips() {
+        for restore in [true, false] {
+            let cfg: Config =
+                toml::from_str(&format!("[popup]\nrestore_clipboard = {restore}\n")).unwrap();
+            assert_eq!(cfg.popup.restore_clipboard, restore);
+            let rendered = cfg.to_toml().unwrap();
+            assert!(rendered.contains(&format!("restore_clipboard = {restore}")));
+            let back: Config = toml::from_str(&rendered).unwrap();
+            assert_eq!(back.popup.restore_clipboard, restore);
+            assert_eq!(
+                serde_json::to_value(&back).unwrap()["popup"]["restore_clipboard"],
+                restore
+            );
+        }
     }
 
     #[test]

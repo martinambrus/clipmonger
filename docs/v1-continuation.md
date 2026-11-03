@@ -94,6 +94,13 @@ portable fresh profile and disposable text windows; then Settings/keyboard/focus
 then installed/UAC cases, and logon/display changes in separate sessions.
 The exact candidate and evidence must accompany every result.
 
+Current Windows acceptance criterion (user decision, 2026-11-03): default
+`clipboard_restore` delivery keeps the selected clip on the clipboard, replacing
+the previous contents (`popup.restore_clipboard = false`). Restoring the previous
+clipboard is opt-in, and saved explicit true/false choices must survive restart.
+Verify both standard and elevated-helper delivery on the rebuilt candidate; older
+dated restoration passes do not validate this new default.
+
 Versioned acceptance scripts:
 [T-905](../tests/manual/T-905-window-matrix.md),
 [T-906](../tests/manual/T-906-inventory-walk.md),
@@ -123,6 +130,9 @@ are STOP: record and hand off; do not explore or switch stations.
   [T-508](../tests/manual/T-508-x11-real-de.md),
   [T-606](../tests/manual/T-606-wayland-compositor-matrix.md),
   [T-607](../tests/manual/T-607-paste-spike-acceptance.md), and T-702 through T-705.
+  Pre-existing X11 permanent hotkeys restore the previous clipboard regardless
+  of `popup.restore_clipboard`; this needs a separate fix and Linux acceptance
+  before claiming the Windows preference behavior on X11.
 - Linux release licensing is unresolved for scanner-generated blur protocol output
   used by winit through wayland-protocols-plasma. The crate's MIT manifest and the
   successful dependency scan do not determine the file-specific output boundary.

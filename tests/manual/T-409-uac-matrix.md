@@ -14,6 +14,11 @@ Portable (user folder + `portable.marker`):
    - Expected: within about 1 s one question "Enable Clipmonger in admin windows?" (default button No); Yes → one UAC prompt → `audit.log` shows `connected`.
 3. Paste via the popup hotkey into the elevated app, the standard app, and the elevated app again.
    - Expected: every paste instant and into the window the hotkey was pressed in; `audit.log` `job` entries with single-digit `ms`.
+   - With default `clipboard_restore` delivery and `restore_clipboard = false`,
+     the selected clip stays on the clipboard on both routes. Repeat with
+     **Restore clipboard after paste** enabled: the previous clipboard returns
+     after the dwell if unchanged. These current criteria do not rewrite the
+     dated verdicts below.
 4. Leave everything idle for more than 8 minutes, then paste into the elevated app.
    - Expected: instant paste, no prompt.
 5. Open the popup from the tray icon and pick a clip; repeat with `clipmonger-cli show-popup`.

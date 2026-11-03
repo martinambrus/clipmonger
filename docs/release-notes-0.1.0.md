@@ -42,6 +42,13 @@ Checksums are **integrity only, not signatures** (seg-12 §8): a
 same-account compromise defeats them. Verify with `sha256sum -c
 SHA256SUMS` in the download directory.
 
+## Clipboard behavior
+
+Windows clipboard paste leaves the selected clip on the clipboard by default.
+Enable **Restore clipboard after paste** to restore the previous clipboard when
+it has not changed in the meantime. Existing explicit preferences are preserved;
+the default delivery strategy remains `clipboard_restore`.
+
 ## Coexistence note
 
 Clipmonger uses a passive clipboard listener by design and coexists
