@@ -2206,11 +2206,11 @@ impl Store {
         if self.read_only {
             return Err(readonly_err());
         }
-        let candidate: Option<(i64, Option<String>, i64, bool, bool)> = {
+        let candidate: Option<(i64, Option<String>, i64, bool, bool, String)> = {
             let conn = self.lock();
-            conn.query_row("SELECT c.rowid, CASE WHEN length(CAST(c.id AS BLOB)) <= 36 THEN c.id END, COALESCE(v.version,0), EXISTS(SELECT 1 FROM clip_payloads p WHERE p.clip_id=c.id AND p.mime='text/uri-list'), EXISTS(SELECT 1 FROM uri_search s WHERE s.clip_id=c.id AND s.version=COALESCE(v.version,0) AND s.parser_version=3) FROM clips c LEFT JOIN uri_payload_versions v ON v.clip_id=c.id WHERE c.rowid>?1 ORDER BY c.rowid LIMIT 1", params![after.unwrap_or(i64::MIN)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional().map_err(|e| db_err(&e))?
+            conn.query_row("SELECT c.rowid, CASE WHEN length(CAST(c.id AS BLOB)) <= 36 THEN c.id END, COALESCE(v.version,0), EXISTS(SELECT 1 FROM clip_payloads p WHERE p.clip_id=c.id AND p.mime='text/uri-list'), EXISTS(SELECT 1 FROM uri_search s WHERE s.clip_id=c.id AND s.version=COALESCE(v.version,0) AND s.parser_version=3), COALESCE((SELECT v FROM meta WHERE k='uri_purge_generation'),'0') FROM clips c LEFT JOIN uri_payload_versions v ON v.clip_id=c.id WHERE c.rowid>?1 ORDER BY c.rowid LIMIT 1", params![after.unwrap_or(i64::MIN)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).optional().map_err(|e| db_err(&e))?
         };
-        let Some((rowid, id, version, has_uri, indexed)) = candidate else {
+        let Some((rowid, id, version, has_uri, indexed, purge_generation)) = candidate else {
             return Ok(None);
         };
         if !has_uri || indexed {
@@ -2238,12 +2238,12 @@ impl Store {
         let mut conn = self.lock();
         let committed = (|| -> Result<bool, CoreError> {
             let tx = conn.transaction().map_err(|e| db_err(&e))?;
-            let current: Option<(i64,i64)> = tx.query_row("SELECT c.rowid, COALESCE(v.version,0) FROM clip_payloads p JOIN clips c ON c.id=p.clip_id LEFT JOIN uri_payload_versions v ON v.clip_id=p.clip_id WHERE p.clip_id=?1 AND p.mime='text/uri-list'", params![id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e| db_err(&e))?;
-            if current == Some((rowid,version)) {
+            let current: Option<(i64,i64,String)> = tx.query_row("SELECT c.rowid, COALESCE(v.version,0), COALESCE((SELECT v FROM meta WHERE k='uri_purge_generation'),'0') FROM clip_payloads p JOIN clips c ON c.id=p.clip_id LEFT JOIN uri_payload_versions v ON v.clip_id=p.clip_id WHERE p.clip_id=?1 AND p.mime='text/uri-list'", params![id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e| db_err(&e))?;
+            if current == Some((rowid,version,purge_generation.clone())) {
             tx.execute("INSERT INTO uri_search(clip_id,version,parser_version,names) VALUES(?1,?2,3,?3) ON CONFLICT(clip_id) DO UPDATE SET version=excluded.version,parser_version=excluded.parser_version,names=excluded.names", params![id, version, names]).map_err(|e| db_err(&e))?;
             }
             tx.commit().map_err(|e| db_err(&e))?;
-            Ok(current == Some((rowid,version)))
+            Ok(current == Some((rowid,version,purge_generation)))
         })().unwrap_or(false);
         Ok(Some((rowid, committed, true)))
     }
@@ -3516,11 +3516,28 @@ fn removed_ids(conn: &Connection) -> Result<Vec<String>, CoreError> {
 
 /// Delete clip and FTS rows; the caller sweeps after all SQL deletions.
 fn delete_clips(conn: &Connection, ids: &[String]) -> Result<(), CoreError> {
+    if !ids.is_empty() {
+        // Rowids and per-clip versions can both be reused after a purge. Keep
+        // in-flight URI backfills from accepting an earlier incarnation.
+        let changed = conn.execute("INSERT INTO meta(k,v) VALUES('uri_purge_generation','1') ON CONFLICT(k) DO UPDATE SET v=CAST(v AS INTEGER)+1 WHERE CAST(v AS INTEGER)<9223372036854775807", []).map_err(|e| db_err(&e))?;
+        if changed != 1 {
+            return Err(CoreError::Corrupt {
+                message: "URI purge generation exhausted".to_string(),
+            });
+        }
+    }
     for id in ids {
         conn.execute("DELETE FROM clips_fts WHERE clip_id=?1", params![id])
             .map_err(|e| db_err(&e))?;
         conn.execute("DELETE FROM clips WHERE id=?1", params![id])
             .map_err(|e| db_err(&e))?;
+        // The cascading payload delete increments the version, so remove it
+        // only after the clip and its payloads have been deleted.
+        conn.execute(
+            "DELETE FROM uri_payload_versions WHERE clip_id=?1",
+            params![id],
+        )
+        .map_err(|e| db_err(&e))?;
     }
     Ok(())
 }
@@ -4022,6 +4039,139 @@ mod tests {
                 .iter()
                 .any(|clip| clip.id == id));
         }
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_versions_follow_clip_lifecycle() {
+        use rusqlite::OptionalExtension;
+        let profile = unique_dir("uri-version-lifecycle");
+        let store = Store::open(&profile).unwrap();
+        let survivor = sample_clip(Uuid::now_v7(), "", "survivor", 100);
+        store
+            .insert_clip(
+                &survivor,
+                &[("text/uri-list".into(), b"file:///survivor".to_vec())],
+            )
+            .unwrap();
+        store.soft_delete(survivor.id).unwrap();
+        let version = |id: Uuid| -> Option<i64> {
+            store
+                .lock()
+                .query_row(
+                    "SELECT version FROM uri_payload_versions WHERE clip_id=?1",
+                    [id.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap()
+        };
+        let original = version(survivor.id).unwrap();
+        for i in 0..3 {
+            let clip = sample_clip(Uuid::now_v7(), "", "cycle", i);
+            store
+                .insert_clip(
+                    &clip,
+                    &[(
+                        "text/uri-list".into(),
+                        format!("file:///cycle{i}").into_bytes(),
+                    )],
+                )
+                .unwrap();
+            store.soft_delete(clip.id).unwrap();
+            // Restore the first clip logically while purging each cycle.
+            store
+                .lock()
+                .execute(
+                    "UPDATE clips SET removed=0 WHERE id=?1",
+                    [survivor.id.to_string()],
+                )
+                .unwrap();
+            assert_eq!(store.purge_removed(), 1);
+            assert_eq!(version(clip.id), None);
+            assert_eq!(version(survivor.id), Some(original));
+            store.soft_delete(survivor.id).unwrap();
+        }
+        store
+            .lock()
+            .execute(
+                "UPDATE clips SET removed=0 WHERE id=?1",
+                [survivor.id.to_string()],
+            )
+            .unwrap();
+        let old = sample_clip(Uuid::now_v7(), "", "old", 1);
+        store
+            .insert_clip(&old, &[("text/uri-list".into(), b"file:///old".to_vec())])
+            .unwrap();
+        let limits = Limits {
+            max_items: 1,
+            max_store_bytes: u64::MAX,
+            max_age_days: 0,
+        };
+        assert_eq!(store.enforce_retention(&limits).unwrap(), 1);
+        assert_eq!(version(old.id), None);
+        assert_eq!(version(survivor.id), Some(original));
+        let archive = profile.join("backup.zip");
+        store.backup_zip(&archive).unwrap();
+        let restored_profile = unique_dir("uri-version-restored");
+        Store::restore_zip(&archive, &restored_profile).unwrap();
+        let restored = Store::open(&restored_profile).unwrap();
+        assert_eq!(
+            restored
+                .lock()
+                .query_row(
+                    "SELECT version FROM uri_payload_versions WHERE clip_id=?1",
+                    [survivor.id.to_string()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            original
+        );
+        restored.soft_delete(survivor.id).unwrap();
+        assert_eq!(restored.purge_removed(), 1);
+        assert_eq!(
+            restored
+                .lock()
+                .query_row("SELECT count(*) FROM uri_payload_versions", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(restored_profile);
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_backfill_discards_purged_and_reinserted_clip() {
+        let profile = unique_dir("uri-purge-race");
+        let store = Store::open(&profile).unwrap();
+        let id = Uuid::now_v7();
+        let clip = sample_clip(id, "", "race", 19);
+        store
+            .insert_clip(
+                &clip,
+                &[("text/uri-list".into(), b"file:///old.txt".to_vec())],
+            )
+            .unwrap();
+        store.lock().execute("DELETE FROM uri_search", []).unwrap();
+        let initial: (i64, i64) = store.lock().query_row("SELECT c.rowid,v.version FROM clips c JOIN uri_payload_versions v ON c.id=v.clip_id WHERE c.id=?1", [id.to_string()], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        let result = store.backfill_uri_step_with_hook(None, || {
+            store.soft_delete(id).unwrap();
+            assert_eq!(store.purge_removed(), 1);
+            store.insert_clip(&clip, &[("text/uri-list".into(), b"file:///new.txt".to_vec())]).unwrap();
+            let replaced: (i64, i64) = store.lock().query_row("SELECT c.rowid,v.version FROM clips c JOIN uri_payload_versions v ON c.id=v.clip_id WHERE c.id=?1", [id.to_string()], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(replaced, initial);
+            store.lock().execute("DELETE FROM uri_search", []).unwrap();
+        }).unwrap().unwrap();
+        assert!(!result.1);
+        assert_eq!(
+            store
+                .lock()
+                .query_row("SELECT count(*) FROM uri_search", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         let _ = std::fs::remove_dir_all(profile);
     }
 
