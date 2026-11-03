@@ -61,10 +61,17 @@ everything in this segment except §10 (v3).
 - Conflict (`ERROR_HOTKEY_ALREADY_REGISTERED`): keep running, mark that
   hotkey `Degraded` in caps with the conflicting owner unknown, surface
   in UI + tray tooltip (ArsClip-parity behavior: never crash on conflict).
-- Scroll-Lock monitoring toggle (F-105): poll `GetKeyState(VK_SCROLL)`
-  on the backend thread; document that some keyboards lack the key.
-  VERIFY at implementation (review M-18): `GetKeyState` is thread-local —
-  confirm correct thread/API (`GetAsyncKeyState` or hook alternative).
+- Scroll-Lock monitoring toggle (F-105): monitor.scroll_lock_toggle defaults
+  off. The daemon polls GetAsyncKeyState(VK_SCROLL) every 50 ms and toggles the
+  shared monitoring-paused state on a physical rising edge. Startup and disabled
+  samples do not create a press. Very short taps can be missed; some keyboards
+  lack the key. Physical-key and recovery behavior still need native QA.
+- Capture admission checks the clipboard owner's executable against current
+  monitor.ignores and privacy.denylist before fingerprinting and again inside
+  sequence-bound payload reads. Unknown owners remain best effort. Windows
+  monitor.min_len uses decoded UTF-8 bytes, including the plain-text basis of
+  mixed plain/HTML or RTF clips.
+
 
 ## 4. Paste engine — `PasteEngine`
 

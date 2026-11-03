@@ -1,5 +1,11 @@
 # T-907 — Keyboard-only operation [manual-qa]
 
+> Current runner: ADR-005, owned winit event loop and CPU rendering.
+> Current-runner native verdict: NOT RUN. Preserve earlier dated results
+> separately. Record RustDesk/physical display, OS/compositor, DPI, monitors
+> and source revision for each run.
+
+
 - **ID / goal:** T-907. Complete the full journey with the mouse detached: open, search, select, paste, configure.
 - **Setup (box, build, profile fixture):** Win or Ubuntu desktop; mouse detached/unplugged; synthetic clips seeded. Use a fresh test profile; SYNTHETIC clipboard fixtures only.
 - **Session timebox:** 45 min (M-02: cap per session; split overruns into a new session).

@@ -646,11 +646,7 @@ pub(crate) struct ServedStore {
 impl ServedStore {
     /// Look up the bytes served for target atom `name`.
     fn for_target(&self, name: &str) -> Option<(&str, &[u8])> {
-        let canonical = mime::x11_to_canonical(name)?;
-        self.payloads
-            .iter()
-            .find(|(mime, _)| *mime == canonical)
-            .map(|(mime, bytes)| (mime.as_str(), bytes.as_slice()))
+        mime::served_target(name, &self.payloads)
     }
 }
 
@@ -1194,5 +1190,39 @@ mod deferred_tests {
         assert!(q.check_terminal().is_err());
         let err = q.check_terminal().unwrap_err();
         assert!(matches!(err, Error::Unavailable(m) if m.contains("overflow")));
+    }
+}
+
+#[cfg(test)]
+mod self_write_alias_tests {
+    use super::ServedStore;
+    use crate::mime;
+
+    #[test]
+    fn utf8_owner_serves_the_plain_read_implied_by_text_offer() {
+        let store = ServedStore {
+            payloads: vec![("text/plain;charset=utf-8".into(), b"hello".to_vec())],
+        };
+        let targets = mime::targets_for(&["text/plain;charset=utf-8".into()]);
+        assert!(targets.iter().any(|target| target == "TEXT"));
+        assert_eq!(
+            mime::x11_to_canonical("TEXT").as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(mime::canonical_to_x11("text/plain"), Some("STRING"));
+        assert_eq!(
+            store.for_target("STRING").map(|(_, bytes)| bytes),
+            Some(b"hello".as_slice())
+        );
+        let both = ServedStore {
+            payloads: vec![
+                ("text/plain".into(), b"plain".to_vec()),
+                ("text/plain;charset=utf-8".into(), b"utf8".to_vec()),
+            ],
+        };
+        assert_eq!(
+            both.for_target("STRING").map(|(_, bytes)| bytes),
+            Some(b"plain".as_slice())
+        );
     }
 }

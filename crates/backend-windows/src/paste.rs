@@ -101,6 +101,20 @@ impl WinPaste {
         clip: &ClipRef,
         payloads: &[(String, Vec<u8>)],
     ) -> Result<()> {
+        self.paste_payloads_with(target, clip, payloads, None)
+    }
+
+    /// Paste with notification of clipboard writes and guarded restores.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::paste_payloads`].
+    pub fn paste_payloads_with(
+        &self,
+        target: &PasteTarget,
+        clip: &ClipRef,
+        payloads: &[(String, Vec<u8>)],
+        observer: Option<&dyn ClipboardWriteObserver>,
+    ) -> Result<()> {
         #[cfg(windows)]
         {
             let _ = clip;
@@ -132,13 +146,13 @@ impl WinPaste {
                 DeliveryRoute::Inject => inject_text(&text.unwrap_or_default())
                     .map_err(|detail| Error::Io(format!("unicode inject failed: {detail}"))),
                 DeliveryRoute::Clipboard => {
-                    clipboard_restore(payloads, self.dwell_ms, self.restore_clipboard)
+                    clipboard_restore(payloads, self.dwell_ms, self.restore_clipboard, observer)
                 }
             }
         }
         #[cfg(not(windows))]
         {
-            let _ = (target, clip, payloads);
+            let _ = (target, clip, payloads, observer);
             Err(Error::Unavailable(
                 "paste needs a Windows session".to_string(),
             ))
@@ -250,11 +264,44 @@ pub struct ClipboardSwap {
     #[cfg_attr(not(windows), allow(dead_code))]
     saved: Option<Vec<(u32, Vec<u8>)>>,
     #[cfg_attr(not(windows), allow(dead_code))]
+    saved_file_list: Option<Vec<u8>>,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pre_state: Option<String>,
     #[cfg_attr(not(windows), allow(dead_code))]
     post_state: Option<String>,
     #[cfg_attr(not(windows), allow(dead_code))]
     temp_text: Option<Vec<u8>>,
+}
+
+/// Receives the lifecycle of a clipboard write owned by a paste operation.
+pub trait ClipboardWriteObserver {
+    /// Register the projected capture before a native write.
+    fn begin(&self, payloads: &[(String, Vec<u8>)]) -> Option<u64>;
+    /// Finalize the sequence while the native clipboard is still open.
+    fn written(&self, id: u64, sequence: Option<u32>);
+    /// Cancel a failed write.
+    fn failed(&self, id: u64);
+    /// Capture limit for a file list, if the monitor would read it.
+    fn snapshot_file_limit(&self) -> Option<u64> {
+        None
+    }
+    /// Register a capture-visible projection of a saved native snapshot.
+    #[cfg(any(windows, test))]
+    fn begin_restore(
+        &self,
+        saved: &[(u32, Vec<u8>)],
+        name_for_id: &dyn Fn(u32) -> Option<String>,
+        saved_file_list: Option<&[u8]>,
+    ) -> Option<u64> {
+        let projected = super::transfer::project_saved_snapshot_with_file(
+            saved,
+            name_for_id,
+            16 * 1024 * 1024,
+            |_| true,
+            saved_file_list,
+        )?;
+        self.begin(&projected)
+    }
 }
 
 impl ClipboardSwap {
@@ -266,6 +313,18 @@ impl ClipboardSwap {
     /// Returns [`Error::Unsupported`] when there are no payload bytes, or
     /// the transfer layer's error when the write fails.
     pub fn begin(payloads: &[(String, Vec<u8>)], restore: bool) -> Result<Self> {
+        Self::begin_with(payloads, restore, None)
+    }
+
+    /// Begin a swap while reporting the actual write boundary to an observer.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::begin`].
+    pub fn begin_with(
+        payloads: &[(String, Vec<u8>)],
+        restore: bool,
+        observer: Option<&dyn ClipboardWriteObserver>,
+    ) -> Result<Self> {
         #[cfg(windows)]
         {
             use super::transfer::{imp, WinTransfer};
@@ -276,20 +335,37 @@ impl ClipboardSwap {
                 ));
             }
             let transfer = WinTransfer::new();
-            let saved = if restore {
+            let (saved, saved_file_list) = if restore {
                 let mut ids = vec![imp::CF_UNICODETEXT, imp::CF_DIB, imp::CF_HDROP];
                 ids.extend(
                     RESTORE_FORMATS
                         .iter()
                         .filter_map(|name| imp::register(name).ok()),
                 );
-                imp::snapshot(&ids, RESTORE_MAX_BYTES, RESTORE_BUDGET)
-                    .filter(|saved| !saved.is_empty())
+                imp::snapshot(
+                    &ids,
+                    RESTORE_MAX_BYTES,
+                    RESTORE_BUDGET,
+                    observer.and_then(ClipboardWriteObserver::snapshot_file_limit),
+                )
+                .filter(|(saved, _)| !saved.is_empty())
+                .map_or((None, None), |(saved, file_list)| (Some(saved), file_list))
             } else {
-                None
+                (None, None)
             };
             let pre_state = transfer.unchanged_indicator();
-            transfer.write(payloads)?;
+            let id = observer.and_then(|o| o.begin(payloads));
+            let result = transfer.write_with_sequence(payloads, |seq| {
+                if let (Some(o), Some(id)) = (observer, id) {
+                    o.written(id, seq);
+                }
+            });
+            if result.is_err() {
+                if let (Some(o), Some(id)) = (observer, id) {
+                    o.failed(id);
+                }
+            }
+            result?;
             let post_state = transfer.unchanged_indicator();
             let temp_text = payloads
                 .iter()
@@ -297,6 +373,7 @@ impl ClipboardSwap {
                 .map(|(_, bytes)| bytes.clone());
             Ok(Self {
                 saved,
+                saved_file_list,
                 pre_state,
                 post_state,
                 temp_text,
@@ -304,7 +381,7 @@ impl ClipboardSwap {
         }
         #[cfg(not(windows))]
         {
-            let _ = (payloads, restore);
+            let _ = (payloads, restore, observer);
             Err(Error::Unavailable(
                 "clipboard swap needs a Windows session".to_string(),
             ))
@@ -313,17 +390,27 @@ impl ClipboardSwap {
 
     /// Sleep `dwell_ms`, then guarded-restore if `restore` is true.
     pub fn finish(self, dwell_ms: u64, restore: bool) {
+        self.finish_with(dwell_ms, restore, None);
+    }
+
+    /// Finish the swap and report a guarded restore write when one occurs.
+    pub fn finish_with(
+        self,
+        dwell_ms: u64,
+        restore: bool,
+        observer: Option<&dyn ClipboardWriteObserver>,
+    ) {
         #[cfg(windows)]
         {
             if !restore {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(dwell_ms));
-            guarded_restore(&self);
+            guarded_restore(&self, observer);
         }
         #[cfg(not(windows))]
         {
-            let _ = (dwell_ms, restore);
+            let _ = (dwell_ms, restore, observer);
         }
     }
 }
@@ -332,7 +419,7 @@ impl ClipboardSwap {
 /// temporary write (sequence indicator AND text content). Shared tail of
 /// `clipboard_restore` and [`ClipboardSwap::finish`]; user copies win.
 #[cfg(windows)]
-fn guarded_restore(swap: &ClipboardSwap) {
+fn guarded_restore(swap: &ClipboardSwap, observer: Option<&dyn ClipboardWriteObserver>) {
     use super::transfer::WinTransfer;
     use clipmonger_platform::traits::ClipboardTransfer as _;
     let transfer = WinTransfer::new();
@@ -343,11 +430,42 @@ fn guarded_restore(swap: &ClipboardSwap) {
         (None, None) => true,
         _ => false,
     };
-    if clipmonger_platform::paste_policy::guarded_restore_decision(unchanged, hash_same) {
-        if let Some(saved) = &swap.saved {
-            let _ = super::transfer::imp::restore(saved);
+    guarded_restore_with(
+        unchanged,
+        hash_same,
+        swap.saved.as_deref(),
+        observer,
+        swap.saved_file_list.as_deref(),
+        super::transfer::imp::format_name,
+        |saved, done| super::transfer::imp::restore_with_sequence(saved, done),
+    );
+    let _ = &swap.pre_state;
+}
+
+#[cfg(any(windows, test))]
+fn guarded_restore_with(
+    unchanged: bool,
+    hash_same: bool,
+    saved: Option<&[(u32, Vec<u8>)]>,
+    observer: Option<&dyn ClipboardWriteObserver>,
+    saved_file_list: Option<&[u8]>,
+    name_for_id: impl Fn(u32) -> Option<String>,
+    restore: impl FnOnce(&[(u32, Vec<u8>)], &mut dyn FnMut(Option<u32>)) -> Result<()>,
+) {
+    if !clipmonger_platform::paste_policy::guarded_restore_decision(unchanged, hash_same) {
+        return;
+    }
+    let Some(saved) = saved else { return };
+    let id = observer.and_then(|o| o.begin_restore(saved, &name_for_id, saved_file_list));
+    let result = restore(saved, &mut |seq| {
+        if let (Some(o), Some(id)) = (observer, id) {
+            o.written(id, seq);
         }
-        let _ = &swap.pre_state;
+    });
+    if result.is_err() {
+        if let (Some(o), Some(id)) = (observer, id) {
+            o.failed(id);
+        }
     }
 }
 
@@ -367,10 +485,15 @@ fn inject_text(bytes: &[u8]) -> std::result::Result<(), String> {
 /// `ClipboardRestore`: save, write payloads, Ctrl+V, restore only when the
 /// slot still equals our temporary write (user copies always win).
 #[cfg(windows)]
-fn clipboard_restore(payloads: &[(String, Vec<u8>)], dwell_ms: u64, restore: bool) -> Result<()> {
-    let swap = ClipboardSwap::begin(payloads, restore)?;
+fn clipboard_restore(
+    payloads: &[(String, Vec<u8>)],
+    dwell_ms: u64,
+    restore: bool,
+    observer: Option<&dyn ClipboardWriteObserver>,
+) -> Result<()> {
+    let swap = ClipboardSwap::begin_with(payloads, restore, observer)?;
     worker_press_paste_chord().map_err(|e| Error::Io(format!("paste chord failed: {e}")))?;
-    swap.finish(dwell_ms, restore);
+    swap.finish_with(dwell_ms, restore, observer);
     Ok(())
 }
 
@@ -399,6 +522,65 @@ impl PasteEngine for WinPaste {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guarded_native_restore_notifies_only_when_guard_allows_write() {
+        use std::cell::RefCell;
+        struct Observer(RefCell<Vec<&'static str>>);
+        impl ClipboardWriteObserver for Observer {
+            fn begin(&self, payloads: &[(String, Vec<u8>)]) -> Option<u64> {
+                assert_eq!(payloads, &[("text/plain".to_string(), b"hi".to_vec())]);
+                self.0.borrow_mut().push("begin");
+                Some(7)
+            }
+            fn written(&self, id: u64, sequence: Option<u32>) {
+                assert_eq!((id, sequence), (7, Some(42)));
+                self.0.borrow_mut().push("written");
+            }
+            fn failed(&self, id: u64) {
+                assert_eq!(id, 7);
+                self.0.borrow_mut().push("failed");
+            }
+        }
+        let observer = Observer(RefCell::new(Vec::new()));
+        let saved = vec![(13, vec![b'h', 0, b'i', 0, 0, 0])];
+        guarded_restore_with(
+            false,
+            true,
+            Some(&saved),
+            Some(&observer),
+            None,
+            |_| None,
+            |_, _| panic!("guard must skip"),
+        );
+        assert!(observer.0.borrow().is_empty());
+        guarded_restore_with(
+            true,
+            true,
+            Some(&saved),
+            Some(&observer),
+            None,
+            |_| None,
+            |actual, done| {
+                assert_eq!(actual, saved.as_slice());
+                assert_eq!(&*observer.0.borrow(), &["begin"]);
+                done(Some(42));
+                Ok(())
+            },
+        );
+        assert_eq!(&*observer.0.borrow(), &["begin", "written"]);
+        observer.0.borrow_mut().clear();
+        guarded_restore_with(
+            true,
+            true,
+            Some(&saved),
+            Some(&observer),
+            None,
+            |_| None,
+            |_, _| Err(Error::Io("failure".into())),
+        );
+        assert_eq!(&*observer.0.borrow(), &["begin", "failed"]);
+    }
 
     #[test]
     fn route_clipboard_first_always_clipboard() {
