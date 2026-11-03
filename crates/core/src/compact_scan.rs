@@ -95,6 +95,8 @@ pub(super) struct ScanState {
     pending: Option<CompactHit>,
     uri_search_incomplete: bool,
 }
+// These flags represent independent properties of the partially read row.
+#[allow(clippy::struct_excessive_bools)]
 struct PartialRow {
     rowid: i64,
     pinned: bool,
@@ -129,13 +131,24 @@ impl ScanState {
 }
 
 impl Store {
+    /// Begin a scan owned by the given session.
+    ///
+    /// # Errors
+    /// Returns a snapshot error if the scan cannot be opened.
     pub fn begin_compact_scan(&self, owner: u64, query: &str) -> Result<SnapshotToken, ScanError> {
         Ok(self.begin_snapshot(owner, query, true)?)
     }
+    /// Cancel an owned scan.
+    ///
+    /// # Errors
+    /// Returns a snapshot error if the token is invalid or unavailable.
     pub fn cancel_compact_scan(&self, owner: u64, token: SnapshotToken) -> Result<(), ScanError> {
         Ok(self.cancel_compact_snapshot(owner, token)?)
     }
     /// Verify that a continuation belongs to the same session and exact query.
+    ///
+    /// # Errors
+    /// Returns a snapshot error for an invalid token, owner, or query.
     pub fn validate_compact_query(
         &self,
         owner: u64,
@@ -155,6 +168,9 @@ impl Store {
     /// of 256 stored bytes and one 128-byte hash. Up to 266,240 raw metadata
     /// bytes and 1,056 MIME index entries may be inspected per step; they are
     /// not included in `bytes_read`. SQLite page and OS I/O are not bounded.
+    ///
+    /// # Errors
+    /// Returns an error for invalid budgets, snapshot state, or scan reads.
     pub fn step_compact_scan(
         &self,
         owner: u64,
@@ -193,6 +209,8 @@ impl Store {
 }
 
 impl ScanState {
+    // The scan phases share budget accounting and continuation state.
+    #[allow(clippy::too_many_lines)]
     fn step(
         &mut self,
         conn: &rusqlite::Connection,
@@ -355,7 +373,7 @@ impl ScanState {
     }
 }
 
-/// Read only bounded metadata. The indexed clip_id prefix and LIMIT cap the
+/// Read only bounded metadata. The indexed `clip_id` prefix and LIMIT cap the
 /// number of visited MIME records; blob lengths are obtained without a SQL
 /// length/substring or UTF conversion of an unrestricted stored value.
 fn project_metadata(
@@ -383,7 +401,7 @@ fn project_metadata(
         }
         let mut mime = String::new();
         cursor.step(conn, NonZeroUsize::new(MAX_MIME_BYTES).unwrap(), |c| {
-            mime.push(c)
+            mime.push(c);
         })?;
         image |= mime.starts_with("image/");
         html |= mime.contains("html");
@@ -410,7 +428,7 @@ fn project_metadata(
             Ok(mut cursor) if cursor.len() <= MAX_HASH_BYTES => {
                 let mut value = String::new();
                 match cursor.step(conn, NonZeroUsize::new(MAX_HASH_BYTES).unwrap(), |c| {
-                    value.push(c)
+                    value.push(c);
                 }) {
                     Ok(_) if crate::model::valid_clip_content_hash(&value) => Some(value),
                     Ok(_) | Err(TextStreamError::InvalidText | TextStreamError::WrongType) => None,
@@ -486,7 +504,7 @@ mod tests {
     fn compact_uri_names_use_snapshot_and_display_label() {
         let (_s, db) = setup();
         for n in 1..=120 {
-            insert(&db, n, n as i64, "", "", false);
+            insert(&db, n, i64::try_from(n).unwrap(), "", "", false);
         }
         db.lock()
             .execute(
@@ -613,7 +631,7 @@ mod tests {
     fn compact_projection_uses_pinned_snapshot_and_valid_hash() {
         let (_s, db) = setup();
         for n in 1..=9 {
-            insert(&db, n, n as i64, "", "row", false);
+            insert(&db, n, i64::try_from(n).unwrap(), "", "row", false);
         }
         let valid = "a".repeat(64);
         {
@@ -640,7 +658,7 @@ mod tests {
             .unwrap();
             conn.execute(
                 "UPDATE clips SET content_hash=?1 WHERE id=?2",
-                params!["a".repeat(100000), id(8)],
+                params!["a".repeat(100_000), id(8)],
             )
             .unwrap();
             conn.execute(
@@ -703,7 +721,14 @@ mod tests {
                 "ordinary"
             };
             let preview = if n % 23 == 0 { "tail\nPRE" } else { "value" };
-            insert(&db, n, (n / 4) as i64, search, preview, n == 114);
+            insert(
+                &db,
+                n,
+                i64::try_from(n / 4).unwrap(),
+                search,
+                preview,
+                n == 114,
+            );
             fixtures.push((n, search.to_owned(), preview.to_owned()));
         }
         let old = db.begin_compact_scan(1, "needle").unwrap();
@@ -733,7 +758,7 @@ mod tests {
         assert_eq!(got[0].id, id(129));
         let sep = db.begin_compact_scan(1, "ordinary\nvalue").unwrap();
         let (got, _) = collect(&db, sep, MAX_BYTES, 32, 50);
-        assert!(!got.is_empty());
+        assert_ne!(got.len(), 0);
     }
     #[test]
     fn compact_scan_large_fields_pending_and_invalid_tail() {
@@ -764,7 +789,14 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert!(empty > 0);
         for n in 0..50 {
-            insert(&db, n, n as i64, "hit", &"\"".repeat(5000), false);
+            insert(
+                &db,
+                n,
+                i64::try_from(n).unwrap(),
+                "hit",
+                &"\"".repeat(5000),
+                false,
+            );
         }
         let t = db.begin_compact_scan(1, "hit").unwrap();
         let (got, _) = collect(&db, t, MAX_BYTES, 32, 50);
@@ -793,7 +825,14 @@ mod tests {
     fn compact_scan_encoded_limit_pending_and_row_limit() {
         let (_s, db) = setup();
         for n in 0..50 {
-            insert(&db, n, n as i64, "hit", &"\0".repeat(4096), false);
+            insert(
+                &db,
+                n,
+                i64::try_from(n).unwrap(),
+                "hit",
+                &"\0".repeat(4096),
+                false,
+            );
         }
         let token = db.begin_compact_scan(1, "hit").unwrap();
         let mut ids = Vec::new();

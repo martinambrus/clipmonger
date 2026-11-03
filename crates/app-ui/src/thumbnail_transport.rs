@@ -179,18 +179,18 @@ mod windows_tests {
     use super::*;
     #[tokio::test]
     async fn local_pipe_uses_the_production_fetch() {
-        let dir = std::env::temp_dir().join(format!(
-            "cm-pipe-profile-{}-{}",
-            std::process::id(),
-            Uuid::now_v7()
-        ));
-        std::fs::create_dir(&dir).unwrap();
         struct Dir(std::path::PathBuf);
         impl Drop for Dir {
             fn drop(&mut self) {
                 std::fs::remove_dir_all(&self.0).unwrap();
             }
         }
+        let dir = std::env::temp_dir().join(format!(
+            "cm-pipe-profile-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        std::fs::create_dir(&dir).unwrap();
         let _dir = Dir(dir.clone());
         let name = format!(
             r"\\.\pipe\cm-thumb-{}-{}",
@@ -302,7 +302,9 @@ mod windows_tests {
 
 fn valid_base64_png(value: &str) -> bool {
     let bytes = value.as_bytes();
-    if bytes.is_empty() || bytes.len() % 4 != 0 || bytes.len() > (512 * 1024_usize).div_ceil(3) * 4
+    if bytes.is_empty()
+        || !bytes.len().is_multiple_of(4)
+        || bytes.len() > (512 * 1024_usize).div_ceil(3) * 4
     {
         return false;
     }
@@ -319,6 +321,9 @@ fn valid_base64_png(value: &str) -> bool {
 
 /// Fetch one encoded PNG (or a null placeholder) using an independent connection.
 /// Decoding and validating PNG pixels belongs to the caller's background worker.
+///
+/// # Errors
+/// Returns an error for invalid input, connection, protocol, timeout, or cancellation.
 pub async fn fetch(
     profile: &Path,
     clip: Uuid,
@@ -360,7 +365,7 @@ pub async fn fetch(
         read_frame(&mut stream, hello_deadline, cancel).await?,
         "hello-0",
     )?;
-    if welcome.get("chosen").and_then(|v| v.as_u64()) != Some(1) {
+    if welcome.get("chosen").and_then(serde_json::Value::as_u64) != Some(1) {
         return Err(FetchError::Protocol);
     }
     let params = HistoryThumbnailParams {

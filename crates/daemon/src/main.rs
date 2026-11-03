@@ -193,8 +193,7 @@ fn setup_windows_backend(
     config: &Config,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
 ) {
-    use clipmonger_backend_windows::{caps as backend_caps, WinAutostart, WinMonitor, WinTransfer};
-    use clipmonger_platform::traits::AutostartManager;
+    use clipmonger_backend_windows::{caps as backend_caps, WinMonitor, WinTransfer};
     use clipmonger_platform::types::SubscribeKind;
 
     let transfer = Arc::new(WinTransfer::new());
@@ -204,15 +203,6 @@ fn setup_windows_backend(
             .map_err(|e| eprintln!("daemon: windows monitor unavailable: {e}"))
             .ok();
     let monitor_ok = initial_monitor.is_some();
-
-    // Autostart handle for future UI wiring; never enabled at startup.
-    // Portable when the profile lives beside the daemon binary.
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
-    let exe_dir = exe
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let autostart = WinAutostart::new(exe, profile.starts_with(&exe_dir));
-    let _ = autostart.is_enabled();
 
     let base_caps = backend_caps::caps_for(false, false);
     state.register_backend("windows", base_caps);
@@ -410,15 +400,14 @@ fn admin_consent_loop(
 #[cfg(all(unix, feature = "backend-x11"))]
 #[allow(clippy::too_many_lines)]
 fn setup_x11_backend(
-    profile: &Path,
+    _profile: &Path,
     state: &Arc<DaemonState>,
     config: &Config,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     use clipmonger_backend_x11::{
-        caps as backend_caps, MonitorOpts, X11Autostart, X11Hotkeys, X11Monitor, X11Transfer,
+        caps as backend_caps, MonitorOpts, X11Hotkeys, X11Monitor, X11Transfer,
     };
-    use clipmonger_platform::traits::AutostartManager;
     use clipmonger_platform::types::SubscribeKind;
 
     let transfer = match X11Transfer::connect(None) {
@@ -453,16 +442,6 @@ fn setup_x11_backend(
     )
     .map_err(|e| eprintln!("daemon: x11 monitor unavailable: {e}"))
     .ok();
-
-    // Autostart handle for future UI wiring; never enabled at startup.
-    // Portable when the profile lives beside the daemon binary.
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
-    let exe_dir = exe
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let home = std::env::var_os("HOME").map_or_else(|| profile.to_path_buf(), PathBuf::from);
-    let autostart = X11Autostart::new(exe, home.join(".config"), profile.starts_with(&exe_dir));
-    let _ = autostart.is_enabled();
 
     let display = std::env::var("DISPLAY").ok().filter(|d| !d.is_empty());
     state.register_backend("x11", backend_caps(display.as_deref()));
@@ -863,12 +842,22 @@ fn run_helper_job(job: &clipmonger_backend_windows::helper::Job) -> Result<(), S
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(|s| s.as_str()) == Some("__thumbnail-decode") {
+    if args.first().map(String::as_str) == Some("__thumbnail-decode") {
         if args.len() != 1 {
             eprintln!("thumbnail-decode: unexpected args");
             std::process::exit(2);
         }
         std::process::exit(clipmonger_daemon::thumbnail::run_thumbnail_child());
+    }
+    #[cfg(all(windows, feature = "backend-windows"))]
+    if args.iter().any(|a| a == "__elevated-persistent") {
+        let profile = profile_arg(&args);
+        std::process::exit(serve_helper(&profile, true));
+    }
+    #[cfg(all(windows, feature = "backend-windows"))]
+    if args.iter().any(|a| a == "__elevated-worker") {
+        let profile = profile_arg(&args);
+        std::process::exit(serve_helper(&profile, false));
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -882,16 +871,6 @@ fn main() {
 
 #[allow(clippy::too_many_lines)]
 async fn async_main(args: Vec<String>) {
-    #[cfg(all(windows, feature = "backend-windows"))]
-    if args.iter().any(|a| a == "__elevated-persistent") {
-        let profile = profile_arg(&args);
-        std::process::exit(serve_helper(&profile, true));
-    }
-    #[cfg(all(windows, feature = "backend-windows"))]
-    if args.iter().any(|a| a == "__elevated-worker") {
-        let profile = profile_arg(&args);
-        std::process::exit(serve_helper(&profile, false));
-    }
     let profile = profile_arg(&args);
 
     if let Some(script) = flag_value(&args, "--script") {
@@ -992,6 +971,28 @@ async fn async_main(args: Vec<String>) {
     .with_guard(ui_subscribe_guard());
     state.attach_event_hub(hub.clone());
     state.set_ui_launcher(ui_launcher(profile.clone()));
+    // Autostart: exactly one daemon-owned service, independent of display backend selection.
+    // Portable performs ZERO manager calls; feature/platform unsupported => unavailable.
+    // Startup false => zero OS writes; startup true => enable exactly once.
+    {
+        let service = std::env::current_exe().ok().map_or_else(
+            clipmonger_daemon::autostart::AutostartService::unconfigured,
+            |exe| clipmonger_daemon::autostart::AutostartService::from_profile(&profile, &exe),
+        );
+        let _ = state.set_autostart_service(service);
+        let enabled = config.autostart.enabled;
+        if let Err(e) = state.apply_autostart_startup(enabled).await {
+            let _ = clipmonger_core::runtime_log::global_emit(
+                clipmonger_core::runtime_log::Role::Daemon,
+                clipmonger_core::runtime_log::Severity::Warn,
+                "autostart.startup_failed",
+                &[
+                    ("class", clipmonger_daemon::runtime_platform_class(&e)),
+                    ("code", "startup_failed"),
+                ],
+            );
+        }
+    }
     let backend_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     setup_session_backends(&profile, &state, &config, &backend_shutdown);
     let stop: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());

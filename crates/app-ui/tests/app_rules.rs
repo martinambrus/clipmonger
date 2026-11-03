@@ -1366,10 +1366,10 @@ fn rule_bookkeeping_events_update_state_and_ask_for_refreshes() {
         format!("{} /tmp/b.zip", strings::text("config.backup_saved"))
     );
     assert_eq!(rig.cmds(), vec![]);
-    rig.push(UiEvent::RestoreDone);
+    rig.push(UiEvent::RestoreDone { warning: None });
     rig.tick();
     assert_eq!(rig.config_error(), strings::text("config.restore_done"));
-    assert!(rig.cmds().is_empty());
+    assert_eq!(rig.cmds(), vec![UiCmd::ConfigGetAfterRestore]);
     rig.app.config().lock().expect("settings").perm_group_new = "Fresh".to_string();
     rig.push(UiEvent::PermGroupsChanged);
     rig.tick();
@@ -3731,16 +3731,17 @@ fn fix_fc3_closed_settings_drops_late_replies_after_pending_apply() {
             "late BackupDone must not fill closed Settings"
         );
         assert_eq!(rig.cmds(), vec![]);
-        rig.push(UiEvent::RestoreDone);
+        rig.push(UiEvent::RestoreDone { warning: None });
         rig.tick();
         assert_eq!(
             rig.config_error(),
             "",
             "late RestoreDone must not fill closed Settings"
         );
-        assert!(
-            rig.cmds().is_empty(),
-            "closed popup refreshes when reopened"
+        assert_eq!(
+            rig.cmds(),
+            vec![UiCmd::ConfigGetAfterRestore],
+            "restore still refreshes history"
         );
         rig.push(UiEvent::ConfigError("late config error".to_string()));
         rig.tick();
@@ -5104,7 +5105,7 @@ fn compact_page_buttons_advance_and_restart_and_restore_drops_old_reply() {
         .unwrap();
     assert_eq!(restart.page, 0);
     assert!(restart.params.cursor.is_none());
-    rig.push(UiEvent::RestoreDone);
+    rig.push(UiEvent::RestoreDone { warning: None });
     rig.push(UiEvent::CompactHistory(
         restart.clone(),
         Err(clipmonger_ipc::proto::IpcError::new(
@@ -5254,7 +5255,7 @@ fn compact_current_refresh_and_restore_supersede_old_replies_during_search() {
     ));
     rig.show();
     assert_eq!(rig.app.vm().current().map(|c| c.id), Some(id(2)));
-    rig.push(UiEvent::RestoreDone);
+    rig.push(UiEvent::RestoreDone { warning: None });
     rig.show();
     let restore = rig
         .cmds()
@@ -5430,7 +5431,7 @@ fn obsolete_transport_errors_do_not_mark_replacement_views_offline() {
         rig.push(status(false, "1"));
         rig.show();
         if scenario == "restore" {
-            rig.push(UiEvent::RestoreDone);
+            rig.push(UiEvent::RestoreDone { warning: None });
             rig.show();
         } else {
             rig.input(egui::Event::Text("new query".into()));
@@ -5475,6 +5476,204 @@ fn obsolete_transport_errors_do_not_mark_replacement_views_offline() {
 }
 
 #[test]
+fn restore_blocks_stale_apply_until_refreshed_config_and_keeps_warning() {
+    use clipmonger_app_ui::ipc_bridge::RestoreWarning;
+    let mut rig = Rig::closed();
+    rig.push(config_reply(&json!({"history":{"max_items":100}})));
+    rig.tick();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    let _ = rig.cmds();
+    let size = egui::vec2(960.0, 680.0);
+    {
+        let mut cfg = rig.app.config().lock().unwrap();
+        cfg.tab = "History".into();
+        cfg.doc
+            .as_mut()
+            .unwrap()
+            .stage("history.max_items", json!(999))
+            .unwrap();
+    }
+    let apply_pos = settings_button(&mut rig, size, 1.0, strings::text("config.apply"))
+        .rect
+        .center();
+    rig.app.config().lock().unwrap().tab = "databases".into();
+    click_settings_button(&mut rig, size, 1.0, strings::text("config.backup_restore"));
+    assert!(matches!(rig.cmds().as_slice(), [UiCmd::BackupRestore(_)]));
+    {
+        let cfg = rig.app.config().lock().unwrap();
+        assert!(cfg.restore_pending);
+        assert!(cfg.doc.is_none());
+        assert_eq!(cfg.pending_apply, [] as [String; 0]);
+        assert!(cfg.edits.is_empty());
+    }
+    // An older reply already in the bridge queue cannot repopulate the form.
+    rig.push(config_reply(&json!({"history":{"max_items":100}})));
+    rig.tick();
+    assert!(rig.app.config().lock().unwrap().doc.is_none());
+    // Even if an edit was staged by a queued interaction, the disabled action
+    // cannot submit it while the restore is in flight.
+    {
+        let mut cfg = rig.app.config().lock().unwrap();
+        cfg.tab = "History".into();
+        let mut doc = config_model::ConfigDoc::from_snapshot(
+            &json!({"config":{"history":{"max_items":100}}}),
+        );
+        doc.stage("history.max_items", json!(999)).unwrap();
+        cfg.doc = Some(doc);
+    }
+    for pressed in [true, false] {
+        settings_frame(
+            &mut rig,
+            size,
+            1.0,
+            vec![
+                egui::Event::PointerMoved(apply_pos),
+                egui::Event::PointerButton {
+                    pos: apply_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+    assert_eq!(rig.cmds(), [] as [clipmonger_app_ui::ipc_bridge::UiCmd; 0]);
+    rig.push(UiEvent::RestoreDone {
+        warning: Some(RestoreWarning::ApplyFailed),
+    });
+    rig.tick();
+    assert_eq!(rig.cmds(), vec![UiCmd::ConfigGetAfterRestore]);
+    assert!(rig.app.config().lock().unwrap().restore_pending);
+    for pressed in [true, false] {
+        settings_frame(
+            &mut rig,
+            size,
+            1.0,
+            vec![
+                egui::Event::PointerMoved(apply_pos),
+                egui::Event::PointerButton {
+                    pos: apply_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+    assert_eq!(rig.cmds(), [] as [clipmonger_app_ui::ipc_bridge::UiCmd; 0]);
+    let message = rig.config_error();
+    assert!(message.contains(strings::text("config.restore_done")));
+    assert!(message.contains(strings::text("config.restore_warning_apply")));
+    rig.push(UiEvent::RestoredConfig(
+        json!({"config":{"history":{"max_items":23}}}),
+    ));
+    rig.tick();
+    let cfg = rig.app.config().lock().unwrap();
+    assert!(!cfg.restore_pending);
+    assert_eq!(cfg.error, message);
+    let doc = cfg.doc.as_ref().unwrap();
+    assert_eq!(doc.get("history.max_items"), Some(&json!(23)));
+    assert_eq!(doc.dirty_keys(), [] as [String; 0]);
+    assert!(cfg.edits.is_empty());
+}
+
+#[test]
+fn restore_failure_refreshes_before_reenabling_and_refresh_failure_recovers() {
+    let mut rig = Rig::closed();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    let _ = rig.cmds();
+    rig.app.config().lock().unwrap().restore_pending = true;
+    rig.push(UiEvent::RestoreFailed("restore failed".into()));
+    rig.tick();
+    assert_eq!(rig.config_error(), "restore failed");
+    assert!(rig.app.config().lock().unwrap().restore_pending);
+    assert_eq!(rig.cmds(), vec![UiCmd::ConfigGetAfterRestore]);
+    rig.push(UiEvent::RestoredConfigError("refresh failed".into()));
+    rig.tick();
+    assert!(!rig.app.config().lock().unwrap().restore_pending);
+    assert_eq!(rig.config_error(), "refresh failed");
+    rig.push(config_reply(&json!({"history":{"max_items":12}})));
+    rig.tick();
+    assert_eq!(
+        rig.app
+            .config()
+            .lock()
+            .unwrap()
+            .doc
+            .as_ref()
+            .unwrap()
+            .get("history.max_items"),
+        Some(&json!(12))
+    );
+}
+
+#[test]
+fn restore_warning_with_closed_settings_reaches_shell_and_refreshes() {
+    use clipmonger_app_ui::ipc_bridge::RestoreWarning;
+    let mut rig = Rig::closed();
+    rig.push(UiEvent::RestoreDone {
+        warning: Some(RestoreWarning::Unknown),
+    });
+    rig.tick();
+    let message = rig.error().expect("shell message");
+    assert!(message.contains(strings::text("config.restore_done")));
+    assert!(message.contains(strings::text("config.restore_warning_unknown")));
+    assert_eq!(rig.config_error(), "");
+    assert_eq!(rig.cmds(), vec![UiCmd::ConfigGetAfterRestore]);
+}
+
+#[test]
+fn restore_warning_survives_refresh_errors_in_settings_and_shell() {
+    use clipmonger_app_ui::ipc_bridge::RestoreWarning;
+    for settings_open in [true, false] {
+        for config_error in [true, false] {
+            let mut rig = Rig::closed();
+            if settings_open {
+                rig.tray(&[TrayAction::OpenConfig]);
+                rig.tick();
+                let _ = rig.cmds();
+            }
+            rig.app.config().lock().unwrap().restore_pending = true;
+            rig.push(UiEvent::RestoreDone {
+                warning: Some(RestoreWarning::ApplyFailed),
+            });
+            rig.tick();
+            assert_eq!(rig.cmds(), vec![UiCmd::ConfigGetAfterRestore]);
+            let refresh_error = "refresh failed";
+            if config_error {
+                rig.push(UiEvent::RestoredConfigError(refresh_error.into()));
+            } else {
+                rig.push(UiEvent::Error(refresh_error.into()));
+            }
+            rig.tick();
+            let status = if settings_open {
+                rig.config_error()
+            } else {
+                rig.error().unwrap()
+            };
+            assert!(
+                status.contains(strings::text("config.restore_done")),
+                "{status}"
+            );
+            assert!(
+                status.contains(strings::text("config.restore_warning_apply")),
+                "{status}"
+            );
+            assert!(status.contains(refresh_error), "{status}");
+            if config_error {
+                assert!(!rig.app.config().lock().unwrap().restore_pending);
+            } else {
+                rig.push(UiEvent::RestoredConfig(json!({"config":{}})));
+                rig.tick();
+                assert!(!rig.app.config().lock().unwrap().restore_pending);
+            }
+        }
+    }
+}
+
+#[test]
 fn compact_backend_errors_do_not_mark_the_transport_offline() {
     for code in ["not_ready", "stale_cursor", "metadata_too_large"] {
         let mut rig = Rig::raw(Setup::new(true));
@@ -5495,5 +5694,79 @@ fn compact_backend_errors_do_not_mark_the_transport_offline() {
             !rig.app.shell().offline(),
             "backend error {code} is not a lost link"
         );
+    }
+}
+
+#[test]
+fn restored_missing_and_partial_theme_resets_previous_theme_defaults() {
+    for (restored, expected_dark, expected_scale) in [
+        (json!({"history":{"max_items":23}}), true, 1.0),
+        (
+            json!({"history":{"max_items":23},"ui":{"theme":{"mode":"light"}}}),
+            false,
+            1.0,
+        ),
+        (
+            json!({"history":{"max_items":23},"ui":{"theme":{"font_scale":1.2}}}),
+            true,
+            1.2,
+        ),
+    ] {
+        let mut rig = Rig::closed();
+        rig.push(light_config(1.4));
+        rig.show();
+        rig.show();
+        rig.show_settings();
+        rig.show_settings();
+        assert!(!is_dark(&rig.popup.ctx));
+        assert_zoom(&rig.popup.ctx, 1.4, "previous popup");
+        {
+            let mut config = rig.app.config().lock().unwrap();
+            config.restore_pending = true;
+            config
+                .doc
+                .as_mut()
+                .unwrap()
+                .stage("history.max_items", json!(999))
+                .unwrap();
+            config
+                .edits
+                .insert("history.max_items".into(), "999".into());
+        }
+        rig.push(UiEvent::RestoreDone { warning: None });
+        rig.tick();
+        rig.push(UiEvent::RestoredConfig(json!({"config":restored})));
+        rig.tick();
+        {
+            let config = rig.app.config().lock().unwrap();
+            let doc = config.doc.as_ref().unwrap();
+            assert_eq!(doc.get("history.max_items"), Some(&json!(23)));
+            assert_eq!(doc.dirty_keys(), [] as [String; 0]);
+            assert!(
+                config.edits.is_empty(),
+                "restore clears old buffers before redraw"
+            );
+        }
+        rig.show();
+        rig.show();
+        rig.show_settings();
+        rig.show_settings();
+        let config = rig.app.config().lock().unwrap();
+        assert!(!config.restore_pending);
+        assert_eq!(config.dark, expected_dark);
+        assert!((config.font_scale - expected_scale).abs() < 1e-6);
+        let doc = config.doc.as_ref().unwrap();
+        assert_eq!(doc.dirty_keys(), [] as [String; 0]);
+        assert_eq!(doc.get("history.max_items"), Some(&json!(23)));
+        assert_eq!(
+            config.edits.get("history.max_items").map(String::as_str),
+            Some("23")
+        );
+        assert!(!config.edits.values().any(|value| value == "999"));
+        drop(config);
+        assert_eq!(is_dark(&rig.popup.ctx), expected_dark);
+        assert_zoom(&rig.popup.ctx, expected_scale, "restored popup");
+        assert_eq!(is_dark(&rig.settings.ctx), expected_dark);
+        assert_zoom(&rig.settings.ctx, expected_scale, "restored settings");
     }
 }

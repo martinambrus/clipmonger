@@ -45,6 +45,7 @@ pub enum SnapshotError {
 
 impl SnapshotToken {
     /// Canonical fixed-size lowercase hex representation.
+    #[must_use]
     pub fn encode(self) -> String {
         let mut out = String::with_capacity(48);
         for byte in self.nonce.into_iter().chain(self.sequence.to_be_bytes()) {
@@ -54,6 +55,9 @@ impl SnapshotToken {
         out
     }
     /// Decode only the canonical 48-byte lowercase hexadecimal representation.
+    ///
+    /// # Errors
+    /// Returns `InvalidToken` if the representation is not canonical.
     pub fn decode(value: &str) -> Result<Self, SnapshotError> {
         let bytes = value.as_bytes();
         if bytes.len() != 48
@@ -64,7 +68,7 @@ impl SnapshotToken {
             return Err(SnapshotError::InvalidToken);
         }
         let mut raw = [0u8; 24];
-        for (out, pair) in raw.iter_mut().zip(bytes.chunks_exact(2)) {
+        for (out, pair) in raw.iter_mut().zip(bytes.as_chunks::<2>().0.iter()) {
             let digit = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
             *out = digit(pair[0]) * 16 + digit(pair[1]);
         }
@@ -153,6 +157,7 @@ impl Store {
     }
     /// Begin an owned snapshot. Query and capacity are checked before opening
     /// the read-only connection. No primary-connection lock is acquired.
+    #[cfg(test)]
     pub(crate) fn begin_compact_snapshot(
         &self,
         owner: u64,
@@ -177,6 +182,8 @@ impl Store {
         if registry.entries.len() >= MAX_SNAPSHOTS {
             return Err(SnapshotError::Capacity);
         }
+        // `try_update` is newer than the workspace MSRV (1.89).
+        #[allow(deprecated)]
         let sequence = NEXT_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| SnapshotError::IdentityExhausted)?;

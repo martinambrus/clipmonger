@@ -621,7 +621,7 @@ pub(crate) fn read_targets(
         serve,
         deferred,
     )?;
-    if actual != AtomEnum::ATOM.into() || !value.len().is_multiple_of(4) {
+    if actual != Atom::from(AtomEnum::ATOM) || !value.len().is_multiple_of(4) {
         return Ok(Vec::new());
     }
     let (chunks, _) = value.as_chunks::<4>();

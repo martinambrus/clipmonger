@@ -1,4 +1,8 @@
-use clipmonger_core::{hash::content_hash, model::{Clip, Rev}, Store};
+use clipmonger_core::{
+    hash::content_hash,
+    model::{Clip, Rev},
+    Store,
+};
 use clipmonger_daemon::{b64_decode, thumbnail::ThumbnailService, DaemonState};
 use image::ImageEncoder;
 use std::path::PathBuf;
@@ -8,7 +12,11 @@ use uuid::Uuid;
 struct Profile(PathBuf);
 impl Profile {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("cm-thumb-endpoint-{}-{}", std::process::id(), Uuid::now_v7()));
+        let path = std::env::temp_dir().join(format!(
+            "cm-thumb-endpoint-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
     }
@@ -20,18 +28,40 @@ impl Drop for Profile {
 }
 fn clip(payloads: &[(String, Vec<u8>)]) -> Clip {
     Clip {
-        id: Uuid::now_v7(), created_ms: 1000, source_app: None, source_os: "test".into(),
-        pinned: false, removed: false, preview: "preview".into(), search_text: "search".into(),
-        formats: payloads.iter().map(|(mime, _)| mime.clone()).collect(), bytes_total: 0,
+        id: Uuid::now_v7(),
+        created_ms: 1000,
+        source_app: None,
+        source_os: "test".into(),
+        pinned: false,
+        removed: false,
+        preview: "preview".into(),
+        search_text: "search".into(),
+        formats: payloads.iter().map(|(mime, _)| mime.clone()).collect(),
+        bytes_total: 0,
         content_hash: content_hash(payloads),
-        rev: Rev { wall_ms: 1000, dev: "test".into(), ctr: 1 }, last_used_ms: 1000,
-        origin_dev: "test".into(), origin: "test".into(),
+        rev: Rev {
+            wall_ms: 1000,
+            dev: "test".into(),
+            ctr: 1,
+        },
+        last_used_ms: 1000,
+        origin_dev: "test".into(),
+        origin: "test".into(),
     }
 }
 fn png(w: u32, h: u32) -> Vec<u8> {
-    let image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba([(x / 2) as u8, (y / 2) as u8, 42, 255]));
+    let image = image::RgbaImage::from_fn(w, h, |x, y| {
+        image::Rgba([
+            u8::try_from(x / 2).unwrap(),
+            u8::try_from(y / 2).unwrap(),
+            42,
+            255,
+        ])
+    });
     let mut out = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut out).write_image(image.as_raw(), w, h, image::ExtendedColorType::Rgba8).unwrap();
+    image::codecs::png::PngEncoder::new(&mut out)
+        .write_image(image.as_raw(), w, h, image::ExtendedColorType::Rgba8)
+        .unwrap();
     out
 }
 fn insert(store: &Store, data: Vec<u8>) -> Clip {
@@ -41,11 +71,21 @@ fn insert(store: &Store, data: Vec<u8>) -> Clip {
     clip
 }
 fn state(store: Store) -> DaemonState {
-    DaemonState::new_with_thumbnail(store, ThumbnailService::new_with_exe(
-        PathBuf::from(env!("CARGO_BIN_EXE_clipmonger-daemon")), Duration::from_secs(3)))
+    DaemonState::new_with_thumbnail(
+        store,
+        ThumbnailService::new_with_exe(
+            PathBuf::from(env!("CARGO_BIN_EXE_clipmonger-daemon")),
+            Duration::from_secs(3),
+        ),
+    )
 }
 fn request(state: &DaemonState, id: Uuid) -> serde_json::Value {
-    state.handle("history.thumbnail", &serde_json::json!({"clip": id.to_string()})).unwrap()
+    state
+        .handle(
+            "history.thumbnail",
+            &serde_json::json!({"clip": id.to_string()}),
+        )
+        .unwrap()
 }
 #[test]
 fn real_child_decodes_default_size_gradient_and_no_upscale() {
@@ -86,7 +126,13 @@ fn failures_and_absences_release_same_service() {
     let deleted = insert(&store, png(3, 2));
     store.soft_delete(deleted.id).unwrap();
     let conn = rusqlite::Connection::open(profile.0.join("clipstore.sqlite3")).unwrap();
-    let key: String = conn.query_row("SELECT blob_key FROM clip_payloads WHERE clip_id=?1", [external.id.to_string()], |row| row.get(0)).unwrap();
+    let key: String = conn
+        .query_row(
+            "SELECT blob_key FROM clip_payloads WHERE clip_id=?1",
+            [external.id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
     drop(conn);
     std::fs::remove_file(profile.0.join("blobs").join(key)).unwrap();
     let state = state(store);
@@ -95,7 +141,12 @@ fn failures_and_absences_release_same_service() {
         assert!(request(&state, good.id)["thumbnail"].is_object());
     }
     for id in [corrupt.id, empty.id, external.id] {
-        assert!(state.handle("history.thumbnail", &serde_json::json!({"clip": id.to_string()})).is_err());
+        assert!(state
+            .handle(
+                "history.thumbnail",
+                &serde_json::json!({"clip": id.to_string()})
+            )
+            .is_err());
         assert!(request(&state, good.id)["thumbnail"].is_object());
     }
 }
@@ -105,17 +156,35 @@ fn validation_and_typed_null() {
     let profile = Profile::new();
     let state = state(Store::open(&profile.0).unwrap());
     let id = Uuid::now_v7().to_string();
-    for params in [serde_json::json!({}), serde_json::json!({"clip": 1}),
-        serde_json::json!({"clip": "bad"}), serde_json::json!({"clip": id, "max_px": null}),
-        serde_json::json!({"clip": id, "max_px": 0}), serde_json::json!({"clip": id, "max_px": 257}),
-        serde_json::json!({"clip": id, "max_px": 1.5}), serde_json::json!({"clip": id, "mime": null}),
-        serde_json::json!({"clip": id, "mime": "text/plain"})] {
-        assert_eq!(state.handle("history.thumbnail", &params).unwrap_err().code, "invalid_params");
+    for params in [
+        serde_json::json!({}),
+        serde_json::json!({"clip": 1}),
+        serde_json::json!({"clip": "bad"}),
+        serde_json::json!({"clip": id, "max_px": null}),
+        serde_json::json!({"clip": id, "max_px": 0}),
+        serde_json::json!({"clip": id, "max_px": 257}),
+        serde_json::json!({"clip": id, "max_px": 1.5}),
+        serde_json::json!({"clip": id, "mime": null}),
+        serde_json::json!({"clip": id, "mime": "text/plain"}),
+    ] {
+        assert_eq!(
+            state.handle("history.thumbnail", &params).unwrap_err().code,
+            "invalid_params"
+        );
     }
     let value = serde_json::to_value(HistoryThumbnailResult { thumbnail: None }).unwrap();
     assert_eq!(value, serde_json::json!({"thumbnail": null}));
-    assert_eq!(serde_json::from_value::<HistoryThumbnailResult>(value).unwrap().thumbnail, None);
-    for (text, bytes) in [("Zg==", &b"f"[..]), ("Zm8=", &b"fo"[..]), ("Zm9v", &b"foo"[..])] {
+    assert_eq!(
+        serde_json::from_value::<HistoryThumbnailResult>(value)
+            .unwrap()
+            .thumbnail,
+        None
+    );
+    for (text, bytes) in [
+        ("Zg==", &b"f"[..]),
+        ("Zm8=", &b"fo"[..]),
+        ("Zm9v", &b"foo"[..]),
+    ] {
         assert_eq!(b64_decode(text).unwrap(), bytes);
     }
 }

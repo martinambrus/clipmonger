@@ -474,7 +474,8 @@ impl PopupApp {
                 });
                 #[cfg(test)]
                 let mut history_clip = None;
-                let _history_area = egui::ScrollArea::vertical()
+                #[allow(unused_variables)] // Used by test-only viewport tracing.
+                let history_area = egui::ScrollArea::vertical()
                     .animated(false)
                     .id_salt("popup_history")
                     .show(ui, |ui| {
@@ -559,10 +560,10 @@ impl PopupApp {
                 #[cfg(test)]
                 if let Some(thumbs) = &mut self.thumbnails {
                     thumbs.history_area = Some((
-                        _history_area
+                        history_area
                             .inner_rect
                             .intersect(history_clip.expect("history clip")),
-                        _history_area.state.offset(),
+                        history_area.state.clamped_offset(),
                     ));
                 }
             }

@@ -5,6 +5,8 @@ use clipmonger_ipc::proto::methods::{
     HistoryCompactCancelParams, HistoryCompactParams, HistoryCompactResult,
 };
 
+// These flags represent independent request and coverage properties.
+#[allow(clippy::struct_excessive_bools)]
 pub(super) struct Compact {
     owner: Option<u64>,
     generation: u64,
@@ -220,6 +222,7 @@ mod tests {
             _ => panic!("wrong command"),
         }
     }
+    #[allow(clippy::needless_pass_by_value)] // Fixtures construct owned JSON rows.
     fn reply(
         tag: &CompactRequest,
         cursor: Option<&str>,
@@ -333,8 +336,8 @@ mod app_bridge_test {
             wake_rx
                 .recv_timeout(end.saturating_duration_since(Instant::now()))
                 .expect("bridge reply");
-            ctx.run_logic(&egui::RawInput::default(), |ctx| {
-                app.logic(ctx, WindowKind::Popup)
+            let _ = ctx.run_logic(&egui::RawInput::default(), |ctx| {
+                app.logic(ctx, WindowKind::Popup);
             });
         }
         assert_eq!(app.vm().compact_rows().unwrap()[0].preview, "compact hit");

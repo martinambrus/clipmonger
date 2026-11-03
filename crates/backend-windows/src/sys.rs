@@ -39,7 +39,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowTextW, SetForegroundWindow,
+    GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, SetForegroundWindow,
 };
 
 /// Last Win32 error as a short string.
@@ -603,22 +603,47 @@ fn window_title_hash_units(units: &[u16]) -> u64 {
     hash
 }
 
+// Reject unusually large titles rather than fingerprinting a truncated prefix.
+// The extra unit detects growth beyond the queried length during the read.
+#[cfg(any(windows, test))]
+const MAX_WINDOW_TITLE_UNITS: usize = 32_768;
+
+#[cfg(any(windows, test))]
+fn window_title_hash_with(
+    length: impl FnOnce() -> i32,
+    read: impl FnOnce(&mut [u16], i32) -> i32,
+) -> u64 {
+    let Ok(len) = usize::try_from(length()) else {
+        return 0;
+    };
+    if len == 0 || len > MAX_WINDOW_TITLE_UNITS {
+        return 0;
+    }
+    let Some(capacity) = len.checked_add(2) else {
+        return 0;
+    };
+    let Ok(native_capacity) = i32::try_from(capacity) else {
+        return 0;
+    };
+    let mut buf = vec![0u16; capacity];
+    let Ok(got) = usize::try_from(read(&mut buf, native_capacity)) else {
+        return 0;
+    };
+    if got == 0 || got > len {
+        return 0;
+    }
+    window_title_hash_units(&buf[..got])
+}
+
 /// FNV-1a hash of the window title; 0 when the title is unavailable.
 #[cfg(windows)]
 pub(crate) fn window_title_hash(hwnd: HWND) -> u64 {
-    // Safety: length query first; hwnd names a window readable by this process.
-    let len = unsafe { GetWindowTextW(hwnd, std::ptr::null_mut(), 0) };
-    if len <= 0 {
-        return 0;
-    }
-    let mut buf = vec![0u16; usize::try_from(len).unwrap_or(0) + 1];
-    // Safety: buffer sized len+1 from the length query on the same window.
-    let got = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), len + 1) };
-    if got <= 0 {
-        return 0;
-    }
-    buf.truncate(usize::try_from(got).unwrap_or(0));
-    window_title_hash_units(&buf)
+    window_title_hash_with(
+        // Safety: the API accepts any HWND; a stale or inaccessible one may fail.
+        || unsafe { GetWindowTextLengthW(hwnd) },
+        // Safety: the slice is initialized and its length equals the supplied capacity.
+        |buf, capacity| unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), capacity) },
+    )
 }
 
 /// Whether `pid` runs elevated, or `None` when it cannot be determined.
@@ -1111,7 +1136,122 @@ pub(crate) fn startup_approved_blob() -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::window_title_hash_units;
+    use super::{window_title_hash_units, window_title_hash_with, MAX_WINDOW_TITLE_UNITS};
+
+    #[test]
+    fn window_title_read_hashes_returned_utf16_units() {
+        for title in ["abc", "café", "😀"] {
+            let units: Vec<u16> = title.encode_utf16().collect();
+            let calls = std::cell::Cell::new(0);
+            let hash = window_title_hash_with(
+                || {
+                    calls.set(calls.get() + 1);
+                    i32::try_from(units.len()).expect("fixture length fits i32")
+                },
+                |buf, capacity| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(
+                        usize::try_from(capacity).expect("positive fixture capacity"),
+                        units.len() + 2
+                    );
+                    assert_eq!(
+                        buf.len(),
+                        usize::try_from(capacity).expect("positive fixture capacity")
+                    );
+                    buf[..units.len()].copy_from_slice(&units);
+                    i32::try_from(units.len()).expect("fixture length fits i32")
+                },
+            );
+            assert_eq!(hash, window_title_hash_units(&units));
+            assert_eq!(calls.get(), 2);
+        }
+    }
+
+    #[test]
+    fn window_title_read_rejects_unavailable_and_invalid_counts() {
+        for len in [
+            -1,
+            0,
+            i32::try_from(MAX_WINDOW_TITLE_UNITS).expect("title limit fits i32") + 1,
+            i32::MAX,
+        ] {
+            assert_eq!(
+                window_title_hash_with(|| len, |_, _| panic!("unexpected read")),
+                0
+            );
+        }
+        for got in [-1, 0, 4, i32::MAX] {
+            assert_eq!(window_title_hash_with(|| 3, |_, _| got), 0);
+        }
+        // A shorter result is valid when the title changes between calls.
+        assert_eq!(
+            window_title_hash_with(
+                || 3,
+                |buf, _| {
+                    buf[0] = u16::from(b'a');
+                    1
+                }
+            ),
+            window_title_hash_units(&[u16::from(b'a')])
+        );
+        // The maximum accepted query remains bounded, including terminator and growth probe.
+        assert_eq!(
+            window_title_hash_with(
+                || i32::try_from(MAX_WINDOW_TITLE_UNITS).expect("title limit fits i32"),
+                |buf, capacity| {
+                    assert_eq!(buf.len(), MAX_WINDOW_TITLE_UNITS + 2);
+                    assert_eq!(
+                        usize::try_from(capacity).expect("positive fixture capacity"),
+                        buf.len()
+                    );
+                    0
+                }
+            ),
+            0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn window_title_hash_reads_owned_hidden_window() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow};
+        struct OwnedWindow(windows_sys::Win32::Foundation::HWND);
+        impl Drop for OwnedWindow {
+            fn drop(&mut self) {
+                // Safety: this test owns the window and runs on its creating thread.
+                unsafe {
+                    DestroyWindow(self.0);
+                }
+            }
+        }
+        let class = super::to_wide("STATIC");
+        let title = "Caption café 😀";
+        let wide_title = super::to_wide(title);
+        // Safety: the built-in class and title are terminated; null handles are valid
+        // for an unowned top-level window, with no WS_VISIBLE style.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                wide_title.as_ptr(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!hwnd.is_null(), "CreateWindowExW failed");
+        let window = OwnedWindow(hwnd);
+        assert_eq!(
+            super::window_title_hash(window.0),
+            window_title_hash_units(&title.encode_utf16().collect::<Vec<_>>())
+        );
+    }
 
     #[test]
     fn window_title_hash_units_ascii_matches_byte_hash_for_ascii() {

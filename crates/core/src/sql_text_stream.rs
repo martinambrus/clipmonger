@@ -155,6 +155,8 @@ impl TextCursor {
             return Err(TextStreamError::LengthChanged);
         }
         let n = (self.length - self.offset).min(budget.get()).min(MAX_STEP);
+        // A fixed, bounded buffer avoids a heap allocation on every stream step.
+        #[allow(clippy::large_stack_arrays)]
         let mut buffer = [0u8; MAX_STEP];
         blob.read_at_exact(&mut buffer[..n], self.offset)?;
         self.offset += n;
@@ -211,14 +213,14 @@ impl TextCursor {
             return Ok(());
         }
         let (value, consumed) = if surrogate && self.carry_len >= 4 {
-            let second = word(self.carry[2], self.carry[3]) as u32;
-            let c = first as u32;
+            let second = u32::from(word(self.carry[2], self.carry[3]));
+            let c = u32::from(first);
             (
                 (second & 0x3ff) + ((c & 0x3f) << 10) + (((c & 0x3c0) + 0x40) << 10),
                 4,
             )
         } else {
-            (first as u32, 2)
+            (u32::from(first), 2)
         };
         let c = char::from_u32(value).ok_or(TextStreamError::InvalidText)?;
         emit(c);
@@ -392,7 +394,7 @@ mod tests {
                     let actual = collect(&conn, TextColumn::SearchText, budget);
                     match &reference {
                         Ok(s) => {
-                            assert_eq!(actual.unwrap(), *s, "{encoding} {units:?} budget {budget}")
+                            assert_eq!(actual.unwrap(), *s, "{encoding} {units:?} budget {budget}");
                         }
                         Err(_) => assert!(
                             matches!(actual, Err(TextStreamError::InvalidText)),
@@ -418,7 +420,7 @@ mod tests {
         loop {
             let step = cursor
                 .step(&conn, NonZeroUsize::new(usize::MAX).unwrap(), |c| {
-                    matcher.feed(c)
+                    matcher.feed(c);
                 })
                 .unwrap();
             assert!(step.bytes_read <= 65536);

@@ -39,6 +39,7 @@ fn exchange(
     response
 }
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // Exercises the complete socket and cancellation sequence.
 async fn compact_owned_socket_progress_cancel_and_legacy() {
     let dir = std::env::temp_dir().join(format!("compact-ipc-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir(&dir).unwrap();
@@ -53,7 +54,7 @@ async fn compact_owned_socket_progress_cancel_and_legacy() {
     let state = Arc::new(DaemonState::new(store));
     let handler: Handler = Arc::new(move |method, params| state.handle(&method, &params));
     let path = dir.join("sock");
-    let _server = Server::bind_with(&path, "token".into(), handler, ServeOptions::default())
+    let server = Server::bind_with(&path, "token".into(), handler, ServeOptions::default())
         .await
         .unwrap();
     let mut w = UnixStream::connect(&path).unwrap();
@@ -161,7 +162,7 @@ async fn compact_owned_socket_progress_cancel_and_legacy() {
             .code,
         "metadata_too_large"
     );
-    drop(_server);
+    drop(server);
     drop(db);
     drop(r);
     drop(w);

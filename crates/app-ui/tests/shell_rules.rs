@@ -2154,7 +2154,10 @@ fn ignored_events() -> Vec<(&'static str, Event)> {
             "BackupDone",
             bridge(UiEvent::BackupDone("/tmp/backup.zip".to_string())),
         ),
-        ("RestoreDone", bridge(UiEvent::RestoreDone)),
+        (
+            "RestoreDone",
+            bridge(UiEvent::RestoreDone { warning: None }),
+        ),
         (
             "LogsTail",
             bridge(UiEvent::LogsTail {

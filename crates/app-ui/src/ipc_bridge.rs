@@ -60,6 +60,8 @@ pub enum UiCmd {
     Stop,
     /// Fetch the full config document.
     ConfigGet,
+    /// Refresh following a restore.
+    ConfigGetAfterRestore,
     /// Apply one config key.
     ConfigSet(String, Value),
     /// Fetch capabilities.
@@ -153,7 +155,12 @@ pub enum UiEvent {
     /// Backup created at the given path.
     BackupDone(String),
     /// Restore completed; history now serves restored clips.
-    RestoreDone,
+    RestoreDone {
+        warning: Option<RestoreWarning>,
+    },
+    RestoreFailed(String),
+    RestoredConfig(Value),
+    RestoredConfigError(String),
     /// Log tail lines with source identity for stale-reply protection.
     LogsTail {
         source: String,
@@ -161,7 +168,10 @@ pub enum UiEvent {
         sink_error: Option<String>,
     },
     /// Log tail lines error with source.
-    LogsTailError { source: String, message: String },
+    LogsTailError {
+        source: String,
+        message: String,
+    },
     /// Config-window error text (never an offline misreport).
     ConfigError(String),
     /// Daemon push: show the popup (hotkey press or `popup.open`).
@@ -235,20 +245,28 @@ impl Bridge {
     }
 }
 
+/// Autostart warning returned after a successful restore.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestoreWarning {
+    ApplyFailed,
+    Unavailable,
+    Portable,
+    Unknown,
+}
+
 /// Map one command to its IPC method name.
 #[must_use]
 pub fn method_for(cmd: &UiCmd) -> &'static str {
     match cmd {
         UiCmd::Status => "status",
-        UiCmd::ListHistory => "history.list",
+        UiCmd::ListHistory | UiCmd::CompactCurrent(_) => "history.list",
         UiCmd::CompactHistory(_) => "history.compact",
         UiCmd::CancelCompactHistory(_) => "history.compact.cancel",
-        UiCmd::CompactCurrent(_) => "history.list",
         UiCmd::DeleteClip(_) => "history.delete",
         UiCmd::PinClip(_, _) => "history.pin",
         UiCmd::PasteClipTo(..) => "paste.execute",
         UiCmd::Stop => "daemon.stop",
-        UiCmd::ConfigGet => "config.get",
+        UiCmd::ConfigGet | UiCmd::ConfigGetAfterRestore => "config.get",
         UiCmd::ConfigSet(_, _) => "config.set",
         UiCmd::CapsGet => "caps.get",
         UiCmd::MonitorToggle => "monitor.set",
@@ -276,6 +294,7 @@ pub fn params_for(cmd: &UiCmd) -> Value {
         | UiCmd::ListHistory
         | UiCmd::Stop
         | UiCmd::ConfigGet
+        | UiCmd::ConfigGetAfterRestore
         | UiCmd::CapsGet
         | UiCmd::PurgeRemoved
         | UiCmd::ListPermanents
@@ -391,6 +410,8 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
         (UiCmd::PasteClipTo(id, ..), Ok(_)) => UiEvent::PasteDone(id),
         (UiCmd::Stop, Ok(_)) => UiEvent::Stopped,
         (UiCmd::ConfigGet, Ok(body)) => UiEvent::Config(body),
+        (UiCmd::ConfigGetAfterRestore, Ok(body)) => UiEvent::RestoredConfig(body),
+        (UiCmd::ConfigGetAfterRestore, Err(error)) => UiEvent::RestoredConfigError(error.message),
         (UiCmd::CapsGet, Ok(body)) => UiEvent::Caps(body),
         (UiCmd::HistoryGet(_), Ok(body)) => UiEvent::HistoryClip(body),
         (UiCmd::ConfigSet(key, _), Ok(body)) => {
@@ -417,16 +438,23 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
         }
         (UiCmd::BackupRestore(_), Ok(body)) => {
             if body.get("ok").and_then(Value::as_bool) == Some(true) {
-                UiEvent::RestoreDone
+                let warning = body.get("autostart_warning").map(|warning| {
+                    match warning.get("code").and_then(Value::as_str) {
+                        Some("apply_failed") => RestoreWarning::ApplyFailed,
+                        Some("unavailable") => RestoreWarning::Unavailable,
+                        Some("portable") => RestoreWarning::Portable,
+                        _ => RestoreWarning::Unknown,
+                    }
+                });
+                UiEvent::RestoreDone { warning }
             } else {
-                UiEvent::ConfigError("unconfirmed backup.restore".to_string())
+                UiEvent::RestoreFailed("unconfirmed backup.restore".to_string())
             }
         }
         (UiCmd::LogsTail(_), Ok(body)) => log_reply("audit".to_string(), &body),
         (UiCmd::LogsTailSource { source, .. }, Ok(body)) => log_reply(source, &body),
-        (UiCmd::BackupCreate(_) | UiCmd::BackupRestore(_), Err(error)) => {
-            UiEvent::ConfigError(error.message)
-        }
+        (UiCmd::BackupCreate(_), Err(error)) => UiEvent::ConfigError(error.message),
+        (UiCmd::BackupRestore(_), Err(error)) => UiEvent::RestoreFailed(error.message),
         (UiCmd::LogsTail(lines), Err(error)) => {
             let _ = lines;
             UiEvent::LogsTailError {

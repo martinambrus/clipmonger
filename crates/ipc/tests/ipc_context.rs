@@ -98,9 +98,17 @@ impl Drop for Completion {
     }
 }
 
+struct Dir(std::path::PathBuf);
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 // The handler owns a finite release wait. Tokens are observed only after a
 // same-connection ping proves the server processed all earlier input frames.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)] // One connection fixture checks the full sequence.
 async fn cancel_duplicates_empty_id_and_disconnect_are_connection_local() {
     let path = std::env::temp_dir().join(format!(
         "cm-context-{}-{:?}",
@@ -108,12 +116,6 @@ async fn cancel_duplicates_empty_id_and_disconnect_are_connection_local() {
         std::thread::current().id()
     ));
     std::fs::create_dir(&path).unwrap();
-    struct Dir(std::path::PathBuf);
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
     let _dir = Dir(path.clone());
     let sock = path.join("ipc.sock");
     let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel::<Observation>(8);
@@ -232,6 +234,7 @@ async fn cancel_duplicates_empty_id_and_disconnect_are_connection_local() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)] // One connection fixture checks the full sequence.
 async fn fatal_response_closes_only_its_connection_with_active_context() {
     use clipmonger_ipc::proto::{IpcError, MAX_LINE_BYTES};
     let path = std::env::temp_dir().join(format!(
@@ -240,12 +243,6 @@ async fn fatal_response_closes_only_its_connection_with_active_context() {
         std::thread::current().id()
     ));
     std::fs::create_dir(&path).unwrap();
-    struct Dir(std::path::PathBuf);
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
     let _dir = Dir(path.clone());
     let sock = path.join("ipc.sock");
     let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel::<Observation>(2);
@@ -375,6 +372,7 @@ async fn fatal_response_closes_only_its_connection_with_active_context() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)] // One connection fixture checks the full sequence.
 async fn duplicate_completion_preserves_peer_and_later_registration() {
     let path = std::env::temp_dir().join(format!(
         "cm-duplicate-context-{}-{:?}",
@@ -382,12 +380,6 @@ async fn duplicate_completion_preserves_peer_and_later_registration() {
         std::thread::current().id()
     ));
     std::fs::create_dir(&path).unwrap();
-    struct Dir(std::path::PathBuf);
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
     let _dir = Dir(path.clone());
     let sock = path.join("ipc.sock");
     let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel::<Observation>(4);
@@ -499,12 +491,6 @@ async fn initial_hello_is_special_even_when_declared_context_method() {
         std::thread::current().id()
     ));
     std::fs::create_dir(&path).unwrap();
-    struct Dir(std::path::PathBuf);
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
     let _dir = Dir(path.clone());
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let context_calls = Arc::clone(&calls);

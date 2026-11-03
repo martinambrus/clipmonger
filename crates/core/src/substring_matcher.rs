@@ -98,7 +98,11 @@ impl SubstringMatcher {
             if class == Context::Ignorable {
                 self.pending = Some((medial, final_sigma));
             } else {
-                self.current = if class == Context::Cased { medial } else { final_sigma };
+                self.current = if class == Context::Cased {
+                    medial
+                } else {
+                    final_sigma
+                };
             }
         }
         if c == 'Σ' && self.preceding_cased {
@@ -125,6 +129,7 @@ impl SubstringMatcher {
     }
 
     /// True only if every still-possible lowercase stream has matched.
+    #[cfg(test)]
     pub(crate) fn is_match(&self) -> bool {
         match self.pending {
             Some((medial, final_sigma)) => medial.matched && final_sigma.matched,
@@ -134,7 +139,8 @@ impl SubstringMatcher {
 
     /// Resolve any trailing sigma at the true end of the logical row.
     pub(crate) fn finish(self) -> bool {
-        self.pending.map_or(self.current.matched, |(_, final_sigma)| final_sigma.matched)
+        self.pending
+            .map_or(self.current.matched, |(_, final_sigma)| final_sigma.matched)
     }
 }
 
@@ -154,16 +160,48 @@ mod tests {
                 }
             }
         }
-        assert_eq!(matcher.finish(), expected, "row={row:?} query={query:?} width={width}");
+        assert_eq!(
+            matcher.finish(),
+            expected,
+            "row={row:?} query={query:?} width={width}"
+        );
     }
 
     #[test]
     fn streaming_substring_cases() {
-        let rows = ["", "Hello, WORLD!\0", "İSTANBUL", "AΣ", "AΣA", "AΣ\u{301}A", "AΣ\u{301} ", "AΣΣ", "AΣ\nA", "abababac", "AΣ\u{345}A"];
-        let queries = ["", "world", "!\0", "i\u{307}", "σ", "ς", "σ\u{301}", "ς\u{301}", "σς", "ς\n", "\nA", "ababac", "missing"];
+        let rows = [
+            "",
+            "Hello, WORLD!\0",
+            "İSTANBUL",
+            "AΣ",
+            "AΣA",
+            "AΣ\u{301}A",
+            "AΣ\u{301} ",
+            "AΣΣ",
+            "AΣ\nA",
+            "abababac",
+            "AΣ\u{345}A",
+        ];
+        let queries = [
+            "",
+            "world",
+            "!\0",
+            "i\u{307}",
+            "σ",
+            "ς",
+            "σ\u{301}",
+            "ς\u{301}",
+            "σς",
+            "ς\n",
+            "\nA",
+            "ababac",
+            "missing",
+        ];
         for row in rows {
             for query in queries {
-                for width in [1, 2, 7] { check(row, query, width); }
+                for width in [1, 2, 7] {
+                    check(row, query, width);
+                }
             }
         }
         let row = format!("AΣ{} ", "\u{301}".repeat(20_000));
@@ -174,32 +212,57 @@ mod tests {
     #[test]
     fn tentative_and_definite_branches() {
         let mut m = SubstringMatcher::new("σ");
-        for c in "AΣ".chars() { m.feed(c); }
+        for c in "AΣ".chars() {
+            m.feed(c);
+        }
         assert!(!m.is_match());
         m.feed(' ');
         assert!(!m.finish());
         let mut m = SubstringMatcher::new("\u{301}");
-        for c in "AΣ\u{301}".chars() { m.feed(c); }
+        for c in "AΣ\u{301}".chars() {
+            m.feed(c);
+        }
         assert!(m.is_match());
         assert!(m.finish());
     }
 
     #[test]
     fn deterministic_adversarial_differential() {
-        let alphabet = ['A', 'Σ', 'σ', 'ς', '\u{301}', '\u{345}', 'İ', '\0', '\n', ' ', 'a', 'b', '\u{200d}'];
+        let alphabet = [
+            'A', 'Σ', 'σ', 'ς', '\u{301}', '\u{345}', 'İ', '\0', '\n', ' ', 'a', 'b', '\u{200d}',
+        ];
         let mut seed = 0x9e37_79b9_u64;
         for _ in 0..1200 {
-            let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
-            let row: String = (0..(next() % 35)).map(|_| alphabet[next() as usize % alphabet.len()]).collect();
-            let query: String = (0..(next() % 6)).map(|_| alphabet[next() as usize % alphabet.len()]).collect();
-            for width in [1, 3, 11] { check(&row, &query, width); }
+            let mut next = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let row: String = (0..(next() % 35))
+                .map(|_| {
+                    alphabet
+                        [usize::try_from(next() % u64::try_from(alphabet.len()).unwrap()).unwrap()]
+                })
+                .collect();
+            let query: String = (0..(next() % 6))
+                .map(|_| {
+                    alphabet
+                        [usize::try_from(next() % u64::try_from(alphabet.len()).unwrap()).unwrap()]
+                })
+                .collect();
+            for width in [1, 3, 11] {
+                check(&row, &query, width);
+            }
         }
     }
 
     #[test]
     fn all_scalars_sigma_context_differential() {
-        for value in 0..=0x10ffff {
-            let Some(c) = char::from_u32(value) else { continue };
+        for value in 0..=0x0010_ffff {
+            let Some(c) = char::from_u32(value) else {
+                continue;
+            };
             for row in [format!("AΣ{c}A"), format!("AΣ{c} "), format!("A{c}Σ ")] {
                 check(&row, "ς", 4);
             }

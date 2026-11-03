@@ -1289,7 +1289,7 @@ mod native_input_tests {
     }
 
     fn shortcut_app() -> (crate::app::PopupApp, Context) {
-        let (app, ctx, _) = shortcut_app_with_keys(
+        let (app, ctx, _, _) = shortcut_app_with_keys(
             &serde_json::json!({"navigate_down":"super+j", "end":"ctrl+c", "home":"ctrl+x", "page_down":"ctrl+v"}),
             false,
         );
@@ -1303,6 +1303,7 @@ mod native_input_tests {
         crate::app::PopupApp,
         Context,
         std::sync::mpsc::Receiver<crate::ipc_bridge::UiCmd>,
+        std::sync::mpsc::Sender<crate::ipc_bridge::UiEvent>,
     ) {
         use crate::app::{AppParts, PopupApp};
         use crate::ipc_bridge::{UiCmd, UiEvent};
@@ -1340,12 +1341,88 @@ mod native_input_tests {
         let ctx = new_context();
         frame(&mut app, &ctx, RawInput::default());
         if permanent {
+            let _ = cmd_rx.try_iter().collect::<Vec<_>>();
+        } else {
+            answer_history(&mut app, &ctx, &cmd_rx, &event_tx, "");
+        }
+        if permanent {
             app.config().lock().expect("config").perm_source = Some(0);
             app.vm_mut().selected = 2;
             frame(&mut app, &ctx, RawInput::default());
         }
-        let _ = cmd_rx.try_iter().collect::<Vec<_>>();
-        (app, ctx, cmd_rx)
+        (app, ctx, cmd_rx, event_tx)
+    }
+
+    fn answer_history(
+        app: &mut crate::app::PopupApp,
+        ctx: &Context,
+        commands: &std::sync::mpsc::Receiver<crate::ipc_bridge::UiCmd>,
+        events: &std::sync::mpsc::Sender<crate::ipc_bridge::UiEvent>,
+        query: &str,
+    ) {
+        use crate::ipc_bridge::{UiCmd, UiEvent};
+        let mut found = false;
+        for cmd in commands.try_iter() {
+            match cmd {
+                UiCmd::CompactHistory(tag) => {
+                    assert_eq!(tag.params.query, query);
+                    let rows: Vec<_> = if query.is_empty() {
+                        (1..=3).map(|n| serde_json::json!({
+                            "id": uuid::Uuid::from_u128(n), "pinned": false,
+                            "last_used_ms": 1, "preview": format!("row {n}"),
+                            "preview_truncated": false, "kind": "text", "thumbnail_hash": null
+                        })).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    events.send(UiEvent::CompactHistory(tag.clone(), Ok(serde_json::json!({
+                        "owner": tag.params.owner, "generation": tag.params.generation,
+                        "rows": rows, "cursor": null, "done": true, "bytes_read": 0, "candidates": 3
+                    })))).unwrap();
+                    found = true;
+                }
+                UiCmd::CompactCurrent(tag) => events
+                    .send(UiEvent::CompactCurrent(
+                        tag,
+                        Ok(serde_json::json!({"clips": []})),
+                    ))
+                    .unwrap(),
+                _ => {}
+            }
+        }
+        assert!(found, "expected compact request for {query:?}");
+        frame(app, ctx, RawInput::default());
+    }
+
+    fn clear_search(app: &mut crate::app::PopupApp, ctx: &Context) {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        let events = [egui::Key::A, egui::Key::Backspace]
+            .into_iter()
+            .map(|key| egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers: if key == egui::Key::A {
+                    modifiers
+                } else {
+                    egui::Modifiers::NONE
+                },
+            })
+            .collect();
+        frame(
+            app,
+            ctx,
+            RawInput {
+                events,
+                ..RawInput::default()
+            },
+        );
+        assert_eq!(app.vm().query, "");
     }
 
     fn frame(app: &mut crate::app::PopupApp, ctx: &Context, input: RawInput) {
@@ -1396,7 +1473,10 @@ mod native_input_tests {
 
     #[test]
     fn native_input_clipboard_overrides_preserve_text_editing() {
-        let (mut app, ctx) = shortcut_app();
+        let (mut app, ctx, commands, events) = shortcut_app_with_keys(
+            &serde_json::json!({"navigate_down":"super+j", "end":"ctrl+c", "home":"ctrl+x", "page_down":"ctrl+v"}),
+            false,
+        );
         let mut adapter = NativeInput::default();
         adapter.observe(
             &WindowEvent::ModifiersChanged(ModifiersState::CONTROL.into()),
@@ -1416,7 +1496,9 @@ mod native_input_tests {
         adapter.finish(&mut paste, 0, Some(egui::Key::V));
         frame(&mut app, &ctx, paste);
         assert_eq!(app.vm().query, "needle");
-        app.vm_mut().query.clear();
+        answer_history(&mut app, &ctx, &commands, &events, "needle");
+        clear_search(&mut app, &ctx);
+        answer_history(&mut app, &ctx, &commands, &events, "");
         ctx.memory_mut(|memory| {
             if let Some(id) = memory.focused() {
                 memory.surrender_focus(id);
@@ -1452,9 +1534,41 @@ mod native_input_tests {
         }
     }
 
+    fn second_history_row(ctx: &Context, search: egui::Rect) -> egui::Rect {
+        let mut rows = ctx
+            .interactive_rects_last_pass()
+            .into_iter()
+            .filter(|rect| rect.top() > search.bottom() && rect.height() <= 25.0)
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        // The three distinct fixture labels have identical geometry and regular
+        // vertical spacing. Tabs and pagination controls must not be mistaken
+        // for a history row just because they are below the search box.
+        let groups: Vec<_> = rows
+            .windows(3)
+            .filter(|group| {
+                let [a, b, c] = group else { unreachable!() };
+                (a.left() - b.left()).abs() < 0.1
+                    && (b.left() - c.left()).abs() < 0.1
+                    && a.size() == b.size()
+                    && b.size() == c.size()
+                    && (b.top() - a.top() - (c.top() - b.top())).abs() < 0.1
+            })
+            .collect();
+        assert_eq!(
+            groups.len(),
+            1,
+            "expected the three rendered history labels: {rows:?}"
+        );
+        groups[0][1]
+    }
+
     #[test]
     fn native_input_clipboard_focus_changes_in_same_batch() {
-        let (mut app, ctx) = shortcut_app();
+        let (mut app, ctx, commands, events) = shortcut_app_with_keys(
+            &serde_json::json!({"navigate_down":"super+j", "end":"ctrl+c", "home":"ctrl+x", "page_down":"ctrl+v"}),
+            false,
+        );
         let search_id = ctx
             .memory(egui::Memory::focused)
             .expect("search owns focus");
@@ -1512,16 +1626,12 @@ mod native_input_tests {
             0,
             "paste into search must not also navigate the list"
         );
-        app.vm_mut().query.clear();
+        answer_history(&mut app, &ctx, &commands, &events, "needle");
+        clear_search(&mut app, &ctx);
+        answer_history(&mut app, &ctx, &commands, &events, "");
         frame(&mut app, &ctx, RawInput::default());
         assert!(ctx.text_edit_focused());
-        let mut rows = ctx
-            .interactive_rects_last_pass()
-            .into_iter()
-            .filter(|rect| rect.top() > search.bottom() && rect.height() <= 25.0)
-            .collect::<Vec<_>>();
-        rows.sort_by(|a, b| a.top().total_cmp(&b.top()));
-        let row = rows.get(1).expect("actual second history row");
+        let row = second_history_row(&ctx, search);
         let native_c = winit::keyboard::Key::Character("c".into());
         let override_key =
             adapter.clipboard_override(&app, WindowKind::Popup, &native_c, true, &[]);
@@ -1550,7 +1660,7 @@ mod native_input_tests {
         } else {
             ("alt+j", "j", egui::Key::J)
         };
-        let (mut app, ctx, commands) =
+        let (mut app, ctx, commands, _) =
             shortcut_app_with_keys(&serde_json::json!({"navigate_down":chord}), permanent);
         assert!(ctx.text_edit_focused());
         let mut adapter = NativeInput::default();
@@ -1664,7 +1774,7 @@ mod native_input_tests {
     #[test]
     fn native_input_alt_ownership_uses_logical_priority_over_physical() {
         for (chord, expected_query, expected_selected) in [("alt+o", "j", 0), ("alt+j", "", 1)] {
-            let (mut app, ctx, _) =
+            let (mut app, ctx, _, _) =
                 shortcut_app_with_keys(&serde_json::json!({"navigate_down":chord}), false);
             let mut adapter = NativeInput::default();
             adapter.observe(
@@ -1701,7 +1811,7 @@ mod native_input_tests {
 
     #[test]
     fn native_input_alt_shortcut_preserves_other_native_text_in_batch() {
-        let (mut app, ctx, _) =
+        let (mut app, ctx, _, _) =
             shortcut_app_with_keys(&serde_json::json!({"navigate_down":"alt+o"}), false);
         let mut adapter = NativeInput::default();
         adapter.observe(

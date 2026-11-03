@@ -32,6 +32,7 @@ impl Thumbnails {
             deferred: false,
         }
     }
+    #[allow(clippy::unused_self)] // Test builds collect per-frame viewport data.
     pub fn begin_frame(&mut self) {
         #[cfg(test)]
         {
@@ -222,6 +223,7 @@ mod tests {
             }
         }
     }
+    #[allow(clippy::needless_pass_by_value)] // Fixtures construct owned format lists.
     fn clip(id: u128, formats: Vec<&str>, hash: &str) -> Clip {
         serde_json::from_value(serde_json::json!({"id":uuid::Uuid::from_u128(id),"created_ms":1,"source_os":"test","preview":format!("row {id}"),"formats":formats,"content_hash":hash,"rev":{"wall_ms":1,"dev":"test"}})).unwrap()
     }
@@ -302,8 +304,7 @@ mod tests {
         let before = app
             .thumbnails
             .as_ref()
-            .map(|thumbs| thumbs.worker.diagnostic_snapshot().len())
-            .unwrap_or(0);
+            .map_or(0, |thumbs| thumbs.worker.diagnostic_snapshot().len());
         let output = ctx.run_ui(input, |ui| {
             app.logic(ui.ctx(), WindowKind::Popup);
             app.ui(ui, WindowKind::Popup);
@@ -335,6 +336,8 @@ mod tests {
         ));
         pixels
     }
+    // Test rectangles are within the positive raster viewport; fractional pixels truncate.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn center(pixels: &[u32], rect: egui::Rect) -> u32 {
         let p = rect.center();
         pixels[p.y as usize * 480 + p.x as usize]
@@ -345,6 +348,7 @@ mod tests {
             render_delayed_worker_pixels(hash_len);
         }
     }
+    #[allow(clippy::too_many_lines)] // The fixture checks one complete rendering sequence.
     fn render_delayed_worker_pixels(hash_len: usize) {
         let profile = Profile::new();
         let listener = UnixListener::bind(profile.0.join("clipmonger.sock")).unwrap();
@@ -363,7 +367,7 @@ mod tests {
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < end =>
                     {
-                        std::thread::yield_now()
+                        std::thread::yield_now();
                     }
                     Err(e) => panic!("accept: {e}"),
                 }
@@ -388,7 +392,7 @@ mod tests {
             while Instant::now() < end {
                 match listener.accept() {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::yield_now()
+                        std::thread::yield_now();
                     }
                     Ok(_) => panic!("duplicate request"),
                     Err(e) => panic!("accept: {e}"),
@@ -402,7 +406,7 @@ mod tests {
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < end =>
                     {
-                        std::thread::yield_now()
+                        std::thread::yield_now();
                     }
                     Err(e) => panic!("accept: {e}"),
                 }
@@ -468,8 +472,8 @@ mod tests {
             .map(|(_, rect)| *rect)
             .collect();
         assert_eq!(red_rects.len(), 2);
-        assert_ne!(center(&first, red_rects[0]), 0xffff0000);
-        assert_ne!(center(&first, red_rects[1]), 0xffff0000);
+        assert_ne!(center(&first, red_rects[0]), 0xffff_0000);
+        assert_ne!(center(&first, red_rects[1]), 0xffff_0000);
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         release.0.take().unwrap().send(()).unwrap();
         wake_rx
@@ -483,10 +487,10 @@ mod tests {
             .map(|(_, rect)| *rect)
             .collect();
         assert_eq!(red_rects.len(), 2);
-        assert_eq!(center(&second, red_rects[0]), 0xffff0000);
-        assert_eq!(center(&second, red_rects[1]), 0xffff0000);
+        assert_eq!(center(&second, red_rects[0]), 0xffff_0000);
+        assert_eq!(center(&second, red_rects[1]), 0xffff_0000);
         let text_rect = slots.iter().find(|(clip, _)| *clip == text.id).unwrap().1;
-        assert_ne!(center(&second, text_rect), 0xffff0000);
+        assert_ne!(center(&second, text_rect), 0xffff_0000);
         dedup_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("dedup observation");
@@ -495,14 +499,14 @@ mod tests {
         let before = frame(&mut app, &other, &mut other_raster);
         let slots = app.thumbnails.as_ref().unwrap().slots.clone();
         let current = slots.iter().find(|(clip, _)| *clip == red.id).unwrap().1;
-        assert_ne!(center(&before, current), 0xffff0000);
+        assert_ne!(center(&before, current), 0xffff_0000);
         wake_rx
             .recv_timeout(Duration::from_secs(3))
             .expect("new context worker wake");
         let after = frame(&mut app, &other, &mut other_raster);
         let slots = app.thumbnails.as_ref().unwrap().slots.clone();
         let current = slots.iter().find(|(clip, _)| *clip == red.id).unwrap().1;
-        assert_eq!(center(&after, current), 0xff0000ff);
+        assert_eq!(center(&after, current), 0xff00_00ff);
         events_tx
             .send(crate::ipc_bridge::UiEvent::Deleted(red.id))
             .unwrap();
@@ -527,6 +531,7 @@ mod tests {
     fn restore_cancels_pending_request_and_draws_new_pixels() {
         pending_replacement(true);
     }
+    #[allow(clippy::too_many_lines)] // The fixture checks one complete rendering sequence.
     fn pending_replacement(restore: bool) {
         use std::io::Read;
         let profile = Profile::new();
@@ -549,7 +554,7 @@ mod tests {
                             if e.kind() == std::io::ErrorKind::WouldBlock
                                 && Instant::now() < end =>
                         {
-                            std::thread::yield_now()
+                            std::thread::yield_now();
                         }
                         Err(e) => panic!("accept: {e}"),
                     }
@@ -650,7 +655,7 @@ mod tests {
         };
         if restore {
             events_tx
-                .send(crate::ipc_bridge::UiEvent::RestoreDone)
+                .send(crate::ipc_bridge::UiEvent::RestoreDone { warning: None })
                 .unwrap();
             events_tx
                 .send(make_reply(&initial, serde_json::json!([])))
@@ -688,14 +693,14 @@ mod tests {
             .unwrap();
         let interim = frame(&mut app, &ctx, &mut raster);
         let rect = app.thumbnails.as_ref().unwrap().slots[0].1;
-        assert_ne!(center(&interim, rect), 0xffff0000);
+        assert_ne!(center(&interim, rect), 0xffff_0000);
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             wake_rx.recv_timeout(remaining).expect("replacement wake");
             let final_pixels = frame(&mut app, &ctx, &mut raster);
             let rect = app.thumbnails.as_ref().unwrap().slots[0].1;
-            if center(&final_pixels, rect) == 0xff0000ff {
+            if center(&final_pixels, rect) == 0xff00_00ff {
                 break;
             }
             assert!(
@@ -754,6 +759,7 @@ mod tests {
             seen.insert(id);
         }
     }
+    #[allow(clippy::too_many_arguments)] // Shared viewport fixture keeps its observation state explicit.
     fn settle_viewport(
         app: &mut PopupApp,
         ctx: &egui::Context,
@@ -803,13 +809,8 @@ mod tests {
         }
     }
     #[test]
+    #[allow(clippy::too_many_lines)] // The fixture checks one complete rendering sequence.
     fn scroll_requests_only_intersecting_rows_and_retries_deferred_work() {
-        let profile = Profile::new();
-        let listener = UnixListener::bind(profile.0.join("clipmonger.sock")).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let (seen_tx, seen_rx) = mpsc::channel();
-        let (stop_tx, stop_rx) = mpsc::sync_channel(1);
-        let (gate_tx, gate_rx) = mpsc::sync_channel(1);
         struct Stop(Option<mpsc::SyncSender<()>>);
         impl Drop for Stop {
             fn drop(&mut self) {
@@ -818,6 +819,12 @@ mod tests {
                 }
             }
         }
+        let profile = Profile::new();
+        let listener = UnixListener::bind(profile.0.join("clipmonger.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::sync_channel(1);
+        let (gate_tx, gate_rx) = mpsc::sync_channel(1);
         let peer = Peer(Some(std::thread::spawn(move || {
             let end = Instant::now() + Duration::from_secs(8);
             let mut first = true;
@@ -877,7 +884,7 @@ mod tests {
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < end =>
                     {
-                        std::thread::yield_now()
+                        std::thread::yield_now();
                     }
                     Err(e) => panic!("accept: {e}"),
                 }
@@ -1062,7 +1069,7 @@ mod tests {
             .expect("failed fetch wake");
         let pixels = frame(&mut app, &ctx, &mut raster);
         let rect = app.thumbnails.as_ref().unwrap().slots[0].1;
-        assert_ne!(center(&pixels, rect), 0xffff0000);
+        assert_ne!(center(&pixels, rect), 0xffff_0000);
         assert!(app.thumbnails.as_ref().unwrap().textures.is_empty());
     }
 }

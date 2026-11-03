@@ -1,12 +1,11 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use clipmonger_core::hash::content_hash;
 use clipmonger_core::model::{Clip, Rev};
-use clipmonger_core::store::{PayloadSnapshot, Store};
+use clipmonger_core::store::Store;
 use clipmonger_core::CoreError;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -42,20 +41,6 @@ fn sample_clip(id: Uuid, preview: &str, search_text: &str, last_used_ms: i64) ->
     }
 }
 
-fn hex_of(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 15) as usize] as char);
-    }
-    out
-}
-
-fn inline_payload(text: &str) -> Vec<(String, Vec<u8>)> {
-    vec![("text/plain".to_string(), text.as_bytes().to_vec())]
-}
-
 fn make_external_data() -> Vec<u8> {
     vec![0xAB_u8; 256 * 1024 + 64]
 }
@@ -72,7 +57,7 @@ const EXTERNAL_READ_SUPPORTED: bool = cfg!(any(
     )
 ));
 
-fn assert_external_open_error(err: CoreError) {
+fn assert_external_open_error(err: &CoreError) {
     if EXTERNAL_READ_SUPPORTED {
         assert!(
             matches!(err, CoreError::Corrupt { .. }),
@@ -100,7 +85,7 @@ fn inline_selected_payload() {
     assert_eq!(snap.clip_id, clip.id);
     assert_eq!(snap.mime, "text/plain");
     assert_eq!(snap.data, data);
-    assert!(!snap.content_hash.is_empty());
+    assert_ne!(snap.content_hash, "");
 }
 
 #[test]
@@ -212,7 +197,7 @@ fn selected_external_corrupt_refused() {
     let err = store
         .get_payload(clip.id, "image/png", 512 * 1024)
         .unwrap_err();
-    assert_external_open_error(err);
+    assert_external_open_error(&err);
 }
 
 #[test]
@@ -236,7 +221,7 @@ fn selected_missing_blob_refused() {
     let err = store
         .get_payload(clip.id, "image/png", 512 * 1024)
         .unwrap_err();
-    assert_external_open_error(err);
+    assert_external_open_error(&err);
 }
 
 #[test]
@@ -278,7 +263,7 @@ fn selected_link_escape_refused() {
         let err = store
             .get_payload(clip.id, "image/png", 512 * 1024)
             .unwrap_err();
-        assert_external_open_error(err);
+        assert_external_open_error(&err);
     }
 }
 
@@ -487,7 +472,7 @@ fn external_file_growth_beyond_cap_detected() {
         .get_payload(clip.id, "image/png", grown.len())
         .unwrap_err();
     // Supported leaf opens detect the size mismatch; other targets stop first.
-    assert_external_open_error(err);
+    assert_external_open_error(&err);
 }
 
 #[test]

@@ -493,7 +493,7 @@ mod compact_row_tests {
         vm.apply_pin(id, true);
         assert!(vm.is_pinned(id));
         vm.remove_clip(id);
-        assert!(vm.visible().is_empty());
+        assert_eq!(vm.visible(), [] as [usize; 0]);
     }
 }
 

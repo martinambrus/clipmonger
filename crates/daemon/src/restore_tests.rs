@@ -58,6 +58,14 @@ impl Drop for Fixture {
 #[test]
 fn actual_candidate_open_failure_keeps_same_daemon_usable() {
     let fixture = Fixture::new();
+    let fake = Arc::new(super::autostart::FakeAutostartCounter::new());
+    fixture
+        .state
+        .set_autostart_service(super::autostart::AutostartService::with_fake(
+            fake.clone(),
+            false,
+        ))
+        .unwrap();
     archive_config(&fixture);
     fs::write(fixture.path.join("config.toml"), b"# retained config\n").unwrap();
     *fixture.state.restore_hook.lock().unwrap() = Some(Box::new(|prepared| {
@@ -68,6 +76,7 @@ fn actual_candidate_open_failure_keeps_same_daemon_usable() {
     }));
     let error = fixture.restore().unwrap_err();
     assert_eq!(error.code, "downgrade_refused");
+    assert_eq!(fake.counts(), (0, 0, 0));
     assert_eq!(fixture.texts(), ["original"]);
     assert!(fixture.state.ingest_capture(
         "test",
@@ -347,6 +356,14 @@ fn config_restore_publishes_same_daemon_settings_caps_and_preserves_unknown() {
 fn legacy_zip4_keeps_existing_live_config_and_fresh_absence() {
     for existing in [false, true] {
         let fixture = Fixture::new();
+        let fake = Arc::new(super::autostart::FakeAutostartCounter::new());
+        fixture
+            .state
+            .set_autostart_service(super::autostart::AutostartService::with_fake(
+                fake.clone(),
+                false,
+            ))
+            .unwrap();
         let mut config = clipmonger_core::Config::default();
         config.history.max_items = 67;
         config.popup.unicode_limit = 91;
@@ -364,6 +381,7 @@ fn legacy_zip4_keeps_existing_live_config_and_fresh_absence() {
             .handle("backup.restore", &json!({"src": zip}))
             .unwrap();
         assert_eq!(fixture.state.config_json(), before);
+        assert_eq!(fake.counts(), (0, 0, 0));
         assert_eq!(fixture.state.paste_budget(), budget);
         if existing {
             assert_eq!(
@@ -443,4 +461,412 @@ fn unsafe_destination_config_is_rejected_without_closing_live_store() {
         false,
         &[("text/plain".into(), b"still usable".to_vec())]
     ));
+}
+
+#[test]
+fn explicit_autostart_stages_and_preserves_old_values_on_failure() {
+    use super::autostart::{AutostartService, FakeAutostartCounter};
+    let fixture = Fixture::new();
+    let fake = Arc::new(FakeAutostartCounter::new());
+    fixture
+        .state
+        .set_autostart_service(AutostartService::with_fake(fake.clone(), false))
+        .unwrap();
+    let set = |key: &str, value: serde_json::Value| {
+        fixture
+            .state
+            .handle("config.set", &json!({"key":key,"value":value}))
+    };
+    for (key, value) in [
+        ("autostart", json!({})),
+        ("autostart.enabled.x", json!(true)),
+        ("autostart.enabled", json!("true")),
+        ("autostart..x", json!(1)),
+    ] {
+        assert!(set(key, value).is_err());
+    }
+    assert_eq!(fake.counts(), (0, 0, 0));
+    set("autostart.future", json!(3)).unwrap();
+    set("history.max_items", json!(17)).unwrap();
+    assert_eq!(fake.counts(), (0, 0, 0));
+    fs::remove_file(fixture.path.join("config.toml")).unwrap();
+    set("autostart.enabled", json!(true)).unwrap();
+    set("autostart.enabled", json!(true)).unwrap();
+    assert_eq!(fake.counts(), (2, 0, 0));
+    let saved = fs::read(fixture.path.join("config.toml")).unwrap();
+    assert_eq!(
+        saved,
+        fixture
+            .state
+            .config
+            .lock()
+            .unwrap()
+            .to_toml()
+            .unwrap()
+            .as_bytes()
+    );
+    assert!(
+        clipmonger_core::Config::load(&fixture.path.join("config.toml"))
+            .unwrap()
+            .autostart
+            .enabled
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(fixture.path.join("config.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    fake.set_fail_disable(true);
+    let error = set("autostart.enabled", json!(false)).unwrap_err();
+    assert!(error.message.contains("OS state may have changed"));
+    assert_eq!(fs::read(fixture.path.join("config.toml")).unwrap(), saved);
+    assert_eq!(
+        fixture
+            .state
+            .handle("config.get", &json!({"key":"autostart.enabled"}))
+            .unwrap()["config"],
+        true
+    );
+    assert!(!fs::read_dir(&fixture.path)
+        .unwrap()
+        .map(Result::unwrap)
+        .any(|e| e
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".config.toml.stage-")));
+}
+
+#[test]
+fn restore_applies_incoming_autostart_and_reports_post_commit_failure() {
+    use super::autostart::{AutostartService, FakeAutostartCounter};
+    for (enabled, portable, fail, warning) in [
+        (true, false, false, None),
+        (false, false, false, None),
+        (true, false, true, Some("apply_failed")),
+        (true, true, false, Some("portable")),
+    ] {
+        let fixture = Fixture::new();
+        let fake = Arc::new(FakeAutostartCounter::new());
+        fake.set_fail_enable(fail);
+        fixture
+            .state
+            .set_autostart_service(AutostartService::with_fake(fake.clone(), portable))
+            .unwrap();
+        fs::write(
+            fixture.path.join("config.toml"),
+            format!("[autostart]\nenabled = {enabled}\n"),
+        )
+        .unwrap();
+        fixture
+            .state
+            .handle("backup.create", &json!({"dest":fixture.archive}))
+            .unwrap();
+        fixture
+            .state
+            .ingest_capture("test", false, &[("text/plain".into(), b"later".to_vec())]);
+        let result = fixture.restore().unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result
+                .get("autostart_warning")
+                .and_then(|v| v["code"].as_str()),
+            warning
+        );
+        assert_eq!(fixture.texts(), ["original"]);
+        assert_eq!(
+            fixture
+                .state
+                .handle("config.get", &json!({"key":"autostart.enabled"}))
+                .unwrap()["config"],
+            enabled
+        );
+        assert_eq!(
+            clipmonger_core::Config::load(&fixture.path.join("config.toml"))
+                .unwrap()
+                .autostart
+                .enabled,
+            enabled
+        );
+        assert_eq!(
+            fake.counts(),
+            if portable {
+                (0, 0, 0)
+            } else if enabled {
+                (1, 0, 0)
+            } else {
+                (0, 1, 0)
+            }
+        );
+    }
+}
+
+#[test]
+fn explicit_autostart_compensates_after_real_rename_failure() {
+    use super::autostart::{AutostartAdapter, AutostartService};
+    use clipmonger_platform::types::Result;
+    struct ReplaceTarget {
+        target: PathBuf,
+        calls: std::sync::Mutex<Vec<bool>>,
+    }
+    impl AutostartAdapter for ReplaceTarget {
+        fn enable(&self) -> Result<()> {
+            self.calls.lock().unwrap().push(true);
+            fs::remove_file(&self.target).unwrap();
+            fs::create_dir(&self.target).unwrap();
+            fs::write(self.target.join("owned"), b"fixture").unwrap();
+            Ok(())
+        }
+        fn disable(&self) -> Result<()> {
+            self.calls.lock().unwrap().push(false);
+            Ok(())
+        }
+        fn is_enabled(&self) -> Result<bool> {
+            Ok(false)
+        }
+    }
+    let fixture = Fixture::new();
+    let target = fixture.path.join("config.toml");
+    fs::write(&target, b"[autostart]\nenabled = false\n").unwrap();
+    let fake = Arc::new(ReplaceTarget {
+        target,
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    fixture
+        .state
+        .set_autostart_service(AutostartService::with_adapter(fake.clone(), false))
+        .unwrap();
+    let error = fixture
+        .state
+        .handle(
+            "config.set",
+            &json!({"key":"autostart.enabled","value":true}),
+        )
+        .unwrap_err();
+    assert!(
+        error.message.contains("commit failed") && error.message.contains("OS state may differ")
+    );
+    assert_eq!(*fake.calls.lock().unwrap(), vec![true, false]);
+    assert_eq!(
+        fixture
+            .state
+            .handle("config.get", &json!({"key":"autostart.enabled"}))
+            .unwrap()["config"],
+        false
+    );
+    assert!(!fs::read_dir(&fixture.path)
+        .unwrap()
+        .map(std::result::Result::unwrap)
+        .any(|e| e
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".config.toml.stage-")));
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_autostart_rejects_symlink_before_native_apply() {
+    use super::autostart::{AutostartService, FakeAutostartCounter};
+    let fixture = Fixture::new();
+    let fake = Arc::new(FakeAutostartCounter::new());
+    fixture
+        .state
+        .set_autostart_service(AutostartService::with_fake(fake.clone(), false))
+        .unwrap();
+    let target = fixture.path.join("other");
+    fs::write(&target, b"untouched").unwrap();
+    std::os::unix::fs::symlink(&target, fixture.path.join("config.toml")).unwrap();
+    assert!(fixture
+        .state
+        .handle(
+            "config.set",
+            &json!({"key":"autostart.enabled","value":true})
+        )
+        .is_err());
+    assert_eq!(fs::read(target).unwrap(), b"untouched");
+    assert_eq!(fake.counts(), (0, 0, 0));
+}
+
+#[test]
+fn explicit_failure_can_change_adapter_state_without_committing_config() {
+    use super::autostart::{AutostartAdapter, AutostartService};
+    use clipmonger_platform::types::{Error, Result};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct Partial {
+        enabled: AtomicBool,
+        calls: AtomicUsize,
+    }
+    impl AutostartAdapter for Partial {
+        fn enable(&self) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.enabled.store(true, Ordering::SeqCst);
+            Err(Error::Io("private backend detail".into()))
+        }
+        fn disable(&self) -> Result<()> {
+            panic!("unexpected disable")
+        }
+        fn is_enabled(&self) -> Result<bool> {
+            panic!("unexpected query")
+        }
+    }
+    let fixture = Fixture::new();
+    let fake = Arc::new(Partial {
+        enabled: AtomicBool::new(false),
+        calls: AtomicUsize::new(0),
+    });
+    fixture
+        .state
+        .set_autostart_service(AutostartService::with_adapter(fake.clone(), false))
+        .unwrap();
+    let target = fixture.path.join("config.toml");
+    let original = b"[autostart]\nenabled = false\n";
+    fs::write(&target, original).unwrap();
+    let err = fixture
+        .state
+        .handle(
+            "config.set",
+            &json!({"key":"autostart.enabled","value":true}),
+        )
+        .unwrap_err();
+    assert!(err.message.contains("OS state may have changed"));
+    assert!(!err.message.contains("private backend detail"));
+    assert!(fake.enabled.load(Ordering::SeqCst));
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fs::read(&target).unwrap(), original);
+    assert_eq!(
+        fixture
+            .state
+            .handle("config.get", &json!({"key":"autostart.enabled"}))
+            .unwrap()["config"],
+        false
+    );
+    assert!(!fs::read_dir(&fixture.path)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .any(|e| e
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".config.toml.stage-")));
+}
+
+#[test]
+fn explicit_unavailable_and_invalid_target_fail_before_application() {
+    use super::autostart::{AutostartService, FakeAutostartCounter};
+    for portable in [false, true] {
+        let fixture = Fixture::new();
+        let fake = Arc::new(FakeAutostartCounter::new());
+        let service = if portable {
+            AutostartService::with_fake(fake.clone(), true)
+        } else {
+            AutostartService::unconfigured()
+        };
+        fixture.state.set_autostart_service(service).unwrap();
+        let target = fixture.path.join("config.toml");
+        fs::write(&target, b"[autostart]\nenabled = false\n").unwrap();
+        let old = fs::read(&target).unwrap();
+        let err = fixture
+            .state
+            .handle(
+                "config.set",
+                &json!({"key":"autostart.enabled","value":true}),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "unavailable");
+        assert_eq!(fake.counts(), (0, 0, 0));
+        assert_eq!(fs::read(&target).unwrap(), old);
+        assert_eq!(
+            fixture
+                .state
+                .handle("config.get", &json!({"key":"autostart.enabled"}))
+                .unwrap()["config"],
+            false
+        );
+        assert!(!fs::read_dir(&fixture.path)
+            .unwrap()
+            .map(Result::unwrap)
+            .any(|e| e
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".config.toml.stage-")));
+    }
+    let fixture = Fixture::new();
+    let fake = Arc::new(FakeAutostartCounter::new());
+    fixture
+        .state
+        .set_autostart_service(AutostartService::with_fake(fake.clone(), false))
+        .unwrap();
+    let target = fixture.path.join("config.toml");
+    fs::create_dir(&target).unwrap();
+    assert!(fixture
+        .state
+        .handle(
+            "config.set",
+            &json!({"key":"autostart.enabled","value":true})
+        )
+        .is_err());
+    assert!(target.is_dir());
+    assert_eq!(fake.counts(), (0, 0, 0));
+    assert_eq!(
+        fixture
+            .state
+            .handle("config.get", &json!({"key":"autostart.enabled"}))
+            .unwrap()["config"],
+        false
+    );
+}
+
+#[test]
+fn restored_config_and_data_survive_partial_native_failure() {
+    use super::autostart::{AutostartAdapter, AutostartService};
+    use clipmonger_platform::types::{Error, Result};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Partial(AtomicBool);
+    impl AutostartAdapter for Partial {
+        fn enable(&self) -> Result<()> {
+            self.0.store(true, Ordering::SeqCst);
+            Err(Error::Io("private detail".into()))
+        }
+        fn disable(&self) -> Result<()> {
+            panic!("unexpected disable")
+        }
+        fn is_enabled(&self) -> Result<bool> {
+            panic!("unexpected query")
+        }
+    }
+    let fixture = Fixture::new();
+    let fake = Arc::new(Partial(AtomicBool::new(false)));
+    fixture
+        .state
+        .set_autostart_service(AutostartService::with_adapter(fake.clone(), false))
+        .unwrap();
+    let raw = b"[autostart]\nenabled = true\n";
+    fs::write(fixture.path.join("config.toml"), raw).unwrap();
+    fixture
+        .state
+        .handle("backup.create", &json!({"dest":fixture.archive}))
+        .unwrap();
+    fixture
+        .state
+        .ingest_capture("test", false, &[("text/plain".into(), b"later".to_vec())]);
+    let result = fixture.restore().unwrap();
+    assert_eq!(
+        result,
+        json!({"ok":true,"autostart_warning":{"code":"apply_failed"}})
+    );
+    assert!(fake.0.load(Ordering::SeqCst));
+    assert_eq!(fixture.texts(), ["original"]);
+    assert_eq!(fs::read(fixture.path.join("config.toml")).unwrap(), raw);
+    assert_eq!(
+        fixture
+            .state
+            .handle("config.get", &json!({"key":"autostart.enabled"}))
+            .unwrap()["config"],
+        true
+    );
 }

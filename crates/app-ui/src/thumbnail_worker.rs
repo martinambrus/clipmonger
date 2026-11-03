@@ -42,11 +42,14 @@ pub struct Request {
     epoch: u64,
 }
 impl Request {
+    #[must_use]
     pub fn key(&self) -> &Key {
         &self.key
     }
 }
 fn new_request(key: Key) -> Option<Request> {
+    // `try_update` is newer than the workspace MSRV.
+    #[allow(deprecated)]
     let epoch = NEXT_REQUEST
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
         .ok()?;
@@ -93,6 +96,7 @@ struct State {
 }
 #[cfg(test)]
 #[derive(Clone, Debug)]
+#[cfg_attr(windows, allow(dead_code))] // Viewport trace consumers are Unix-only tests.
 pub(crate) struct WorkerTrace {
     pub(crate) event: &'static str,
     pub(crate) id: Uuid,
@@ -110,7 +114,10 @@ impl Shared {
     #[cfg(test)]
     fn trace(&self, event: &'static str, request: &Request) {
         if self.trace_enabled.load(Ordering::Relaxed) {
-            let mut trace = self.trace.lock().unwrap_or_else(|p| p.into_inner());
+            let mut trace = self
+                .trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if trace.len() < 1024 {
                 trace.push(WorkerTrace {
                     event,
@@ -136,6 +143,9 @@ struct ExitHook {
 }
 impl Worker {
     /// Create the runtime on the owned thread before reporting success.
+    ///
+    /// # Errors
+    /// Returns `Closed` if the thread or its runtime cannot start.
     pub fn start(profile: PathBuf, wake: Wake) -> Result<Self, Failure> {
         #[cfg(test)]
         {
@@ -171,15 +181,12 @@ impl Worker {
         let thread = std::thread::Builder::new()
             .name("thumbnail-worker".into())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                {
-                    Ok(rt) => rt,
-                    Err(_) => {
-                        let _ = started_tx.send(false);
-                        return;
-                    }
+                else {
+                    let _ = started_tx.send(false);
+                    return;
                 };
                 if started_tx.send(true).is_err() {
                     return;
@@ -204,20 +211,26 @@ impl Worker {
         })
     }
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn diagnostic_enable(&self) {
         self.shared.trace_enabled.store(true, Ordering::Relaxed);
     }
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn diagnostic_snapshot(&self) -> Vec<WorkerTrace> {
         self.shared
             .trace
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
     /// Replace visible identities. Excess entries are ignored and may be retried later.
     pub fn set_visible(&self, keys: impl IntoIterator<Item = Key>) {
-        let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.visible = keys
             .into_iter()
             .filter(Key::valid)
@@ -241,9 +254,19 @@ impl Worker {
         }
     }
     /// Admit one visible request; duplicate current-slot/row requests coalesce.
+    #[must_use]
     pub fn submit(&self, request: Request) -> Admission {
-        let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.stopped || self.thread.as_ref().is_none_or(|t| t.is_finished()) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopped
+            || self
+                .thread
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
+        {
             return Admission::Closed;
         }
         if !state.visible.contains(&request.key) {
@@ -266,12 +289,19 @@ impl Worker {
         Admission::Queued
     }
     /// Stop and join the owned worker, reporting a thread panic.
+    ///
+    /// # Errors
+    /// Returns `Closed` if the worker thread panicked.
     pub fn shutdown(mut self) -> Result<(), Failure> {
         self.stop_and_join()
     }
     fn stop_and_join(&mut self) -> Result<(), Failure> {
         {
-            let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.stopped = true;
             state.queue.clear();
             if let Some((_, cancel)) = &state.active {
@@ -285,12 +315,13 @@ impl Worker {
         }
     }
     /// Drain one result, freeing its pending identity even when it became stale.
+    #[must_use]
     pub fn try_recv(&self) -> Option<Completion> {
         let completion = self.results.try_recv().ok()?;
         self.shared
             .state
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pending
             .remove(&completion.request);
         Some(completion)
@@ -310,12 +341,15 @@ fn run(
 ) {
     loop {
         let (job, mut cancel) = {
-            let mut state = shared.state.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             while state.queue.is_empty() && !state.stopped {
                 state = shared
                     .changed
                     .wait(state)
-                    .unwrap_or_else(|p| p.into_inner());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
             if state.stopped {
                 return;
@@ -353,7 +387,10 @@ fn run(
         } else {
             result
         };
-        let mut state = shared.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.active = None;
         if state.stopped {
             return;
@@ -389,8 +426,18 @@ fn map_error(e: FetchError) -> Failure {
 }
 
 fn decode_base64(value: &str) -> Result<Vec<u8>, Failure> {
+    fn digit(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
     let bytes = value.as_bytes();
-    if bytes.is_empty() || bytes.len() % 4 != 0 || bytes.len() > PNG_CAP.div_ceil(3) * 4 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) || bytes.len() > PNG_CAP.div_ceil(3) * 4 {
         return Err(Failure::Invalid);
     }
     let padding = bytes.iter().rev().take_while(|b| **b == b'=').count();
@@ -404,18 +451,8 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, Failure> {
     if len > PNG_CAP {
         return Err(Failure::Invalid);
     }
-    fn digit(b: u8) -> Option<u8> {
-        match b {
-            b'A'..=b'Z' => Some(b - b'A'),
-            b'a'..=b'z' => Some(b - b'a' + 26),
-            b'0'..=b'9' => Some(b - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
     let mut out = Vec::with_capacity(len);
-    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (i, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let last = i + 1 == bytes.len() / 4;
         let a = digit(chunk[0]).ok_or(Failure::Invalid)?;
         let b = digit(chunk[1]).ok_or(Failure::Invalid)?;
@@ -500,6 +537,7 @@ struct CacheEntry {
 }
 /// Bounded CPU cache. Offscreen entries remain until explicit invalidation or LRU eviction.
 /// Eviction forgets error suppression and invalidates its outstanding request epoch.
+#[derive(Default)]
 pub struct Cache {
     entries: HashMap<Key, CacheEntry>,
     visible: HashSet<Key>,
@@ -514,17 +552,6 @@ pub enum CacheState {
     Ready,
     Cooldown,
     Invalid,
-}
-impl Default for Cache {
-    fn default() -> Self {
-        Self {
-            entries: HashMap::new(),
-            visible: HashSet::new(),
-            requests: HashMap::new(),
-            bytes: 0,
-            clock: 0,
-        }
-    }
 }
 impl Cache {
     /// Replace current identities; deleted and offscreen keys cannot accept late results.
@@ -925,7 +952,7 @@ mod tests {
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < end =>
                     {
-                        std::thread::yield_now()
+                        std::thread::yield_now();
                     }
                     Err(e) => panic!("accept failed: {e}"),
                 }
@@ -1073,10 +1100,6 @@ mod tests {
         }
         #[test]
         fn worker_result_from_before_eviction_is_rejected_after_reintroduction() {
-            let profile = Profile::new();
-            let listener = listen(&profile.0);
-            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-            let (release_tx, release_rx) = mpsc::sync_channel(1);
             struct Release(Option<mpsc::SyncSender<()>>);
             impl Drop for Release {
                 fn drop(&mut self) {
@@ -1085,6 +1108,10 @@ mod tests {
                     }
                 }
             }
+            let profile = Profile::new();
+            let listener = listen(&profile.0);
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
             let peer = Peer(Some(std::thread::spawn(move || {
                 let (mut first, _, _) = handshake(&listener);
                 ready_tx.send(()).unwrap();
@@ -1221,8 +1248,9 @@ mod tests {
             assert_eq!(worker.submit(request(&second)), Admission::Queued);
             {
                 let mut state = worker.shared.state.lock().unwrap();
-                state.queue.front_mut().unwrap().deadline =
-                    Instant::now() - Duration::from_millis(1);
+                state.queue.front_mut().unwrap().deadline = Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .unwrap();
             }
             worker.set_visible([second]);
             eof_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1253,7 +1281,7 @@ mod tests {
             let keys: Vec<_> = (1..=9).map(key).collect();
             worker.set_visible(keys.clone());
             for k in &keys[..8] {
-                assert_eq!(worker.submit(request(&k)), Admission::Queued);
+                assert_eq!(worker.submit(request(k)), Admission::Queued);
                 wakes.recv_timeout(Duration::from_secs(2)).unwrap();
             }
             let last = request(&keys[8]);

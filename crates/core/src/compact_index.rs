@@ -103,8 +103,8 @@ fn check_index(
     Ok(true)
 }
 
-fn classify(error: rusqlite::Error) -> Result<IndexStatus, CoreError> {
-    if let rusqlite::Error::SqliteFailure(ref inner, _) = error {
+fn classify(error: &rusqlite::Error) -> Result<IndexStatus, CoreError> {
+    if let rusqlite::Error::SqliteFailure(inner, _) = error {
         match inner.code {
             ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => {
                 return Ok(IndexStatus::NotReadyBusy)
@@ -113,12 +113,15 @@ fn classify(error: rusqlite::Error) -> Result<IndexStatus, CoreError> {
             _ => {}
         }
     }
-    Err(db_err(&error))
+    Err(db_err(error))
 }
 
 impl Store {
     /// Prepare outside critical startup. The deadline is cooperative, not an OS
     /// deadline or a bound on SQLite's total memory. Cancellation is shared.
+    ///
+    /// # Errors
+    /// Returns a database error for failures other than busy or interruption.
     #[allow(dead_code)]
     pub fn prepare_compact_history_index(
         &self,
@@ -145,7 +148,7 @@ impl Store {
         };
         let conn = match Connection::open_with_flags(&self.db_path, flags) {
             Ok(c) => c,
-            Err(e) => return classify(e),
+            Err(e) => return classify(&e),
         };
         conn.busy_timeout(
             Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
@@ -176,7 +179,7 @@ impl Store {
         let check = || match index_present(&conn) {
             Ok(value) => Ok(Ok(value)),
             Err(CheckError::Invalid) => Err(invalid_index()),
-            Err(CheckError::Sql(error)) => classify(error).map(Err),
+            Err(CheckError::Sql(error)) => classify(&error).map(Err),
         };
         let result = (|| {
             let present = match check()? {
@@ -191,10 +194,10 @@ impl Store {
             }
             ddl_active.store(true, Ordering::Relaxed);
             if let Err(e) = conn.execute_batch("CREATE INDEX IF NOT EXISTS main.idx_clips_compact_history ON clips(removed, last_used_ms DESC, id DESC)") {
-                return classify(e);
+                return classify(&e);
             }
             if let Err(e) = conn.execute_batch("CREATE INDEX IF NOT EXISTS main.idx_compact_payload_clip ON clip_payloads(clip_id)") {
-                return classify(e);
+                return classify(&e);
             }
             ddl_active.store(false, Ordering::Relaxed);
             match check()? {
@@ -255,7 +258,7 @@ mod tests {
     fn insert_rows(conn: &Connection, count: usize) {
         for n in 0..count {
             conn.execute("INSERT INTO main.clips(id, created_ms, source_os, removed, content_hash, rev_ms, rev_dev, last_used_ms) VALUES (?1, 0, 'test', ?2, ?1, 0, 'test', ?3)",
-                rusqlite::params![format!("{n:05}"), (n % 7 == 0) as i64, (n / 4) as i64]).unwrap();
+                rusqlite::params![format!("{n:05}"), i64::from(n % 7 == 0), i64::try_from(n / 4).unwrap()]).unwrap();
         }
     }
 
@@ -313,7 +316,7 @@ mod tests {
         let expected: Vec<(String, i64)> = (0..64)
             .rev()
             .filter(|n| n % 7 != 0)
-            .map(|n| (format!("{n:05}"), (n / 4) as i64))
+            .map(|n| (format!("{n:05}"), i64::from(n / 4)))
             .collect();
         let mut actual = Vec::new();
         let mut cursor = (1000_i64, "z".to_string());

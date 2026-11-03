@@ -36,6 +36,9 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, ProfileError
 }
 
 /// Resolve credentials anew; filesystem calls themselves are synchronous.
+///
+/// # Errors
+/// Returns `ProfileError` for missing, invalid, or unreadable credentials.
 pub fn resolve(profile: &Path) -> Result<ProfileConnection, ProfileError> {
     let token = read_bounded(&profile.join("token"), 4096)?.ok_or(ProfileError)?;
     let token = std::str::from_utf8(&token)

@@ -13,6 +13,9 @@ pub enum UriSearchError {
 
 /// Derive names, rejecting an entire list if any non-comment entry cannot be
 /// represented. A caller must leave such a list pending for repair or retry.
+///
+/// # Errors
+/// Returns an error if input or output exceeds its limit, is not UTF-8, or contains an invalid entry.
 pub fn basenames(bytes: &[u8]) -> Result<String, UriSearchError> {
     if bytes.len() > URI_PAYLOAD_LIMIT {
         return Err(UriSearchError::TooLarge);

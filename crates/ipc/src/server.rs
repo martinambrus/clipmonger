@@ -488,6 +488,8 @@ impl Server {
     }
 
     #[cfg(unix)]
+    // Keep binding deferred until the caller polls this future.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn bind_internal(
         sock: &Path,
         token: String,
@@ -725,7 +727,7 @@ impl<S> SharedWriter<S> {
         }
         let mut guard = tokio::select! {
             biased;
-            _ = self.wait_closed() => return Err(()),
+            () = self.wait_closed() => return Err(()),
             g = self.inner.slot.lock() => g,
         };
         if self.is_closed() {
@@ -739,34 +741,25 @@ impl<S> SharedWriter<S> {
         }
         let res = tokio::select! {
             biased;
-            _ = self.wait_closed() => return Err(()),
+            () = self.wait_closed() => return Err(()),
             r = half.write_all(bytes) => r,
         };
-        match res {
-            Ok(()) => {
-                let flush_res = tokio::select! {
-                    biased;
-                    _ = self.wait_closed() => return Err(()),
-                    r = half.flush() => r,
-                };
-                match flush_res {
-                    Ok(()) => {
-                        if self.is_closed() {
-                            Err(())
-                        } else {
-                            Ok(true)
-                        }
-                    }
-                    Err(_) => {
-                        self.trigger_close();
-                        Err(())
-                    }
-                }
-            }
-            Err(_) => {
-                self.trigger_close();
-                Err(())
-            }
+        if res.is_err() {
+            self.trigger_close();
+            return Err(());
+        }
+        let flush_res = tokio::select! {
+            biased;
+            () = self.wait_closed() => return Err(()),
+            r = half.flush() => r,
+        };
+        if flush_res.is_err() {
+            self.trigger_close();
+            Err(())
+        } else if self.is_closed() {
+            Err(())
+        } else {
+            Ok(true)
         }
     }
 
@@ -859,7 +852,7 @@ async fn windows_accept_loop(
     }
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(all(test, any(unix, windows)))]
 async fn serve_conn<S>(
     stream: S,
     token: String,
@@ -980,7 +973,7 @@ async fn serve_requests<S, R>(
     loop {
         let frame_opt = tokio::select! {
             biased;
-            _ = writer.wait_closed() => {
+            () = writer.wait_closed() => {
                 break;
             }
             f = next_frame(reader) => f,
@@ -1142,7 +1135,7 @@ async fn serve_context_requests<S, R>(
         loop {
             let frame = tokio::select! {
                 biased;
-                _ = read_writer.wait_closed() => break,
+                () = read_writer.wait_closed() => break,
                 frame = next_frame(&mut reader) => frame,
             };
             let env = match frame {
@@ -1388,8 +1381,8 @@ async fn write_events<S>(
     loop {
         tokio::select! {
             biased;
-            _ = writer.wait_closed() => return,
-            _ = wake.notified() => {
+            () = writer.wait_closed() => return,
+            () = wake.notified() => {
                 for env in hub.drain(id) {
                     let Ok(bytes) = encode_line(&env) else {
                         continue;
@@ -1508,38 +1501,32 @@ where
         error,
         seq: None,
     };
-    match encode_line(&env) {
-        Ok(bytes) => {
-            if writer.write_bytes(&bytes).await.is_ok() {
-                Ok(ReplyDelivery::Original)
-            } else {
-                Err(())
-            }
+    if let Ok(bytes) = encode_line(&env) {
+        if writer.write_bytes(&bytes).await.is_ok() {
+            Ok(ReplyDelivery::Original)
+        } else {
+            Err(())
         }
-        Err(_) => {
-            let fallback = Envelope {
-                v: IPC_VERSION.to_string(),
-                id: id.to_string(),
-                kind: FrameKind::Res,
-                method: None,
-                params: None,
-                result: None,
-                error: Some(IpcError::new(
-                    "oversize",
-                    "response exceeds frame limit".to_string(),
-                )),
-                seq: None,
-            };
-            match encode_line(&fallback) {
-                Ok(fb_bytes) => {
-                    writer.write_bytes(&fb_bytes).await?;
-                    Ok(ReplyDelivery::Fallback)
-                }
-                Err(_) => {
-                    writer.trigger_close();
-                    Err(())
-                }
-            }
+    } else {
+        let fallback = Envelope {
+            v: IPC_VERSION.to_string(),
+            id: id.to_string(),
+            kind: FrameKind::Res,
+            method: None,
+            params: None,
+            result: None,
+            error: Some(IpcError::new(
+                "oversize",
+                "response exceeds frame limit".to_string(),
+            )),
+            seq: None,
+        };
+        if let Ok(bytes) = encode_line(&fallback) {
+            writer.write_bytes(&bytes).await?;
+            Ok(ReplyDelivery::Fallback)
+        } else {
+            writer.trigger_close();
+            Err(())
         }
     }
 }
@@ -1553,9 +1540,8 @@ where
 
     let mut line = Vec::new();
     loop {
-        let available = match reader.fill_buf().await {
-            Ok(bytes) => bytes,
-            Err(_) => return None,
+        let Ok(available) = reader.fill_buf().await else {
+            return None;
         };
         if available.is_empty() {
             return if line.is_empty() {
@@ -1811,7 +1797,7 @@ mod reply_close_tests {
         assert!(subscribe(&writer, &hub, &req, None, &mut subscription)
             .await
             .is_err());
-        assert!(hub.subscribers("foo").is_empty());
+        assert_eq!(hub.subscribers("foo").len(), 0);
         assert!(subscription.is_none());
         writer.close_and_take().await;
     }
@@ -1832,7 +1818,7 @@ mod reply_close_tests {
         // Hold the slot until this task has queued for it, independently of scheduler timing.
         let second = writer.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let waiting = tokio::spawn(async move {
+        let queued = tokio::spawn(async move {
             let mut operation = Box::pin(second.write_bytes(b"wait"));
             let mut started = Some(started_tx);
             std::future::poll_fn(|cx| match operation.as_mut().poll(cx) {
@@ -1842,7 +1828,7 @@ mod reply_close_tests {
                     }
                     Poll::Pending
                 }
-                ready => ready,
+                ready @ Poll::Ready(_) => ready,
             })
             .await
         });
@@ -1859,7 +1845,7 @@ mod reply_close_tests {
             .unwrap()
             .unwrap()
             .is_err());
-        assert!(timeout(Duration::from_secs(5), waiting)
+        assert!(timeout(Duration::from_secs(5), queued)
             .await
             .unwrap()
             .unwrap()
@@ -2153,6 +2139,7 @@ mod context_registry_tests {
         pending_subscribe_closes_and_unsubscribes(2).await;
     }
 
+    #[allow(clippy::too_many_lines)] // The shared fixture checks each disconnect mode.
     async fn pending_subscribe_closes_and_unsubscribes(mode: u8) {
         use tokio::io::AsyncWriteExt as _;
         let (stream, mut client) = tokio::io::duplex(8192);
@@ -2285,7 +2272,7 @@ mod context_registry_tests {
             .unwrap()
             .unwrap();
         assert!(flag.load(Ordering::SeqCst));
-        assert!(hub.subscribers("topic").is_empty());
+        assert_eq!(hub.subscribers("topic").len(), 0);
         drop(release_guard);
     }
 
@@ -2316,7 +2303,7 @@ mod context_registry_tests {
                     }
                     Poll::Pending
                 }
-                ready => ready,
+                ready @ Poll::Ready(_) => ready,
             })
             .await
         });
@@ -2420,7 +2407,7 @@ mod context_registry_tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(hub.subscribers("topic").is_empty());
+        assert_eq!(hub.subscribers("topic").len(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2435,9 +2422,7 @@ mod context_registry_tests {
             let context = ContextHandler {
                 method: "m".into(),
                 handler: Arc::new(move |_, _| {
-                    if panic_case {
-                        panic!("expected fixture panic");
-                    }
+                    assert!(!panic_case, "expected fixture panic");
                     Err(IpcError::new("fixture_error", "expected".into()))
                 }),
             };
@@ -2485,6 +2470,7 @@ mod context_registry_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)] // One connection exercises all routing cases.
     async fn routing_excludes_special_and_nonrequest_frames() {
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
         for (method, with_hub, expected_context, expected_ordinary) in [
