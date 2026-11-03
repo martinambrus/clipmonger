@@ -1,6 +1,17 @@
 # Machine-wide uninstall cleanup and separately selected default-profile removal.
-param([Parameter(Mandatory=$true)][string]$InstallDir, [ValidateSet("Cleanup", "ProfileInfo", "ProfileDelete")][string]$Mode = "Cleanup", [string]$Expected = "")
+param([Parameter(Mandatory=$true)][string]$InstallDir, [ValidateSet("Cleanup", "ProfileInfo", "ProfileDelete", "TaskExceptionClassifier")][string]$Mode = "Cleanup", [string]$Expected = "")
 $ErrorActionPreference = 'Stop'
+# Accept the missing-task HRESULT, including through the wrappers used by the
+# PowerShell COM adapter. Unknown wrappers and other HRESULTs remain failures.
+function Test-MissingTaskException([Exception]$exception) {
+    while ($exception -is [Management.Automation.MethodInvocationException] -or
+           $exception -is [Reflection.TargetInvocationException]) {
+        $exception = $exception.InnerException
+    }
+    return ($null -ne $exception -and $exception.HResult -eq -2147024894)
+}
+# This read-only mode exposes the exact classifier to focused policy-respecting tests.
+if ($Mode -eq 'TaskExceptionClassifier') { return ${function:Test-MissingTaskException} }
 if ($Mode -ne 'Cleanup') {
     Add-Type -Path (Join-Path $InstallDir 'profile-removal.cs')
     if ($Mode -eq 'ProfileInfo') {
@@ -67,7 +78,7 @@ $folder = $service.GetFolder('\')
 $task = $null
 try { $task = $folder.GetTask('ClipmongerHelper') }
 catch {
-    if ($_.Exception.HResult -ne -2147024894) { throw }
+    if (-not (Test-MissingTaskException $_.Exception)) { throw }
 }
 if ($null -ne $task) {
     $actions = $task.Definition.Actions
