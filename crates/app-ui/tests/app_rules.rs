@@ -5898,3 +5898,98 @@ fn popup_activation_metadata_follows_show_raise_and_hide() {
     rig.tick();
     assert_eq!(rig.app.take_popup_activation_metadata(), None);
 }
+
+fn settings_texts(rig: &mut Rig, size: egui::Vec2) -> Vec<(String, egui::Rect, egui::Rect)> {
+    let output = settings_frame(rig, size, 1.0, Vec::new());
+    let mut texts = Vec::new();
+    for shape in &output.shapes {
+        settings_text_bounds(&shape.shape, shape.clip_rect, &mut texts);
+    }
+    texts
+}
+
+fn settings_click_at(rig: &mut Rig, size: egui::Vec2, pos: egui::Pos2) {
+    settings_frame(rig, size, 1.0, vec![egui::Event::PointerMoved(pos)]);
+    for pressed in [true, false] {
+        settings_frame(
+            rig,
+            size,
+            1.0,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+    }
+}
+
+fn settings_rig(tab: &str) -> Rig {
+    let mut rig = Rig::closed();
+    rig.push(UiEvent::Config(json!({"config": {
+        "popup": {"placement": "cursor"},
+        "autostart": {"enabled": false}
+    }})));
+    rig.tick();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    rig.app.config().lock().expect("settings").tab = tab.to_string();
+    rig
+}
+
+#[test]
+fn settings_enum_row_is_a_dropdown_that_stages_the_pick() {
+    let size = egui::vec2(960.0, 680.0);
+    let mut rig = settings_rig("Popup");
+    for _ in 0..3 {
+        settings_frame(&mut rig, size, 1.0, Vec::new());
+    }
+    click_settings_button(&mut rig, size, 1.0, "cursor");
+    click_settings_button(&mut rig, size, 1.0, "center");
+    let cfg = rig.app.config().lock().expect("settings");
+    assert_eq!(
+        cfg.doc.as_ref().expect("doc").staged("popup.placement"),
+        Some(&json!("center"))
+    );
+}
+
+#[test]
+fn portable_start_on_login_is_disabled_with_a_reason() {
+    let size = egui::vec2(960.0, 680.0);
+    let label = strings::text("config.autostart_enabled");
+    let reason = strings::text("config.restore_warning_portable");
+    for portable in [false, true] {
+        let mut rig = settings_rig("Startup");
+        rig.push(UiEvent::Status(json!({"autostart_portable": portable})));
+        rig.tick();
+        for _ in 0..3 {
+            settings_frame(&mut rig, size, 1.0, Vec::new());
+        }
+        let texts = settings_texts(&mut rig, size);
+        assert_eq!(
+            texts.iter().any(|(text, _, _)| text == reason),
+            portable,
+            "portable reason painted only when portable: {texts:?}"
+        );
+        // The checkbox caption is the last painted copy of the row label.
+        let (_, rect, _) = texts
+            .iter()
+            .rev()
+            .find(|(text, _, _)| text == label)
+            .unwrap_or_else(|| panic!("missing {label:?}: {texts:?}"));
+        settings_click_at(&mut rig, size, rect.center());
+        let cfg = rig.app.config().lock().expect("settings");
+        let staged = cfg
+            .doc
+            .as_ref()
+            .expect("doc")
+            .staged("autostart.enabled")
+            .cloned();
+        assert_eq!(
+            staged,
+            (!portable).then_some(json!(true)),
+            "portable={portable}"
+        );
+    }
+}

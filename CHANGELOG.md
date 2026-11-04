@@ -50,12 +50,18 @@ reserved for the release that passes all seg-11 §5 gates.
   visible reason.
 - Settings: the unused `windows.helper_auto_elevate` row was removed
   (28 rows).
+- Settings: placement, paste delivery and log level are dropdowns; the
+  Permanent Clips note says a clip's hotkey works once the clip is saved.
 
 ### Fixed
 
 - Windows clipboard pastes no longer randomly insert nothing: the capture
   monitor leaves the clipboard alone briefly after the daemon's own paste
   write, so the target's Ctrl+V can read it.
+- Portable mode: Start on login is disabled with the reason shown, and the
+  daemon refuses the change as unsupported instead of reporting a failed
+  apply. `status` reports `autostart_portable`.
+
 - A long popup history no longer runs under the footer, and a paste error is
   shown in a red box above the status line.
 - A popup opened by `clipmonger-cli show-popup` pastes into the window that

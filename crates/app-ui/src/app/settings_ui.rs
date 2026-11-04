@@ -33,6 +33,8 @@ pub struct ConfigWindowState {
     pub perm_source: Option<usize>,
     pub perm_group_new: String,
     pub perm_confirm_delete: Option<uuid::Uuid>,
+    /// The daemon runs portable, where Start on login is unavailable.
+    pub autostart_portable: bool,
 }
 
 impl ConfigWindowState {
@@ -71,6 +73,7 @@ impl ConfigWindowState {
             perm_source: None,
             perm_group_new: String::new(),
             perm_confirm_delete: None,
+            autostart_portable: false,
         }
     }
 }
@@ -400,8 +403,34 @@ pub fn render_config_viewport(
                         ui.label(label);
                         if *kind == config_model::Kind::Bool {
                             let mut flag = current == "true";
-                            if ui.checkbox(&mut flag, label.as_str()).changed() {
+                            let portable = key == "autostart.enabled" && config.autostart_portable;
+                            if ui
+                                .add_enabled(
+                                    !portable,
+                                    egui::Checkbox::new(&mut flag, label.as_str()),
+                                )
+                                .changed()
+                            {
                                 stage_edits.push((key.clone(), Value::Bool(flag)));
+                            }
+                            if portable {
+                                ui.label(strings::text("config.restore_warning_portable"));
+                            }
+                        } else if *kind == config_model::Kind::Enum {
+                            let mut picked = current.clone();
+                            egui::ComboBox::from_id_salt(("cfg_enum", key.as_str()))
+                                .selected_text(current.as_str())
+                                .show_ui(ui, |ui| {
+                                    for choice in config_model::enum_choices(key) {
+                                        ui.selectable_value(
+                                            &mut picked,
+                                            (*choice).to_string(),
+                                            *choice,
+                                        );
+                                    }
+                                });
+                            if picked != *current {
+                                stage_edits.push((key.clone(), Value::String(picked)));
                             }
                         } else {
                             let entry = config

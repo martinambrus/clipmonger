@@ -544,6 +544,41 @@ fn explicit_autostart_stages_and_preserves_old_values_on_failure() {
 }
 
 #[test]
+fn portable_autostart_set_is_unsupported_and_reported_in_status() {
+    use super::autostart::{AutostartService, FakeAutostartCounter};
+    for portable in [false, true] {
+        let fixture = Fixture::new();
+        let fake = Arc::new(FakeAutostartCounter::new());
+        fixture
+            .state
+            .set_autostart_service(AutostartService::with_fake(fake.clone(), portable))
+            .unwrap();
+        let status = fixture.state.handle("status", &json!({})).unwrap();
+        assert_eq!(status["autostart_portable"], portable);
+        let result = fixture.state.handle(
+            "config.set",
+            &json!({"key":"autostart.enabled","value":true}),
+        );
+        if portable {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, "unsupported", "got {error:?}");
+            assert!(error.message.contains("portable mode"), "got {error:?}");
+            assert_eq!(fake.counts(), (0, 0, 0));
+            assert_eq!(
+                fixture
+                    .state
+                    .handle("config.get", &json!({"key":"autostart.enabled"}))
+                    .unwrap()["config"],
+                false
+            );
+        } else {
+            result.unwrap();
+            assert_eq!(fake.counts(), (1, 0, 0));
+        }
+    }
+}
+
+#[test]
 fn restore_applies_incoming_autostart_and_reports_post_commit_failure() {
     use super::autostart::{AutostartService, FakeAutostartCounter};
     for (enabled, portable, fail, warning) in [
@@ -777,7 +812,12 @@ fn explicit_unavailable_and_invalid_target_fail_before_application() {
                 &json!({"key":"autostart.enabled","value":true}),
             )
             .unwrap_err();
-        assert_eq!(err.code, "unavailable");
+        let code = if portable {
+            "unsupported"
+        } else {
+            "unavailable"
+        };
+        assert_eq!(err.code, code);
         assert_eq!(fake.counts(), (0, 0, 0));
         assert_eq!(fs::read(&target).unwrap(), old);
         assert_eq!(

@@ -336,7 +336,9 @@ pub fn validate(key: &str, value: &Value) -> ValidateResult {
     ValidateResult(validate_inner(key, value))
 }
 
-fn enum_allowed(key: &str) -> &'static [&'static str] {
+/// The allowed values of an enum row, in display order; empty for other keys.
+#[must_use]
+pub fn enum_choices(key: &str) -> &'static [&'static str] {
     match key {
         "popup.placement" => &["cursor", "center"],
         "popup.delivery" => &["clipboard_restore", "unicode_inject"],
@@ -395,7 +397,7 @@ fn validate_inner(key: &str, value: &Value) -> Result<(), String> {
             let Some(text) = value.as_str() else {
                 return Err("config.invalid_type".to_string());
             };
-            if enum_allowed(key).contains(&text) {
+            if enum_choices(key).contains(&text) {
                 Ok(())
             } else {
                 Err("config.invalid_enum".to_string())

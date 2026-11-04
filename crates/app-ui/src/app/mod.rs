@@ -454,10 +454,14 @@ impl PopupApp {
                     .unwrap_or(false);
                 self.paused = paused;
                 self.vm.set_paused(paused);
-                if let Some(version) = body.get("version").and_then(Value::as_str) {
-                    if let Ok(mut config) = self.config.lock() {
+                if let Ok(mut config) = self.config.lock() {
+                    if let Some(version) = body.get("version").and_then(Value::as_str) {
                         config.version_text = version.to_string();
                     }
+                    config.autostart_portable = body
+                        .get("autostart_portable")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                 }
                 self.feed(Event::Bridge(UiEvent::Status(body)));
                 if recovering && self.shell.desired().popup_open {

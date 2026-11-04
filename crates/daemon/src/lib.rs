@@ -2333,7 +2333,7 @@ impl DaemonState {
         self.autostart_service()?.query().await
     }
 
-    #[cfg(test)]
+    /// Whether the installed autostart service runs in portable mode.
     pub fn autostart_is_portable(&self) -> bool {
         self.autostart.lock().is_ok_and(|s| {
             s.as_ref()
@@ -3605,6 +3605,12 @@ impl DaemonState {
                 "config.set: autostart.enabled requires a boolean".into(),
             ));
         }
+        if key == "autostart.enabled" && self.autostart_is_portable() {
+            return Err(IpcError::new(
+                "unsupported",
+                "config.set: autostart is unavailable in portable mode".into(),
+            ));
+        }
         let current = self
             .config
             .lock()
@@ -4574,6 +4580,7 @@ impl DaemonState {
                 "version": DAEMON_VERSION,
                 "monitoring_paused": self.paused(),
                 "suppressed_self_writes": self.self_writes.lock().ok().map(|registry| registry.suppressed_count()),
+                "autostart_portable": self.autostart_is_portable(),
             })),
             "caps.get" | "caps.refresh" => Ok(self.caps_snapshot()),
             "ping" => Ok(serde_json::json!({"pong": true})),
