@@ -20,8 +20,12 @@ pub type UiLauncher = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 pub enum PopupSource {
     /// A hotkey press: captures the target and mints a gesture.
     Press,
-    /// A `popup.open` request (CLI, tray, second UI instance): neither.
+    /// A `popup.open` request (tray, second UI instance): neither.
     Request,
+    /// A `popup.open` request asking for the target (`clipmonger-cli
+    /// show-popup`): captures the target like a press, never toggles and
+    /// never mints a gesture.
+    CliRequest,
 }
 
 /// Presses closer together than this are one press (key repeat, or the
@@ -131,6 +135,8 @@ impl DaemonState {
         let (target, toggle) = match source {
             PopupSource::Press => capture(ui.as_ref()),
             PopupSource::Request => (None, false),
+            // The popup in front is no target; the request only raises it.
+            PopupSource::CliRequest => (capture(ui.as_ref()).0, false),
         };
         let gesture = if source == PopupSource::Press && !toggle {
             let at_ms = crate::now_ms();
@@ -155,7 +161,7 @@ impl DaemonState {
         let event = ShowPopupEvent {
             source: match source {
                 PopupSource::Press => "hotkey",
-                PopupSource::Request => "request",
+                PopupSource::Request | PopupSource::CliRequest => "request",
             }
             .to_string(),
             toggle,
@@ -963,6 +969,56 @@ mod tests {
             "and no second show follows"
         );
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cli_request_captures_the_target_but_never_toggles_or_mints() {
+        let (state, sock, _) = served("cli-request").await;
+        let stream = subscribe(&sock);
+        let now = Instant::now();
+        let mut draw = || -> Result<u64, clipmonger_core::entropy::Error> {
+            panic!("a CLI request draws no gesture")
+        };
+        assert!(state.trigger_popup_with(
+            PopupSource::CliRequest,
+            now,
+            |_| (Some(0x77), false),
+            &mut draw
+        ));
+        let (stream, open) = next_show(stream, Duration::from_secs(2)).expect("cli show");
+        assert_eq!(
+            (open.source.as_str(), open.target, open.gesture, open.toggle),
+            ("request", Some(0x77), None, false)
+        );
+        assert!(state.trigger_popup_with(
+            PopupSource::CliRequest,
+            now,
+            |_| (None, true),
+            &mut draw
+        ));
+        let (_, raise) = next_show(stream, Duration::from_secs(2)).expect("raise show");
+        assert_eq!(
+            (raise.target, raise.gesture, raise.toggle),
+            (None, None, false),
+            "the popup in front is raised, not toggled, and is no target"
+        );
+        assert!(state.gesture_tokens.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn popup_open_captures_only_when_asked() {
+        let (state, sock, _) = served("cli-param").await;
+        let stream = subscribe(&sock);
+        let answer = state
+            .handle("popup.open", &json!({"capture_target": false}))
+            .expect("popup.open");
+        assert_eq!(answer, json!({"delivered": true}));
+        let (_, show) = next_show(stream, Duration::from_secs(2)).expect("show");
+        assert_eq!(
+            (show.source.as_str(), show.target, show.gesture),
+            ("request", None, None)
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn popup_entropy_decisions_use_the_production_path() {
         let (state, sock, _) = served("entropy-decisions").await;

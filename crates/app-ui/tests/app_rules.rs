@@ -873,22 +873,41 @@ fn rule_push_hotkey_trace_flags_follow_the_context() {
     }
 }
 
-// rule 2: a request push opens with an empty context, whatever the push carries
+// rule 2: a request push opens with its target and never a gesture
 #[test]
-fn rule_push_request_opens_with_an_empty_context() {
+fn rule_push_request_opens_with_its_target_and_no_gesture() {
     for source in ["request", "cli", "second_launch"] {
         let mut rig = Rig::closed();
         rig.push(push_event(source, false, Some(5), Some(6)));
         rig.tick();
         assert!(rig.is_open(), "source {source}");
-        assert_eq!(rig.context(), PasteContext::default(), "source {source}");
+        assert_eq!(
+            rig.context(),
+            PasteContext {
+                target: Some(5),
+                gesture: None
+            },
+            "source {source}"
+        );
         assert_eq!(
             rig.trace(),
-            vec![open_line("request", false, false)],
+            vec![open_line("request", true, false)],
             "source {source}"
         );
         assert_open_commands(&rig.cmds());
     }
+}
+
+// rule 2: a request push without a target opens with an empty context
+#[test]
+fn rule_push_request_without_target_opens_with_an_empty_context() {
+    let mut rig = Rig::closed();
+    rig.push(request());
+    rig.tick();
+    assert!(rig.is_open());
+    assert_eq!(rig.context(), PasteContext::default());
+    assert_eq!(rig.trace(), vec![open_line("request", false, false)]);
+    assert_open_commands(&rig.cmds());
 }
 
 // rule 2: a toggle push while open hides the popup

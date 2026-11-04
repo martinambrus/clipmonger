@@ -29,7 +29,8 @@ hidden. Windows and X11 retain the popup; Wayland recreates it for a show and
 applies an available activation token. X11 carries the input timestamp.
 
 A hotkey push replaces target and gesture. A request opens a hidden popup with
-empty context; an already-open request raises it with the current open context.
+the pushed target (CLI only) and no gesture; an already-open request raises it
+with the current open context.
 Hiding clears context. Paste captures context before hiding; failure can reopen
 with an error and empty context. See ADR-004 and ADR-005.
 
