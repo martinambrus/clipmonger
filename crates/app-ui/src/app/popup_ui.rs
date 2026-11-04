@@ -245,13 +245,22 @@ impl PopupApp {
 
     /// Paint the footer and report whether Settings was activated.
     fn render_footer(&self, ui: &mut egui::Ui) -> bool {
+        if let Some(error) = self.shell.error() {
+            let color = ui.visuals().error_fg_color;
+            egui::Frame::new()
+                .fill(color.gamma_multiply(0.15))
+                .stroke(egui::Stroke::new(1.0, color))
+                .corner_radius(4.0)
+                .inner_margin(6.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(egui::RichText::new(error).color(color).strong());
+                });
+        }
         if !self.vm.banner().is_empty() {
             ui.label(self.vm.banner());
         }
         ui.label(self.vm.status_line());
-        if let Some(error) = self.shell.error() {
-            ui.label(error);
-        }
         ui.button(strings::text("config.open_config")).clicked()
     }
 
@@ -299,7 +308,6 @@ impl PopupApp {
         let mut pin_row: Option<usize> = Option::None;
         let mut delete_row: Option<usize> = Option::None;
         let mut search_focused = false;
-        let mut open_settings = false;
         let mut first_page = false;
         let mut next_page = false;
         let mut thumbnail_demand = Vec::new();
@@ -328,6 +336,7 @@ impl PopupApp {
         self.last_reveal = current;
         let pending = self.pending_reveal.take();
 
+        let mut open_settings = false;
         egui::CentralPanel::default().show(ui, |ui| {
             let full_rect = ui.max_rect();
             let footer_height = {
@@ -340,9 +349,9 @@ impl PopupApp {
                 self.render_footer(&mut measure);
                 measure.min_size().y
             };
-            ui.set_max_height(
-                (full_rect.height() - footer_height - ui.spacing().item_spacing.y).max(0.0),
-            );
+            // CentralPanel's min rect already spans the window, so `set_max_height`
+            // cannot shrink it; the scroll areas stop at the footer instead.
+            let content_bottom = full_rect.bottom() - footer_height - ui.spacing().item_spacing.y;
             // Resolve pointer focus before TextEdit consumes a batched clipboard event.
             let search_id = ui.make_persistent_id("popup_search");
             if let Some(response) = ui.ctx().read_response(search_id) {
@@ -420,6 +429,8 @@ impl PopupApp {
                 }
                 egui::ScrollArea::vertical()
                     .animated(false)
+                    .min_scrolled_height(0.0)
+                    .max_height((content_bottom - ui.cursor().top()).max(0.0))
                     .id_salt((
                         "popup_permanents",
                         group_names.get(perm_source.unwrap_or(0)),
@@ -477,6 +488,8 @@ impl PopupApp {
                 #[allow(unused_variables)] // Used by test-only viewport tracing.
                 let history_area = egui::ScrollArea::vertical()
                     .animated(false)
+                    .min_scrolled_height(0.0)
+                    .max_height((content_bottom - ui.cursor().top()).max(0.0))
                     .id_salt("popup_history")
                     .show(ui, |ui| {
                         #[cfg(test)]

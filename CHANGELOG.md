@@ -50,6 +50,8 @@ reserved for the release that passes all seg-11 §5 gates.
 - Windows clipboard pastes no longer randomly insert nothing: the capture
   monitor leaves the clipboard alone briefly after the daemon's own paste
   write, so the target's Ctrl+V can read it.
+- A long popup history no longer runs under the footer, and a paste error is
+  shown in a red box above the status line.
 - A popup opened by `clipmonger-cli show-popup` pastes into the window that
   was active, instead of the next window Windows activates after the popup
   hides.

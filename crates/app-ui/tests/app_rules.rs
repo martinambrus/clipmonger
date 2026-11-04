@@ -4209,16 +4209,14 @@ fn l1_settings_short_160() {
 
 #[test]
 fn fix_n3_long_history_keeps_error_and_settings_painted_inside_window() {
-    fn text_bounds(
-        shape: &egui::Shape,
-        clip: egui::Rect,
-        out: &mut Vec<(String, egui::Rect, egui::Rect)>,
-    ) {
+    type Painted = (String, egui::Rect, egui::Rect, Option<egui::Color32>);
+    fn text_bounds(shape: &egui::Shape, clip: egui::Rect, out: &mut Vec<Painted>) {
         match shape {
             egui::Shape::Text(text) => out.push((
                 text.galley.text().to_string(),
                 egui::Rect::from_min_size(text.pos, text.galley.size()),
                 clip,
+                text.galley.job.sections.first().map(|s| s.format.color),
             )),
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
@@ -4254,16 +4252,45 @@ fn fix_n3_long_history_keeps_error_and_settings_painted_inside_window() {
         for clipped in &output.shapes {
             text_bounds(&clipped.shape, clipped.clip_rect, &mut texts);
         }
-        for expected in [
+        let status = rig.app.vm().status_line();
+        let footer = [
             "paste failed with a long history",
             strings::text("config.open_config"),
-            rig.app.vm().status_line().as_str(),
-        ] {
+            status.as_str(),
+        ];
+        for expected in footer {
             assert!(
-                texts.iter().any(|(text, rect, clip)| {
+                texts.iter().any(|(text, rect, clip, _)| {
                     text == expected && window.contains_rect(*rect) && clip.contains_rect(*rect)
                 }),
                 "{expected:?} must be painted inside the window and its clip: {texts:?}"
+            );
+        }
+        let error_fg = rig.popup.ctx.global_style().visuals.error_fg_color;
+        assert!(
+            texts.iter().any(|(text, _, _, color)| {
+                text == "paste failed with a long history" && *color == Some(error_fg)
+            }),
+            "the paste error must be painted in the error colour: {texts:?}"
+        );
+        let footer_rects: Vec<egui::Rect> = texts
+            .iter()
+            .filter(|(text, ..)| footer.contains(&text.as_str()))
+            .map(|(_, rect, ..)| *rect)
+            .collect();
+        for (text, rect, clip, _) in texts
+            .iter()
+            .filter(|(text, ..)| text.starts_with("History row"))
+        {
+            let visible = rect.intersect(*clip);
+            if !visible.is_positive() {
+                continue;
+            }
+            assert!(
+                footer_rects
+                    .iter()
+                    .all(|footer| !footer.intersects(visible)),
+                "{text:?} at {visible:?} overlaps the footer {footer_rects:?}"
             );
         }
     }
