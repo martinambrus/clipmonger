@@ -670,26 +670,26 @@ fn r1_hotkey_push_while_closed_opens_with_the_press_context() {
 }
 
 #[test]
-fn r2_request_push_while_closed_opens_without_context() {
+fn r2_request_push_while_closed_opens_with_target_only() {
     run(vec![
-        Case::new("plain request", false).ev(100, request(), open_seq(), &[open(true)]),
+        Case::new("plain request", false).ev(100, request(), open_seq(), &[open(true), no_ctx()]),
         Case::new("request carrying a target and a gesture", false).ev(
             100,
             push("request", false, Some(7), Some(9)),
             open_seq(),
-            &[open(true)],
+            &[open(true), ctx_of(Some(7), None)],
         ),
         Case::new("an empty source is a request", false).ev(
             100,
             push("", false, Some(7), Some(9)),
             open_seq(),
-            &[open(true)],
+            &[open(true), ctx_of(Some(7), None)],
         ),
         Case::new("an unknown source is a request", false).ev(
             100,
             push("tray", false, Some(7), Some(9)),
             open_seq(),
-            &[open(true)],
+            &[open(true), ctx_of(Some(7), None)],
         ),
         Case::new("no context left over from a hotkey press", false)
             .ev(100, hotkey(7, 9), open_seq(), &[open(true), ctx(7, 9)])

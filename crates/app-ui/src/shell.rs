@@ -235,7 +235,11 @@ impl Shell {
         } else if self.want.popup_open {
             vec![Effect::Raise]
         } else {
-            self.open_popup(Context::default())
+            // A request may carry the target (CLI), never a gesture.
+            self.open_popup(Context {
+                target: event.target,
+                gesture: None,
+            })
         }
     }
 
@@ -455,8 +459,8 @@ impl Shell {
     ///   open if closed, else `Raise` first; the context becomes
     ///   `{p.target, p.gesture}` (replacing any old one); then the open sequence.
     /// - `Bridge(ShowPopup(p))`, any other source (a request), no toggle:
-    ///   closed: open with an empty context and the open sequence; open: only
-    ///   `Raise`, the context stays.
+    ///   closed: open with the context `{p.target, no gesture}` and the open
+    ///   sequence; open: only `Raise`, the context stays.
     /// - `Bridge(PasteFailed(msg))`: closed: open with an empty context, the
     ///   open sequence, then the error line is `msg`; open: the error line is
     ///   `msg`, nothing else.

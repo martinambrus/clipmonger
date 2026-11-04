@@ -23,8 +23,10 @@ Popup hotkey and trigger path:
     active window, none on Wayland); on Windows a press while the UI's
     popup is the foreground window hides it instead (`toggle`);
   - a press mints a single-use gesture token bound to that target (30 s);
-    `popup.open` (CLI, second launch) captures nothing and mints nothing,
-    and the tray opens the popup inside the UI without a target;
+    `popup.open` mints nothing; with `capture_target: true`
+    (`clipmonger-cli show-popup`) it captures the target like a press but
+    never toggles, without it (second launch) it captures nothing, and the
+    tray opens the popup inside the UI without a target;
   - Windows: the daemon raises the UI's popup itself while handling the
     press. Only the process that received the hotkey may take the
     foreground, and only until the next input (the key release), so an

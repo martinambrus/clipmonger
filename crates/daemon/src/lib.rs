@@ -4597,7 +4597,15 @@ impl DaemonState {
                 Ok(serde_json::json!({"ok": true}))
             }
             "popup.open" => {
-                let delivered = self.trigger_popup(popup::PopupSource::Request);
+                // Only the CLI asks for the target: a second launch would
+                // capture the Start menu or Explorer instead.
+                let source = if params.get("capture_target").and_then(Value::as_bool) == Some(true)
+                {
+                    popup::PopupSource::CliRequest
+                } else {
+                    popup::PopupSource::Request
+                };
+                let delivered = self.trigger_popup(source);
                 Ok(serde_json::json!({"delivered": delivered}))
             }
             "hotkey.conflict" => {
