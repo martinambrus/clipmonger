@@ -63,6 +63,17 @@ pub struct AppParts {
     pub allow_foreground: Box<dyn Fn()>,
 }
 
+/// Size and position the open popup was given, in physical pixels.
+struct PopupFrame {
+    /// Usable area of the popup's monitor.
+    work: placement::Rect,
+    /// Physical pixels per point there.
+    scale: f32,
+    /// Top-left, unknown where the compositor places the popup (Wayland).
+    pos: Option<(i32, i32)>,
+    size: (i32, i32),
+}
+
 /// The application behind the runner's windows.
 #[allow(clippy::struct_excessive_bools)]
 pub struct PopupApp {
@@ -91,7 +102,14 @@ pub struct PopupApp {
     placement_pending: bool,
     placement_waiting_for_geometry: bool,
     placement: placement::Placement,
-    pending_physical_pos: Option<(i32, i32)>,
+    /// Desktop snapshot to size and place the popup with at the next pass.
+    pending_desktop: Option<placement::DesktopContext>,
+    /// Popup size in points the clips need, from the last unfiltered pass.
+    popup_fit: Option<(f32, f32)>,
+    /// Where the open popup was sized and placed.
+    popup_frame: Option<PopupFrame>,
+    /// Pixels per point at the last popup pass; a change re-places the popup.
+    last_ppp: Option<f32>,
     /// Put the keyboard focus into the search box at the next render.
     focus_search: bool,
     /// Theme last applied to the contexts: popup, settings (dark, font scale bits).
@@ -152,7 +170,10 @@ impl PopupApp {
             placement_pending: open,
             placement_waiting_for_geometry: false,
             placement: placement::Placement::Center,
-            pending_physical_pos: None,
+            pending_desktop: None,
+            popup_fit: None,
+            popup_frame: None,
+            last_ppp: None,
             focus_search: open,
             theme_applied: [None, None],
             preview_width: 80,
@@ -279,7 +300,8 @@ impl PopupApp {
             self.placement_pending = true;
             self.placement_waiting_for_geometry = false;
         } else if was_open && !is_open {
-            self.pending_physical_pos = None;
+            self.pending_desktop = None;
+            self.popup_frame = None;
             self.placement_pending = false;
             self.placement_waiting_for_geometry = false;
             self.record(&TraceEvent::Hide { reason });
@@ -955,12 +977,80 @@ impl PopupApp {
         }
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    /// Size and place the popup from a delivered desktop snapshot: the size
+    /// the clips need (`popup_fit`, once measured) within the destination
+    /// work area, then the position for that size. A DPI or zoom change while
+    /// open asks for a new snapshot.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn handle_pending_placement(&mut self, ctx: &egui::Context) {
-        if let Some(pending_pos) = self.pending_physical_pos.take() {
-            let ppp = ctx.pixels_per_point();
-            let egui_pos = egui::pos2(pending_pos.0 as f32 / ppp, pending_pos.1 as f32 / ppp);
+        let ppp = ctx.pixels_per_point();
+        if self.shell.desired().popup_open
+            && self
+                .last_ppp
+                .is_some_and(|last| (last - ppp).abs() > f32::EPSILON)
+        {
+            self.placement_pending = true;
+        }
+        self.last_ppp = Some(ppp);
+        let Some(mut desktop) = self.pending_desktop.take() else {
+            return;
+        };
+        let work = placement::destination_monitor(
+            desktop.cursor,
+            &desktop.monitors,
+            desktop.current_monitor,
+            desktop.primary_monitor,
+        );
+        let scale = ctx.zoom_factor() * desktop.destination_scale as f32;
+        if let (Some(fit), Some(work)) = (self.popup_fit, work) {
+            desktop.popup_physical_size = placement::popup_size(fit, scale, work);
+            let (w, h) = desktop.popup_physical_size;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                w as f32 / scale,
+                h as f32 / scale,
+            )));
+        }
+        let pos = placement::place_with_context(self.placement, &desktop);
+        if let Some(pos) = pos {
+            let egui_pos = egui::pos2(pos.0 as f32 / ppp, pos.1 as f32 / ppp);
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui_pos));
+        }
+        self.popup_frame = work.map(|work| PopupFrame {
+            work,
+            scale,
+            pos,
+            size: desktop.popup_physical_size,
+        });
+    }
+
+    /// Grow the open popup when its unfiltered clips need more height than it
+    /// has, up to the work-area cap; it shrinks only at the next show.
+    #[allow(clippy::cast_precision_loss)]
+    fn grow_popup(&mut self, ctx: &egui::Context) {
+        if self.placement_pending || self.pending_desktop.is_some() {
+            return;
+        }
+        let (Some(fit), Some(frame)) = (self.popup_fit, self.popup_frame.as_mut()) else {
+            return;
+        };
+        let height = placement::popup_size(fit, frame.scale, frame.work).1;
+        if height <= frame.size.1.saturating_add(2) {
+            return;
+        }
+        frame.size.1 = height;
+        let (w, h) = frame.size;
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            w as f32 / frame.scale,
+            h as f32 / frame.scale,
+        )));
+        if let Some(pos) = frame.pos {
+            let pos = placement::place(self.placement, pos, &[frame.work], frame.size);
+            frame.pos = Some(pos);
+            let ppp = ctx.pixels_per_point();
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                pos.0 as f32 / ppp,
+                pos.1 as f32 / ppp,
+            )));
         }
     }
 }
@@ -1168,11 +1258,7 @@ impl runner::App for PopupApp {
                 .monitors
                 .iter()
                 .any(|monitor| monitor.w > 0 && monitor.h > 0);
-        self.pending_physical_pos = if self.placement_waiting_for_geometry {
-            None
-        } else {
-            crate::placement::place_with_context(self.placement, &ctx)
-        };
+        self.pending_desktop = (!self.placement_waiting_for_geometry).then_some(ctx);
     }
 
     fn desktop_geometry_changed(&mut self) {

@@ -22,6 +22,7 @@ fn explicit_physical_size_controls_public_center_and_cursor_geometry() {
             primary_monitor: None,
             popup_physical_size: size,
             supports_global_position: true,
+            destination_scale: 1.0,
         };
         assert_eq!(
             place_with_context(Placement::Cursor, &context),
@@ -48,6 +49,7 @@ fn unsupported_global_position_suppresses_both_public_placement_modes() {
         primary_monitor: None,
         popup_physical_size: (960, 720),
         supports_global_position: false,
+        destination_scale: 1.0,
     };
     assert_eq!(place_with_context(Placement::Cursor, &context), None);
     assert_eq!(place_with_context(Placement::Center, &context), None);

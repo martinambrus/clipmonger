@@ -5,6 +5,10 @@ use crate::{ipc_bridge, keymap, popup, strings};
 
 use super::{now_ms, PopupApp};
 
+/// Width in points around a preview line: panel margins, scroll bar and the
+/// image thumbnail slot.
+const FIT_MARGIN: f32 = 72.0;
+
 impl PopupApp {
     /// Apply one view-model effect: shell events for the keys that pick,
     /// dismiss or refresh, bridge commands for the rest.
@@ -311,6 +315,8 @@ impl PopupApp {
         let mut first_page = false;
         let mut next_page = false;
         let mut thumbnail_demand = Vec::new();
+        // List content height minus the height the list may use.
+        let mut list_overflow: Option<f32> = None;
         if let Some(thumbs) = &mut self.thumbnails {
             thumbs.begin_frame();
         }
@@ -417,10 +423,11 @@ impl PopupApp {
                 if rows.is_empty() {
                     ui.label(strings::text("popup.empty"));
                 }
-                egui::ScrollArea::vertical()
+                let list_height = (content_bottom - ui.cursor().top()).max(0.0);
+                let permanents_area = egui::ScrollArea::vertical()
                     .animated(false)
                     .min_scrolled_height(0.0)
-                    .max_height((content_bottom - ui.cursor().top()).max(0.0))
+                    .max_height(list_height)
                     .id_salt((
                         "popup_permanents",
                         group_names.get(perm_source.unwrap_or(0)),
@@ -444,6 +451,7 @@ impl PopupApp {
                             }
                         }
                     });
+                list_overflow = Some(permanents_area.content_size.y - list_height);
             } else {
                 let count = self.vm.visible().len();
                 if self.compact.uri_search_incomplete {
@@ -478,11 +486,11 @@ impl PopupApp {
                 });
                 #[cfg(test)]
                 let mut history_clip = None;
-                #[allow(unused_variables)] // Used by test-only viewport tracing.
+                let list_height = (content_bottom - ui.cursor().top()).max(0.0);
                 let history_area = egui::ScrollArea::vertical()
                     .animated(false)
                     .min_scrolled_height(0.0)
-                    .max_height((content_bottom - ui.cursor().top()).max(0.0))
+                    .max_height(list_height)
                     .id_salt("popup_history")
                     .show(ui, |ui| {
                         #[cfg(test)]
@@ -578,6 +586,7 @@ impl PopupApp {
                             ui.weak(strings::text("popup.history_end"));
                         }
                     });
+                list_overflow = Some(history_area.content_size.y - list_height);
                 #[cfg(test)]
                 if let Some(thumbs) = &mut self.thumbnails {
                     thumbs.history_area = Some((
@@ -599,6 +608,16 @@ impl PopupApp {
         });
         if let Some(thumbs) = &mut self.thumbnails {
             thumbs.update(ui.ctx(), thumbnail_demand);
+        }
+        // A filtered list says nothing about the size the clips need.
+        if let (Some(overflow), true) = (list_overflow, query.is_empty()) {
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let glyph = ui.fonts_mut(|fonts| fonts.glyph_width(&font, 'n'));
+            #[allow(clippy::cast_precision_loss)]
+            let width = self.preview_width as f32 * glyph + FIT_MARGIN;
+            let height = ui.ctx().viewport_rect().height() + overflow;
+            self.popup_fit = Some((width, height));
+            self.grow_popup(ui.ctx());
         }
         if first_page {
             self.reset_compact(false);

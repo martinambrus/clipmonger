@@ -13,6 +13,13 @@ Center placement. Wayland delegates placement to the compositor and remembers
 Settings size only. Settings normal geometry persists on close and exit;
 font zoom does not change its native size.
 
+The popup sizes itself at every show: the height its unfiltered clip list
+needs, at most 90% of the destination monitor's usable height; the width of
+`popup.preview_width` characters, at most 30% of its usable width; at least
+320x160 points. Usable area is the work area on Windows and the monitor
+elsewhere. While open it only grows (placed again inside the usable area); a
+DPI or zoom change places and sizes it again.
+
 The Windows popup is a transient tool window: it accepts search keyboard focus
 without a taskbar or Alt-Tab entry. Its native policy survives repeated show/hide
 and style changes. Settings remains an ordinary taskbar/Alt-Tab window. A

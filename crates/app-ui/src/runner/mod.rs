@@ -1040,15 +1040,15 @@ impl<A: App> Runner<A> {
         let current_scale = host.window.scale_factor();
         let monitors: Vec<_> = event_loop
             .available_monitors()
-            .map(|monitor| (monitor_rect(&monitor), monitor.scale_factor()))
+            .map(|monitor| (work_rect(&monitor), monitor.scale_factor()))
             .collect();
         Some(desktop_context_from_snapshot(
             (physical.width, physical.height),
             current_scale,
             &monitors,
             query_cursor(event_loop),
-            host.window.current_monitor().as_ref().map(monitor_rect),
-            event_loop.primary_monitor().as_ref().map(monitor_rect),
+            host.window.current_monitor().as_ref().map(work_rect),
+            event_loop.primary_monitor().as_ref().map(work_rect),
             !self.per_show,
         ))
     }
@@ -1085,6 +1085,7 @@ fn desktop_context_from_snapshot(
         primary_monitor,
         popup_physical_size,
         supports_global_position,
+        destination_scale,
     }
 }
 
@@ -1142,6 +1143,34 @@ fn monitor_rect(monitor: &winit::monitor::MonitorHandle) -> crate::placement::Re
         w: i32::try_from(size.width).unwrap_or(i32::MAX),
         h: i32::try_from(size.height).unwrap_or(i32::MAX),
     }
+}
+
+/// Usable area of a monitor for the popup: the work area without the taskbar
+/// on Windows, the whole monitor elsewhere.
+fn work_rect(monitor: &winit::monitor::MonitorHandle) -> crate::placement::Rect {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
+        use winit::platform::windows::MonitorHandleExtWindows as _;
+        let mut info = MONITORINFO {
+            cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).unwrap_or(0),
+            ..MONITORINFO::default()
+        };
+        // SAFETY: the handle comes from winit's live monitor enumeration and
+        // `info` is a writable MONITORINFO with its size set.
+        #[allow(unsafe_code)]
+        let ok = unsafe { GetMonitorInfoW(HMONITOR(monitor.hmonitor() as _), &raw mut info) };
+        if ok.as_bool() {
+            let work = info.rcWork;
+            return crate::placement::Rect {
+                x: work.left,
+                y: work.top,
+                w: work.right.saturating_sub(work.left),
+                h: work.bottom.saturating_sub(work.top),
+            };
+        }
+    }
+    monitor_rect(monitor)
 }
 
 fn query_cursor(event_loop: &ActiveEventLoop) -> Option<(i32, i32)> {

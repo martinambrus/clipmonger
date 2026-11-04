@@ -104,6 +104,17 @@ impl Pass {
             .collect()
     }
 
+    /// The sizes of the `InnerSize` commands.
+    fn sizes(&self) -> Vec<egui::Vec2> {
+        self.commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::ViewportCommand::InnerSize(size) => Some(*size),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn painted(&self, text: &str) -> bool {
         self.texts.iter().any(|painted| painted == text)
     }
@@ -3217,6 +3228,7 @@ fn desktop(cursor: Option<(i32, i32)>) -> placement::DesktopContext {
         primary_monitor: None,
         popup_physical_size: (720, 540),
         supports_global_position: true,
+        destination_scale: 1.0,
     }
 }
 
@@ -3236,10 +3248,86 @@ fn rule_placement_waits_for_native_context_despite_monitor_size() {
         assert_none(&pass.positions(), "placement commands");
         assert!(rig.app.wants_desktop_context());
         deliver(&mut rig, desktop(Some((-1700, 100))));
-        assert_eq!(rig.tick().positions(), vec![egui::pos2(-1320.0, 70.0)]);
+        let pass = rig.tick();
+        // A rendered popup knows the size its clips need and centres that size.
+        let size = match pass.sizes().as_slice() {
+            [] => egui::vec2(720.0, 540.0),
+            [size] if visible => *size,
+            sizes => panic!("unexpected sizes {sizes:?}"),
+        };
+        let centre = egui::pos2(
+            -1920.0 + ((1920.0 - size.x) / 2.0).floor(),
+            -200.0 + ((1080.0 - size.y) / 2.0).floor(),
+        );
+        assert_eq!(pass.positions(), vec![centre]);
         assert!(!rig.app.wants_desktop_context());
         assert_none(&rig.tick().positions(), "placement commands");
     }
+}
+
+#[test]
+fn rule_popup_size_follows_clips_and_stops_at_the_work_area_cap() {
+    let mut sizes = Vec::new();
+    for count in [3, 12, 200] {
+        let mut rig = Rig::opened();
+        let clips: Vec<_> = (1..=count)
+            .map(|n| clip(n, &format!("History row {n}")))
+            .collect();
+        rig.push(history(&clips));
+        rig.tick();
+        rig.show();
+        deliver(&mut rig, desktop(Some((-1700, 100))));
+        let pass = rig.show();
+        assert_eq!(pass.sizes().len(), 1, "{count} clips: one size");
+        sizes.push(pass.sizes()[0]);
+        assert_none(&rig.show().sizes(), "idle sizes");
+    }
+    assert!(sizes[0].y < sizes[1].y, "{sizes:?}");
+    // 30% of the 1920 wide and 90% of the 1080 high work area.
+    assert_eq!(sizes[2], egui::vec2(576.0, 972.0));
+}
+
+#[test]
+fn rule_dpi_change_while_open_places_and_sizes_again() {
+    let mut rig = Rig::opened();
+    rig.show();
+    deliver(&mut rig, desktop(Some((-1700, 100))));
+    rig.show();
+    rig.show();
+    assert!(!rig.app.wants_desktop_context());
+    rig.popup.info.native_pixels_per_point = Some(1.5);
+    rig.show();
+    assert!(
+        rig.app.wants_desktop_context(),
+        "a new scale needs a new snapshot"
+    );
+    deliver(&mut rig, desktop(Some((-1700, 100))));
+    let pass = rig.show();
+    assert_eq!(pass.sizes().len(), 1);
+    assert_eq!(pass.positions().len(), 1);
+    assert!(!rig.app.wants_desktop_context());
+}
+
+#[test]
+fn rule_open_popup_grows_when_clips_arrive_and_stays_in_the_work_area() {
+    let mut rig = Rig::opened();
+    rig.push(config_reply(&json!({"popup": {"placement": "cursor"}})));
+    rig.tick();
+    rig.show();
+    deliver(&mut rig, desktop(Some((-1700, 100))));
+    let first = rig.show();
+    assert_eq!(first.positions(), vec![egui::pos2(-1700.0, 100.0)]);
+    let width = first.sizes()[0].x;
+    let clips: Vec<_> = (1..=200)
+        .map(|n| clip(n, &format!("History row {n}")))
+        .collect();
+    rig.push(history(&clips));
+    rig.tick();
+    let grown = rig.show();
+    assert_eq!(grown.sizes(), vec![egui::vec2(width, 972.0)]);
+    // The bottom edge stays at the work area's bottom (-200 + 1080).
+    assert_eq!(grown.positions(), vec![egui::pos2(-1700.0, -92.0)]);
+    assert_none(&rig.show().commands, "idle commands");
 }
 
 #[test]

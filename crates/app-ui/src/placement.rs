@@ -189,8 +189,9 @@ pub fn place(
     }
 }
 
-/// Snapshot of physical desktop for placement.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Snapshot of physical desktop for placement. On Windows the monitor
+/// rectangles are the work areas (without the taskbar).
+#[derive(Debug, Clone, PartialEq)]
 pub struct DesktopContext {
     pub monitors: Vec<Rect>,
     pub cursor: Option<(i32, i32)>,
@@ -198,6 +199,30 @@ pub struct DesktopContext {
     pub primary_monitor: Option<Rect>,
     pub popup_physical_size: (i32, i32),
     pub supports_global_position: bool,
+    /// Native scale factor of the destination monitor.
+    pub destination_scale: f64,
+}
+
+/// Smallest popup size in points.
+pub const POPUP_MIN: (f32, f32) = (320.0, 160.0);
+
+/// Popup size in physical pixels for a wanted size in points at `scale`
+/// physical pixels per point: at most 30% of the work area's width and 90% of
+/// its height, at least [`POPUP_MIN`] (the minimum wins on a tiny work area).
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "physical popup dimensions are small and rounded to whole pixels"
+)]
+#[must_use]
+pub fn popup_size(wanted: (f32, f32), scale: f32, work: Rect) -> (i32, i32) {
+    let w = (wanted.0 * scale)
+        .min(work.w as f32 * 0.3)
+        .max(POPUP_MIN.0 * scale);
+    let h = (wanted.1 * scale)
+        .min(work.h as f32 * 0.9)
+        .max(POPUP_MIN.1 * scale);
+    (w.round() as i32, h.round() as i32)
 }
 
 /// Compute placement from full desktop context, honoring cursor/center rules and fallbacks.
@@ -302,6 +327,7 @@ mod placement_context_tests {
             primary_monitor: None,
             popup_physical_size: (480, 360),
             supports_global_position: true,
+            destination_scale: 1.0,
         };
         let pos = place_with_context(Placement::Cursor, &ctx).unwrap();
         assert!(pos.0 < 0, "should be on negative monitor: {pos:?}");
@@ -321,6 +347,7 @@ mod placement_context_tests {
             primary_monitor: Some(monitors[0]),
             popup_physical_size: (480, 360),
             supports_global_position: true,
+            destination_scale: 1.0,
         };
         let pos = place_with_context(Placement::Center, &ctx).unwrap();
         assert_eq!(pos, (720, 360));
@@ -339,6 +366,7 @@ mod placement_context_tests {
             primary_monitor: None,
             popup_physical_size: (480, 360),
             supports_global_position: false,
+            destination_scale: 1.0,
         };
         assert!(place_with_context(Placement::Cursor, &ctx).is_none());
     }
@@ -351,7 +379,31 @@ mod placement_context_tests {
             primary_monitor: None,
             popup_physical_size: (480, 360),
             supports_global_position: true,
+            destination_scale: 1.0,
         };
         assert!(place_with_context(Placement::Center, &ctx).is_none());
+    }
+    #[test]
+    fn popup_size_caps_at_work_area_share() {
+        let work = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1040,
+        };
+        assert_eq!(popup_size((500.0, 300.0), 1.0, work), (500, 300));
+        assert_eq!(popup_size((900.0, 2000.0), 1.0, work), (576, 936));
+        assert_eq!(popup_size((500.0, 300.0), 1.5, work), (576, 450));
+    }
+    #[test]
+    fn popup_size_keeps_minimum_on_small_work_area() {
+        let work = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 150,
+        };
+        assert_eq!(popup_size((10.0, 10.0), 1.0, work), (320, 160));
+        assert_eq!(popup_size((10.0, 10.0), 2.0, work), (640, 320));
     }
 }

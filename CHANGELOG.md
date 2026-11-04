@@ -28,6 +28,10 @@ reserved for the release that passes all seg-11 §5 gates.
   starts the UI when none is running.
 - `popup.preview_lines` (default 3, Popup tab): popup previews keep up to
   that many lines; `popup.preview_width` caps their total characters.
+- The popup sizes itself to its clips at every show: it grows with the
+  clip list up to 90% of the monitor's usable height (on Windows without
+  the taskbar), is at most 30% of its usable width, and is sized again
+  after a DPI or zoom change. While open it only grows.
 
 ### Changed
 
