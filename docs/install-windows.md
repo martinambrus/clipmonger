@@ -1,8 +1,8 @@
 # Installing Clipmonger on Windows
 
-> The prompts below were checked on Windows 10; the Windows 11 check is still
-> open ([T-1204](../tests/manual/T-1204-bypass-docs-accuracy.md)). If a screen
-> does not match, please report it.
+> The prompts below were checked on Windows 10 and Windows 11
+> ([T-1204](../tests/manual/T-1204-bypass-docs-accuracy.md)). If a screen does
+> not match, please report it.
 
 Clipmonger 0.1.0 runs on 64-bit Windows 10 and Windows 11. The release has two
 Windows downloads:

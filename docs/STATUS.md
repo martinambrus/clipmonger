@@ -28,8 +28,9 @@ implemented; Phase 7 packaging/QA and native acceptance remain open.
   and T-410 passed on 2026-11-04; T-409 leg 5 (CLI-opened popups) passed on 527ad07
   the same day. T-409 legs 11-17 remain open. Historical dated passes remain scoped to their old builds.
 - Windows-only 0.1.0 pre-release: artifacts (NSIS setup, portable ZIP,
-  SHA256SUMS) are built from the branch head that carries
+  SHA256SUMS) are built from 5a5f4e1, see
   [the release notes](release-notes-0.1.0.md); Linux artifacts are not published.
+  T-1204 (install guide on Windows 10 and Windows 11) passed on 2026-11-05.
 - Resolved 2026-11-04: dropped clipboard pastes into elevated windows were
   the daemon's capture reading its own paste write while the target handled
   Ctrl+V; fixed and verified on the Windows 10 VM, see

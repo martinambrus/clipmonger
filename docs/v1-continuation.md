@@ -131,8 +131,9 @@ colours, full-width rows with tooltips). The user's guided Windows retest of
 the batch passed on 2026-11-04.
 
 Next: the Windows-only 0.1.0 pre-release ([notes](release-notes-0.1.0.md)) is
-built from the branch head that carries this update. Then T-409 legs 11-17, the
-Windows 11 leg of T-1204 and the remaining tasks in the table above.
+built from 5a5f4e1. T-1204 (install guide on Windows 10 and Windows 11) passed,
+user-verified on 2026-11-05. Then T-409 legs 11-17 and the remaining tasks in
+the table above.
 
 The PC may reboot before testing resumes. Treat all prior PIDs, running apps,
 WSL sessions and temporary directories as historical. Recheck Git status and

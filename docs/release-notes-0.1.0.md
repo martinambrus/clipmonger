@@ -70,8 +70,9 @@ entry.
 ## Not yet verified
 
 Checked by hand on Windows: capture and paste, the popup, Settings, the UAC
-helper (T-409 legs 1-10) and autostart after reboot (T-410). Still open:
+helper (T-409 legs 1-10), autostart after reboot (T-410) and the install
+guide on Windows 10 and Windows 11 (T-1204). Still open:
 T-409 legs 11-17, installer recovery paths, DPI and monitor changes, the
-keyboard-only pass and the full window matrix (T-905 to T-908), the install
-guide on a clean Windows 11 (T-1204), the 24-hour soak, fuzzing and coverage
+keyboard-only pass and the full window matrix (T-905 to T-908), the 24-hour
+soak, fuzzing and coverage
 calibration. See [STATUS](STATUS.md).
