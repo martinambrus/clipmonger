@@ -800,6 +800,12 @@ impl CapsAggregator {
         }
     }
 
+    /// The GNOME extension link state.
+    #[must_use]
+    pub fn extension_connected(&self) -> bool {
+        self.extension_connected.lock().is_ok_and(|flag| *flag)
+    }
+
     /// Aggregate snapshot as JSON (levels as lowercase strings).
     ///
     /// With live backends the top-level keys keep their existing shape with
@@ -2279,6 +2285,13 @@ impl DaemonState {
     /// Flip the GNOME extension link state in caps.
     pub fn set_extension_connected(&self, connected: bool) {
         self.caps.set_extension_connected(connected);
+        self.notify_caps_changed();
+    }
+
+    /// Whether the GNOME extension is connected (it owns the GNOME chord).
+    #[must_use]
+    pub fn extension_connected(&self) -> bool {
+        self.caps.extension_connected()
     }
 
     /// The configured popup chord, read live so a `config.set` applies

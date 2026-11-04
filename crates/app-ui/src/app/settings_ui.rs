@@ -518,9 +518,9 @@ pub fn render_config_viewport(
                             ui.colored_label(ui.visuals().error_fg_color, error);
                         }
                         if key == "popup.hotkey"
-                            && config.hotkey_apply == config_model::HotkeyApply::OnRestart
+                            && config.hotkey_apply == config_model::HotkeyApply::DesktopConfirms
                         {
-                            ui.label(strings::text("config.applies_on_restart"));
+                            ui.label(strings::text("config.desktop_confirms_hotkey"));
                         }
                     }
                 });

@@ -628,25 +628,28 @@ pub enum HotkeyApply {
     /// The daemon (Windows, X11) or the GNOME extension rebinds at once.
     #[default]
     Live,
-    /// The Wayland `GlobalShortcuts` portal binds once per daemon run.
-    OnRestart,
+    /// The Wayland `GlobalShortcuts` portal rebinds live, and the desktop
+    /// asks the user to confirm the new shortcut.
+    DesktopConfirms,
 }
 
 /// When a `popup.hotkey` change applies, from a `caps.get` reply:
-/// [`HotkeyApply::OnRestart`] only while the portal owns the chord (a
-/// Wayland backend without the GNOME extension).
+/// [`HotkeyApply::DesktopConfirms`] only while the portal owns the chord (a
+/// live Wayland portal hotkey without the GNOME extension).
 #[must_use]
 pub fn hotkey_apply(caps: &Value) -> HotkeyApply {
+    // The portal holds the chord only when the Wayland hotkey is live: a
+    // desktop without the portal (GNOME before 48) reports it degraded.
     let wayland = caps
-        .get("backends")
-        .and_then(|backends| backends.get("wayland"))
-        .is_some();
+        .pointer("/backends/wayland/hotkey/level")
+        .and_then(Value::as_str)
+        == Some("full");
     let extension = caps
         .get("extension_connected")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if wayland && !extension {
-        HotkeyApply::OnRestart
+        HotkeyApply::DesktopConfirms
     } else {
         HotkeyApply::Live
     }
@@ -658,13 +661,20 @@ mod hotkey_note_tests {
     fn hotkey_restart_note_only_for_the_wayland_portal() {
         use super::{hotkey_apply, HotkeyApply};
         use serde_json::json;
-        let needs = |caps: &serde_json::Value| hotkey_apply(caps) == HotkeyApply::OnRestart;
-        let portal = json!({"backends": {"wayland": {}, "x11": {}}, "extension_connected": false});
-        let gnome = json!({"backends": {"wayland": {}, "x11": {}}, "extension_connected": true});
+        let needs = |caps: &serde_json::Value| hotkey_apply(caps) == HotkeyApply::DesktopConfirms;
+        let live = json!({"hotkey": {"level": "full"}});
+        let portal =
+            json!({"backends": {"wayland": live, "x11": {}}, "extension_connected": false});
+        let gnome = json!({"backends": {"wayland": live, "x11": {}}, "extension_connected": true});
+        let no_portal = json!({"backends": {"wayland": {"hotkey": {"level": "degraded"}}}, "extension_connected": false});
         let x11 = json!({"backends": {"x11": {}}, "extension_connected": false});
         let windows = json!({"backends": {"windows": {}}, "extension_connected": false});
         assert!(needs(&portal));
         assert!(!needs(&gnome));
+        assert!(
+            !needs(&no_portal),
+            "GNOME 46 has no portal: nothing confirms"
+        );
         assert!(!needs(&x11));
         assert!(!needs(&windows));
         assert!(!needs(&json!({})), "unknown caps: no note");

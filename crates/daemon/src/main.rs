@@ -699,11 +699,7 @@ fn setup_wayland_backend(
 
     // Portal session owns the popup hotkey (first bind may show a system
     // dialog; `status.portal_bind_pending` forewarns the UI per W-F4).
-    clipmonger_daemon::portal::spawn_portal_session(
-        Arc::clone(state),
-        config.popup.hotkey.clone(),
-        capture_primary,
-    );
+    clipmonger_daemon::portal::spawn_portal_session(Arc::clone(state), capture_primary);
 }
 
 /// Start the session backends selected by `want_backends` (X11 and/or

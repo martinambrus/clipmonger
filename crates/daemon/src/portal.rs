@@ -8,15 +8,19 @@
 
 use std::sync::Arc;
 
-/// Spawn the portal session thread for `chord` (fire-and-forget).
+/// Spawn the portal session thread (fire-and-forget).
 ///
-/// The thread attempts `CreateSession` + `BindShortcuts` on the first run
+/// The thread binds `popup.hotkey` through `CreateSession` + `BindShortcuts`
 /// (the portal may show a system dialog; the UI forewarns from the
-/// `portal_bind_pending` status field). Success and failure update only
-/// the portal hotkey capability and its owned notes. `Activated` fires
-/// trigger the popup like the X11/Windows hotkey threads.
+/// `portal_bind_pending` status field) and follows a changed chord live: it
+/// closes the session and binds the new chord, so the desktop asks again.
+/// A refused bind is not retried until the chord changes. While the GNOME
+/// extension is connected it owns the chord and the portal binds nothing
+/// (GNOME 48+ offers both). Success and failure update only the portal
+/// hotkey capability and its owned notes. `Activated` fires trigger the
+/// popup like the X11/Windows hotkey threads.
 #[cfg(all(unix, feature = "backend-wayland"))]
-pub fn spawn_portal_session(state: Arc<crate::DaemonState>, chord: String, _capture_primary: bool) {
+pub fn spawn_portal_session(state: Arc<crate::DaemonState>, _capture_primary: bool) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -28,15 +32,75 @@ pub fn spawn_portal_session(state: Arc<crate::DaemonState>, chord: String, _capt
                 return;
             }
         };
-        runtime.block_on(run_session(state, chord));
+        runtime.block_on(run_session(state));
     });
 }
 
-#[cfg(all(unix, feature = "backend-wayland"))]
-async fn run_session(state: Arc<crate::DaemonState>, chord: String) {
-    use clipmonger_backend_wayland::portal::{bind_requested, parse_activated};
+/// What the portal thread does next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PortalStep {
+    /// Nothing to change.
+    Idle,
+    /// Close any session and bind this chord in a new one.
+    Bind(String),
+    /// Close the session: the GNOME extension owns the chord.
+    Release,
+}
 
-    let shortcuts = match ashpd::desktop::global_shortcuts::GlobalShortcuts::new().await {
+/// Plan the next portal step. `extension` holds off the portal while the
+/// GNOME extension is connected or may still connect (start-up and
+/// reconnect grace); `bound` is the chord of the live session; `refused`
+/// is the last chord the portal refused, not retried until it changes.
+fn portal_step(
+    wanted: &str,
+    extension: bool,
+    bound: Option<&str>,
+    refused: Option<&str>,
+) -> PortalStep {
+    if extension {
+        return if bound.is_some() {
+            PortalStep::Release
+        } else {
+            PortalStep::Idle
+        };
+    }
+    if wanted.is_empty() || bound == Some(wanted) || refused == Some(wanted) {
+        return PortalStep::Idle;
+    }
+    PortalStep::Bind(wanted.to_string())
+}
+
+/// How long the portal waits for the GNOME extension on a GNOME desktop:
+/// at daemon start, and after the extension went away (it reconnects with
+/// backoff), so a short gap shows no portal dialog.
+const EXTENSION_START_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+const EXTENSION_GONE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often the thread re-reads the chord and the extension link.
+const PORTAL_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether the portal should hold off for the extension: connected now, or
+/// on a GNOME desktop within the grace since start or since last seen.
+fn extension_holds(
+    connected: bool,
+    gnome: bool,
+    since_start: std::time::Duration,
+    since_seen: Option<std::time::Duration>,
+) -> bool {
+    connected
+        || (gnome
+            && match since_seen {
+                Some(gone) => gone < EXTENSION_GONE_GRACE,
+                None => since_start < EXTENSION_START_GRACE,
+            })
+}
+
+#[cfg(all(unix, feature = "backend-wayland"))]
+async fn run_session(state: Arc<crate::DaemonState>) {
+    use ashpd::desktop::global_shortcuts::GlobalShortcuts;
+    use clipmonger_backend_wayland::portal::parse_activated;
+    use std::time::Instant;
+
+    let shortcuts = match GlobalShortcuts::new().await {
         Ok(shortcuts) => shortcuts,
         Err(e) => {
             note_failed(
@@ -46,60 +110,118 @@ async fn run_session(state: Arc<crate::DaemonState>, chord: String) {
             return;
         }
     };
+    let Ok(mut activated) = shortcuts.receive_activated().await else {
+        note_failed(&state, "portal activation signal unavailable");
+        return;
+    };
+    let gnome = std::env::var("XDG_CURRENT_DESKTOP")
+        .is_ok_and(|desktop| desktop.split(':').any(|d| d.eq_ignore_ascii_case("gnome")));
+    let started = Instant::now();
+    let mut extension_seen: Option<Instant> = None;
+    let mut session = None;
+    let mut bound: Option<String> = None;
+    let mut refused: Option<String> = None;
+    loop {
+        let connected = state.extension_connected();
+        if connected {
+            extension_seen = Some(Instant::now());
+        }
+        let holds = extension_holds(
+            connected,
+            gnome,
+            started.elapsed(),
+            extension_seen.map(|seen| seen.elapsed()),
+        );
+        let wanted = state.popup_hotkey();
+        match portal_step(&wanted, holds, bound.as_deref(), refused.as_deref()) {
+            PortalStep::Idle => {}
+            PortalStep::Release => {
+                if let Some(old) = session.take() {
+                    let _ = ashpd::desktop::Session::close(&old).await;
+                }
+                bound = None;
+                note_extension(&state);
+            }
+            PortalStep::Bind(chord) => {
+                if let Some(old) = session.take() {
+                    let _ = ashpd::desktop::Session::close(&old).await;
+                }
+                bound = None;
+                if let Some(new) = bind_chord(&shortcuts, &state, &chord).await {
+                    refused = None;
+                    bound = Some(chord);
+                    session = Some(new);
+                } else {
+                    refused = Some(chord);
+                }
+            }
+        }
+        tokio::select! {
+            signal = futures_util::StreamExt::next(&mut activated) => {
+                let Some(signal) = signal else {
+                    note_failed(&state, "portal activation signal ended");
+                    return;
+                };
+                let payload = serde_json::json!({"shortcut_id": signal.shortcut_id()});
+                if bound.is_some() && parse_activated(&payload).is_some() {
+                    let activation_token = shortcut_activation_token(signal.options());
+                    state.trigger_popup_activation(clipmonger_platform::types::HotkeyActivation {
+                        x11_time: None,
+                        activation_token,
+                    });
+                }
+            }
+            () = tokio::time::sleep(PORTAL_POLL) => {}
+        }
+    }
+}
+
+/// Bind `chord` in a new portal session (the desktop may ask the user).
+/// Publishes the portal hotkey result; `None` when the session or the bind
+/// failed (the session is closed again).
+#[cfg(all(unix, feature = "backend-wayland"))]
+async fn bind_chord(
+    shortcuts: &ashpd::desktop::global_shortcuts::GlobalShortcuts,
+    state: &crate::DaemonState,
+    chord: &str,
+) -> Option<ashpd::desktop::Session<ashpd::desktop::global_shortcuts::GlobalShortcuts>> {
+    use ashpd::desktop::global_shortcuts::{BindShortcutsOptions, NewShortcut};
+    use clipmonger_backend_wayland::portal::bind_requested;
+
     // ashpd's CreateSessionOptions type is private; Default is the only spelling.
     #[allow(clippy::default_trait_access)]
     let session = match shortcuts.create_session(Default::default()).await {
         Ok(session) => session,
         Err(e) => {
             note_failed(
-                &state,
+                state,
                 &format!("portal session failed, use compositor-native recipes: {e}"),
             );
-            return;
+            return None;
         }
     };
-    let plan = bind_requested(&[chord]);
-    let mut bound_shortcuts = Vec::new();
-    for request in &plan {
-        bound_shortcuts.push(
-            ashpd::desktop::global_shortcuts::NewShortcut::new(
-                request.id.clone(),
-                "Clipmonger popup",
-            )
-            .preferred_trigger(Some(request.trigger.as_str())),
-        );
-    }
+    let requests: Vec<NewShortcut> = bind_requested(&[chord.to_string()])
+        .iter()
+        .map(|request| {
+            NewShortcut::new(request.id.clone(), "Clipmonger popup")
+                .preferred_trigger(Some(request.trigger.as_str()))
+        })
+        .collect();
     state.set_portal_bind_pending(true);
-    let bind_outcome = shortcuts
-        .bind_shortcuts(
-            &session,
-            &bound_shortcuts,
-            None,
-            ashpd::desktop::global_shortcuts::BindShortcutsOptions::default(),
-        )
+    let outcome = shortcuts
+        .bind_shortcuts(&session, &requests, None, BindShortcutsOptions::default())
         .await;
     state.set_portal_bind_pending(false);
-    if let Err(e) = bind_outcome {
+    if let Err(e) = outcome {
+        let _ = ashpd::desktop::Session::close(&session).await;
         note_failed(
-            &state,
+            state,
             &format!("portal bind failed, use compositor-native recipes: {e}"),
         );
-        return;
+        return None;
     }
-    note_bound(&state);
-    let Ok(mut activated) = shortcuts.receive_activated().await else {
-        return;
-    };
-    while let Some(signal) = futures_util::StreamExt::next(&mut activated).await {
-        let payload = serde_json::json!({"shortcut_id": signal.shortcut_id()});
-        if parse_activated(&payload).is_some() {
-            let activation_token = shortcut_activation_token(signal.options());
-            state.trigger_popup_activation(clipmonger_platform::types::HotkeyActivation {
-                x11_time: None,
-                activation_token,
-            });
-        }
-    }
+    note_bound(state);
+    Some(session)
 }
 
 #[cfg(all(unix, feature = "backend-wayland"))]
@@ -113,6 +235,9 @@ fn shortcut_activation_token(
         .map(str::to_owned)
 }
 
+const PORTAL_LIVE: &str = "hotkey via GlobalShortcuts portal";
+const PORTAL_RELEASED: &str = "hotkey via GNOME extension (portal holds no binding)";
+
 /// Publish only the portal-owned hotkey result, retaining capture and policy.
 fn note_bound(state: &crate::DaemonState) {
     publish_hotkey(state, None);
@@ -122,13 +247,25 @@ fn note_failed(state: &crate::DaemonState, note: &str) {
     publish_hotkey(state, Some(note));
 }
 
+/// The GNOME extension owns the chord; the portal holds no binding.
+fn note_extension(state: &crate::DaemonState) {
+    publish_hotkey(state, None);
+    state.caps.update_backend("wayland", |caps| {
+        caps.notes.retain(|note| note != PORTAL_LIVE);
+        caps.notes.push(PORTAL_RELEASED.to_string());
+    });
+}
+
 fn publish_hotkey(state: &crate::DaemonState, failure: Option<&str>) {
     use clipmonger_platform::types::Level;
     const UNAVAILABLE: &str = "hotkey Unavailable: use compositor-native recipes";
-    const LIVE: &str = "hotkey via GlobalShortcuts portal";
+    const LIVE: &str = PORTAL_LIVE;
     state.caps.update_backend("wayland", |caps| {
         caps.notes.retain(|note| {
-            note != UNAVAILABLE && note != LIVE && !note.starts_with("hotkey Degraded: portal ")
+            note != UNAVAILABLE
+                && note != LIVE
+                && note != PORTAL_RELEASED
+                && !note.starts_with("hotkey Degraded: portal ")
         });
         if let Some(note) = failure {
             caps.hotkey = Level::Degraded;
@@ -142,6 +279,75 @@ fn publish_hotkey(state: &crate::DaemonState, failure: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn portal_step_binds_follows_changes_and_yields_to_the_extension() {
+        use super::{portal_step, PortalStep};
+        let bind = |chord: &str| PortalStep::Bind(chord.to_string());
+        assert_eq!(
+            portal_step("ctrl+alt+h", false, None, None),
+            bind("ctrl+alt+h")
+        );
+        assert_eq!(
+            portal_step("ctrl+alt+h", false, Some("ctrl+alt+h"), None),
+            PortalStep::Idle,
+            "bound: nothing to do"
+        );
+        assert_eq!(
+            portal_step("ctrl+alt+j", false, Some("ctrl+alt+h"), None),
+            bind("ctrl+alt+j"),
+            "a changed chord rebinds live"
+        );
+        assert_eq!(
+            portal_step("ctrl+alt+j", false, None, Some("ctrl+alt+j")),
+            PortalStep::Idle,
+            "a refused chord waits for a change: no dialog loop"
+        );
+        assert_eq!(
+            portal_step("ctrl+alt+k", false, None, Some("ctrl+alt+j")),
+            bind("ctrl+alt+k")
+        );
+        assert_eq!(
+            portal_step("ctrl+alt+h", true, Some("ctrl+alt+h"), None),
+            PortalStep::Release,
+            "the extension takes over a bound chord"
+        );
+        assert_eq!(
+            portal_step("ctrl+alt+h", true, None, None),
+            PortalStep::Idle
+        );
+        assert_eq!(portal_step("", false, None, None), PortalStep::Idle);
+    }
+
+    #[test]
+    fn extension_holds_off_the_portal_on_gnome_within_its_grace() {
+        use super::{extension_holds, EXTENSION_GONE_GRACE, EXTENSION_START_GRACE};
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        assert!(
+            extension_holds(true, false, s(100), None),
+            "connected anywhere"
+        );
+        assert!(
+            extension_holds(false, true, s(1), None),
+            "GNOME start grace"
+        );
+        assert!(!extension_holds(false, true, EXTENSION_START_GRACE, None));
+        assert!(
+            extension_holds(false, true, s(100), Some(s(5))),
+            "short reconnect gap"
+        );
+        assert!(!extension_holds(
+            false,
+            true,
+            s(100),
+            Some(EXTENSION_GONE_GRACE)
+        ));
+        assert!(
+            !extension_holds(false, false, s(0), None),
+            "KDE binds at once"
+        );
+    }
+
     #[cfg(all(unix, feature = "backend-wayland"))]
     #[test]
     fn activated_signal_options_preserve_only_valid_tokens() {

@@ -125,9 +125,10 @@ Need a Linux machine with an X11 session (Xvfb for the automated leg).
    working; after the holder let go the daemon took k within 5 s and
    caps returned to `full`. With the extension enabled too, one press
    opens the popup once. A chord that duplicates a Mutter shortcut
-   (`super+a`) is not refused on X11 either: both fire. Settings shows
-   "Applies on restart" only while the Wayland portal owns the chord (a
-   Wayland backend without the extension, `config_model::hotkey_apply`).
+   (`super+a`) is not refused on X11 either: both fire. Settings notes
+   that the desktop asks to confirm a new shortcut only while the Wayland
+   portal owns the chord (a Wayland backend without the extension,
+   `config_model::hotkey_apply`).
    - `crates/backend-x11/src/hotkeys.rs` `X11Hotkeys::register` ungrabs
      the old chord first. Grab the new chord first; the same keycode and
      modifier mask is a no-op (an ungrab after the new grab would drop
@@ -151,6 +152,16 @@ Need a Linux machine with an X11 session (Xvfb for the automated leg).
 2. Wayland portal: the chord is bound once per daemon run
    (`crates/daemon/src/portal.rs`); a rebind may show the portal dialog
    again, so decide the UX before making it live.
+   Decided 2026-11-05 (option B): the portal thread follows `popup.hotkey`
+   live. On a change it closes the session and binds the new chord in a
+   new one, so the desktop asks to confirm it; a refused or cancelled bind
+   is not retried until the chord changes (no dialog loop). While the
+   GNOME extension is connected the portal binds nothing and releases a
+   bound chord, so on GNOME 48+ (portal and extension) the old chord no
+   longer fires after a change; on a GNOME desktop the portal waits 10 s
+   at start and 30 s after the extension went away before binding.
+   Unverified: needs a KDE Plasma 6 or GNOME 48+ session (VM): rebind
+   dialog per desktop, the GNOME release, and the start grace.
 3. GNOME extension: its keybindings follow a changed chord only once the
    daemon pushes `config.changed` (seg-07 §3). Status 2026-11-04: the
    daemon publishes `config.changed` (non-exclusive topic) on every config
