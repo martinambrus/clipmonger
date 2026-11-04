@@ -147,6 +147,8 @@ reason (per-OS reserved lists = VERIFY at implementation).
 
 egui Visuals provides dark/light themes and font scaling. Platform follow-OS
 detection is an application responsibility and requires native verification.
+Error text uses a light red on dark and a dark red on light visuals (at
+least 4.5:1 against the panel; egui's pure red is below that on both).
 Bundled and system font notices must accompany releases. Accent color and
 high-contrast expansion retain their planned scope.
 

@@ -64,6 +64,9 @@ reserved for the release that passes all seg-11 §5 gates.
 
 ### Fixed
 
+- Error text in the popup and in Settings is readable: a lighter red on
+  dark and a darker red on light themes replace pure red, and the popup
+  error is plain text without a tinted box.
 - Windows clipboard pastes no longer randomly insert nothing: the capture
   monitor leaves the clipboard alone briefly after the daemon's own paste
   write, so the target's Ctrl+V can read it.

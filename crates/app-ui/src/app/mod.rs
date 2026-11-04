@@ -32,6 +32,12 @@ pub const DRAIN_CAP: usize = 32;
 /// How long "pause for one hour" pauses.
 pub const PAUSE_PERIOD: Duration = Duration::from_secs(3600);
 
+/// Error text colours. egui's pure red (255, 0, 0) has too little luminance
+/// for thin text: under 4.5:1 against both panel fills, and blurred by
+/// subpixel and remote-desktop colour rendering. These keep at least 6:1.
+pub const ERROR_ON_DARK: egui::Color32 = egui::Color32::from_rgb(255, 120, 120);
+pub const ERROR_ON_LIGHT: egui::Color32 = egui::Color32::from_rgb(190, 0, 0);
+
 /// Unix milliseconds now (the pick time of a paste).
 #[must_use]
 pub fn now_ms() -> i64 {
@@ -913,7 +919,8 @@ impl PopupApp {
     }
 
     /// Apply the Settings state's theme to `ctx` when it differs from what was
-    /// applied to that kind of window: dark or light visuals and
+    /// applied to that kind of window: dark or light visuals (with the
+    /// readable error colour) and
     /// `ctx.set_zoom_factor(font_scale)` (so the OS scale still counts). Compare
     /// the scale by `f32::to_bits`.
     fn apply_theme(&mut self, ctx: &egui::Context, kind: WindowKind) {
@@ -935,11 +942,13 @@ impl PopupApp {
         } else {
             egui::Theme::Light
         });
-        ctx.set_visuals(if dark {
+        let mut visuals = if dark {
             egui::Visuals::dark()
         } else {
             egui::Visuals::light()
-        });
+        };
+        visuals.error_fg_color = if dark { ERROR_ON_DARK } else { ERROR_ON_LIGHT };
+        ctx.set_visuals(visuals);
         ctx.set_zoom_factor(scale);
     }
 

@@ -2467,6 +2467,45 @@ fn fix_x2_hidden_theme_wins_over_the_visible_system_theme() {
     }
 }
 
+/// WCAG contrast ratio of two opaque colours.
+fn contrast(a: egui::Color32, b: egui::Color32) -> f32 {
+    fn luminance(c: egui::Color32) -> f32 {
+        let lin = |v: u8| {
+            let v = f32::from(v) / 255.0;
+            if v <= 0.040_45 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+    }
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+// Error text (popup footer, Settings field errors) must stay readable: at
+// least 4.5:1 against the panel in both themes and both windows.
+#[test]
+fn rule_error_colour_contrasts_with_the_panel_in_both_themes() {
+    for mode in ["dark", "light"] {
+        let mut rig = Rig::opened();
+        rig.push(config_reply(&json!({"ui": {"theme": {"mode": mode}}})));
+        rig.tick();
+        for kind in [WindowKind::Popup, WindowKind::Settings] {
+            rig.pass(kind, true);
+            let visuals = rig.win_mut(kind).ctx.global_style().visuals.clone();
+            let ratio = contrast(visuals.error_fg_color, visuals.panel_fill);
+            assert!(
+                ratio >= 4.5,
+                "{kind:?} {mode}: error {:?} on panel {:?} has contrast {ratio}",
+                visuals.error_fg_color,
+                visuals.panel_fill
+            );
+        }
+    }
+}
+
 fn assert_zoom(ctx: &egui::Context, expected: f32, what: &str) {
     let zoom = ctx.zoom_factor();
     assert!(
@@ -4349,6 +4388,38 @@ fn l1_settings_short_160() {
     settings_layout_controls(1.6, 400.0);
 }
 
+/// No filled rect other than the panel lies under `rect` (text drawn without
+/// a tinted box).
+fn assert_plain_on_panel(
+    shapes: &[egui::epaint::ClippedShape],
+    rect: egui::Rect,
+    panel_fill: egui::Color32,
+) {
+    fn filled_rects(shape: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
+        match shape {
+            egui::Shape::Rect(rect) if rect.fill != egui::Color32::TRANSPARENT => {
+                out.push((rect.rect, rect.fill));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    filled_rects(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut fills = Vec::new();
+    for clipped in shapes {
+        filled_rects(&clipped.shape, &mut fills);
+    }
+    assert!(
+        fills
+            .iter()
+            .all(|(fill_rect, fill)| *fill == panel_fill || !fill_rect.intersects(rect)),
+        "{rect:?} must be plain text on the panel: {fills:?}"
+    );
+}
+
 #[test]
 fn fix_n3_long_history_keeps_error_and_settings_painted_inside_window() {
     type Painted = (String, egui::Rect, egui::Rect, Option<egui::Color32>);
@@ -4408,6 +4479,13 @@ fn fix_n3_long_history_keeps_error_and_settings_painted_inside_window() {
                 "{expected:?} must be painted inside the window and its clip: {texts:?}"
             );
         }
+        let error_rect = texts
+            .iter()
+            .find(|(text, ..)| text == "paste failed with a long history")
+            .map(|(_, rect, ..)| *rect)
+            .expect("error text painted");
+        let panel_fill = rig.popup.ctx.global_style().visuals.panel_fill;
+        assert_plain_on_panel(&output.shapes, error_rect, panel_fill);
         let error_fg = rig.popup.ctx.global_style().visuals.error_fg_color;
         assert!(
             texts.iter().any(|(text, _, _, color)| {

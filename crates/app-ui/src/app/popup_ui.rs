@@ -250,16 +250,7 @@ impl PopupApp {
     /// Paint the footer and report whether Settings was activated.
     fn render_footer(&self, ui: &mut egui::Ui) -> bool {
         if let Some(error) = self.shell.error() {
-            let color = ui.visuals().error_fg_color;
-            egui::Frame::new()
-                .fill(color.gamma_multiply(0.15))
-                .stroke(egui::Stroke::new(1.0, color))
-                .corner_radius(4.0)
-                .inner_margin(6.0)
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(egui::RichText::new(error).color(color).strong());
-                });
+            ui.colored_label(ui.visuals().error_fg_color, error);
         }
         if !self.vm.banner().is_empty() {
             ui.label(self.vm.banner());
