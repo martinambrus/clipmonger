@@ -29,6 +29,10 @@ reserved for the release that passes all seg-11 §5 gates.
 
 ### Changed
 
+- Popup list: the separate "Current item" block is gone (the newest row is
+  the current clip), "First page" is disabled on the first page, "End of
+  history" follows the last row, and text rows no longer get an empty
+  thumbnail box.
 - Windows admin-window paste (ADR-003): the app asks once when an
   elevated window is first focused. Program Files installs then use one
   UAC prompt to register a logon task that starts the elevated helper

@@ -2,7 +2,6 @@
 
 const ENTRIES: &[(&str, &str)] = &[
     ("popup.search_hint", "Type to filter"),
-    ("popup.current", "Current item"),
     ("popup.empty", "Nothing here yet"),
     ("popup.loading", "Loading history…"),
     ("popup.history_error", "History is unavailable. Refresh to try again."),
@@ -151,7 +150,6 @@ const ENTRIES: &[(&str, &str)] = &[
 /// Every view string id shipped in v1.
 pub const IDS: &[&str] = &[
     "popup.search_hint",
-    "popup.current",
     "popup.empty",
     "popup.loading",
     "popup.history_error",

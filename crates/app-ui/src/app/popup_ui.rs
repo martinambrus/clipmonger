@@ -372,16 +372,6 @@ impl PopupApp {
                 field.request_focus();
             }
             search_focused = field.has_focus();
-            if let Some(current) = self.vm.current().cloned() {
-                ui.label(strings::text("popup.current"));
-                ui.horizontal(|ui| {
-                    self.thumbnail_slot(ui, &current, &mut thumbnail_demand);
-                    ui.vertical(|ui| {
-                        ui.label(strings::text(popup::preview_kind(&current)));
-                        ui.label(popup::display_preview(&current.preview, self.preview_width));
-                    });
-                });
-            }
             let group_names = self
                 .config
                 .lock()
@@ -471,11 +461,14 @@ impl PopupApp {
                 } else if count == 0 {
                     ui.label(strings::text("popup.empty"));
                 }
-                if self.compact.done && count > 0 {
-                    ui.label(strings::text("popup.history_end"));
-                }
+                let history_end = self.compact.done && count > 0;
                 ui.horizontal(|ui| {
-                    first_page = ui.button(strings::text("popup.first_page")).clicked();
+                    first_page = ui
+                        .add_enabled(
+                            !self.compact.on_first_page(),
+                            egui::Button::new(strings::text("popup.first_page")),
+                        )
+                        .clicked();
                     next_page = ui
                         .add_enabled(
                             !self.compact.loading && !self.compact.done && !self.compact.error,
@@ -529,9 +522,17 @@ impl PopupApp {
                                     .sense(egui::Sense::click()),
                                 |ui| {
                                     if let Some(row) = &compact {
-                                        self.compact_thumbnail_slot(ui, row, &mut thumbnail_demand);
+                                        if row.kind == clipmonger_core::store::CompactKind::Image {
+                                            self.compact_thumbnail_slot(
+                                                ui,
+                                                row,
+                                                &mut thumbnail_demand,
+                                            );
+                                        }
                                     } else if let Some(clip) = &legacy {
-                                        self.thumbnail_slot(ui, clip, &mut thumbnail_demand);
+                                        if popup::preview_kind(clip) == "popup.kind_image" {
+                                            self.thumbnail_slot(ui, clip, &mut thumbnail_demand);
+                                        }
                                     }
                                     ui.selectable_label(selected, &truncated)
                                 },
@@ -568,6 +569,9 @@ impl PopupApp {
                                 }
                                 let _ = clip_id;
                             });
+                        }
+                        if history_end {
+                            ui.weak(strings::text("popup.history_end"));
                         }
                     });
                 #[cfg(test)]

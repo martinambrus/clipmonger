@@ -88,6 +88,9 @@ impl Compact {
     pub fn accepts(&self, tag: &CompactRequest) -> bool {
         self.pending.as_ref() == Some(tag) && self.matches(tag)
     }
+    pub fn on_first_page(&self) -> bool {
+        self.page == 0
+    }
     pub fn next_page(&mut self) {
         if !self.loading && !self.done && self.cursor.is_some() {
             if let Some(page) = self.page.checked_add(1) {

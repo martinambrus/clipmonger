@@ -352,7 +352,7 @@ mod tests {
         pixels[p.y as usize * 480 + p.x as usize]
     }
     #[test]
-    fn real_popup_renders_delayed_worker_pixels_in_current_and_row() {
+    fn real_popup_renders_delayed_worker_pixels_in_row() {
         for hash_len in [16, 64] {
             render_delayed_worker_pixels(hash_len);
         }
@@ -480,9 +480,8 @@ mod tests {
             .filter(|(clip, _)| *clip == red.id)
             .map(|(_, rect)| *rect)
             .collect();
-        assert_eq!(red_rects.len(), 2);
+        assert_eq!(red_rects.len(), 1);
         assert_ne!(center(&first, red_rects[0]), 0xffff_0000);
-        assert_ne!(center(&first, red_rects[1]), 0xffff_0000);
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         release.0.take().unwrap().send(()).unwrap();
         wake_rx
@@ -495,11 +494,12 @@ mod tests {
             .filter(|(clip, _)| *clip == red.id)
             .map(|(_, rect)| *rect)
             .collect();
-        assert_eq!(red_rects.len(), 2);
+        assert_eq!(red_rects.len(), 1);
         assert_eq!(center(&second, red_rects[0]), 0xffff_0000);
-        assert_eq!(center(&second, red_rects[1]), 0xffff_0000);
-        let text_rect = slots.iter().find(|(clip, _)| *clip == text.id).unwrap().1;
-        assert_ne!(center(&second, text_rect), 0xffff_0000);
+        assert!(
+            !slots.iter().any(|(clip, _)| *clip == text.id),
+            "text rows get no thumbnail slot"
+        );
         dedup_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("dedup observation");

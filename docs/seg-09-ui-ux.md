@@ -45,7 +45,8 @@ subject to T-905 through T-908; compilation is not manual acceptance.
 ## 2. Popup (F-201–208)
 
 Layout top→bottom: search field (F-204, focused by default, live filter)
-→ "Current Clipboard" item → permanent-group tabs (F-301) → clip list
+→ permanent-group tabs (F-301) → clip list (no separate "Current Clipboard"
+item since 2026-11-04; the newest row is the current clip)
 (newest first; F-205 previews: image thumbnails via `image`, file rows
 with icons (VERIFY icon source per OS), pinned shortcuts, headers) →
 status line (count, caps warnings, e.g. "monitoring paused").

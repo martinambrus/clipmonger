@@ -1593,6 +1593,8 @@ mod native_input_tests {
             .filter(|rect| rect.top() > search.bottom() && rect.height() <= 25.0)
             .collect::<Vec<_>>();
         rows.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        // A text row's clickable scope and its label share one rect.
+        rows.dedup();
         // The three distinct fixture labels have identical geometry and regular
         // vertical spacing. Tabs and pagination controls must not be mistaken
         // for a history row just because they are below the search box.

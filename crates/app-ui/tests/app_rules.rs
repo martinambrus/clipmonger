@@ -1873,9 +1873,31 @@ fn rule_paint_reopen_paints_the_rows_again() {
     rig.push(toggle());
     rig.show();
     rig.push(request());
-    let pass = rig.show();
+    rig.show();
     assert!(rig.is_open());
+    let commands = rig.cmds();
+    rig.answer_compact(&commands, &[clip(1, "alpha row")]);
+    let pass = rig.show();
     assert!(pass.painted("alpha row"), "painted: {:?}", pass.texts);
+}
+
+// The history list ends with "End of history", below the page buttons and the last row.
+#[test]
+fn compact_history_end_follows_the_last_row() {
+    let mut rig = Rig::raw(Setup::new(true));
+    let commands = rig.cmds();
+    rig.answer_compact(&commands, &[clip(1, "alpha row"), clip(2, "beta row")]);
+    let pass = rig.show();
+    let bound = |label: &str| {
+        pass.bounds
+            .iter()
+            .find(|(text, _, _)| text == label)
+            .unwrap_or_else(|| panic!("{label:?} not painted: {:?}", pass.texts))
+            .1
+    };
+    let end = bound(strings::text("popup.history_end"));
+    assert!(end.top() >= bound("beta row").bottom());
+    assert!(bound(strings::text("popup.first_page")).bottom() <= bound("alpha row").top());
 }
 
 // Settings: ui(Settings) paints the Settings body
@@ -4643,6 +4665,18 @@ fn history_row_context_menu_handles_text_and_thumbnail_clicks() {
     for thumbnail in [false, true] {
         for pin in [true, false] {
             let mut rig = active_list_rig(false, 3);
+            if thumbnail {
+                // Only image rows carry a thumbnail slot.
+                let images: Vec<Clip> = (1..=3)
+                    .map(|n| {
+                        let mut clip = clip(n, &format!("History row {n}"));
+                        clip.formats = vec!["image/png".to_string()];
+                        clip
+                    })
+                    .collect();
+                rig.load(&images);
+                rig.show();
+            }
             // Resolve the actual clickable text child before aiming at it.
             let child = popup_widget(&mut rig, "History row 2");
             let pass = rig.show();
@@ -5122,8 +5156,30 @@ fn compact_page_buttons_advance_and_restart_and_restore_drops_old_reply() {
         .unwrap();
     let row = |n, name| json!({"id":id(n),"pinned":false,"last_used_ms":1,"preview":name,"preview_truncated":false,"kind":"text","thumbnail_hash":null});
     rig.push(UiEvent::CompactHistory(first.clone(), Ok(json!({"owner":first.params.owner,"generation":first.params.generation,"rows":[row(1,"first")],"cursor":"token","done":false,"bytes_read":0,"candidates":1}))));
-    assert!(rig.show().painted("first"));
+    let pass = rig.show();
+    assert!(pass.painted("first"));
     let _ = rig.cmds();
+    let first_page = pass
+        .bounds
+        .iter()
+        .find(|(text, _, _)| text == strings::text("popup.first_page"))
+        .expect("First page painted")
+        .1;
+    for pressed in [true, false] {
+        rig.input(egui::Event::PointerButton {
+            pos: first_page.center(),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        rig.show();
+    }
+    assert!(
+        !rig.cmds()
+            .iter()
+            .any(|c| matches!(c, UiCmd::CompactHistory(_) | UiCmd::CancelCompactHistory(_))),
+        "First page is disabled on the first page"
+    );
     click_popup_widget(&mut rig, strings::text("popup.next_page"));
     let page = rig
         .cmds()

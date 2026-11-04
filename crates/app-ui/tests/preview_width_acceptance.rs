@@ -204,9 +204,9 @@ fn preview_history_truncates_at_5_20_80() {
     }
 }
 
-// CurrentClipboard preview truncates too
+// The current clipboard is no longer painted above the history list.
 #[test]
-fn preview_current_clipboard_truncates() {
+fn preview_current_clipboard_is_not_painted() {
     let mut rig = Rig::opened();
     let current = clip(2, &long_multibyte());
     let history_clip = clip(1, "history short");
@@ -217,8 +217,9 @@ fn preview_current_clipboard_truncates() {
         rig.config_width(width);
         let pass = rig.show();
         let expected = expected_truncate(&current.preview, width);
-        assert!(pass.painted(&expected), "width {width}: {:?}", pass.texts);
+        assert!(!pass.painted(&expected), "width {width}: {:?}", pass.texts);
         assert!(!pass.painted(&current.preview));
+        assert!(pass.painted(&expected_truncate("history short", width)));
         assert_eq!(rig.app.vm().current(), Some(&current));
         assert_stored_unchanged(&rig, &history_clip);
     }
@@ -238,8 +239,8 @@ fn preview_reload_updates_display() {
         let expected = expected_truncate(&original.preview, width);
         assert_eq!(
             pass.texts.iter().filter(|text| **text == expected).count(),
-            2,
-            "history and current must both reflect snapshot width {width}"
+            1,
+            "history must reflect snapshot width {width}"
         );
         assert!(!pass.painted(&original.preview));
         assert_stored_unchanged(&rig, &original);
@@ -293,8 +294,8 @@ fn preview_full_query_still_finds_original_and_activation_correct() {
                     .iter()
                     .filter(|text| **text == expected_truncate(&decoy.preview, width))
                     .count(),
-                1,
-                "the decoy remains only in Current Clipboard, never in filtered rows"
+                0,
+                "the decoy is never painted in filtered rows"
             );
             assert_eq!(rig.app.vm().current(), Some(&decoy_stored.0));
             assert_eq!(

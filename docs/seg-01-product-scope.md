@@ -37,7 +37,8 @@ segment carries a completion task — implementers MUST NOT invent it.
 - F-204 Search/filter popup items (ArsClip: find in popup). Milestone: v1.
 - F-205 Image/file previews in popup; "Current Clipboard" item; pinned
   items with shortcut keys; clip headers. Milestone: v1 previews + current
-  item; v2 pins/headers parity.
+  item; v2 pins/headers parity. The separate current item was dropped from
+  the popup on 2026-11-04: the newest history row already shows it.
 - F-206 Paste modes: paste as-is; "Paste Using > Mimic" (match surrounding
   formatting); "Paste And Select"; paste-into-field variants. Milestone:
   v2 (needs per-OS paste-simulation research, esp. Wayland — see open
