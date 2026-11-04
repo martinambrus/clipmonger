@@ -1,6 +1,6 @@
 # V1 continuation — acceptance candidate
 
-Updated 2026-11-03. Start here when continuing without the previous conversation.
+Updated 2026-11-04. Start here when continuing without the previous conversation.
 
 ## Scope and current state
 
@@ -17,14 +17,17 @@ alone as sufficient to publish.
 
 ## Source and artifacts
 
-- Delivered main before this documentation update: 0af3e0cfbe4038ca665bbdd96cddf59c2878bcaa.
-- Combined application source checkpoint: 9d1e15a7c1894b0f0cc6420ab93cb79bf36d1ffa on packaging-qa-20261103,
-  [draft PR #41](https://github.com/martinambrus/clipmonger/pull/41).
+- Delivered main before this documentation update: a8dc22c1737b6c7bb2ba9cab844171207c3a83d4.
+- Combined application source checkpoint: 3757fcf13e1162b66cae2fadc1ab707217a3fe9a on packaging-qa-20261103,
+  [draft PR #41](https://github.com/martinambrus/clipmonger/pull/41). Since 9d1e15a it adds 2dabd38
+  (Windows tray-opened popup takes keyboard focus) and 3757fcf (Alt-Tab destination documented as a
+  known limitation). These two commits are local until pushed.
 - It includes the helper-registration work from [draft PR #37](https://github.com/martinambrus/clipmonger/pull/37)
   and failed-paste work from [draft PR #39](https://github.com/martinambrus/clipmonger/pull/39).
   Those drafts are not separately delivered or native-accepted.
 - Windows test packet: C:\Temp\clipmonger-review-65b2b2a-9f0460cb. Use the files named in its SHA256SUMS
-  and the build-specific WINDOWS-TESTING.md. This is a local draft, not a release.
+  and the build-specific WINDOWS-TESTING.md. This is a local draft, not a release. Its packages
+  predate 2dabd38; the guided session runs unpackaged 2dabd38 binaries (see below).
 - The packet contains Windows and Linux portable ZIPs and an unsigned Windows
   NSIS setup. Portable ZIPs carry a portable marker and full license notices;
   Linux also carries the GNOME extension and compiled settings schema.
@@ -43,6 +46,10 @@ That correction passed independent review, synthetic package controls and actual
 regenerated Linux/bundle checks. Its exact-head automated review is clean; query
 live CI before delivery. CodeQL neutral or an in-progress Rust analysis is not
 an all-five-checks pass. The application PR remains draft.
+
+For 2dabd38 (UI crate only): formatting, strict Clippy for Linux and Windows GNU,
+and the clipmonger-app-ui tests (560 passed, 1 ignored) passed. The full workspace
+suite was not rerun; daemon and CLI sources are unchanged since 65b2b2a.
 
 The GNOME extension build and 34 tests passed on unchanged extension/dependency
 inputs; a later core-only search correction did not rerun that unchanged build.
@@ -80,7 +87,7 @@ A delivered source change does not close a native gate.
 
 | ID | Remaining acceptance |
 | --- | --- |
-| #19 | Coding still required for the observed Alt+Tab destination defect; then tray, focus, popup lifecycle and real display acceptance. |
+| #19 | Alt+Tab destination is a documented known limitation (3757fcf); tray focus fixed (2dabd38) and guided tray/focus/lifecycle checks passed. Remaining: DPI/monitor changes and physical-display acceptance. |
 | #22 | Installed autostart enable/disable, canonical executable path and logon/reboot; portable writes no Run value. |
 | #26 | Installer/uninstaller, default-preserving profile UI, recovery, interoperability, manual matrix and release record. |
 | #41 | Real X11/Wayland/GNOME: live hotkey changes, portal rebind, extension/push and activation behavior. |
@@ -95,19 +102,25 @@ A delivered source change does not close a native gate.
 
 ## Resume point and possible reboot
 
-Interactive testing stopped at the user's request for a fresh conversation.
-**The popup Alt+Tab destination is still failing.** On build 65b2b2a, chat A →
-Notepad B → Ctrl+Alt+H → one Alt+Tab returns to Notepad B. Without opening the
-popup, the same A → B → Alt+Tab sequence returns to chat A. The persistent
-TOOLWINDOW change passes its native style/repeated-show/Settings checks, but
-that does not prove the requested destination. Do not mark Step 10 complete.
+Alt+Tab from the focused popup lands on the most recent ordinary window (B), not
+the one before it (A). This is accepted as a known limitation: Windows reserves
+Alt+Tab (RegisterHotKey fails with 1409), low-level hooks did not help, and a
+post-switch foreground redirect worked in a probe but not in the app. Do not
+reopen it without a new approach. The popup still dismisses without pasting.
 
-An isolated three-window diagnostic compared a posted native switch command
-with hiding before forwarding it. The baseline stayed on its popup; hiding
-returned to B only. Both completed, but neither proved the requested switch or
-physical Alt+Tab message delivery. No second production destination fix exists.
-The next investigation is a bounded real-key message trace before choosing a
-fix; do not repeat an app build on the strength of style assertions alone.
+Guided Windows pass on 2dabd38 (2026-11-04, dedicated QA profile, Windows
+10.0.26300): W01-W07, W09 and W10 PASS; W08 (Scroll Lock) SKIPPED because the
+keyboard has no Scroll Lock key. Results with notes are in
+`/home/zathrus/clipmonger-work/continuation/RESULTS-2dabd38.csv`.
+
+Next: T-409 (UAC/helper) and T-410 (autostart/reboot), then a popup/Settings UI
+batch from the pass findings: prominent paste errors; drop the duplicate current-item
+section; disable First Page at the start; place or drop "End of history"; stop the
+footer overlapping the list; no image placeholders for text clips; a configurable
+multiline preview character limit with ellipsis; Settings filter on all tabs;
+`popup.activation_failed` warnings on CLI show-popup; inline red validation errors
+that keep focus; dropdowns for enum settings; remove the stale permanent-hotkey note.
+Rerun the affected W cases on the new build.
 
 The PC may reboot before testing resumes. Treat all prior PIDs, running apps,
 WSL sessions and temporary directories as historical. Recheck Git status and
@@ -119,7 +132,7 @@ before startup capture. The agent handles build/start/restart while the user
 performs visible checks. No background diagnostic needs to remain running.
 
 Local operational handoff: `/home/zathrus/clipmonger-work/continuation/REBOOT-HANDOFF.md`
-and `CURRENT.md`. Exact observations are in
+and `CURRENT.md` (both predate 2026-11-04; this page wins). Earlier observations are in
 `packaging-qa/windows-guided-acceptance-1/session-state.json`; source, packages,
 reviews and diagnostics are under `packaging-qa/popup-alt-tab-1` within the same
 persistent work directory. Recheck the 5 GB backing-drive and 4 GiB memory
@@ -134,8 +147,8 @@ then installed/UAC cases, and logon/display changes in separate sessions.
 The exact candidate and evidence must accompany every result.
 
 The active guided session reuses its dedicated profile at
-C:\Temp\clipmonger-review-9635310-b879a2ee\profile-portable-qa with the current
-65b2b2a binaries, which are unchanged by the later documentation correction.
+C:\Temp\clipmonger-review-9635310-b879a2ee\profile-portable-qa with 2dabd38
+binaries in its portable-qa folder (previous 65b2b2a binaries in portable-qa\prev-65b2b2a).
 Autostart is disabled and `popup.restore_clipboard = false` is now explicitly
 saved after testing both choices. Preserve that test history when restarting;
 do not substitute the working user profile.

@@ -60,11 +60,11 @@ default-true results below retain their original scope.
 Guided Windows QA on a1dc017 confirmed that the selected item remains on the
 clipboard for a normal text paste; further native cases remain open.
 
-Guided testing now has an unresolved popup Alt+Tab destination defect: the
-popup closes but returns to Notepad instead of the previous ordinary app. The
-transient style change alone did not solve it. #19 therefore still needs a fix,
-then native verification. The user will resume testing in a fresh conversation
-and may reboot; follow the continuation's process/file/profile recovery steps.
+Popup Alt+Tab returning to the most recent window (Notepad) instead of the
+previous ordinary app is accepted as a Windows limitation. A tray-opened
+popup now takes keyboard focus. The 2026-11-04 guided pass on that build passed
+W01-W07, W09 and W10 (W08 skipped: no Scroll Lock key); see the continuation for
+the next cases and the UI findings batch.
 
 The combined candidate also batches selected clipboard metadata reads; local
 release calibration reduced 10k-search p95 from 192.49 ms to 45.83 ms against
