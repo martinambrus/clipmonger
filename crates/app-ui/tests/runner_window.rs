@@ -819,14 +819,7 @@ fn activation_policy_native_selection() {
         ActivationPolicy::Unsupported,
         "per_show always unsupported"
     );
-    #[cfg(target_os = "windows")]
-    {
-        assert_eq!(native_policy(false), ActivationPolicy::Unsupported);
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        assert_eq!(native_policy(false), ActivationPolicy::Supported);
-    }
+    assert_eq!(native_policy(false), ActivationPolicy::Supported);
 }
 
 #[test]

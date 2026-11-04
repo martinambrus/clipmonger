@@ -264,6 +264,8 @@ impl OsWindow for Window {
     }
 
     fn focus_window(&self) {
+        #[cfg(target_os = "windows")]
+        force_foreground(self);
         #[cfg(not(target_os = "windows"))]
         Window::focus_window(self);
     }
@@ -332,6 +334,39 @@ mod activation_message_tests {
     }
 }
 
+/// Take the foreground for `window` without winit's synthetic Alt press. A
+/// tray click leaves the shell holding the foreground lock, so a refused
+/// `SetForegroundWindow` is retried while sharing the foreground thread's
+/// input state, which the lock permits.
+#[cfg(target_os = "windows")]
+fn force_foreground(window: &Window) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    };
+    let Some(raw) = hwnd(window) else {
+        return;
+    };
+    let hwnd = HWND(raw as *mut std::ffi::c_void);
+    // SAFETY: hwnd belongs to the live borrowed window on this event-loop
+    // thread, which owns a message queue; input is detached before returning.
+    #[allow(unsafe_code)]
+    unsafe {
+        if SetForegroundWindow(hwnd).as_bool() {
+            return;
+        }
+        let me = GetCurrentThreadId();
+        let them = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        let attached = them != 0 && them != me && AttachThreadInput(me, them, true).as_bool();
+        let _ = SetForegroundWindow(hwnd);
+        let _ = BringWindowToTop(hwnd);
+        if attached {
+            let _ = AttachThreadInput(me, them, false);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActivationPolicy {
     Supported,
@@ -343,14 +378,7 @@ pub fn native_policy(per_show: bool) -> ActivationPolicy {
     if per_show {
         ActivationPolicy::Unsupported
     } else {
-        #[cfg(target_os = "windows")]
-        {
-            ActivationPolicy::Unsupported
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            ActivationPolicy::Supported
-        }
+        ActivationPolicy::Supported
     }
 }
 
@@ -383,9 +411,9 @@ pub fn try_activate_with_policy<W: OsWindow>(
     ActivationStatus::Done
 }
 
-/// Try to activate the popup window for X11/macOS.
+/// Try to activate the popup window for Windows/X11/macOS.
 /// Returns `Done` when pending should be cleared, `Pending` when it should be retained.
-/// On Windows and Wayland (`per_show`), always returns `Done` without focusing.
+/// On Wayland (`per_show`), always returns `Done` without focusing.
 pub fn try_activate<W: OsWindow>(window: &W, per_show: bool) -> ActivationStatus {
     try_activate_with_policy(window, native_policy(per_show))
 }
