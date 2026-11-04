@@ -563,7 +563,9 @@ fn popup_builder_describes_a_hidden_undecorated_utility_window() {
     assert_eq!(b.visible, Some(false));
     assert_eq!(b.resizable, Some(false));
     assert!(is_unset_or(b.active, true), "active: {:?}", b.active);
-    assert_eq!(b.window_type, Some(X11WindowType::Utility));
+    // Normal, not utility: Mutter refuses focus to a parentless utility
+    // window mapped over another app (GNOME Xorg).
+    assert_eq!(b.window_type, Some(X11WindowType::Normal));
     assert_eq!(b.app_id.as_deref(), Some("clipmonger"));
 }
 

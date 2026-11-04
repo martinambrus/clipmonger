@@ -24,7 +24,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clipmonger_app_ui::app::{now_ms, AppParts, PopupApp, Trace, DRAIN_CAP};
+use clipmonger_app_ui::app::{now_ms, AppParts, PopupApp, Trace, DRAIN_CAP, FOCUS_LOSS_GRACE_MS};
 use clipmonger_app_ui::ipc_bridge::{UiCmd, UiEvent};
 use clipmonger_app_ui::runner::{App, Desired, WindowKind};
 use clipmonger_app_ui::shell::Context as PasteContext;
@@ -323,6 +323,14 @@ impl Rig {
     /// The focus state the Popup window reports from now on.
     fn focus(&mut self, focused: Option<bool>) {
         self.popup.info.focused = focused;
+    }
+
+    /// Let a pending focus loss outlast its grace (none on Windows).
+    fn outlast_focus_grace(&self) {
+        let _ = self;
+        if FOCUS_LOSS_GRACE_MS > 0 {
+            thread::sleep(Duration::from_millis(FOCUS_LOSS_GRACE_MS + 20));
+        }
     }
 
     /// The monitor size the Popup window reports from now on.
@@ -1933,11 +1941,14 @@ fn rule_paint_settings_window_shows_the_settings_body() {
 // 8. Focus loss, as an edge on the popup window's focus
 // ---------------------------------------------------------------------------
 
-/// One focus cycle: the window gets the focus, then loses it.
+/// One focus cycle: the window gets the focus, then loses it for longer
+/// than the focus-loss grace.
 fn focus_cycle(rig: &mut Rig) {
     rig.focus(Some(true));
     rig.tick();
     rig.focus(Some(false));
+    rig.tick();
+    rig.outlast_focus_grace();
     rig.tick();
 }
 
@@ -1949,6 +1960,8 @@ fn rule_focus_loss_after_focus_hides() {
     rig.tick();
     assert!(rig.is_open(), "focus alone hides nothing");
     rig.focus(Some(false));
+    rig.tick();
+    rig.outlast_focus_grace();
     rig.tick();
     assert!(!rig.is_open());
     assert_eq!(
@@ -1967,8 +1980,31 @@ fn rule_focus_loss_is_seen_on_visible_passes() {
     assert!(rig.is_open());
     rig.focus(Some(false));
     rig.show();
+    rig.outlast_focus_grace();
+    rig.show();
     assert!(!rig.is_open());
     assert_eq!(rig.trace().last(), Some(&hide_line("focus_lost")));
+}
+
+// rule 8: a loss that reverses within the grace (Mutter's keyboard grab right
+// after it focuses the popup on GNOME Xorg) hides nothing
+#[test]
+fn rule_focus_loss_that_returns_within_the_grace_keeps_the_popup() {
+    if FOCUS_LOSS_GRACE_MS == 0 {
+        return;
+    }
+    let mut rig = Rig::opened();
+    rig.focus(Some(true));
+    rig.tick();
+    rig.focus(Some(false));
+    rig.tick();
+    assert!(rig.is_open(), "the loss waits out its grace");
+    rig.focus(Some(true));
+    rig.tick();
+    rig.outlast_focus_grace();
+    rig.tick();
+    assert!(rig.is_open(), "the focus came back");
+    assert_eq!(rig.trace(), vec![open_line("start", false, false)]);
 }
 
 // rule 8: a popup that was never seen focused does not hide
@@ -2077,6 +2113,8 @@ fn rule_focus_stale_egui_event_does_not_hide_a_fresh_popup() {
     rig.show();
     assert!(rig.is_open());
     rig.focus(Some(false));
+    rig.show();
+    rig.outlast_focus_grace();
     rig.show();
     assert!(
         !rig.is_open(),

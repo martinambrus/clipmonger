@@ -102,8 +102,8 @@ pub struct PopupApp {
     paused: bool,
     /// The shell closed since the last `Hidden`: confirm it at the next pass.
     hide_unconfirmed: bool,
-    /// The popup has been seen focused since it opened.
-    seen_focus: bool,
+    /// Popup focus since it opened, and a pending focus loss.
+    focus: FocusTracker,
     /// Placement pending for next desktop context.
     placement_pending: bool,
     placement_waiting_for_geometry: bool,
@@ -172,7 +172,7 @@ impl PopupApp {
             pause_deadline: None,
             paused: false,
             hide_unconfirmed: false,
-            seen_focus: false,
+            focus: FocusTracker::default(),
             placement_pending: open,
             placement_waiting_for_geometry: false,
             placement: placement::Placement::Center,
@@ -324,7 +324,7 @@ impl PopupApp {
         if !was_open && is_open {
             self.send(UiCmd::ListPermanents);
             self.send(UiCmd::PermGroups);
-            self.seen_focus = false;
+            self.focus.reset();
         } else if was_open && !is_open {
             if let Some(thumbs) = &mut self.thumbnails {
                 thumbs.revoke_visibility();
@@ -334,7 +334,7 @@ impl PopupApp {
             }
             self.invalidate_current();
             self.hide_unconfirmed = true;
-            self.seen_focus = false;
+            self.focus.reset();
         }
     }
 
@@ -891,16 +891,13 @@ impl PopupApp {
     }
 
     /// Focus loss, as an edge on the popup window's focus. While the shell is
-    /// open: the ROOT entry of the context's input viewports reporting
-    /// `focused == Some(true)` sets `seen_focus`; reporting `Some(false)` after
-    /// that clears it and calls `feed(Event::FocusLost)`. While the shell is
-    /// closed `seen_focus` is cleared. Never read the egui focus events: a
-    /// stale one from a hidden pass would hide a fresh popup.
+    /// open, the ROOT entry of the context's input viewports reporting
+    /// `focused` feeds [`FocusTracker::observe`]; a loss it confirms calls
+    /// `feed(Event::FocusLost)`. While the shell is closed the tracker is
+    /// reset. Never read the egui focus events: a stale one from a hidden pass
+    /// would hide a fresh popup.
     fn track_focus(&mut self, ctx: &egui::Context) {
-        if !self.shell.desired().popup_open {
-            self.seen_focus = false;
-            return;
-        }
+        let open = self.shell.desired().popup_open;
         let focused = ctx.input(|input| {
             input
                 .raw
@@ -908,13 +905,8 @@ impl PopupApp {
                 .get(&egui::ViewportId::ROOT)
                 .and_then(|info| info.focused)
         });
-        match focused {
-            Some(true) => self.seen_focus = true,
-            Some(false) if self.seen_focus => {
-                self.seen_focus = false;
-                self.feed(Event::FocusLost);
-            }
-            _ => {}
+        if self.focus.observe(open, focused, self.millis()) {
+            self.feed(Event::FocusLost);
         }
     }
 
@@ -970,6 +962,11 @@ impl PopupApp {
         deadlines.push(
             self.shell
                 .next_deadline()
+                .and_then(|ms| self.start.checked_add(Duration::from_millis(ms))),
+        );
+        deadlines.push(
+            self.focus
+                .deadline()
                 .and_then(|ms| self.start.checked_add(Duration::from_millis(ms))),
         );
         let next = deadlines
@@ -1278,6 +1275,57 @@ impl runner::App for PopupApp {
     }
 }
 
+/// How long a popup focus loss must last before it dismisses. On GNOME
+/// Xorg, Mutter grabs the keyboard right after it focuses a new window, so
+/// the popup sees a focus-out that reverses moments later; a loss that ends
+/// within this grace is ignored. Windows dismisses at once, as before.
+pub const FOCUS_LOSS_GRACE_MS: Millis = if cfg!(windows) { 0 } else { 150 };
+
+/// Popup focus since it opened, and a focus loss waiting out its grace.
+#[derive(Debug, Default)]
+struct FocusTracker {
+    seen: bool,
+    lost_at: Option<Millis>,
+}
+
+impl FocusTracker {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Feed one pass: `true` when a loss after the popup was seen focused
+    /// has lasted [`FOCUS_LOSS_GRACE_MS`] without the focus returning.
+    fn observe(&mut self, open: bool, focused: Option<bool>, now: Millis) -> bool {
+        if !open {
+            self.reset();
+            return false;
+        }
+        match focused {
+            Some(true) => {
+                self.seen = true;
+                self.lost_at = None;
+            }
+            Some(false) if self.seen => {
+                self.lost_at.get_or_insert(now);
+            }
+            _ => {}
+        }
+        let confirmed = self
+            .lost_at
+            .is_some_and(|at| now >= at.saturating_add(FOCUS_LOSS_GRACE_MS));
+        if confirmed {
+            self.reset();
+        }
+        confirmed
+    }
+
+    /// Shell-clock time at which a pending loss is confirmed.
+    fn deadline(&self) -> Option<Millis> {
+        self.lost_at
+            .map(|at| at.saturating_add(FOCUS_LOSS_GRACE_MS))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1353,5 +1401,45 @@ mod tests {
             }
             assert!(!app.shell.desired().popup_open, "focus_first={focus_first}");
         }
+    }
+
+    #[test]
+    fn focus_loss_waits_out_the_grace_and_a_returning_focus_cancels_it() {
+        use super::{FocusTracker, FOCUS_LOSS_GRACE_MS as GRACE};
+        let mut focus = FocusTracker::default();
+        assert!(
+            !focus.observe(true, Some(false), 0),
+            "never focused: no loss"
+        );
+        assert!(!focus.observe(true, Some(true), 1));
+        let fired = focus.observe(true, Some(false), 2);
+        assert_eq!(
+            fired,
+            GRACE == 0,
+            "a loss fires at once only without a grace"
+        );
+        if GRACE > 0 {
+            assert_eq!(focus.deadline(), Some(2 + GRACE));
+            assert!(
+                !focus.observe(true, Some(true), 3),
+                "Mutter's grab ends: focus back"
+            );
+            assert_eq!(focus.deadline(), None);
+            assert!(!focus.observe(true, Some(false), 10));
+            assert!(!focus.observe(true, Some(false), 9 + GRACE));
+            assert!(
+                focus.observe(true, Some(false), 10 + GRACE),
+                "a lasting loss dismisses"
+            );
+        }
+        assert!(
+            !focus.observe(true, Some(false), 1000),
+            "fires once per focus"
+        );
+        assert!(!focus.observe(false, Some(true), 1001));
+        assert!(
+            !focus.observe(true, Some(false), 1002),
+            "closing clears what was seen"
+        );
     }
 }

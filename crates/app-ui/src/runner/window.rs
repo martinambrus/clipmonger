@@ -12,7 +12,8 @@ pub const SETTINGS_CLASS: &str = "ClipmongerSettings";
 
 /// Viewport builder of the popup, sizes in points. Undecorated, always on top,
 /// without taskbar entry, not resizable, active, created hidden, X11 window
-/// type utility, app id "clipmonger". `position` is set only when given.
+/// type normal (Mutter refuses focus to a parentless utility window), app id
+/// "clipmonger". `position` is set only when given.
 #[must_use]
 pub fn popup_builder(title: &str, size: [f32; 2], position: Option<[f32; 2]>) -> ViewportBuilder {
     let mut builder = ViewportBuilder::default()
@@ -25,7 +26,7 @@ pub fn popup_builder(title: &str, size: [f32; 2], position: Option<[f32; 2]>) ->
         .with_active(true)
         .with_resizable(false)
         .with_visible(false)
-        .with_window_type(egui::X11WindowType::Utility);
+        .with_window_type(egui::X11WindowType::Normal);
     if let Some(pos) = position {
         builder = builder.with_position(pos);
     }

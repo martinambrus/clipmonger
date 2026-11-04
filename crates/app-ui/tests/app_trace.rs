@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clipmonger_app_ui::app::trace::{hide_reason, line, open_source, TRACE_ENV};
-use clipmonger_app_ui::app::{AppParts, PopupApp, Trace, TraceEvent};
+use clipmonger_app_ui::app::{AppParts, PopupApp, Trace, TraceEvent, FOCUS_LOSS_GRACE_MS};
 use clipmonger_app_ui::ipc_bridge::{UiCmd, UiEvent};
 use clipmonger_app_ui::runner::{App, WindowKind};
 use clipmonger_app_ui::shell::Event;
@@ -837,6 +837,9 @@ fn rule_app_hide_lines_name_the_reason() {
                 rig.info.focused = Some(true);
                 rig.tick();
                 rig.info.focused = Some(false);
+                rig.tick();
+                // The loss counts once it outlasts its grace (none on Windows).
+                std::thread::sleep(std::time::Duration::from_millis(FOCUS_LOSS_GRACE_MS + 20));
                 rig.tick();
             }),
             "focus_lost",
