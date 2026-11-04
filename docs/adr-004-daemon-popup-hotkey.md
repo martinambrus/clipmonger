@@ -125,8 +125,9 @@ Need a Linux machine with an X11 session (Xvfb for the automated leg).
    working; after the holder let go the daemon took k within 5 s and
    caps returned to `full`. With the extension enabled too, one press
    opens the popup once. A chord that duplicates a Mutter shortcut
-   (`super+a`) is not refused on X11 either: both fire. Still open: the
-   Settings note.
+   (`super+a`) is not refused on X11 either: both fire. Settings shows
+   "Applies on restart" only while the Wayland portal owns the chord (a
+   Wayland backend without the extension, `config_model::hotkey_apply`).
    - `crates/backend-x11/src/hotkeys.rs` `X11Hotkeys::register` ungrabs
      the old chord first. Grab the new chord first; the same keycode and
      modifier mask is a no-op (an ungrab after the new grab would drop

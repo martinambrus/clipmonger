@@ -18,6 +18,8 @@ pub struct ConfigWindowState {
     pub edits: std::collections::HashMap<String, String>,
     pub error: String,
     pub caps_text: String,
+    /// When a popup-hotkey change applies (from the daemon caps).
+    pub hotkey_apply: config_model::HotkeyApply,
     pub version_text: String,
     pub profile: PathBuf,
     pub backup_path: String,
@@ -62,6 +64,7 @@ impl ConfigWindowState {
             edits: std::collections::HashMap::new(),
             error: String::new(),
             caps_text: String::new(),
+            hotkey_apply: config_model::HotkeyApply::Live,
             version_text: String::new(),
             profile,
             backup_path,
@@ -514,9 +517,9 @@ pub fn render_config_viewport(
                         if let Some(error) = config.field_errors.get(key) {
                             ui.colored_label(ui.visuals().error_fg_color, error);
                         }
-                        // The Windows daemon applies a new chord live.
-                        #[cfg(not(windows))]
-                        if key == "popup.hotkey" {
+                        if key == "popup.hotkey"
+                            && config.hotkey_apply == config_model::HotkeyApply::OnRestart
+                        {
                             ui.label(strings::text("config.applies_on_restart"));
                         }
                     }

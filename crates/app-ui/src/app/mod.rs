@@ -582,6 +582,7 @@ impl PopupApp {
             UiEvent::Caps(body) => {
                 if let Ok(mut config) = self.config.lock() {
                     config.caps_text = body.to_string();
+                    config.hotkey_apply = config_model::hotkey_apply(&body);
                 }
             }
             UiEvent::Permanents(body) => {
