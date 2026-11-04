@@ -92,6 +92,7 @@ impl WinMonitor {
 
     /// Defer reading clipboard updates that `probe` reports as self-writes.
     #[must_use]
+    #[cfg_attr(not(windows), allow(unused_mut))]
     pub fn with_self_writes(mut self, probe: SelfWriteProbe) -> Self {
         #[cfg(windows)]
         {
