@@ -24,7 +24,7 @@ pub(crate) fn valid_profile(value: &str) -> bool {
             .any(|part| part == "." || part == ".." || part.ends_with([' ', '.']))
 }
 
-fn valid_sid(value: &str) -> bool {
+pub(crate) fn valid_sid(value: &str) -> bool {
     let parts: Vec<_> = value.split('-').collect();
     if !(4..=18).contains(&parts.len()) || parts[0] != "S" || parts[1] != "1" {
         return false;

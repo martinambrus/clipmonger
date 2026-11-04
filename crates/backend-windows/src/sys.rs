@@ -1682,12 +1682,12 @@ pub(crate) mod task {
     use windows_sys::Win32::Security::{
         AccessCheck, DuplicateToken, GetAce, GetSecurityDescriptorControl,
         GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation,
-        IsTokenRestricted, MapGenericMask, SecurityImpersonation, TokenElevation,
-        TokenIntegrityLevel, TokenIsAppContainer, TokenLinkedToken, TokenUser, ACCESS_ALLOWED_ACE,
-        ACE_HEADER, DACL_SECURITY_INFORMATION, GENERIC_MAPPING, GROUP_SECURITY_INFORMATION,
-        INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-        SE_DACL_PROTECTED, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE, TOKEN_ELEVATION,
-        TOKEN_INFORMATION_CLASS, TOKEN_LINKED_TOKEN, TOKEN_QUERY,
+        IsTokenRestricted, LookupAccountNameW, MapGenericMask, SecurityImpersonation,
+        TokenElevation, TokenIntegrityLevel, TokenIsAppContainer, TokenLinkedToken, TokenUser,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, DACL_SECURITY_INFORMATION, GENERIC_MAPPING,
+        GROUP_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE,
+        TOKEN_ELEVATION, TOKEN_INFORMATION_CLASS, TOKEN_LINKED_TOKEN, TOKEN_QUERY,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
@@ -2219,6 +2219,35 @@ pub(crate) mod task {
             task.GetSecurityDescriptor(i32::try_from(SECURITY_PARTS).map_err(|_| "security flags")?)
         })?)
     }
+    /// The scheduler reads registered SIDs back as account names (`user`,
+    /// `DOMAIN\user`); resolve them so readback compares against the
+    /// registered SID. SID text and an empty value pass through unchanged, so
+    /// any other value still fails the comparison.
+    fn account_sid(account: &str) -> Result<String, String> {
+        if account.is_empty() || elevated_task::valid_sid(account) {
+            return Ok(account.into());
+        }
+        let name = to_wide(account);
+        // SECURITY_MAX_SID_SIZE (68 bytes), DWORD-aligned for the SID layout.
+        let mut sid = [0u32; 17];
+        let mut sid_size = u32::try_from(std::mem::size_of_val(&sid)).map_err(|_| "sid size")?;
+        let mut domain = [0u16; 256];
+        let mut domain_len = u32::try_from(domain.len()).map_err(|_| "domain size")?;
+        let mut kind = 0;
+        // Safety: NUL-terminated name, writable SID and domain buffers with their sizes.
+        win_ok(unsafe {
+            LookupAccountNameW(
+                std::ptr::null(),
+                name.as_ptr(),
+                sid.as_mut_ptr().cast(),
+                &raw mut sid_size,
+                domain.as_mut_ptr(),
+                &raw mut domain_len,
+                &raw mut kind,
+            )
+        })?;
+        sid_text(sid.as_mut_ptr().cast())
+    }
     fn principal_snapshot(
         definition: &ITaskDefinition,
     ) -> Result<elevated_task::TaskPrincipal, String> {
@@ -2232,7 +2261,7 @@ pub(crate) mod task {
             native(principal.LogonType(&raw mut logon))?;
             native(principal.RunLevel(&raw mut level))?;
             Ok(elevated_task::TaskPrincipal {
-                sid: bstr(&user)?,
+                sid: account_sid(&bstr(&user)?)?,
                 interactive: logon == TASK_LOGON_INTERACTIVE_TOKEN,
                 highest: level == TASK_RUNLEVEL_HIGHEST,
             })
@@ -2318,7 +2347,7 @@ pub(crate) mod task {
                 principal,
                 trigger: elevated_task::TaskTrigger {
                     count: trigger_count,
-                    sid: bstr(&trigger_user)?,
+                    sid: account_sid(&bstr(&trigger_user)?)?,
                     is_logon: trigger_logon,
                     enabled: trigger_enabled.as_bool(),
                 },
@@ -2543,6 +2572,28 @@ pub(crate) mod task {
                     | MB_SETFOREGROUND
                     | MB_TOPMOST,
             ) == 6
+        }
+    }
+
+    #[cfg(test)]
+    mod account_tests {
+        use super::{account_sid, process_token, token_sid, GetCurrentProcess};
+
+        #[test]
+        fn scheduler_account_names_resolve_to_the_registered_sid() {
+            // Safety: current-process pseudo-handle; the opened token is owned.
+            let own = process_token(unsafe { GetCurrentProcess() }).expect("own token");
+            let sid = token_sid(&own).expect("own SID");
+            let user = std::env::var("USERNAME").expect("USERNAME");
+            let domain = std::env::var("USERDOMAIN").expect("USERDOMAIN");
+            assert_eq!(account_sid(&user).expect("bare name"), sid);
+            assert_eq!(
+                account_sid(&format!("{domain}\\{user}")).expect("qualified"),
+                sid
+            );
+            assert_eq!(account_sid(&sid).expect("SID text"), sid);
+            assert_eq!(account_sid("").expect("empty"), "");
+            assert!(account_sid("clipmonger-no-such-account-7f3a").is_err());
         }
     }
 
