@@ -26,7 +26,7 @@ Registry screenshots/exports per leg, caps dump after each reboot. Redact paths/
 
 ## Verdict
 
-- Verdict: PASS / FAIL / BLOCKED (circle one)
-- Notes:
-- Signature:
-- Date:
+- Verdict: **PASS** (steps 1-6; installed 2623046, portable 2dabd38)
+- Notes: Windows 10.0.26300. Settings "Start on login" wrote the HKCU Run value with the installed UI, `--minimized` and the quoted profile, and removed it when cleared. After a reboot Clipmonger started without a window and history was intact; with autostart off it did not start and a manual start worked. The helper logon task runs at every logon independently of app autostart (ADR-003). Portable: applying autostart was refused and wrote nothing; the checkbox and message do not explain this yet. Uninstall with the profile kept left no files, task, Run, Startup, Start menu, Uninstall or Software keys and no process; nothing was written outside the portable folder.
+- Signature: user (interactive session)
+- Date: 2026-11-04

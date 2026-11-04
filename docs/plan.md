@@ -182,9 +182,9 @@ from this update.
   only admin-paste gesture (bound to the press target) and pushes it with
   `ui.show_popup`; one UI per profile. Verified with synthesized presses
   on the Windows host; hands-on checklist passed 2026-10-31.
-  Open: T-410 Windows logon and reboot-persist legs remain unverified;
+  T-410 Windows logon and reboot-persist legs passed 2026-11-04;
   autostart is applied at startup, on Settings changes, and after restore,
-  with portable mode skipped. Also open:
+  with portable mode skipped. Open:
   explicit pipe DACL. PNG/DIB conversion was implemented in subsequent Phase 1 work.
 - **3. X11 backend. (DONE 2026-10-26, WSL Xvfb)** Seg-05 (XFixes + manager role, transfer+INCR,
   hotkeys, enigo paste, KSNI tray, .desktop autostart). Tests T-501…508

@@ -84,6 +84,13 @@ scope and do not validate the registration hardening or native ACL/UAC boundary.
 
 Caps dumps before/after each leg, audit.log excerpt, screenshots of the UAC prompt and Degraded caps state. Redact paths/window titles/tokens (finding 52).
 
+## Verdict (2026-11-04, 2dabd38 portable, 2623046 installed)
+
+- Verdict: **PASS** for legs 1-4, 6-10 and the tray half of leg 5; **FAIL** for the `clipmonger-cli show-popup` half of leg 5; legs 11-17 were not run.
+- Notes: Windows 10.0.26300. Portable: consent asked once, one UAC; helper pastes 1-17 ms, also after 10 min idle; tray-opened popup pasted into a standard window and refused the admin target with a visible reason; No and UAC cancel were not asked again and left admin paste visibly refused (caps Degraded after cancel); tray Exit left no process, task or Run value; `restore_clipboard` on restored the previous clipboard on both routes. CLI-opened popups have no target: over the admin window the popup hid itself (`popup.activation_failed`), over a standard window Enter focused the admin window and the paste was refused. Installed: the first leg 8 run on 65b2b2a failed because the registrar compared the read-back principal and trigger account names with the expected SID (exit 101, helper never ran); after 2623046 the task verified, the helper connected, reconnected after an app restart without a prompt, and started at logon after a reboot with no window. Admin and standard pastes worked throughout.
+- Signature: user (interactive session)
+- Date: 2026-11-04
+
 ## Verdict (2026-10-31, ADR-004 design)
 
 - Verdict: **PASS** for portable legs 1-3 and 5; legs 4 and 6-12 were not re-run (ADR-004 changed only the leg 5 expectation).

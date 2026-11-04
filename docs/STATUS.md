@@ -17,8 +17,9 @@ implemented; Phase 7 packaging/QA and native acceptance remain open.
   are recorded in the continuation. The additional performance results retain
   their actual measurements and initial target; no timing miss is waived.
 - The user takes over Windows UI/clipboard/installer/UAC testing. Current CPU-runner
-  T-905 through T-908, capture fault paths, T-409 hardening and T-410 logon/reboot
-  need actual results. Historical dated passes remain scoped to their old builds.
+  T-905 through T-908 and capture fault paths need actual results. T-409 legs 1-10
+  and T-410 passed on 2026-11-04 except CLI-opened popups (T-409 leg 5); T-409 legs
+  11-17 remain open. Historical dated passes remain scoped to their old builds.
 - Real Linux X11/Wayland/GNOME acceptance and blur-derived generated-protocol
   licensing remain open. Artifact checks do not settle either boundary.
 - [Feature-to-test index](v1-qa-traceability.md) maps the v1 slices and explicit
@@ -45,8 +46,8 @@ Source of truth for step detail: `plan.md` Steps.
 - Windows admin-window paste 2026-10-30 (ADR-003, D-025): elevated helper reworked (single-thread pipe protocol, liveness from the pipe instead of heartbeats, per-job target window + 2 s deadline, popup UI owns the hotkey, windowless daemon/helper/UI, `portable.marker` portable profile). User-verified on this Windows box: portable (`C:\Temp\clipmonger-portable`) consent → one UAC → admin and standard pastes (helper round trip 1-2 ms), 17 min idle, tray Exit stops UI + daemon + helper, no scheduled task; installed (`C:\Program Files\Clipmonger`) consent → one UAC → `ClipmongerHelper` logon task, logoff/logon starts the helper with no visible window, app start reconnects with no prompt. Settings matrix is 28 rows (`windows.helper_auto_elevate` removed, `popup.restore_clipboard` counted); app-ui suite green.
 - Daemon-owned popup hotkey 2026-10-30 (ADR-004, D-026): the daemon owns the popup hotkey on every OS and pushes `ui.show_popup` to one UI per profile (`ui.lock`; a second launch hands over); a press captures the paste target and mints the only gesture that allows an admin-window paste; Windows applies hotkey changes without a restart. Verified on this Windows box with synthesized presses: popup opens in front and a second press hides it (5/5), `clipmonger-cli show-popup`, UI restart by the next press, daemon restart by the UI, second-launch handover. Hands-on checklist passed 2026-10-31 (user, over RustDesk; it found the Settings edit-field fix in CHANGELOG); Linux items in ADR-004 "Open items".
 - Windows test infra 2026-10-30: installed build + marker-tagged `ClipmongerHelper` logon task active for the QA user; portable copy kept in `C:\Temp\clipmonger-portable`; earlier test folders, binaries and the legacy task removed.
-- Manual pending (user/native legs): ADR-004 Linux open items (X11 live hotkey change, push path on a Linux desktop), `T-410`, `T-508`, `T-606`, `T-607`, `T-702..T-705`, `T-1117`, `T-1204` (Windows `T-905..T-908` done via CPU fallback; egui path still needs real GPU display).
-- Known gaps: update-check (`T-1202`, out of `0.1.0`), per-box caps goldens beyond headless, coverage-floor enforcement, cargo-packager installers (native runners), CI matrix; Windows autostart logon and reboot persistence remains unverified (`T-410`); explicit DACL for the helper pipe (default DACL + peer binary checks today); a popup-hotkey change needs a daemon restart on Linux (X11, portal, GNOME extension; ADR-004 open items 1-3); `store::tests::self_concurrent_burst` is load-sensitive (failed once under a parallel rebuild, passes alone).
+- Manual pending (user/native legs): ADR-004 Linux open items (X11 live hotkey change, push path on a Linux desktop), `T-409` legs 5 (CLI popup) and 11-17, `T-508`, `T-606`, `T-607`, `T-702..T-705`, `T-1117`, `T-1204` (Windows `T-905..T-908` done via CPU fallback; egui path still needs real GPU display).
+- Known gaps: update-check (`T-1202`, out of `0.1.0`), per-box caps goldens beyond headless, coverage-floor enforcement, cargo-packager installers (native runners), CI matrix; explicit DACL for the helper pipe (default DACL + peer binary checks today); a popup-hotkey change needs a daemon restart on Linux (X11, portal, GNOME extension; ADR-004 open items 1-3); `store::tests::self_concurrent_burst` is load-sensitive (failed once under a parallel rebuild, passes alone).
 
 ## Document inventory
 - `README.md` — Plan (source of truth)
