@@ -118,8 +118,15 @@ Need a Linux machine with an X11 session (Xvfb for the automated leg).
 1. Live popup-hotkey change on X11. Status 2026-11-04: code and Xvfb test
    done (`X11Hotkeys::register` grabs the new chord first, the X11 poll
    thread runs the shared `run_hotkeys_with_activation` loop,
-   `t506_refused_change_keeps_chord`). Still open: the Settings note
-   and the manual Xorg leg below.
+   `t506_refused_change_keeps_chord`). Manual leg passed 2026-11-04 on
+   GNOME 46 Xorg with the extension disabled: h → j → k without a
+   restart; with another client holding ctrl+alt+k the change was refused
+   (`BadAccess`, x11 hotkey `degraded` with the note) and ctrl+alt+j kept
+   working; after the holder let go the daemon took k within 5 s and
+   caps returned to `full`. With the extension enabled too, one press
+   opens the popup once. A chord that duplicates a Mutter shortcut
+   (`super+a`) is not refused on X11 either: both fire. Still open: the
+   Settings note.
    - `crates/backend-x11/src/hotkeys.rs` `X11Hotkeys::register` ungrabs
      the old chord first. Grab the new chord first; the same keycode and
      modifier mask is a no-op (an ungrab after the new grab would drop
@@ -162,3 +169,13 @@ Need a Linux machine with an X11 session (Xvfb for the automated leg).
    a press while the popup is in front does not hide it (the daemon sets
    `toggle` on Windows only), and the popup does not yet use `x11_time` /
    `activation_token` to take focus.
+   Status 2026-11-04 (GNOME 46, Wayland and Xorg): `show-popup`, second
+   launch, UI restart and daemon restart (by the UI on its next call)
+   pass. A second press hides the popup on GNOME Wayland
+   (`hotkey.fired{focused_popup_pid}`) and on X11. The popup takes focus
+   on both: on Xorg it is a normal X11 window (Mutter refused a
+   parentless utility window) and a focus loss dismisses only after
+   150 ms (Mutter's keyboard grab right after focusing a new window
+   otherwise closed it at once). On GNOME Wayland the extension places
+   the popup at the pointer or centre. The UI restarts a vanished daemon
+   only on its next call, so hotkeys stay dead until then (left as is).
