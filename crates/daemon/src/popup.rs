@@ -156,7 +156,7 @@ impl DaemonState {
         };
         if !toggle {
             let ui = hub.subscribers(SHOW_POPUP_TOPIC).into_iter().next();
-            activate_popup(ui.as_ref());
+            activate_popup(ui.as_ref(), source == PopupSource::Press);
         }
         let event = ShowPopupEvent {
             source: match source {
@@ -714,15 +714,18 @@ fn press_target(_ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
 /// Windows: bring the UI's popup to the front right here, inside the press
 /// handling. Only the process that received the hotkey may take the
 /// foreground, and only until the next input (releasing the chord), so a
-/// later activation by the UI itself would race the key release.
+/// later activation by the UI itself would race the key release. A request
+/// still tries (a second launch passes its foreground right on first) but
+/// usually has no right, so only a failed press is reported.
 #[cfg(all(windows, feature = "backend-windows"))]
-fn activate_popup(ui: Option<&SubscriberInfo>) {
+fn activate_popup(ui: Option<&SubscriberInfo>, pressed: bool) {
     let Some(ui) = ui else {
         return;
     };
     if let (Some(hwnd), Some(pid)) = (registered_popup_hwnd(ui), ui.peer_pid) {
         report_popup_activation(
             clipmonger_backend_windows::show_owned_window(hwnd.cast_signed(), pid),
+            pressed,
             |event, fields| {
                 crate::daemon_runtime_emit(
                     clipmonger_core::runtime_log::Severity::Warn,
@@ -735,8 +738,8 @@ fn activate_popup(ui: Option<&SubscriberInfo>) {
 }
 
 #[cfg(any(test, all(windows, feature = "backend-windows")))]
-fn report_popup_activation(ok: bool, emit: impl FnOnce(&str, &[(&str, &str)])) {
-    if !ok {
+fn report_popup_activation(ok: bool, pressed: bool, emit: impl FnOnce(&str, &[(&str, &str)])) {
+    if !ok && pressed {
         emit("popup.activation_failed", &[("class", "unavailable")]);
     }
 }
@@ -748,7 +751,7 @@ mod activation_report_tests {
     #[test]
     fn failure_emits_only_fixed_metadata_and_success_is_silent() {
         let calls = std::cell::RefCell::new(Vec::new());
-        report_popup_activation(false, |event, fields| {
+        report_popup_activation(false, true, |event, fields| {
             calls.borrow_mut().push((
                 event.to_owned(),
                 fields
@@ -757,7 +760,10 @@ mod activation_report_tests {
                     .collect::<Vec<_>>(),
             ));
         });
-        report_popup_activation(true, |_, _| panic!("success must be silent"));
+        report_popup_activation(true, true, |_, _| panic!("success must be silent"));
+        report_popup_activation(false, false, |_, _| {
+            panic!("a request without the foreground right must be silent")
+        });
         assert_eq!(
             *calls.borrow(),
             vec![(
@@ -770,7 +776,7 @@ mod activation_report_tests {
 
 /// Elsewhere the UI raises its own window when the push arrives.
 #[cfg(not(all(windows, feature = "backend-windows")))]
-fn activate_popup(_ui: Option<&SubscriberInfo>) {}
+fn activate_popup(_ui: Option<&SubscriberInfo>, _pressed: bool) {}
 
 #[cfg(all(test, unix))]
 mod tests {
