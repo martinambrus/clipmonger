@@ -281,6 +281,9 @@ pub struct EventsSubscribeResult {
 }
 /// Event topic the daemon pushes to the UI to show its popup.
 pub const SHOW_POPUP_TOPIC: &str = "ui.show_popup";
+/// Event topic the daemon pushes when its config was replaced; subscribers
+/// (the GNOME extension) re-read it with `config.get`.
+pub const CONFIG_CHANGED_TOPIC: &str = "config.changed";
 /// Payload of the daemon→UI `ui.show_popup` event.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShowPopupEvent {
@@ -337,6 +340,9 @@ pub struct HotkeyConflictParams {
     pub chord: String,
     #[serde(default)]
     pub reason: String,
+    /// `chord` registered after an earlier conflict: drop the conflict note.
+    #[serde(default)]
+    pub cleared: bool,
 }
 /// Hotkey conflict output for `hotkey.conflict`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

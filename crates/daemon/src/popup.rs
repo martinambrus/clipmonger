@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use clipmonger_ipc::proto::methods::{ShowPopupEvent, SHOW_POPUP_TOPIC};
+use clipmonger_ipc::proto::methods::{ShowPopupEvent, CONFIG_CHANGED_TOPIC, SHOW_POPUP_TOPIC};
 use clipmonger_ipc::server::{EventHub, SubscriberInfo};
 use clipmonger_platform::traits::HotkeyManager;
 use clipmonger_platform::types::HotkeyId;
@@ -48,6 +48,19 @@ impl DaemonState {
     pub fn attach_event_hub(&self, hub: EventHub) {
         if let Ok(mut trigger) = self.popup.lock() {
             trigger.hub = Some(hub);
+        }
+    }
+
+    /// Tell `config.changed` subscribers to re-read the config. Nothing is
+    /// held while none is subscribed: a subscriber reads it on connect.
+    pub(crate) fn notify_config_changed(&self) {
+        let hub = self
+            .popup
+            .lock()
+            .ok()
+            .and_then(|trigger| trigger.hub.clone());
+        if let Some(hub) = hub {
+            let _ = hub.publish(CONFIG_CHANGED_TOPIC, serde_json::json!({}));
         }
     }
 
@@ -785,7 +798,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use clipmonger_ipc::client::{Client, EventStream};
-    use clipmonger_ipc::proto::methods::{ShowPopupEvent, SHOW_POPUP_TOPIC};
+    use clipmonger_ipc::proto::methods::{ShowPopupEvent, CONFIG_CHANGED_TOPIC, SHOW_POPUP_TOPIC};
     use clipmonger_ipc::server::{EventHub, ServeOptions, Server, TopicRule};
     use serde_json::json;
 
@@ -801,10 +814,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = clipmonger_core::Store::open(&dir).expect("store");
         let state = Arc::new(DaemonState::new(store));
-        let hub = EventHub::new(vec![TopicRule {
-            topic: SHOW_POPUP_TOPIC.to_string(),
-            exclusive: true,
-        }]);
+        let hub = EventHub::new(vec![
+            TopicRule {
+                topic: SHOW_POPUP_TOPIC.to_string(),
+                exclusive: true,
+            },
+            TopicRule {
+                topic: CONFIG_CHANGED_TOPIC.to_string(),
+                exclusive: false,
+            },
+        ]);
         state.attach_event_hub(hub.clone());
         let launches = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&launches);
@@ -875,6 +894,39 @@ mod tests {
             state.trigger_popup(PopupSource::Request),
             "the UI is there now"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn config_set_pushes_config_changed_to_every_subscriber() {
+        let (state, sock, _) = served("config-changed").await;
+        state.set_profile_dir(
+            &std::env::temp_dir().join(format!("cm-popup-config-changed-{}", std::process::id())),
+        );
+        let streams: Vec<EventStream> = (0..2)
+            .map(|_| {
+                Client::connect(&sock, TOKEN)
+                    .expect("connect")
+                    .subscribe(&[CONFIG_CHANGED_TOPIC], json!({}))
+                    .expect("config.changed is not exclusive")
+            })
+            .collect();
+        state
+            .handle(
+                "config.set",
+                &json!({"key": "popup.hotkey", "value": "ctrl+alt+j"}),
+            )
+            .expect("config.set");
+        for mut stream in streams {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(stream.next_event().map(|(method, _)| method));
+            });
+            let method = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("config.changed arrives")
+                .expect("event");
+            assert_eq!(method, CONFIG_CHANGED_TOPIC);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

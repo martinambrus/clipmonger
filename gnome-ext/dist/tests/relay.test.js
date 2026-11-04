@@ -16,6 +16,19 @@ test('connect -> hello -> ready: subscribe then config resync ordering', () => {
     assert.equal(relay.state, 'Ready');
     assert.deepEqual(kinds(intents), ['connect', 'send-hello', 'send:events.subscribe', 'send:config.get', 'resync']);
 });
+test('config.changed push re-reads config only while ready', () => {
+    const { relay, intents } = harness();
+    relay.handleEvent('config.changed');
+    assert.deepEqual(kinds(intents), []);
+    relay.start();
+    relay.handleConnected();
+    relay.handleHelloOk();
+    intents.length = 0;
+    relay.handleEvent('config.changed');
+    relay.handleEvent('ui.show_popup');
+    relay.handleEvent(undefined);
+    assert.deepEqual(kinds(intents), ['send:config.get']);
+});
 test('backoff sequence 1,2,4,8,16,30 cap and reset on welcome', () => {
     const { relay } = harness();
     assert.deepEqual([0, 1, 2, 3, 4, 5, 6].map((a) => relay.backoffDelayMs(a)), [1000, 2000, 4000, 8000, 16000, 30000, 30000]);

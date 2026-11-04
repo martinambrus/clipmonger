@@ -115,7 +115,11 @@ ADR-003 (popup-hotkey owner and gesture lines).
 
 Need a Linux machine with an X11 session (Xvfb for the automated leg).
 
-1. Live popup-hotkey change on X11 (Windows only today):
+1. Live popup-hotkey change on X11. Status 2026-11-04: code and Xvfb test
+   done (`X11Hotkeys::register` grabs the new chord first, the X11 poll
+   thread runs the shared `run_hotkeys_with_activation` loop,
+   `t506_refused_change_keeps_chord`). Still open: the Settings note
+   and the manual Xorg leg below.
    - `crates/backend-x11/src/hotkeys.rs` `X11Hotkeys::register` ungrabs
      the old chord first. Grab the new chord first; the same keycode and
      modifier mask is a no-op (an ungrab after the new grab would drop
@@ -140,7 +144,18 @@ Need a Linux machine with an X11 session (Xvfb for the automated leg).
    (`crates/daemon/src/portal.rs`); a rebind may show the portal dialog
    again, so decide the UX before making it live.
 3. GNOME extension: its keybindings follow a changed chord only once the
-   daemon pushes `config.changed` (seg-07 §3; not implemented).
+   daemon pushes `config.changed` (seg-07 §3). Status 2026-11-04: the
+   daemon publishes `config.changed` (non-exclusive topic) on every config
+   replacement; the extension re-reads `config.get` and re-binds, keeping
+   the old chord when the new one is refused, and clears its conflict
+   note with `hotkey.conflict{cleared: true}` once a chord binds.
+   Manual leg passed 2026-11-04 (GNOME 46, Wayland): ctrl+alt+h → j → k
+   → h apply without a restart and the old chord stops working.
+   Limitation: Mutter refuses a keybinding only for a duplicate name, not
+   for keys another binding already uses, so GNOME never reports a
+   conflict. A chord that duplicates a Shell shortcut (`super+a`, the app
+   grid) silently takes it over. The refused-chord fallback is reachable
+   on X11 only.
 4. Verify the push path on a Linux desktop (X11 grab, portal, extension,
    `clipmonger-cli show-popup`, second launch, UI and daemon restart);
    on Linux it is covered by unit and socket tests only. Known gaps there:

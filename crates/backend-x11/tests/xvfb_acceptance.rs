@@ -1928,6 +1928,45 @@ fn t506_hotkey_conflict() {
     fired.expect("synthesized ctrl+alt+F9 must fire the registered hotkey");
 }
 
+/// Xvfb twin of the Windows `t406_refused_change_keeps_chord`: a change to a
+/// chord another client holds is refused and the old grab stays; a change
+/// to a free chord releases the old one (ADR-004 open item 1).
+#[test]
+fn t506_refused_change_keeps_chord() {
+    let Some((_guard, xvfb)) = fixture("t506_refused_change_keeps_chord") else {
+        return;
+    };
+    let display = xvfb.addr().to_string();
+    let (held, rival_chord, free) = ("ctrl+alt+F9", "ctrl+alt+F10", "ctrl+alt+F11");
+
+    let mut rival = X11Hotkeys::connect(Some(display.as_str())).expect("rival connect");
+    rival
+        .register(HotkeyId(1), rival_chord)
+        .expect("rival holds chord B");
+    let mut owner = X11Hotkeys::connect(Some(display.as_str())).expect("owner connect");
+    owner
+        .register(HotkeyId(1), held)
+        .expect("owner holds chord A");
+
+    owner
+        .register(HotkeyId(1), rival_chord)
+        .expect_err("a change to a held chord must be refused");
+    let mut probe = X11Hotkeys::connect(Some(display.as_str())).expect("probe connect");
+    probe
+        .register(HotkeyId(2), held)
+        .expect_err("chord A must stay grabbed after a refused change");
+
+    owner
+        .register(HotkeyId(1), free)
+        .expect("a change to a free chord succeeds");
+    probe
+        .register(HotkeyId(2), held)
+        .expect("chord A is released once the change lands");
+    owner
+        .poll(Duration::from_millis(100))
+        .expect("owner still polls after the changes");
+}
+
 // ---------------------------------------------------------------------------
 // t507: paste into a scratch window (transfer + restore halves)
 // ---------------------------------------------------------------------------

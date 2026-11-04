@@ -93,6 +93,9 @@ export const hotkeyFiredRequest = (id: string, hotkeyId: number): Envelope =>
   req(id, 'hotkey.fired', { id: hotkeyId });
 export const hotkeyConflictRequest = (id: string, chord: string, reason: string): Envelope =>
   req(id, 'hotkey.conflict', { chord, reason });
+/** `chord` registered after an earlier conflict: the daemon drops its note. */
+export const hotkeyConflictClearedRequest = (id: string, chord: string): Envelope =>
+  req(id, 'hotkey.conflict', { chord, reason: '', cleared: true });
 export interface CaptureEvent {
   clip: string; origin: string; source_app: string | null; sensitive: boolean;
   offers: Array<{ mime: string; bytes_hint: number; inline_b64?: string; blob?: boolean }>;

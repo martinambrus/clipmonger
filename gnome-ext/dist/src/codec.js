@@ -93,6 +93,8 @@ export const configGetRequest = (id) => req(id, 'config.get', {});
 export const eventsSubscribeRequest = (id) => req(id, 'events.subscribe', { topics: ['config.changed'] });
 export const hotkeyFiredRequest = (id, hotkeyId) => req(id, 'hotkey.fired', { id: hotkeyId });
 export const hotkeyConflictRequest = (id, chord, reason) => req(id, 'hotkey.conflict', { chord, reason });
+/** `chord` registered after an earlier conflict: the daemon drops its note. */
+export const hotkeyConflictClearedRequest = (id, chord) => req(id, 'hotkey.conflict', { chord, reason: '', cleared: true });
 /** G-F3: capture.report params = {event, payloads:{mime:base64}}; large payloads go via blobPutRequests first. */
 export function captureReportRequest(id, event, payloads = {}) {
     return req(id, 'capture.report', { event, payloads });

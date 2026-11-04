@@ -96,6 +96,11 @@ export class Relay {
             this.scheduleHeartbeat();
         }, this.heartbeatMs);
     }
+    /** Daemon push: `config.changed` re-reads the config (popup chord, filters). */
+    handleEvent(method) {
+        if (this.state === 'Ready' && method === 'config.changed')
+            this.emit({ type: 'send', method: 'config.get' });
+    }
     /** A pong (any ping response) resets the miss counter. */
     handlePong() { this.misses = 0; }
     get missedHeartbeats() { return this.misses; }

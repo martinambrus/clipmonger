@@ -1018,10 +1018,16 @@ async fn async_main(args: Vec<String>) {
     state.set_config(config.clone());
     state.set_paste_limits(config.popup.unicode_limit, config.popup.delivery_dwell_ms);
     // Before the backends start: a hotkey thread may trigger the popup at once.
-    let hub = clipmonger_ipc::server::EventHub::new(vec![clipmonger_ipc::server::TopicRule {
-        topic: clipmonger_ipc::proto::methods::SHOW_POPUP_TOPIC.to_string(),
-        exclusive: true,
-    }])
+    let hub = clipmonger_ipc::server::EventHub::new(vec![
+        clipmonger_ipc::server::TopicRule {
+            topic: clipmonger_ipc::proto::methods::SHOW_POPUP_TOPIC.to_string(),
+            exclusive: true,
+        },
+        clipmonger_ipc::server::TopicRule {
+            topic: clipmonger_ipc::proto::methods::CONFIG_CHANGED_TOPIC.to_string(),
+            exclusive: false,
+        },
+    ])
     .with_guard(ui_subscribe_guard());
     state.attach_event_hub(hub.clone());
     state.set_ui_launcher(ui_launcher(profile.clone()));

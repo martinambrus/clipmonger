@@ -116,7 +116,7 @@ export class IpcClient {
         if (env.kind === 'res') {
           if (env.error) this.relay.rejectResponse(env.id, new Error(env.error.code));
           else this.relay.resolveResponse(env.id, env.result);
-        } else if (env.kind === 'event') this.onEvent(env);
+        } else if (env.kind === 'event') { this.relay.handleEvent(env.method); this.onEvent(env); }
       }
     } catch { /* fall through to disconnect */ }
     this.relay.handleDisconnect();

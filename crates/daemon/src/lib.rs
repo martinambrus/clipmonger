@@ -2592,6 +2592,7 @@ impl DaemonState {
                 clipmonger_core::PasteDelivery::UnicodeInject => PasteStrategy::UnicodeInject,
             },
         );
+        self.notify_config_changed();
     }
 
     /// Snapshot all settings used by one paste. Restore publishes this tuple
@@ -4624,13 +4625,19 @@ impl DaemonState {
                     .get("reason")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let note = if reason.is_empty() {
-                    format!("hotkey conflict: {chord}")
+                let cleared = params
+                    .get("cleared")
+                    .and_then(Value::as_bool)
+                    .unwrap_or_default();
+                let note = if cleared {
+                    None
+                } else if reason.is_empty() {
+                    Some(format!("hotkey conflict: {chord}"))
                 } else {
-                    format!("hotkey conflict: {chord}: {reason}")
+                    Some(format!("hotkey conflict: {chord}: {reason}"))
                 };
                 if let Ok(mut slot) = self.hotkey_conflict_note.lock() {
-                    *slot = Some(note);
+                    *slot = note;
                 }
                 Ok(serde_json::json!({"ok": true}))
             }
@@ -5977,6 +5984,26 @@ mod tests {
                 .iter()
                 .any(|n| n.as_str().unwrap_or_default().contains("ctrl+alt+h")),
             "conflict must surface in caps notes, got {notes:?}"
+        );
+        state
+            .handle(
+                "hotkey.conflict",
+                &serde_json::json!({"chord": "ctrl+alt+j", "cleared": true}),
+            )
+            .expect("hotkey.conflict cleared");
+        let status = state
+            .handle("status", &serde_json::json!({}))
+            .expect("status");
+        let notes = status
+            .pointer("/caps/notes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !notes
+                .iter()
+                .any(|n| n.as_str().unwrap_or_default().contains("hotkey conflict")),
+            "a cleared conflict must leave caps notes, got {notes:?}"
         );
     }
 

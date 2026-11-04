@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { encodeEnvelope, decodeEnvelope, helloRequest, pingRequest, captureReportRequest, hotkeyFiredRequest, hotkeyConflictRequest, blobPutRequests, chunkPayload, sha256Hex, base64Encode, base64Decode, createIdGen, CodecError, CHUNK_RAW_BYTES, } from '../src/codec.js';
+import { encodeEnvelope, decodeEnvelope, helloRequest, pingRequest, captureReportRequest, hotkeyFiredRequest, hotkeyConflictRequest, hotkeyConflictClearedRequest, blobPutRequests, chunkPayload, sha256Hex, base64Encode, base64Decode, createIdGen, CodecError, CHUNK_RAW_BYTES, } from '../src/codec.js';
 test('envelope roundtrip: hello keys are exactly the wire shape', () => {
     const line = encodeEnvelope(helloRequest('e1', 'tok123'));
     const obj = JSON.parse(line);
@@ -17,6 +17,9 @@ test('builders: ping / hotkey.fired / hotkey.conflict / capture.report (G-F3/G-F
     const conflict = JSON.parse(encodeEnvelope(hotkeyConflictRequest('e4', 'ctrl+alt+v', 'grabbed')));
     assert.equal(conflict.method, 'hotkey.conflict');
     assert.deepEqual(conflict.params, { chord: 'ctrl+alt+v', reason: 'grabbed' });
+    const cleared = JSON.parse(encodeEnvelope(hotkeyConflictClearedRequest('e6', 'ctrl+alt+j')));
+    assert.equal(cleared.method, 'hotkey.conflict');
+    assert.deepEqual(cleared.params, { chord: 'ctrl+alt+j', reason: '', cleared: true });
     const report = JSON.parse(encodeEnvelope(captureReportRequest('e5', { clip: 'c1', origin: 'Clipboard', source_app: null, sensitive: false, offers: [] }, { 'text/plain': 'aGk=' })));
     assert.equal(report.method, 'capture.report');
     assert.deepEqual(report.params.payloads, { 'text/plain': 'aGk=' });
