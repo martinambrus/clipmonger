@@ -124,6 +124,73 @@ daemon and daemon.stop does not itself quit the UI. Do not reuse that coordinato
 or infer that --headless disables capture. Clipboard/window-station errors 5/183
 are STOP: record and hand off; do not explore or switch stations.
 
+## Open: dropped clipboard paste into elevated windows (2026-11-04)
+
+State: under diagnosis on a Windows 10 VM. Continue there; no fix is decided.
+
+Symptom: a popup paste (Ctrl+Alt+H, pick, Enter) sometimes inserts nothing,
+although the clip is on the clipboard afterwards. Failures are random: 2 of 7
+attempts in one run. Seen repeatedly on a Windows 10 Pro 21H2 (19044.1806) VM
+under the built-in Administrator account, and once on the Windows 11 host
+(10.0.26300) in an elevated Notepad through the helper. Not seen into
+non-elevated windows on the host.
+
+Context: the built-in Administrator (RID 500) has no split token, so the daemon
+and every window run elevated. dcb5a96 makes an elevated daemon paste directly
+(the helper refuses an elevated requester) and skips the consent prompt. Before
+it every paste failed with "admin helper is not running". After it pasting
+works except for this intermittent drop.
+
+Delivery is the default `clipboard_restore`: write the clipboard, wait until the
+target is the foreground window (`settle_foreground` in
+crates/backend-windows/src/paste.rs, `pin_helper_target` in helper.rs), then
+press Ctrl+V (`worker_press_paste_chord`). Both routes share this sequence.
+
+Diagnostic round 1 logged the target thread state (`GetGUIThreadInfo`) and
+modifier keys around the chord. Failed and successful pastes were identical:
+the target was foreground within about 30 ms after one activation, keyboard focus
+was on the Notepad Edit control with the caret, there was no menu mode,
+Ctrl/Alt/Shift/Win were up (only the picking Enter was still down), and the chord
+returned Ok. The keystroke arrives; timing, focus, menu mode and stuck modifiers
+are ruled out.
+
+Working hypothesis: clipboard contention. Notepad's `OpenClipboard` on Ctrl+V
+fails silently while another process has the clipboard open right after our
+write. Candidates: VM clipboard sharing (guest tools), the daemon's own capture
+reacting to the write, or another clipboard listener.
+
+Diagnostic round 2 (not yet run) is on branch diag/paste-clipboard-20261104.
+That branch is for diagnosis only; never merge it, and delete it after the fix.
+It appends to C:\Temp\clipmonger-paste-diag.log (create C:\Temp first):
+settle start/done with wait time and activation count, the pre-chord state, and
+for 150 ms after the chord every change of `GetOpenClipboardWindow` (window, pid,
+image path) and of the clipboard sequence number. A process that opens the
+clipboard without a window shows as null.
+
+Next steps:
+
+1. On the VM, build the diag branch and install the binaries (see below).
+2. Paste a synthetic clip into Notepad 10 times. Record ok/fail per attempt and
+   match the attempts to log entries in order.
+3. Identify what holds the clipboard open in the failed attempts. Note the VM
+   software and whether host clipboard sharing is on.
+4. Choose the fix from the evidence. Do not choose it before. Options:
+   wait before the chord until the clipboard is not open (bounded); if the
+   holder is the daemon's own capture, stop it opening the clipboard for
+   registered self-writes; retry once when the target content does not change.
+   Add a regression test where the logic is testable, then remove the diag code.
+
+Building on the VM: release binaries are normally cross-built on Linux for
+x86_64-pc-windows-gnu with `--locked`. A native Windows build has not been
+verified; GUI builds need Rust 1.95 or newer. Build the three binaries with
+`cargo build --release --locked -p clipmonger-app-ui --bin clipmonger`,
+`-p clipmonger-daemon --bin clipmonger-daemon` and
+`-p clipmonger-app-cli --bin clipmonger-cli`. Install them: quit Clipmonger from
+the tray, make sure no clipmonger process remains, copy the three exes into
+C:\Program Files\Clipmonger over an existing install, then start it from the
+Start menu. The installer and portable packages need the Linux packaging tools
+and notice scan; they are not needed for diagnosis.
+
 ## Other release gates: do not silently waive
 
 - Linux desktop acceptance needs actual X11/Wayland/GNOME environments:
