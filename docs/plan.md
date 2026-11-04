@@ -63,8 +63,8 @@ clipboard for a normal text paste; further native cases remain open.
 Popup Alt+Tab returning to the most recent window (Notepad) instead of the
 previous ordinary app is accepted as a Windows limitation. A tray-opened
 popup now takes keyboard focus. The 2026-11-04 guided pass on that build passed
-W01-W07, W09 and W10 (W08 skipped: no Scroll Lock key); see the continuation for
-the next cases and the UI findings batch.
+W01-W07, W09 and W10 (W08 skipped: no Scroll Lock key). The UI findings batch
+from that pass is implemented and passed its guided retest; see the continuation.
 
 The combined candidate also batches selected clipboard metadata reads; local
 release calibration reduced 10k-search p95 from 192.49 ms to 45.83 ms against
@@ -88,8 +88,9 @@ Next: use the exact candidate and Windows test packet, record each native/manual
 result, fix confirmed failures with regressions, refresh affected review/CI and
 artifacts, and reconcile the remaining release gates before integration/publication.
 The detailed procedure and protected-data boundaries are in the continuation.
-V2 and V3 remain future design-reopen milestones. No tag or publication follows
-from this update.
+V2 and V3 remain future design-reopen milestones. A Windows-only 0.1.0
+pre-release ([notes](release-notes-0.1.0.md)) is built from this candidate;
+it does not close the native gates or the Linux release.
 
 ## Steps (historical records)
 

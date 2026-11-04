@@ -1,6 +1,6 @@
 # Docs status
 
-## Current implementation (2026-11-03)
+## Current implementation (2026-11-04)
 
 Start at [v1 continuation](v1-continuation.md) for exact candidate identity,
 software evidence, outstanding task IDs, test packet and the next-agent procedure.
@@ -13,7 +13,8 @@ implemented; Phase 7 packaging/QA and native acceptance remain open.
 - Popup Alt+Tab landing on the most recent window instead of the one before it
   is a documented Windows limitation. A tray-opened popup now takes keyboard
   focus. The guided Windows pass on that build passed except the skipped Scroll
-  Lock case; UAC/autostart cases and a popup/Settings UI batch are next.
+  Lock case. The popup/Settings UI batch from its findings (f99f45e and earlier)
+  passed its guided Windows retest on 2026-11-04.
 - Windows clipboard paste now defaults to keeping the selected item on the
   clipboard; restoration is opt-in and existing explicit preferences are preserved.
 - The combined draft includes image/file-list storage, backup/restore safety,
@@ -26,6 +27,9 @@ implemented; Phase 7 packaging/QA and native acceptance remain open.
   T-905 through T-908 and capture fault paths need actual results. T-409 legs 1-10
   and T-410 passed on 2026-11-04; T-409 leg 5 (CLI-opened popups) passed on 527ad07
   the same day. T-409 legs 11-17 remain open. Historical dated passes remain scoped to their old builds.
+- Windows-only 0.1.0 pre-release: artifacts (NSIS setup, portable ZIP,
+  SHA256SUMS) are built from the branch head that carries
+  [the release notes](release-notes-0.1.0.md); Linux artifacts are not published.
 - Resolved 2026-11-04: dropped clipboard pastes into elevated windows were
   the daemon's capture reading its own paste write while the target handled
   Ctrl+V; fixed and verified on the Windows 10 VM, see
@@ -37,8 +41,8 @@ implemented; Phase 7 packaging/QA and native acceptance remain open.
   million-case fuzzing, coverage calibration, per-box caps goldens, applicable
   integration matrix, signed manuals and the final release audit. Seven passing
   software checks are not all seven release gates.
-- No tag or published release exists for this candidate. No remaining task is
-  completed merely by this documentation refresh.
+- Publishing the Windows 0.1.0 pre-release does not close the gates above or
+  any remaining task.
 
 ## Historical implementation records
 

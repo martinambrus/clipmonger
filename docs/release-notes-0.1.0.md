@@ -1,77 +1,77 @@
-# Clipmonger 0.1.0 (draft — do not publish without user approval)
+# Clipmonger 0.1.0 (Windows pre-release)
 
-Pre-release hardening build. No tag or GitHub release has been created
-for this draft (R-F4); the user reviews artifacts and notes first.
+First public pre-release of Clipmonger, for 64-bit Windows 10 and Windows 11.
+Linux builds are not part of this release. Changes are listed in
+[CHANGELOG.md](../CHANGELOG.md) under 0.1.0.
 
 ## Artifacts
 
-- `clipmonger-0.1.0-windows-x86_64.zip` — `clipmonger-daemon.exe`,
-  `clipmonger-cli.exe`, `clipmonger.exe` (UI). Cross-built on WSL2 with
-  the windows-gnu target; not a native-runner build (seg-12 §2).
-- `clipmonger-0.1.0-linux-x86_64.zip` — `clipmonger-daemon`,
-  `clipmonger-cli`, `clipmonger` (UI), built GNOME extension under
-  `gnome-extension/`, including its compiled GSettings schema. Copy that
-  directory to the GNOME Shell extensions directory under the UUID from
-  `metadata.json` before enabling it. Open the extension preferences with
-  `gnome-extensions prefs clipmonger@extensions.clipmonger.dev` and set
-  **Profile directory** (`profile-dir`) to the absolute extraction directory
-  containing `portable.marker`. If the app uses `--profile-dir`, enter that
-  directory instead. Leaving it blank selects the default user data profile.
-- Both portable ZIPs contain `portable.marker`, portable-use instructions,
-  and the complete `licenses/` directory, including font notices and their
-  README, upstream license texts, and generated `RUST-NOTICES.txt`.
-- `clipmonger-0.1.0-windows-x86_64-setup.exe` — unsigned NSIS installer
-  for Program Files and a Start menu entry, with the same license payload.
-  Uninstall preserves profiles by default. The optional deletion checkbox
-  names the default roaming profile directory and all its contents, requires
-  separate confirmation, and refuses an unknown or different shell account.
-  Custom and portable profiles outside that directory are preserved.
-- `SHA256SUMS` — sha256sum-format checksums for both ZIPs and the installer.
+- `clipmonger-0.1.0-windows-x86_64-setup.exe`: unsigned NSIS installer for
+  Program Files with a Start menu entry. Uninstall keeps profiles by default.
+  The optional deletion checkbox names the default roaming profile directory
+  and all its contents, requires separate confirmation, and refuses an unknown
+  or different shell account. Custom and portable profiles outside that
+  directory are kept.
+- `clipmonger-0.1.0-windows-x86_64.zip`: portable copy with `clipmonger.exe`
+  (UI), `clipmonger-daemon.exe` and `clipmonger-cli.exe`. It contains
+  `portable.marker`, so the profile is stored beside the programs, and
+  portable-use instructions.
+- Both contain the complete `licenses/` directory: font notices and their
+  README, upstream license texts and the generated `RUST-NOTICES.txt`.
+- `SHA256SUMS`: sha256sum-format checksums for the installer and the ZIP.
 
-The brief-named artifact files use the `-x86_64` suffix; they correspond
-to the `linux-x64` / `windows-x64` naming in the release analysis.
+The binaries are cross-built on WSL2 with the `x86_64-pc-windows-gnu` target,
+not on a native Windows build runner (seg-12 §2).
 
-Linux package builds and payload checks require `glib-compile-schemas` and
-`gsettings` from GLib. Use the same GLib toolchain to build and verify a
-package: the checker recompiles its XML and compares the compiled bytes.
+## Unsigned binaries (seg-12 §5)
 
-## Unsigned-warning (seg-12 §5)
+The binaries are **not signed**. Windows SmartScreen warns on the first
+download and run. Follow [Installing on Windows](install-windows.md), which
+verifies the download against `SHA256SUMS` before any warning is bypassed.
 
-These binaries are **unsigned**. Windows SmartScreen will friction the
-first install/run: follow [Installing on Windows](install-windows.md),
-which verifies the download against `SHA256SUMS` first (accuracy checked by
-`tests/manual/T-1204-bypass-docs-accuracy.md`). Linux has no signing friction expected.
-
-Checksums are **integrity only, not signatures** (seg-12 §8): a
-same-account compromise defeats them. Verify with `sha256sum -c
-SHA256SUMS` in the download directory.
+Checksums are **integrity only, not signatures** (seg-12 §8): someone who can
+replace both the file and `SHA256SUMS`, or who controls your account, defeats
+them.
 
 ## Clipboard behavior
 
-Windows clipboard paste leaves the selected clip on the clipboard by default.
-Enable **Restore clipboard after paste** to restore the previous clipboard when
-it has not changed in the meantime. Existing explicit preferences are preserved;
-the default delivery strategy remains `clipboard_restore`.
+Paste leaves the selected clip on the clipboard by default. Enable **Restore
+clipboard after paste** to restore the previous clipboard when it has not
+changed in the meantime. Existing explicit preferences are kept; the default
+delivery strategy remains `clipboard_restore`.
 
-## Coexistence note
+Pasting into a window that runs as administrator uses an elevated helper,
+started after one consent and User Account Control prompt (once for an
+install, at every start for the portable copy). When Clipmonger itself runs
+elevated, for example under the built-in Administrator account, it pastes
+directly and needs no helper. Such pastes need the hotkey press that opened
+the popup; from a popup opened by the tray or `clipmonger-cli show-popup` they
+are refused with a visible reason.
 
-Clipmonger uses a passive clipboard listener by design and coexists
-with ArsClip and clipboard sync tools. Current-build interoperability with
-RustDesk and ScreenConnect still requires the native checks below; pause sync
-tools only for clean manual test runs.
-Only one Clipmonger daemon may hold a profile at a time
-(`already_running`); portable mode leaves no autostart entries.
+## Coexistence
 
-## Known pending (manual/native legs)
+Clipmonger uses a passive clipboard listener and coexists with other clipboard
+managers and clipboard sync tools. Only one Clipmonger daemon may hold a
+profile at a time (`already_running`). Portable mode creates no autostart
+entry.
 
-T-409 legs 11-17, T-508, T-606/T-607, T-702..T-705
-(GNOME/Ubuntu), T-905..T-908 (real displays), per-box caps goldens,
-coverage floor, update-check (T-1202). See `CHANGELOG.md`.
+## Known limitations
 
-The current draft still needs installer/uninstaller, confirmation and recovery
-acceptance; elevated-helper and failed-paste acceptance; and the current CPU
-runner's native display and focus checks. The profile-deletion component's
-synthetic Windows fixture is not installer UI or UAC acceptance. Positive file
-symbolic-link controls remain unverified where the test token lacks privilege.
-Linux release clearance for the blur-derived protocol output remains open.
-A local draft artifact or checksum pass does not approve publication.
+- Alt+Tab from the open popup closes it and switches to the most recently used
+  window, not the one before it. Windows reserves Alt+Tab for the shell.
+- A popup opened by `clipmonger-cli show-popup` while an administrator window
+  is in front appears without keyboard focus; click it or use the hotkey.
+- Under the built-in Administrator account every window runs as
+  administrator, so only a popup opened by the hotkey can paste.
+- Windows 11 Smart App Control blocks unsigned programs; Clipmonger cannot run
+  while it is on.
+- No update check (T-1202 is out of 0.1.0 scope).
+
+## Not yet verified
+
+Checked by hand on Windows: capture and paste, the popup, Settings, the UAC
+helper (T-409 legs 1-10) and autostart after reboot (T-410). Still open:
+T-409 legs 11-17, installer recovery paths, DPI and monitor changes, the
+keyboard-only pass and the full window matrix (T-905 to T-908), the install
+guide on a clean Windows 11 (T-1204), the 24-hour soak, fuzzing and coverage
+calibration. See [STATUS](STATUS.md).

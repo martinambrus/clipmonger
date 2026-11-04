@@ -1,6 +1,6 @@
 # V1 continuation — acceptance candidate
 
-Updated 2026-11-04. Start here when continuing without the previous conversation.
+Updated 2026-11-04 (Windows 0.1.0 pre-release). Start here when continuing without the previous conversation.
 
 ## Scope and current state
 
@@ -114,22 +114,25 @@ keyboard has no Scroll Lock key. Results with notes are in
 `/home/zathrus/clipmonger-work/continuation/RESULTS-2dabd38.csv`.
 
 T-409 and T-410 (2026-11-04): T-409 legs 1-10 and all T-410 steps PASS; the
-`clipmonger-cli show-popup` half of T-409 leg 5 FAILS (CLI-opened popups have no
-target and lose focus to the admin window); T-409 legs 11-17 not run. The first
+`clipmonger-cli show-popup` half of T-409 leg 5 first FAILED (CLI-opened popups
+had no target) and PASSED on 527ad07; T-409 legs 11-17 not run. The first
 installed run on 65b2b2a exposed a helper-task readback bug (scheduler returns
 account names, registrar expected the SID); fixed on `packaging-qa-20261103` in
 2623046 and re-run from an installer built on 65b2b2a plus that fix. Verdicts are
 in the T-409/T-410 files on that branch; rows in the same results CSV.
 
-Next: fix CLI/tray-opened popup targeting and focus, then a popup/Settings UI
-batch from the pass findings: prominent paste errors; drop the duplicate current-item
-section; disable First Page at the start; place or drop "End of history"; stop the
-footer overlapping the list; no image placeholders for text clips; a configurable
-multiline preview character limit with ellipsis; Settings filter on all tabs;
-`popup.activation_failed` warnings on CLI show-popup; inline red validation errors
-that keep focus; dropdowns for enum settings; remove the stale permanent-hotkey note;
-disable or explain portable "Start on login" (it reports a misleading failure).
-Rerun the affected W cases on the new build.
+Done since: CLI-opened popup targeting (527ad07), the dropped elevated paste
+(8c4e597, below) and the popup/Settings UI batch from the pass findings
+(c9918d0 through f99f45e: prominent paste errors, footer off the list, simpler
+list paging, multiline preview cap `popup.preview_lines`, enum dropdowns,
+portable Start on login disabled, Settings filter across tabs, inline
+validation errors, popup sized to its clips and the work area, readable error
+colours, full-width rows with tooltips). The user's guided Windows retest of
+the batch passed on 2026-11-04.
+
+Next: the Windows-only 0.1.0 pre-release ([notes](release-notes-0.1.0.md)) is
+built from the branch head that carries this update. Then T-409 legs 11-17, the
+Windows 11 leg of T-1204 and the remaining tasks in the table above.
 
 The PC may reboot before testing resumes. Treat all prior PIDs, running apps,
 WSL sessions and temporary directories as historical. Recheck Git status and

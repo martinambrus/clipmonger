@@ -1,9 +1,8 @@
 # Installing Clipmonger on Windows
 
-> Draft. The Windows prompts below must be checked against a clean, current
-> Windows 10 and Windows 11 install before each release
-> ([T-1204](../tests/manual/T-1204-bypass-docs-accuracy.md)). Correct this page
-> whenever a screen does not match.
+> The prompts below were checked on Windows 10; the Windows 11 check is still
+> open ([T-1204](../tests/manual/T-1204-bypass-docs-accuracy.md)). If a screen
+> does not match, please report it.
 
 Clipmonger 0.1.0 runs on 64-bit Windows 10 and Windows 11. The release has two
 Windows downloads:
@@ -85,3 +84,11 @@ Pasting into a program that runs as administrator needs a helper. The first
 time, Clipmonger asks whether to start it, and Windows shows a User Account
 Control prompt. With the installer this is asked once. With the portable ZIP
 the helper is asked for each time Clipmonger starts.
+
+If Clipmonger itself runs as administrator, for example when you are signed in
+as the built-in Administrator account, it pastes directly. No helper is
+started and nothing is asked.
+
+A paste into an administrator window needs the popup hotkey. From a popup
+opened by the tray icon or by `clipmonger-cli show-popup`, such a paste is
+refused and the popup shows why.

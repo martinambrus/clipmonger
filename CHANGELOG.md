@@ -3,7 +3,9 @@
 All notable changes to Clipmonger. Semver per seg-12 §6; `1.0.0` is
 reserved for the release that passes all seg-11 §5 gates.
 
-## [Unreleased]
+## [0.1.0] — 2026-11-04
+
+First public pre-release, Windows only. Linux builds are not published yet.
 
 ### Added
 
@@ -157,7 +159,7 @@ pending; dated verification notes below retain their original scope.
   raced the UAC desktop switch. Release builds now enable the
   platform backend features so the shipped daemon is not a skeleton.
 
-## [0.1.0] — 2026-10-27
+## Unpublished 0.1.0 draft — 2026-10-27
 
 Pre-release hardening build (R-F1). Draft artifacts are unsigned local
 zips; no tag or GitHub release is created by this step (R-F4).
