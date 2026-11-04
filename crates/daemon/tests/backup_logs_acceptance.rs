@@ -255,6 +255,7 @@ fn config_all_rows_persist_across_reload() {
         ("popup.hotkey", json!("ctrl+alt+x")),
         ("popup.placement", json!("center")),
         ("popup.preview_width", json!(42)),
+        ("popup.preview_lines", json!(2)),
         ("popup.dismiss_on_focus_loss", json!(false)),
         ("popup.keys", json!({"copy": "ctrl+c"})),
         (
@@ -275,8 +276,8 @@ fn config_all_rows_persist_across_reload() {
     ];
     assert_eq!(
         cases.len(),
-        29,
-        "28 ROWS keys (popup.keys.* by wire) + ui.theme"
+        30,
+        "29 ROWS keys (popup.keys.* by wire) + ui.theme"
     );
     for (key, value) in cases {
         state

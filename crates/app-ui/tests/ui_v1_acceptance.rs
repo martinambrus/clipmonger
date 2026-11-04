@@ -7,7 +7,7 @@
 //! Frozen builder API named by this file:
 //!
 //! `config_model`:
-//!   `pub const ROWS: &[Row]` (29 rows, in the seg-03 S6 table order below)
+//!   `pub const ROWS: &[Row]` (30 rows, in the seg-03 S6 table order below)
 //!   `pub struct Row { pub key: &'static str, pub tab: Tab,
 //!                     pub kind: Kind, pub label: &'static str }`
 //!   `pub enum Tab { History, Popup, Advanced, PermanentClips, Privacy,
@@ -152,20 +152,20 @@ fn t901_clips_unicode_query_pins_current_lowercase_rule() {
 #[test]
 fn t901_settings_filter_over_rows_keys() {
     let keys = row_keys();
-    assert_eq!(config_model::ROWS.len(), 29);
+    assert_eq!(config_model::ROWS.len(), 30);
     // Empty query returns every row in ROWS order.
     assert_eq!(
         search::filter_settings(&keys, ""),
-        (0..29).collect::<Vec<usize>>()
+        (0..30).collect::<Vec<usize>>()
     );
     // The 8 monitor.* rows are the first 8 rows (seg-03 S6 order).
     assert_eq!(
         search::filter_settings(&keys, "monitor."),
         vec![0, 1, 2, 3, 4, 5, 6, 7]
     );
-    // The 10 popup.* rows (case-insensitive).
-    let popup_idx: Vec<usize> = (0..29).filter(|i| keys[*i].starts_with("popup.")).collect();
-    assert_eq!(popup_idx.len(), 10, "expected 10 popup.* rows in ROWS");
+    // The 11 popup.* rows (case-insensitive).
+    let popup_idx: Vec<usize> = (0..30).filter(|i| keys[*i].starts_with("popup.")).collect();
+    assert_eq!(popup_idx.len(), 11, "expected 11 popup.* rows in ROWS");
     assert_eq!(search::filter_settings(&keys, "POPUP."), popup_idx);
     // "keys" selects exactly the popup.keys.* row.
     assert_eq!(
@@ -179,7 +179,7 @@ fn t901_settings_filter_over_rows_keys() {
 fn t901_config_filter_rows_searches_keys_and_labels() {
     assert_eq!(
         config_model::filter_rows(""),
-        (0..29).collect::<Vec<usize>>()
+        (0..30).collect::<Vec<usize>>()
     );
     assert_eq!(
         config_model::filter_rows("monitor."),
@@ -187,7 +187,7 @@ fn t901_config_filter_rows_searches_keys_and_labels() {
     );
     assert_eq!(
         config_model::filter_rows("POPUP."),
-        (0..29)
+        (0..30)
             .filter(|i| config_model::ROWS[*i].key.starts_with("popup."))
             .collect::<Vec<usize>>()
     );
@@ -511,7 +511,7 @@ fn t905_monitor_rect_falls_back_only_when_size_unknown() {
 // t909_*: settings-coverage matrix (T-909) + ConfigDoc behaviour
 // ---------------------------------------------------------------------------
 
-/// The exact 29 v1 keys (seg-03 S6, analysis S5 T-909), in table order,
+/// The exact 30 v1 keys (seg-03 S6, analysis S5 T-909), in table order,
 /// each with its seg-09 S4 tab (ledger U1-F2) and control kind.
 const EXPECTED_ROWS: &[(&str, config_model::Tab, config_model::Kind)] = {
     use config_model::{Kind as K, Tab as T};
@@ -531,6 +531,7 @@ const EXPECTED_ROWS: &[(&str, config_model::Tab, config_model::Kind)] = {
         ("popup.hotkey", T::Popup, K::Chord),
         ("popup.placement", T::Popup, K::Enum),
         ("popup.preview_width", T::Popup, K::Int),
+        ("popup.preview_lines", T::Popup, K::Int),
         ("popup.dismiss_on_focus_loss", T::Popup, K::Bool),
         ("popup.keys.*", T::Popup, K::ChordMap),
         ("popup.paste_chords", T::Popup, K::PasteChords),
@@ -552,8 +553,8 @@ const EXPECTED_ROWS: &[(&str, config_model::Tab, config_model::Kind)] = {
 fn t909_rows_are_exactly_the_v1_keys() {
     assert_eq!(
         config_model::ROWS.len(),
-        29,
-        "ROWS must hold exactly the 29 v1 rows"
+        30,
+        "ROWS must hold exactly the 30 v1 rows"
     );
     let got: Vec<&str> = row_keys();
     let want: Vec<&str> = EXPECTED_ROWS.iter().map(|(key, _, _)| *key).collect();

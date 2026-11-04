@@ -97,6 +97,7 @@ pub struct PopupApp {
     /// Theme last applied to the contexts: popup, settings (dark, font scale bits).
     theme_applied: [Option<(bool, u32)>; 2],
     preview_width: u32,
+    preview_lines: u32,
     pending_activation: bool,
     pending_activation_metadata: Option<runner::PopupActivation>,
     pending_reveal: Option<(Option<String>, usize, uuid::Uuid)>,
@@ -155,6 +156,7 @@ impl PopupApp {
             focus_search: open,
             theme_applied: [None, None],
             preview_width: 80,
+            preview_lines: 3,
             pending_activation: false,
             pending_activation_metadata: None,
             pending_reveal: None,
@@ -711,6 +713,10 @@ impl PopupApp {
                     .get("popup.preview_width")
                     .and_then(Value::as_u64)
                     .map_or(80, |n| u32::try_from(n).unwrap_or(80));
+                let lines = doc
+                    .get("popup.preview_lines")
+                    .and_then(Value::as_u64)
+                    .map_or(3, |n| u32::try_from(n).unwrap_or(3));
                 let placement_str = doc
                     .get("popup.placement")
                     .and_then(Value::as_str)
@@ -725,6 +731,7 @@ impl PopupApp {
                     config.edits.clear();
                 }
                 self.preview_width = width;
+                self.preview_lines = lines;
                 if placement_changed {
                     self.placement = new_placement;
                     self.placement_waiting_for_geometry = false;

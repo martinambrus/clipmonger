@@ -508,7 +508,11 @@ impl PopupApp {
                                 continue;
                             };
                             let selected = self.vm.selected == row;
-                            let truncated = popup::display_preview(&preview, self.preview_width);
+                            let truncated = popup::display_preview(
+                                &preview,
+                                self.preview_width,
+                                self.preview_lines,
+                            );
                             // Register the row as clickable when its child UI is created.
                             // Adding click sense afterward clears focus on the next pass.
                             let row_rect = egui::Rect::from_min_size(

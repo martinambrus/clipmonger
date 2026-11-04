@@ -483,7 +483,7 @@ fn u9_perm_strings_exist() {
 fn u10_config_tab_excludes_legacy_groups_row() {
     assert_eq!(
         config_model::ROWS.len(),
-        29,
+        30,
         "T-909 matrix includes the Scroll Lock row"
     );
     assert!(
@@ -515,5 +515,5 @@ fn u10_config_tab_excludes_legacy_groups_row() {
     ] {
         total += config_model::visible_rows(tab).len();
     }
-    assert_eq!(total, 29, "visible_rows partitions the 29-row matrix");
+    assert_eq!(total, 30, "visible_rows partitions the 30-row matrix");
 }

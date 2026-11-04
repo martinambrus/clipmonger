@@ -26,6 +26,8 @@ reserved for the release that passes all seg-11 §5 gates.
 - Daemon-to-UI push (`events.subscribe`, `ui.show_popup`):
   `clipmonger-cli show-popup` opens the popup through the daemon, which
   starts the UI when none is running.
+- `popup.preview_lines` (default 3, Popup tab): popup previews keep up to
+  that many lines; `popup.preview_width` caps their total characters.
 
 ### Changed
 

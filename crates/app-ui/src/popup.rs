@@ -51,10 +51,13 @@ pub fn preview_kind(clip: &Clip) -> &'static str {
     }
 }
 
-/// Display-only truncation for history and Current Clipboard previews.
+/// Display-only truncation for history previews.
 ///
-/// `width` is a Unicode scalar count from `popup.preview_width`. The total
-/// visible budget includes the deterministic ellipsis `…`. Width 1 is valid and
+/// Keeps at most `lines` lines (`popup.preview_lines`; `\n`, `\r\n` and `\r`
+/// break lines, a trailing break is dropped) and at most `width` Unicode scalars
+/// in total (`popup.preview_width`; line breaks do not count). The total
+/// visible budget includes the deterministic ellipsis `…`, appended whenever
+/// characters or lines were cut. Zero `lines` is treated as 1. Width 1 is valid and
 /// yields `…` when truncation is needed. Invalid zero (reachable via manual
 /// TOML edit or `CLIPMONGER_POPUP_PREVIEW_WIDTH=0` env override despite
 /// validation requiring ≥1) is clamped to 1 for safe display without panic.
@@ -62,17 +65,47 @@ pub fn preview_kind(clip: &Clip) -> &'static str {
 /// verbatim without allocating `width` bytes, and truncation only collects the
 /// needed `width-1` scalars. Never slices UTF-8 by byte offsets.
 #[must_use]
-pub fn display_preview(preview: &str, width: u32) -> String {
-    let effective = if width == 0 { 1 } else { width as usize };
-    let count = preview.chars().count();
-    if count <= effective {
-        return preview.to_string();
+pub fn display_preview(preview: &str, width: u32, lines: u32) -> String {
+    let budget = width.max(1) as usize;
+    let max_lines = lines.max(1);
+    let mut out = String::new();
+    let mut used = 0;
+    let mut line = 1;
+    let mut cut = false;
+    let mut chars = preview.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' && chars.peek() == Some(&'\n') {
+            continue;
+        }
+        if c == '\n' || c == '\r' {
+            if chars.peek().is_none() {
+                break;
+            }
+            if line == max_lines {
+                cut = true;
+                break;
+            }
+            line += 1;
+            out.push('\n');
+            continue;
+        }
+        if used == budget {
+            cut = true;
+            break;
+        }
+        out.push(c);
+        used += 1;
     }
-    if effective == 1 {
-        return "…".to_string();
+    if cut {
+        if used == budget {
+            // Make room for the ellipsis inside the character budget.
+            while out.ends_with('\n') {
+                out.pop();
+            }
+            out.pop();
+        }
+        out.push('…');
     }
-    let mut out: String = preview.chars().take(effective - 1).collect();
-    out.push('…');
     out
 }
 
@@ -503,53 +536,77 @@ mod display_preview_tests {
 
     #[test]
     fn empty_and_short_preserved() {
-        assert_eq!(display_preview("", 5), "");
-        assert_eq!(display_preview("hi", 80), "hi");
-        assert_eq!(display_preview("abc", 3), "abc");
+        assert_eq!(display_preview("", 5, 1), "");
+        assert_eq!(display_preview("hi", 80, 1), "hi");
+        assert_eq!(display_preview("abc", 3, 1), "abc");
     }
 
     #[test]
     fn width_one_ellipsis() {
-        assert_eq!(display_preview("abcdef", 1), "…");
-        assert_eq!(display_preview("a", 1), "a");
-        assert_eq!(display_preview("", 1), "");
+        assert_eq!(display_preview("abcdef", 1, 1), "…");
+        assert_eq!(display_preview("a", 1, 1), "a");
+        assert_eq!(display_preview("", 1, 1), "");
     }
 
     #[test]
     fn truncates_with_ellipsis_budget() {
-        assert_eq!(display_preview("abcdefghij", 5), "abcd…");
-        assert_eq!(display_preview("abcdefghij", 5).chars().count(), 5);
+        assert_eq!(display_preview("abcdefghij", 5, 1), "abcd…");
+        assert_eq!(display_preview("abcdefghij", 5, 1).chars().count(), 5);
     }
 
     #[test]
     fn multibyte_scalar() {
         let preview = "🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀";
-        assert_eq!(display_preview(preview, 5), "🦀🦀🦀🦀…");
-        assert_eq!(display_preview(preview, 5).chars().count(), 5);
+        assert_eq!(display_preview(preview, 5, 1), "🦀🦀🦀🦀…");
+        assert_eq!(display_preview(preview, 5, 1).chars().count(), 5);
     }
 
     #[test]
     fn zero_safe() {
         // invalid zero treated as 1
-        assert_eq!(display_preview("abcdef", 0), "…");
-        assert_eq!(display_preview("", 0), "");
-        assert_eq!(display_preview("a", 0), "a");
+        assert_eq!(display_preview("abcdef", 0, 1), "…");
+        assert_eq!(display_preview("", 0, 1), "");
+        assert_eq!(display_preview("a", 0, 1), "a");
     }
 
     #[test]
     fn huge_width_no_huge_alloc() {
         let short = "abc";
         // huge width should return verbatim without allocating huge capacity
-        assert_eq!(display_preview(short, 1_000_000), "abc");
+        assert_eq!(display_preview(short, 1_000_000, 1), "abc");
         let long = "x".repeat(200);
-        assert_eq!(display_preview(&long, 1_000_000), long);
+        assert_eq!(display_preview(&long, 1_000_000, 1), long);
+    }
+
+    #[test]
+    fn multiline_keeps_lines_and_counts_only_chars() {
+        assert_eq!(display_preview("ab\ncd", 80, 3), "ab\ncd");
+        assert_eq!(display_preview("ab\ncd\nef\ngh", 80, 3), "ab\ncd\nef…");
+        assert_eq!(display_preview("ab\ncd\nef", 80, 1), "ab…");
+        // Line breaks do not count toward the width.
+        assert_eq!(display_preview("ab\ncd", 4, 3), "ab\ncd");
+        assert_eq!(display_preview("ab\ncdef", 4, 3), "ab\nc…");
+        assert_eq!(display_preview("ab\ncd", 1, 3), "…");
+    }
+
+    #[test]
+    fn crlf_and_trailing_break() {
+        assert_eq!(display_preview("ab\r\ncd\r\n", 80, 3), "ab\ncd");
+        assert_eq!(display_preview("ab\rcd", 80, 3), "ab\ncd");
+        assert_eq!(display_preview("ab\n", 80, 1), "ab");
+        assert_eq!(display_preview("ab\r\n\r\ncd", 80, 1), "ab…");
+    }
+
+    #[test]
+    fn zero_lines_is_one() {
+        assert_eq!(display_preview("ab\ncd", 80, 0), "ab…");
     }
 
     #[test]
     fn does_not_slice_bytes() {
         let s = "a🦀b";
         // ensure truncation respects char boundaries, not bytes
-        let out = display_preview(s, 2);
+        let out = display_preview(s, 2, 1);
         assert_eq!(out, "a…");
         assert_eq!(out.chars().count(), 2);
     }

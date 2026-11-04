@@ -154,6 +154,12 @@ pub const ROWS: &[Row] = &[
         label: "config.popup_preview_width",
     },
     Row {
+        key: "popup.preview_lines",
+        tab: Tab::Popup,
+        kind: Kind::Int,
+        label: "config.popup_preview_lines",
+    },
+    Row {
         key: "popup.dismiss_on_focus_loss",
         tab: Tab::Popup,
         kind: Kind::Bool,
@@ -357,6 +363,7 @@ fn validate_inner(key: &str, value: &Value) -> Result<(), String> {
             let min: i64 = match key {
                 "history.max_items"
                 | "popup.preview_width"
+                | "popup.preview_lines"
                 | "monitor.max_bytes"
                 | "history.max_store_bytes"
                 | "popup.unicode_limit"

@@ -190,6 +190,7 @@ MUST NOT be promised in v1.
   | popup.hotkey | chord | per-OS default (§9-8) | History | v1 |
   | popup.placement | enum | cursor | History | v1 |
   | popup.preview_width | int | 80 | History | v1 |
+  | popup.preview_lines | int | 3 | History | v1 |
   | popup.dismiss_on_focus_loss | bool | true | History | v1 |
   | popup.keys.* | chord map | seg-09 §8 | History | v1 |
   | popup.paste_chords | [{app,chord}] | [{*,ctrl/cmd+v}] | History | v1 (M-08) |

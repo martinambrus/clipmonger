@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 struct Pass {
     texts: Vec<String>,
+    rects: Vec<(String, egui::Rect)>,
 }
 impl Pass {
     fn painted(&self, text: &str) -> bool {
@@ -21,9 +22,12 @@ impl Pass {
     }
 }
 
-fn collect_text(shape: &egui::Shape, out: &mut Vec<String>) {
+fn collect_text(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
     match shape {
-        egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+        egui::Shape::Text(text) => out.push((
+            text.galley.text().to_string(),
+            text.galley.rect.translate(text.pos.to_vec2()),
+        )),
         egui::Shape::Vec(shapes) => {
             for shape in shapes {
                 collect_text(shape, out);
@@ -92,11 +96,12 @@ impl Rig {
         });
         output.textures_delta.clear(); // No renderer consumes textures in this headless rig.
         assert_eq!(runs, 1, "egui discarded pass");
-        let mut texts = Vec::new();
+        let mut rects = Vec::new();
         for clipped in &output.shapes {
-            collect_text(&clipped.shape, &mut texts);
+            collect_text(&clipped.shape, &mut rects);
         }
-        Pass { texts }
+        let texts = rects.iter().map(|(text, _)| text.clone()).collect();
+        Pass { texts, rects }
     }
     fn tick(&mut self) {
         let app = &mut self.app;
@@ -173,6 +178,38 @@ fn assert_stored_unchanged(rig: &Rig, original: &Clip) {
         .find(|clip| clip.id == original.id)
         .expect("stored clip");
     assert_eq!(stored, original, "complete stored clip must stay unchanged");
+}
+
+// popup.preview_lines keeps up to N lines; a multi-line row does not overlap the next
+#[test]
+fn preview_lines_keep_line_breaks_without_overlap() {
+    let mut rig = Rig::opened();
+    let multi = clip(1, "L1\nL2\nL3\nL4");
+    let next = clip(2, "next row");
+    rig.load(&[multi.clone(), next]);
+    rig.push(UiEvent::Config(
+        json!({"config": {"popup": {"preview_width": 80, "preview_lines": 2}}}),
+    ));
+    rig.tick();
+    let _ = rig.cmds();
+    let pass = rig.show();
+    assert!(pass.painted("L1\nL2…"), "texts {:?}", pass.texts);
+    let rect = |text: &str| {
+        pass.rects
+            .iter()
+            .find(|(painted, _)| painted == text)
+            .map_or_else(
+                || panic!("`{text}` not painted: {:?}", pass.texts),
+                |(_, rect)| *rect,
+            )
+    };
+    let first = rect("L1\nL2…");
+    let second = rect("next row");
+    assert!(
+        first.bottom() <= second.top(),
+        "rows overlap: {first:?} vs {second:?}"
+    );
+    assert_stored_unchanged(&rig, &multi);
 }
 
 // history rows at 5/20/80 show truncated multibyte, not verbatim long

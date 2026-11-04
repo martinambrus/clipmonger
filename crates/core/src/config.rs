@@ -60,6 +60,10 @@ fn default_preview_width() -> u32 {
     80
 }
 
+fn default_preview_lines() -> u32 {
+    3
+}
+
 fn default_true() -> bool {
     true
 }
@@ -178,6 +182,8 @@ pub struct PopupConfig {
     pub placement: String,
     #[serde(default = "default_preview_width")]
     pub preview_width: u32,
+    #[serde(default = "default_preview_lines")]
+    pub preview_lines: u32,
     #[serde(default = "default_true")]
     pub dismiss_on_focus_loss: bool,
     /// Chord map (seg-09 S8 keymap).
@@ -204,6 +210,7 @@ impl Default for PopupConfig {
             hotkey: default_hotkey(),
             placement: default_placement(),
             preview_width: default_preview_width(),
+            preview_lines: default_preview_lines(),
             dismiss_on_focus_loss: true,
             keys: BTreeMap::new(),
             paste_chords: default_paste_chords(),
@@ -451,6 +458,11 @@ impl Config {
         if let Some(v) = env_str("CLIPMONGER_POPUP_PREVIEW_WIDTH") {
             if let Ok(n) = v.parse::<u32>() {
                 self.popup.preview_width = n;
+            }
+        }
+        if let Some(v) = env_str("CLIPMONGER_POPUP_PREVIEW_LINES") {
+            if let Ok(n) = v.parse::<u32>() {
+                self.popup.preview_lines = n;
             }
         }
         if let Some(v) = env_str("CLIPMONGER_POPUP_DISMISS_ON_FOCUS_LOSS") {
