@@ -1116,10 +1116,11 @@ mod tests {
             } else {
                 Failure::Retryable
             };
-            let accepted_at = if index == 1 || index == 2 {
-                now.checked_sub(Duration::from_secs(1)).unwrap()
-            } else {
-                now
+            // Key 2 (hidden) cools down first, then visible key 1, then key 0.
+            let accepted_at = match index {
+                1 => now.checked_sub(Duration::from_millis(500)).unwrap(),
+                2 => now.checked_sub(Duration::from_secs(1)).unwrap(),
+                _ => now,
             };
             assert!(thumbs.cache.accept(
                 Completion {
@@ -1129,23 +1130,39 @@ mod tests {
                 accepted_at
             ));
         }
+        let earliest = thumbs
+            .cache
+            .retry_deadline(&keys[1], now)
+            .expect("visible key 1 cools down");
+        let later = thumbs
+            .cache
+            .retry_deadline(&keys[0], now)
+            .expect("visible key 0 cools down");
+        assert!(earliest < later);
         let ctx = egui::Context::default();
         for _ in 0..3 {
             ctx.run_ui(egui::RawInput::default(), |_| {})
                 .textures_delta
                 .clear();
         }
+        // Bound the wake by the clock around the pass instead of a fixed
+        // window: a loaded run can spend hundreds of milliseconds before it.
+        let before = Instant::now();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             thumbs.update(
                 ui.ctx(),
                 vec![keys[0].clone(), keys[1].clone(), keys[3].clone()],
             );
         });
+        let after = Instant::now();
         let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
         output.textures_delta.clear();
+        let slack = Duration::from_millis(5);
         assert!(
-            delay > Duration::from_millis(500) && delay <= Duration::from_secs(1),
-            "earliest visible delay: {delay:?}"
+            delay + slack >= earliest.saturating_duration_since(after)
+                && delay <= earliest.saturating_duration_since(before) + slack,
+            "earliest visible delay: {delay:?}, deadline in {:?}",
+            earliest.saturating_duration_since(before)
         );
         // The remaining retry entry is hidden, and the visible invalid entry is terminal.
         let other = egui::Context::default();
