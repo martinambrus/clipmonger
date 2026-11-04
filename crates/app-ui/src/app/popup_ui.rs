@@ -300,7 +300,9 @@ impl PopupApp {
         if let Some(error) = self.shell.error() {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
-        if !self.vm.banner().is_empty() {
+        if self.vm.banner_alert() {
+            ui.colored_label(ui.visuals().error_fg_color, self.vm.banner());
+        } else if !self.vm.banner().is_empty() {
             ui.label(self.vm.banner());
         }
         ui.label(self.vm.status_line());

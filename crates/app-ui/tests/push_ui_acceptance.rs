@@ -6,7 +6,9 @@ use std::time::Duration;
 use clipmonger_app_ui::ipc_bridge::{Bridge, Transport, UiCmd, UiEvent};
 use clipmonger_app_ui::lifecycle::{claim_single_instance, InstanceClaim};
 use clipmonger_app_ui::push::push_event;
-use clipmonger_ipc::proto::methods::{ShowPopupEvent, SHOW_POPUP_TOPIC};
+use clipmonger_ipc::proto::methods::{
+    ShowPopupEvent, CAPS_CHANGED_TOPIC, HISTORY_CHANGED_TOPIC, SHOW_POPUP_TOPIC,
+};
 use clipmonger_ipc::proto::IpcError;
 use serde_json::{json, Value};
 
@@ -32,6 +34,14 @@ fn show_popup_push_maps_to_a_shell_event() {
             x11_time: None,
             activation_token: None,
         }))
+    );
+    assert_eq!(
+        push_event(HISTORY_CHANGED_TOPIC, json!({})),
+        Some(UiEvent::HistoryChanged)
+    );
+    assert_eq!(
+        push_event(CAPS_CHANGED_TOPIC, json!({})),
+        Some(UiEvent::CapsChanged)
     );
     assert_eq!(
         push_event("config.changed", json!({})),
@@ -115,6 +125,7 @@ async fn listener_delivers_pushes_and_yields_to_another_instance() {
     let counter = Arc::clone(&wakes);
     spawn_listener(
         move || Client::connect(&connect_sock, TOKEN).ok(),
+        || {},
         json!({}),
         tx,
         Arc::new(move || {
@@ -144,6 +155,7 @@ async fn listener_delivers_pushes_and_yields_to_another_instance() {
     let second_sock = sock.clone();
     spawn_listener(
         move || Client::connect(&second_sock, TOKEN).ok(),
+        || {},
         json!({}),
         tx2,
         Arc::new(|| {}),
@@ -152,4 +164,32 @@ async fn listener_delivers_pushes_and_yields_to_another_instance() {
         rx2.recv_timeout(Duration::from_secs(5)).expect("refusal"),
         UiEvent::AnotherInstance
     );
+}
+
+#[test]
+fn listener_calls_restart_while_no_daemon_answers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+
+    use clipmonger_app_ui::push::spawn_listener;
+    let restarts = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&restarts);
+    let (tx, _rx) = mpsc::channel();
+    spawn_listener(
+        || None,
+        move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        },
+        json!({}),
+        tx,
+        Arc::new(|| {}),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while restarts.load(Ordering::SeqCst) < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restart is asked again with backoff"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

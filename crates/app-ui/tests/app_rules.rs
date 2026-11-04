@@ -2679,6 +2679,60 @@ fn rule_config_scale_change_is_compared_by_bits() {
     assert_eq!(rig.popup.ctx.zoom_factor().to_bits(), next.to_bits());
 }
 
+// rule 11: a popup chord another application holds shows a banner from the
+// status poll, and a status without one clears it
+#[test]
+fn rule_status_popup_hotkey_conflict_shows_and_clears_the_banner() {
+    let mut rig = Rig::opened();
+    rig.push(UiEvent::Status(
+        json!({"caps": {"popup_hotkey_conflict": "ctrl+alt+k"}}),
+    ));
+    rig.tick();
+    assert_eq!(
+        rig.app.vm().banner(),
+        strings::text("popup.hotkey_conflict").replace("{chord}", "ctrl+alt+k")
+    );
+    assert!(rig.app.vm().banner_alert(), "drawn in the error colour");
+    rig.push(UiEvent::Status(
+        json!({"caps": {"popup_hotkey_conflict": null}}),
+    ));
+    rig.tick();
+    assert_eq!(rig.app.vm().banner(), "");
+    assert!(!rig.app.vm().banner_alert());
+    rig.push(UiEvent::CapsChanged);
+    rig.tick();
+    assert_eq!(
+        rig.cmds(),
+        vec![UiCmd::Status, UiCmd::CapsGet],
+        "a caps push reads the status and caps at once"
+    );
+}
+
+// rule 11: a pushed history change lists the history again while the popup
+// is open, and does nothing while it is closed
+#[test]
+fn rule_history_change_push_lists_again_only_while_open() {
+    let mut rig = Rig::raw(Setup::new(true));
+    let tag = rig
+        .cmds()
+        .into_iter()
+        .find_map(|cmd| match cmd {
+            UiCmd::CompactHistory(tag) => Some(tag),
+            _ => None,
+        })
+        .expect("initial compact history request");
+    rig.push(UiEvent::CompactHistory(tag.clone(), Ok(json!({"owner":tag.params.owner,"generation":tag.params.generation,"rows":[],"cursor":null,"done":true,"bytes_read":0,"candidates":0}))));
+    rig.tick();
+    let _ = rig.cmds();
+    rig.push(UiEvent::HistoryChanged);
+    rig.tick();
+    assert_compact_begin(&rig.cmds());
+    let mut closed = Rig::closed();
+    closed.push(UiEvent::HistoryChanged);
+    closed.tick();
+    assert_eq!(closed.cmds(), vec![], "a closed popup lists when it opens");
+}
+
 // rule 11: popup.keys overrides reach the key bindings of the popup
 #[test]
 fn rule_config_key_override_reaches_the_popup_keys() {

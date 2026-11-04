@@ -284,6 +284,13 @@ pub const SHOW_POPUP_TOPIC: &str = "ui.show_popup";
 /// Event topic the daemon pushes when its config was replaced; subscribers
 /// (the GNOME extension) re-read it with `config.get`.
 pub const CONFIG_CHANGED_TOPIC: &str = "config.changed";
+/// Event topic the daemon pushes after it stored a captured clip; an open
+/// popup lists the history again.
+pub const HISTORY_CHANGED_TOPIC: &str = "history.changed";
+/// Event topic the daemon pushes when the popup-hotkey state changed
+/// (refused, held again, conflict set or cleared); the UI reads the status
+/// and caps again.
+pub const CAPS_CHANGED_TOPIC: &str = "caps.changed";
 /// Payload of the daemon→UI `ui.show_popup` event.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShowPopupEvent {

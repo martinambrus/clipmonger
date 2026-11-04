@@ -5,7 +5,10 @@
 
 use std::time::{Duration, Instant};
 
-use clipmonger_ipc::proto::methods::{ShowPopupEvent, CONFIG_CHANGED_TOPIC, SHOW_POPUP_TOPIC};
+use clipmonger_ipc::proto::methods::{
+    ShowPopupEvent, CAPS_CHANGED_TOPIC, CONFIG_CHANGED_TOPIC, HISTORY_CHANGED_TOPIC,
+    SHOW_POPUP_TOPIC,
+};
 use clipmonger_ipc::server::{EventHub, SubscriberInfo};
 use clipmonger_platform::traits::HotkeyManager;
 use clipmonger_platform::types::HotkeyId;
@@ -54,13 +57,30 @@ impl DaemonState {
     /// Tell `config.changed` subscribers to re-read the config. Nothing is
     /// held while none is subscribed: a subscriber reads it on connect.
     pub(crate) fn notify_config_changed(&self) {
+        self.publish_event(CONFIG_CHANGED_TOPIC);
+    }
+
+    /// Tell `history.changed` subscribers (the UI) a captured clip was
+    /// stored. Nothing is held: the popup lists the history when it opens.
+    pub(crate) fn notify_history_changed(&self) {
+        self.publish_event(HISTORY_CHANGED_TOPIC);
+    }
+
+    /// Tell `caps.changed` subscribers (the UI) the popup-hotkey state
+    /// changed, so a conflict banner appears or clears at once.
+    pub(crate) fn notify_caps_changed(&self) {
+        self.publish_event(CAPS_CHANGED_TOPIC);
+    }
+
+    /// Publish an empty event on `topic` to its current subscribers.
+    fn publish_event(&self, topic: &str) {
         let hub = self
             .popup
             .lock()
             .ok()
             .and_then(|trigger| trigger.hub.clone());
         if let Some(hub) = hub {
-            let _ = hub.publish(CONFIG_CHANGED_TOPIC, serde_json::json!({}));
+            let _ = hub.publish(topic, serde_json::json!({}));
         }
     }
 
@@ -823,7 +843,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use clipmonger_ipc::client::{Client, EventStream};
-    use clipmonger_ipc::proto::methods::{ShowPopupEvent, CONFIG_CHANGED_TOPIC, SHOW_POPUP_TOPIC};
+    use clipmonger_ipc::proto::methods::{
+        ShowPopupEvent, CAPS_CHANGED_TOPIC, CONFIG_CHANGED_TOPIC, HISTORY_CHANGED_TOPIC,
+        SHOW_POPUP_TOPIC,
+    };
     use clipmonger_ipc::server::{EventHub, ServeOptions, Server, TopicRule};
     use serde_json::json;
 
@@ -846,6 +869,14 @@ mod tests {
             },
             TopicRule {
                 topic: CONFIG_CHANGED_TOPIC.to_string(),
+                exclusive: false,
+            },
+            TopicRule {
+                topic: HISTORY_CHANGED_TOPIC.to_string(),
+                exclusive: false,
+            },
+            TopicRule {
+                topic: CAPS_CHANGED_TOPIC.to_string(),
                 exclusive: false,
             },
         ]);
@@ -993,6 +1024,74 @@ mod tests {
             params: json!({}),
         };
         assert_eq!(super::extension_press_decision(Some(&unknown), None), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hotkey_state_changes_push_caps_changed() {
+        let (state, sock, _) = served("caps-changed").await;
+        let mut stream = Client::connect(&sock, TOKEN)
+            .expect("connect")
+            .subscribe(&[CAPS_CHANGED_TOPIC], json!({}))
+            .expect("caps.changed is not exclusive");
+        state.set_hotkey_status(
+            "x11",
+            &super::ChordStatus::Refused("ctrl+alt+k: denied: held".into()),
+        );
+        state.set_hotkey_status("x11", &super::ChordStatus::Held);
+        state
+            .handle(
+                "hotkey.conflict",
+                &json!({"chord": "super+v", "cleared": true}),
+            )
+            .expect("hotkey.conflict");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                let _ = tx.send(stream.next_event().map(|(method, _)| method));
+            }
+        });
+        for which in ["refused", "held", "conflict cleared"] {
+            let method = rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("{which} pushes caps.changed"))
+                .expect("event");
+            assert_eq!(method, CAPS_CHANGED_TOPIC, "{which}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stored_capture_pushes_history_changed_once() {
+        let (state, sock, _) = served("history-changed").await;
+        let mut stream = Client::connect(&sock, TOKEN)
+            .expect("connect")
+            .subscribe(&[HISTORY_CHANGED_TOPIC], json!({}))
+            .expect("history.changed is not exclusive");
+        let payload = |text: &str| vec![("text/plain".to_string(), text.as_bytes().to_vec())];
+        assert!(state.ingest_capture("test", false, &payload("first")));
+        assert!(
+            !state.ingest_capture("test", true, &payload("secret")),
+            "a sensitive capture stores nothing"
+        );
+        assert!(state.ingest_capture("test", false, &payload("second")));
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                let _ = tx.send(stream.next_event().map(|(method, _)| method));
+            }
+        });
+        let next = || rx.recv_timeout(Duration::from_secs(2));
+        assert_eq!(
+            next().expect("first event").expect("event"),
+            HISTORY_CHANGED_TOPIC
+        );
+        assert_eq!(
+            next().expect("second event").expect("event"),
+            HISTORY_CHANGED_TOPIC
+        );
+        assert!(
+            next().is_err(),
+            "one event per stored clip, none for the skip"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -183,6 +183,10 @@ pub enum UiEvent {
     ShowPopup(clipmonger_ipc::proto::methods::ShowPopupEvent),
     /// Another UI instance owns the popup; this one should exit.
     AnotherInstance,
+    /// Daemon push: a captured clip was stored (an open popup lists again).
+    HistoryChanged,
+    /// Daemon push: the popup-hotkey state changed (status and caps again).
+    CapsChanged,
 }
 
 /// Bridge handle spawner; the thread owns the transport alone.

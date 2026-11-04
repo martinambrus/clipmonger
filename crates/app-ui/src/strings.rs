@@ -15,6 +15,10 @@ const ENTRIES: &[(&str, &str)] = &[
     ("popup.paused", "Monitoring paused"),
     ("popup.degraded", "Some features limited"),
     ("popup.offline", "Connection lost. Reconnecting."),
+    (
+        "popup.hotkey_conflict",
+        "Popup shortcut {chord} is already in use. Reassign it in Settings.",
+    ),
     ("popup.stale_target", "Target changed. Pick the destination again."),
     ("popup.paste_ok", "Pasted"),
     ("popup.paste_blocked", "Paste is not available right now"),
@@ -164,6 +168,7 @@ pub const IDS: &[&str] = &[
     "popup.paused",
     "popup.degraded",
     "popup.offline",
+    "popup.hotkey_conflict",
     "popup.stale_target",
     "popup.paste_ok",
     "popup.paste_blocked",

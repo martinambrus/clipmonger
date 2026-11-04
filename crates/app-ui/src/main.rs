@@ -108,14 +108,26 @@ impl ipc_bridge::Transport for DaemonTransport {
     }
 }
 
-/// Listen for daemon pushes (popup requests) on their own connection.
+/// Listen for daemon pushes (popup requests, history changes) on their own
+/// connection, and start the daemon again when it crashed.
 fn start_push_listener(
     profile: PathBuf,
     extra: Value,
     events: mpsc::Sender<ipc_bridge::UiEvent>,
     wake: push::Wake,
 ) {
-    push::spawn_listener(move || try_connect(&profile), extra, events, wake);
+    let restart_profile = profile.clone();
+    push::spawn_listener(
+        move || try_connect(&profile),
+        move || {
+            if lifecycle::daemon_crashed(&restart_profile) {
+                let _ = spawn_daemon(&restart_profile);
+            }
+        },
+        extra,
+        events,
+        wake,
+    );
 }
 
 /// Another UI holds the profile: have the daemon show that UI's popup.
@@ -141,7 +153,8 @@ fn sibling_daemon() -> PathBuf {
     dir.join(format!("clipmonger-daemon{}", std::env::consts::EXE_SUFFIX))
 }
 
-/// Spawn the sibling daemon and wait for its rendezvous file.
+/// Spawn the sibling daemon and wait for its rendezvous file. A thread waits
+/// on the child so a daemon that later exits is reaped, not left defunct.
 fn spawn_daemon(profile: &Path) -> bool {
     let outcome = std::process::Command::new(sibling_daemon())
         .arg("--profile-dir")
@@ -150,9 +163,12 @@ fn spawn_daemon(profile: &Path) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
-    if outcome.is_err() {
+    let Ok(mut child) = outcome else {
         return false;
-    }
+    };
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     for _ in 0..SPAWN_TRIES {
         if profile.join("rendezvous.json").exists() {
             return true;

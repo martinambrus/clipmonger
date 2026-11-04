@@ -200,6 +200,8 @@ pub struct PopupVm {
     offline: bool,
     target_valid: bool,
     paused: bool,
+    /// Banner text for a popup chord another application holds.
+    hotkey_conflict: String,
     keymap: keymap::Keymap,
     /// Target session wired to the paste guard.
     pub target_session: target_session::TargetSession,
@@ -224,6 +226,7 @@ impl PopupVm {
             offline: false,
             target_valid: true,
             paused: false,
+            hotkey_conflict: String::new(),
             keymap: keymap::Keymap::defaults(),
             target_session: target_session::TargetSession::new(),
         }
@@ -273,6 +276,14 @@ impl PopupVm {
     /// Mark the daemon link down or up.
     pub fn set_offline(&mut self, offline: bool) {
         self.offline = offline;
+    }
+
+    /// Record the popup chord another application holds (`None` clears it),
+    /// from the daemon's `caps.popup_hotkey_conflict`.
+    pub fn set_hotkey_conflict(&mut self, chord: Option<&str>) {
+        self.hotkey_conflict = chord.map_or_else(String::new, |chord| {
+            strings::text("popup.hotkey_conflict").replace("{chord}", chord)
+        });
     }
 
     /// Mark the captured target stale or valid.
@@ -395,11 +406,20 @@ impl PopupVm {
         )
     }
 
+    /// Whether the banner is an alert drawn in the error colour: a popup
+    /// chord another application holds.
+    #[must_use]
+    pub fn banner_alert(&self) -> bool {
+        !self.offline && !self.hotkey_conflict.is_empty()
+    }
+
     /// Banner text for the current state, empty when all is well.
     #[must_use]
     pub fn banner(&self) -> &str {
         if self.offline {
             strings::text("popup.offline")
+        } else if !self.hotkey_conflict.is_empty() {
+            &self.hotkey_conflict
         } else if !self.target_valid {
             strings::text("popup.stale_target")
         } else {

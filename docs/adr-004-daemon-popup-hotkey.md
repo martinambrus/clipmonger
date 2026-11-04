@@ -178,5 +178,11 @@ Need a Linux machine with an X11 session (Xvfb for the automated leg).
    parentless utility window) and a focus loss dismisses only after
    150 ms (Mutter's keyboard grab right after focusing a new window
    otherwise closed it at once). On GNOME Wayland the extension places
-   the popup at the pointer or centre. The UI restarts a vanished daemon
-   only on its next call, so hotkeys stay dead until then (left as is).
+   the popup at the pointer or centre. A daemon that crashed (its
+   `rendezvous.json` left behind) is started again by the UI's push
+   listener within seconds; a clean stop removes the file, so the daemon
+   stays stopped until a UI call needs it. The UI reaps every daemon it
+   starts. Pushes `history.changed` (an open popup lists again) and
+   `caps.changed` (the popup re-reads status and caps) keep the popup
+   current; a chord another application holds shows a red banner
+   (`caps.popup_hotkey_conflict`).

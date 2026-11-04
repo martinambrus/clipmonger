@@ -486,6 +486,10 @@ impl PopupApp {
                     .unwrap_or(false);
                 self.paused = paused;
                 self.vm.set_paused(paused);
+                self.vm.set_hotkey_conflict(
+                    body.pointer("/caps/popup_hotkey_conflict")
+                        .and_then(Value::as_str),
+                );
                 if let Ok(mut config) = self.config.lock() {
                     if let Some(version) = body.get("version").and_then(Value::as_str) {
                         config.version_text = version.to_string();
@@ -825,6 +829,15 @@ impl PopupApp {
                 });
                 if !routed {
                     self.feed(Event::Bridge(UiEvent::Error(message)));
+                }
+            }
+            UiEvent::CapsChanged => {
+                self.send(UiCmd::Status);
+                self.send(UiCmd::CapsGet);
+            }
+            UiEvent::HistoryChanged => {
+                if self.shell.desired().popup_open {
+                    self.feed(Event::Refresh);
                 }
             }
             event @ (UiEvent::ShowPopup(_)

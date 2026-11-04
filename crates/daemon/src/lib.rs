@@ -1596,6 +1596,31 @@ impl StoreFailure {
 /// Store real monitor payloads: sensitive events only bump `privacy_skips`,
 /// everything else becomes a clip row. `origin` names the capture backend
 /// (`windows`, `x11`, ...); `id_seed` feeds id generation.
+/// The popup chord another application holds, for the popup banner: a
+/// backend note `hotkey Degraded: <chord>: denied: ...` (`set_hotkey_status`
+/// with a refused registration) or the extension's `hotkey conflict: <chord>`
+/// note. Refusals that are not a conflict (starting, connection errors) and
+/// cleared conflicts yield `None`.
+fn popup_hotkey_conflict(snapshot: &Value, extension_note: Option<&str>) -> Option<String> {
+    let backend = snapshot
+        .get("backends")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|backends| backends.values())
+        .filter_map(|caps| caps.get("notes").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .find_map(|note| {
+            let (chord, why) = note.strip_prefix("hotkey Degraded: ")?.split_once(": ")?;
+            why.starts_with("denied:").then(|| chord.to_string())
+        });
+    backend.or_else(|| {
+        let rest = extension_note?.strip_prefix("hotkey conflict: ")?;
+        let chord = rest.split_once(": ").map_or(rest, |(chord, _)| chord);
+        (!chord.is_empty()).then(|| chord.to_string())
+    })
+}
+
 fn store_payloads(
     store: &Store,
     origin: &str,
@@ -2486,13 +2511,19 @@ impl DaemonState {
     #[must_use]
     pub fn caps_snapshot(&self) -> Value {
         let mut snapshot = self.caps.snapshot();
-        if let Ok(note) = self.hotkey_conflict_note.lock() {
-            if let Some(note) = note.as_ref() {
-                if let Some(notes) = snapshot.get_mut("notes").and_then(Value::as_array_mut) {
-                    notes.push(Value::from(note.clone()));
-                }
+        let extension_note = self
+            .hotkey_conflict_note
+            .lock()
+            .ok()
+            .and_then(|note| note.clone());
+        if let Some(note) = extension_note.as_ref() {
+            if let Some(notes) = snapshot.get_mut("notes").and_then(Value::as_array_mut) {
+                notes.push(Value::from(note.clone()));
             }
         }
+        snapshot["popup_hotkey_conflict"] =
+            popup_hotkey_conflict(&snapshot, extension_note.as_deref())
+                .map_or(Value::Null, Value::from);
         if self.elevation_refused() {
             if let Some(paste) = snapshot.get_mut("paste") {
                 paste["level"] = Value::from("degraded");
@@ -2558,6 +2589,7 @@ impl DaemonState {
                 }
             }
         });
+        self.notify_caps_changed();
     }
 
     /// Override the paste delivery budget from config.
@@ -2731,6 +2763,7 @@ impl DaemonState {
                     eprintln!("daemon: retention failed: {e}");
                 }
             }
+            self.notify_history_changed();
         }
         Ok(stored)
     }
@@ -2975,6 +3008,7 @@ impl DaemonState {
         store
             .enforce_retention(&retention_limits(&cfg))
             .map_err(|error| IpcError::new(error.code(), error.to_string()))?;
+        self.notify_history_changed();
         Ok(true)
     }
 
@@ -4643,6 +4677,7 @@ impl DaemonState {
                 if let Ok(mut slot) = self.hotkey_conflict_note.lock() {
                     *slot = note;
                 }
+                self.notify_caps_changed();
                 Ok(serde_json::json!({"ok": true}))
             }
             "config.get" => Ok(self.handle_config_get(params)),
@@ -6009,6 +6044,59 @@ mod tests {
                 .any(|n| n.as_str().unwrap_or_default().contains("hotkey conflict")),
             "a cleared conflict must leave caps notes, got {notes:?}"
         );
+    }
+
+    #[test]
+    fn popup_hotkey_conflict_names_only_a_held_chord() {
+        use clipmonger_platform::types::{BackendCaps, Level, PasteCaps, PasteStrategy};
+        let (_dir, state) = fresh_state("hotkey-conflict-field");
+        let field = |state: &DaemonState| state.caps_snapshot()["popup_hotkey_conflict"].clone();
+        assert_eq!(field(&state), Value::Null);
+        state.register_backend(
+            "x11",
+            BackendCaps {
+                monitor: Level::Full,
+                transfer: Level::Full,
+                hotkey: Level::Full,
+                paste: PasteCaps {
+                    level: Level::Full,
+                    strategy: PasteStrategy::ClipboardRestore,
+                    reason: String::new(),
+                },
+                tray: Level::Unavailable,
+                autostart: false,
+                primary_selection: true,
+                notes: Vec::new(),
+            },
+        );
+        state.set_hotkey_status(
+            "x11",
+            &crate::popup::ChordStatus::Refused("popup hotkey starting".into()),
+        );
+        assert_eq!(field(&state), Value::Null, "starting is no conflict");
+        state.set_hotkey_status(
+            "x11",
+            &crate::popup::ChordStatus::Refused(
+                "ctrl+alt+k: denied: hotkey chord already registered (ctrl+alt+k)".into(),
+            ),
+        );
+        assert_eq!(field(&state), serde_json::json!("ctrl+alt+k"));
+        state.set_hotkey_status("x11", &crate::popup::ChordStatus::Held);
+        assert_eq!(field(&state), Value::Null, "held again");
+        state
+            .handle(
+                "hotkey.conflict",
+                &serde_json::json!({"chord": "super+v", "reason": "accel already grabbed"}),
+            )
+            .expect("hotkey.conflict");
+        assert_eq!(field(&state), serde_json::json!("super+v"));
+        state
+            .handle(
+                "hotkey.conflict",
+                &serde_json::json!({"chord": "super+v", "cleared": true}),
+            )
+            .expect("hotkey.conflict cleared");
+        assert_eq!(field(&state), Value::Null);
     }
 
     #[test]

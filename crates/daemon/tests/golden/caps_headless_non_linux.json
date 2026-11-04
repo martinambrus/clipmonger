@@ -17,6 +17,7 @@
     "reason": "no backends in foundation skeleton",
     "strategy": "unavailable"
   },
+  "popup_hotkey_conflict": null,
   "primary_selection": false,
   "transfer": {
     "level": "unavailable",

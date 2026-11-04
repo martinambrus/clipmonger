@@ -171,6 +171,14 @@ pub fn claim_single_instance(profile: &std::path::Path) -> InstanceClaim {
     }
 }
 
+/// Whether an unreachable daemon crashed rather than stopped: a clean stop
+/// (`daemon.stop`, tray Exit, `clipmonger-cli stop`) removes the profile's
+/// `rendezvous.json`, a crash leaves it. Only a crashed daemon is started
+/// again without a UI call asking for it.
+#[must_use]
+pub fn daemon_crashed(profile: &std::path::Path) -> bool {
+    profile.join("rendezvous.json").exists()
+}
 #[cfg(test)]
 mod tests {
     use super::{start_mode, StartMode};
@@ -179,5 +187,16 @@ mod tests {
     fn no_daemon_still_opens_window_offline() {
         assert_eq!(start_mode(false), StartMode::Offline);
         assert_eq!(start_mode(true), StartMode::Attached);
+    }
+
+    #[test]
+    fn only_a_left_rendezvous_counts_as_a_crash() {
+        let profile = std::env::temp_dir().join(format!("cm-ui-crashed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&profile);
+        std::fs::create_dir_all(&profile).expect("profile");
+        assert!(!super::daemon_crashed(&profile), "a clean stop removed it");
+        std::fs::write(profile.join("rendezvous.json"), "{}").expect("rendezvous");
+        assert!(super::daemon_crashed(&profile), "a crash leaves it");
+        let _ = std::fs::remove_dir_all(&profile);
     }
 }
