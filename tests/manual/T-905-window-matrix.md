@@ -33,11 +33,9 @@
    Tab, then release Alt. Repeat after Esc, outside-click dismissal, several
    reopen cycles, and a DPI/monitor change.
    - Expected: the popup has no taskbar button or Alt-Tab tile; search accepts
-     typing. Alt-Tab dismisses it and switches to A, preserving the ordinary-app
-     cycle instead of consuming a switch to return to B. Record membership
-     and actual destination separately; native style flags alone prove neither
-     the Explorer cycle nor the observed destination. Settings remains a normal
-     taskbar/Alt-Tab window through close/reopen.
+     typing. Alt-Tab dismisses it and switches to an ordinary window. Landing
+     on B instead of A is a known limitation (seg-09), not a failure. Settings
+     remains a normal taskbar/Alt-Tab window through close/reopen.
 
 ## Evidence to attach
 

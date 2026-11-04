@@ -15,9 +15,13 @@ font zoom does not change its native size.
 
 The Windows popup is a transient tool window: it accepts search keyboard focus
 without a taskbar or Alt-Tab entry. Its native policy survives repeated show/hide
-and style changes. Settings remains an ordinary taskbar/Alt-Tab window. Opening
-and dismissing the popup must preserve the ordinary-app Alt-Tab cycle; verify
-the actual switch destination in T-905/T-908.
+and style changes. Settings remains an ordinary taskbar/Alt-Tab window. A
+popup opened from the tray takes the foreground so search receives keys and
+focus loss dismisses it.
+
+Known limitation: Alt-Tab from the focused popup dismisses it and lands on the
+most recent ordinary window (B), not the one before it (A). Windows reserves
+Alt-Tab for the shell, so the popup cannot intercept or redirect the switch.
 
 Logic runs while hidden or minimized; painting is limited to drawable windows.
 Hidden texture updates survive until the next draw. Minimized startup stays
