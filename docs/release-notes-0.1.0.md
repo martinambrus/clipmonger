@@ -38,9 +38,9 @@ package: the checker recompiles its XML and compares the compiled bytes.
 ## Unsigned-warning (seg-12 §5)
 
 These binaries are **unsigned**. Windows SmartScreen will friction the
-first install/run: use the per-OS bypass documentation (manual script
-`tests/manual/T-1204-bypass-docs-accuracy.md`) and verify the download
-against `SHA256SUMS` first. Linux has no signing friction expected.
+first install/run: follow [Installing on Windows](install-windows.md),
+which verifies the download against `SHA256SUMS` first (accuracy checked by
+`tests/manual/T-1204-bypass-docs-accuracy.md`). Linux has no signing friction expected.
 
 Checksums are **integrity only, not signatures** (seg-12 §8): a
 same-account compromise defeats them. Verify with `sha256sum -c

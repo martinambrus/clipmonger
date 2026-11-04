@@ -6,9 +6,9 @@
 
 ## Steps
 
-1. Download/copy the Windows zip to the clean VM; verify `SHA256SUMS`.
+1. Download the Windows zip, the setup exe and `SHA256SUMS` to the clean VM with a browser (so they carry the downloaded-file mark); verify them with the command in `docs/install-windows.md`.
    - Expected: Checksums verify before any bypass step.
-2. Follow only the draft bypass doc to first run.
+2. Follow only `docs/install-windows.md` to first run, once for the installer and once for the portable ZIP.
    - Expected: Every doc step matches the actual SmartScreen UI; no undocumented clicks.
 3. Note any doc/UI mismatch with screenshots.
    - Expected: Doc corrected in the same session; mismatches listed.
