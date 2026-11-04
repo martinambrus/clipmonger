@@ -84,6 +84,13 @@ scope and do not validate the registration hardening or native ACL/UAC boundary.
 
 Caps dumps before/after each leg, audit.log excerpt, screenshots of the UAC prompt and Degraded caps state. Redact paths/window titles/tokens (finding 52).
 
+## Verdict (2026-11-04, 527ad07 portable, leg 5 rerun)
+
+- Verdict: **PASS** for leg 5 (`clipmonger-cli show-popup` and tray).
+- Notes: Windows 10.0.26300. The CLI popup now captures the window that was active. Over a standard window Enter pasted into it. Over the admin window the popup appeared without focus (a non-elevated process cannot take the foreground from an elevated window without the input; daemon logged `popup.activation_failed`) and stayed open; after a click into it, Enter was refused with the elevation error in the status line. Regression: a tray-opened popup pasted into the previously active standard window, and a hotkey-opened popup pasted into the admin window through the helper.
+- Signature: user (interactive session)
+- Date: 2026-11-04
+
 ## Verdict (2026-11-04, 2dabd38 portable, 2623046 installed)
 
 - Verdict: **PASS** for legs 1-4, 6-10 and the tray half of leg 5; **FAIL** for the `clipmonger-cli show-popup` half of leg 5; legs 11-17 were not run.

@@ -23,6 +23,11 @@ Known limitation: Alt-Tab from the focused popup dismisses it and lands on the
 most recent ordinary window (B), not the one before it (A). Windows reserves
 Alt-Tab for the shell, so the popup cannot intercept or redirect the switch.
 
+Known limitation: a popup opened by `clipmonger-cli show-popup` while an elevated
+window is in front appears without focus. Windows lets a non-elevated process
+take the foreground only with the input that triggered it; the hotkey has it, a
+CLI call does not. The popup stays open until clicked or dismissed.
+
 Logic runs while hidden or minimized; painting is limited to drawable windows.
 Hidden texture updates survive until the next draw. Minimized startup stays
 hidden. Windows and X11 retain the popup; Wayland recreates it for a show and

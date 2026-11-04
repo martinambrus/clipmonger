@@ -64,7 +64,7 @@ Only one Clipmonger daemon may hold a profile at a time
 
 ## Known pending (manual/native legs)
 
-T-409 legs 5 (CLI popup) and 11-17, T-508, T-606/T-607, T-702..T-705
+T-409 legs 11-17, T-508, T-606/T-607, T-702..T-705
 (GNOME/Ubuntu), T-905..T-908 (real displays), per-box caps goldens,
 coverage floor, update-check (T-1202). See `CHANGELOG.md`.
 

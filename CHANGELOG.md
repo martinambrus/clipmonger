@@ -47,6 +47,9 @@ reserved for the release that passes all seg-11 §5 gates.
 
 ### Fixed
 
+- A popup opened by `clipmonger-cli show-popup` pastes into the window that
+  was active, instead of the next window Windows activates after the popup
+  hides.
 - Popup context, keyboard ownership, placement and offline/shutdown handling
   in the unified runner; Settings and remote displays use the same UI.
 - Windows popup activation uses asynchronous showing and bounded confirmation;
