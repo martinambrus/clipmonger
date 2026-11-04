@@ -57,6 +57,14 @@ selected clip on the clipboard (`popup.restore_clipboard = false`). Restoring
 the previous clipboard is opt-in; existing explicit preferences are preserved.
 The default delivery strategy remains `clipboard_restore`. Earlier dated
 default-true results below retain their original scope.
+Guided Windows QA on a1dc017 confirmed that the selected item remains on the
+clipboard for a normal text paste; further native cases remain open.
+
+Popup Alt+Tab returning to the most recent window (Notepad) instead of the
+previous ordinary app is accepted as a Windows limitation. A tray-opened
+popup now takes keyboard focus. The 2026-11-04 guided pass on that build passed
+W01-W07, W09 and W10 (W08 skipped: no Scroll Lock key); see the continuation for
+the next cases and the UI findings batch.
 
 The combined candidate also batches selected clipboard metadata reads; local
 release calibration reduced 10k-search p95 from 192.49 ms to 45.83 ms against
