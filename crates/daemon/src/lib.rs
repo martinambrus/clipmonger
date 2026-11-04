@@ -2225,6 +2225,15 @@ impl DaemonState {
         })
     }
 
+    /// Whether a clipboard sequence belongs to a completed write of our own
+    /// that the capture boundary will suppress. Does not consume it.
+    #[must_use]
+    pub fn expects_self_write(&self, sequence: u32) -> bool {
+        self.self_writes.lock().is_ok_and(|registry| {
+            registry.expects_sequence(&sequence.to_string(), self.self_write_now())
+        })
+    }
+
     /// Whether Scroll Lock toggling is configured.
     #[must_use]
     pub fn scroll_lock_toggle_enabled(&self) -> bool {

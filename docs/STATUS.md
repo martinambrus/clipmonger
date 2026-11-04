@@ -20,9 +20,10 @@ implemented; Phase 7 packaging/QA and native acceptance remain open.
   T-905 through T-908 and capture fault paths need actual results. T-409 legs 1-10
   and T-410 passed on 2026-11-04 except CLI-opened popups (T-409 leg 5); T-409 legs
   11-17 remain open. Historical dated passes remain scoped to their old builds.
-- Open: clipboard pastes into elevated windows are sometimes dropped; under
-  diagnosis on a Windows 10 VM, see
-  [the continuation](v1-continuation.md#open-dropped-clipboard-paste-into-elevated-windows-2026-11-04).
+- Resolved 2026-11-04: dropped clipboard pastes into elevated windows were
+  the daemon's capture reading its own paste write while the target handled
+  Ctrl+V; fixed and verified on the Windows 10 VM, see
+  [the continuation](v1-continuation.md#resolved-dropped-clipboard-paste-into-elevated-windows-2026-11-04).
 - Real Linux X11/Wayland/GNOME acceptance and blur-derived generated-protocol
   licensing remain open. Artifact checks do not settle either boundary.
 - [Feature-to-test index](v1-qa-traceability.md) maps the v1 slices and explicit

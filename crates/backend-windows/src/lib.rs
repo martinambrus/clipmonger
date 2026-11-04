@@ -41,7 +41,7 @@ pub use autostart::WinAutostart;
 pub use capture_policy::CapturePolicy;
 pub use foreground::{current_process_integrity, target_integrity, Integrity};
 pub use hotkeys::WinHotkeys;
-pub use monitor::WinMonitor;
+pub use monitor::{SelfWriteProbe, WinMonitor};
 pub use paste::WinPaste;
 /// Elevated-helper spawn/auth primitives (Windows only; the runas served
 /// leg is manual QA, never automated).

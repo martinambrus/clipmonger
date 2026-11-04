@@ -194,7 +194,7 @@ fn setup_windows_backend(
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     use clipmonger_backend_windows::{
-        caps as backend_caps, CapturePolicy, WinCaptureTransfer, WinMonitor,
+        caps as backend_caps, CapturePolicy, SelfWriteProbe, WinCaptureTransfer, WinMonitor,
     };
     use clipmonger_platform::types::SubscribeKind;
 
@@ -202,12 +202,21 @@ fn setup_windows_backend(
         let state = Arc::clone(state);
         Arc::new(move || state.windows_capture_exclusions())
     };
-    let initial_monitor = clipmonger_daemon::capture::subscribed(
-        || WinMonitor::with_policy(Arc::clone(&policy)),
-        &[SubscribeKind::Clipboard],
-    )
-    .map_err(|e| eprintln!("daemon: windows monitor unavailable: {e}"))
-    .ok();
+    let self_writes: SelfWriteProbe = {
+        let state = Arc::clone(state);
+        Arc::new(move |sequence| state.expects_self_write(sequence))
+    };
+    let monitor = {
+        let policy = Arc::clone(&policy);
+        move || {
+            WinMonitor::with_policy(Arc::clone(&policy))
+                .map(|monitor| monitor.with_self_writes(Arc::clone(&self_writes)))
+        }
+    };
+    let initial_monitor =
+        clipmonger_daemon::capture::subscribed(&monitor, &[SubscribeKind::Clipboard])
+            .map_err(|e| eprintln!("daemon: windows monitor unavailable: {e}"))
+            .ok();
     let monitor_ok = initial_monitor.is_some();
 
     let base_caps = backend_caps::caps_for(false, false);
@@ -264,12 +273,7 @@ fn setup_windows_backend(
                 &shutdown,
                 &state,
                 "windows",
-                || {
-                    clipmonger_daemon::capture::subscribed(
-                        || WinMonitor::with_policy(Arc::clone(&policy)),
-                        &[SubscribeKind::Clipboard],
-                    )
-                },
+                || clipmonger_daemon::capture::subscribed(&monitor, &[SubscribeKind::Clipboard]),
                 |events| {
                     for event in events {
                         let transfer =

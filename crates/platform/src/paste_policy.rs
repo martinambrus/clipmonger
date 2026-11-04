@@ -229,6 +229,17 @@ impl SuppressionRegistry {
         false
     }
 
+    /// Whether a completed, unexpired write is bound to this event sequence.
+    /// Only peeks: the capture boundary still consumes the expectation, so
+    /// a monitor can hold off reading our own write without changing what
+    /// gets suppressed.
+    #[must_use]
+    pub fn expects_sequence(&self, state: &str, now_ms: u64) -> bool {
+        self.expectations.iter().any(|e| {
+            e.ready && !e.bridge && e.expires_ms > now_ms && e.pre_state.as_deref() == Some(state)
+        })
+    }
+
     /// Suppressed-event count for diagnostics (events are counted, not stored).
     #[must_use]
     pub fn suppressed_count(&self) -> u64 {

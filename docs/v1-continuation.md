@@ -124,72 +124,64 @@ daemon and daemon.stop does not itself quit the UI. Do not reuse that coordinato
 or infer that --headless disables capture. Clipboard/window-station errors 5/183
 are STOP: record and hand off; do not explore or switch stations.
 
-## Open: dropped clipboard paste into elevated windows (2026-11-04)
+## Resolved: dropped clipboard paste into elevated windows (2026-11-04)
 
-State: under diagnosis on a Windows 10 VM. Continue there; no fix is decided.
+State: fixed on this branch and verified on the Windows 10 VM. Branch
+diag/paste-clipboard-20261104 was for diagnosis only; never merge it, and
+delete it.
 
-Symptom: a popup paste (Ctrl+Alt+H, pick, Enter) sometimes inserts nothing,
-although the clip is on the clipboard afterwards. Failures are random: 2 of 7
-attempts in one run. Seen repeatedly on a Windows 10 Pro 21H2 (19044.1806) VM
-under the built-in Administrator account, and once on the Windows 11 host
-(10.0.26300) in an elevated Notepad through the helper. Not seen into
-non-elevated windows on the host.
+Symptom: a popup paste (Ctrl+Alt+H, pick, Enter) sometimes inserted nothing,
+although the clip was on the clipboard afterwards (2 of 7, and 3 of 10, in
+manual runs). Seen on a Windows 10 Pro 21H2 (19044.1806) VMware VM under the
+built-in Administrator, where dcb5a96 lets the elevated daemon paste directly,
+and once on the Windows 11 host in an elevated Notepad through the helper.
 
-Context: the built-in Administrator (RID 500) has no split token, so the daemon
-and every window run elevated. dcb5a96 makes an elevated daemon paste directly
-(the helper refuses an elevated requester) and skips the consent prompt. Before
-it every paste failed with "admin helper is not running". After it pasting
-works except for this intermittent drop.
+Cause: the daemon's own capture monitor. `clipboard_restore` writes the clip
+and presses Ctrl+V about 2 ms later. The write's `WM_CLIPBOARDUPDATE` woke the
+monitor, which opened the clipboard to enumerate and fingerprint it, and the
+daemon then read the payloads, before `suppress_capture` dropped the write as
+our own. When the target's `OpenClipboard` for Ctrl+V landed while the monitor
+held the clipboard, it failed silently and nothing was pasted.
 
-Delivery is the default `clipboard_restore`: write the clipboard, wait until the
-target is the foreground window (`settle_foreground` in
-crates/backend-windows/src/paste.rs, `pin_helper_target` in helper.rs), then
-press Ctrl+V (`worker_press_paste_chord`). Both routes share this sequence.
+Evidence: round 1 (diag log) ruled out timing, focus, menu mode and stuck
+modifiers. An external poller of `GetOpenClipboardWindow` and the sequence
+number then showed every manual failure with the daemon holding the clipboard
+right after the write and no Notepad read. A write-then-Ctrl+V harness into
+Notepad, 30 trials per arm, failed 25 with the daemon and VMware Tools running,
+29 with only the daemon, 0 with only VMware Tools, 0 with neither, and 0 with
+the daemon when Ctrl+V came 50 ms after the write. VMware Tools clipboard
+sharing is not involved.
 
-Diagnostic round 1 logged the target thread state (`GetGUIThreadInfo`) and
-modifier keys around the chord. Failed and successful pastes were identical:
-the target was foreground within about 30 ms after one activation, keyboard focus
-was on the Notepad Edit control with the caret, there was no menu mode,
-Ctrl/Alt/Shift/Win were up (only the picking Enter was still down), and the chord
-returned Ok. The keystroke arrives; timing, focus, menu mode and stuck modifiers
-are ruled out.
+Fix: the monitor gets a `SelfWriteProbe` that peeks, without consuming, at the
+self-write registry (`SuppressionRegistry::expects_sequence`, wired through
+`DaemonState::expects_self_write`). A sequence the daemon finalized as its own
+write is not read for `SELF_WRITE_DEFER` (150 ms). The read then happens as
+before and the capture boundary still suppresses it, so history behaviour is
+unchanged; the poll deadline is capped at the deferral end so the read happens
+well inside the 2 s suppression TTL. Other clipboard changes are read at once.
+Unit tests cover the deferred wake, the idle fallback and the registry peek.
 
-Working hypothesis: clipboard contention. Notepad's `OpenClipboard` on Ctrl+V
-fails silently while another process has the clipboard open right after our
-write. Candidates: VM clipboard sharing (guest tools), the daemon's own capture
-reacting to the write, or another clipboard listener.
+Verification: the release daemon built natively on the VM (Rust 1.99.1
+x86_64-pc-windows-gnu, WinLibs GCC 16.2 for SQLite and dlltool) pasted 20 of
+20 popup picks into elevated Notepad. The poller saw Notepad read the
+clipboard 3-9 ms after each write and no daemon read in that window. On the
+VM the backend-windows session_acceptance tests t402, t405 and
+t_show_owned_window_restores_minimized, and the daemon perm_daemon_acceptance
+tests d4 and d8, fail the same way with and without the fix.
 
-Diagnostic round 2 (not yet run) is on branch diag/paste-clipboard-20261104.
-That branch is for diagnosis only; never merge it, and delete it after the fix.
-It appends to C:\Temp\clipmonger-paste-diag.log (create C:\Temp first):
-settle start/done with wait time and activation count, the pre-chord state, and
-for 150 ms after the chord every change of `GetOpenClipboardWindow` (window, pid,
-image path) and of the clipboard sequence number. A process that opens the
-clipboard without a window shows as null.
+Not addressed: the monitor's idle fallback still enumerates and fingerprints
+the clipboard on each quiet poll (`monitor.poll_ms`, default 500 ms) to catch
+WSLg/RDP copies that do not bump the sequence number. That can rarely collide
+with any application's paste, and so can other clipboard managers reading our
+write. Neither was observed here.
 
-Next steps:
-
-1. On the VM, build the diag branch and install the binaries (see below).
-2. Paste a synthetic clip into Notepad 10 times. Record ok/fail per attempt and
-   match the attempts to log entries in order.
-3. Identify what holds the clipboard open in the failed attempts. Note the VM
-   software and whether host clipboard sharing is on.
-4. Choose the fix from the evidence. Do not choose it before. Options:
-   wait before the chord until the clipboard is not open (bounded); if the
-   holder is the daemon's own capture, stop it opening the clipboard for
-   registered self-writes; retry once when the target content does not change.
-   Add a regression test where the logic is testable, then remove the diag code.
-
-Building on the VM: release binaries are normally cross-built on Linux for
-x86_64-pc-windows-gnu with `--locked`. A native Windows build has not been
-verified; GUI builds need Rust 1.95 or newer. Build the three binaries with
-`cargo build --release --locked -p clipmonger-app-ui --bin clipmonger`,
-`-p clipmonger-daemon --bin clipmonger-daemon` and
-`-p clipmonger-app-cli --bin clipmonger-cli`. Install them: quit Clipmonger from
-the tray, make sure no clipmonger process remains, copy the three exes into
-C:\Program Files\Clipmonger over an existing install, then start it from the
-Start menu. The installer and portable packages need the Linux packaging tools
-and notice scan; they are not needed for diagnosis.
+Building on Windows natively works: install rustup with the
+x86_64-pc-windows-gnu host and a MinGW-w64 GCC (WinLibs UCRT) on PATH, then
+`cargo build --release --locked -p clipmonger-daemon --bin clipmonger-daemon`
+(and likewise `-p clipmonger-app-ui --bin clipmonger`, `-p clipmonger-app-cli
+--bin clipmonger-cli`). To install, quit Clipmonger, make sure no clipmonger
+process remains, copy the exes into C:\Program Files\Clipmonger and start it
+again.
 
 ## Other release gates: do not silently waive
 

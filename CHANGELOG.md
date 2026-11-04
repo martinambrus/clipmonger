@@ -47,6 +47,9 @@ reserved for the release that passes all seg-11 §5 gates.
 
 ### Fixed
 
+- Windows clipboard pastes no longer randomly insert nothing: the capture
+  monitor leaves the clipboard alone briefly after the daemon's own paste
+  write, so the target's Ctrl+V can read it.
 - Popup context, keyboard ownership, placement and offline/shutdown handling
   in the unified runner; Settings and remote displays use the same UI.
 - Windows popup activation uses asynchronous showing and bounded confirmation;

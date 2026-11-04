@@ -33,7 +33,23 @@ pub struct WinMonitor {
     poll_state: PollState,
     #[cfg(windows)]
     policy: crate::capture_policy::CapturePolicy,
+    #[cfg(windows)]
+    self_writes: Option<SelfWriteProbe>,
 }
+
+/// Reports whether a clipboard sequence number belongs to a write the
+/// daemon registered as its own, without consuming the registration.
+pub type SelfWriteProbe = std::sync::Arc<dyn Fn(u32) -> bool + Send + Sync>;
+
+/// How long the monitor leaves the clipboard alone after a self-write.
+///
+/// A paste writes the clipboard and presses Ctrl+V about 2 ms later. Reading
+/// the write at once holds the clipboard open while the target handles the
+/// chord, and its `OpenClipboard` then fails silently, so nothing is pasted.
+/// The deferred read still reaches the capture boundary, where the
+/// registration suppresses it as before.
+#[cfg(any(windows, test))]
+const SELF_WRITE_DEFER: Duration = Duration::from_millis(150);
 
 impl WinMonitor {
     /// Start the pump thread and install the clipboard listener.
@@ -62,6 +78,7 @@ impl WinMonitor {
                 subscribed_clipboard: false,
                 poll_state: PollState::default(),
                 policy,
+                self_writes: None,
             })
         }
         #[cfg(not(windows))]
@@ -71,6 +88,20 @@ impl WinMonitor {
                 "clipboard monitor needs a Windows session".to_string(),
             ))
         }
+    }
+
+    /// Defer reading clipboard updates that `probe` reports as self-writes.
+    #[must_use]
+    pub fn with_self_writes(mut self, probe: SelfWriteProbe) -> Self {
+        #[cfg(windows)]
+        {
+            self.self_writes = Some(probe);
+        }
+        #[cfg(not(windows))]
+        {
+            drop(probe);
+        }
+        self
     }
 }
 
@@ -401,10 +432,12 @@ impl ClipboardMonitor for WinMonitor {
                 .wakes
                 .as_ref()
                 .ok_or_else(|| Error::Unavailable("monitor pump is not running".to_string()))?;
+            let self_writes = self.self_writes.clone();
             self.poll_state.poll(
                 rx,
                 timeout,
                 current_seq,
+                |seq| self_writes.as_ref().is_some_and(|probe| probe(seq)),
                 || current_event(&self.policy),
                 |event| content_fingerprint(event, &self.policy),
                 std::thread::sleep,
@@ -427,16 +460,43 @@ struct PollState {
     last_seq: Option<u32>,
     last_hash: Option<String>,
     pending_error: Option<Error>,
+    /// A self-write sequence and the instant its read becomes allowed.
+    self_write: Option<(u32, Instant)>,
 }
 
 #[cfg(any(windows, test))]
 impl PollState {
+    /// Whether reading `seq` must wait because it is a recent self-write.
+    /// The probe is asked once per sequence; once its deferral ends, the
+    /// sequence is read like any other update.
+    fn defers(&mut self, seq: Option<u32>, is_self_write: &mut impl FnMut(u32) -> bool) -> bool {
+        let Some(seq) = seq else {
+            return false;
+        };
+        match self.self_write {
+            Some((deferred, until)) if deferred == seq => Instant::now() < until,
+            _ if is_self_write(seq) => {
+                self.self_write = Some((seq, Instant::now() + SELF_WRITE_DEFER));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The end of a pending self-write deferral, if one is still running.
+    fn deferral_end(&self) -> Option<Instant> {
+        self.self_write
+            .map(|(_, until)| until)
+            .filter(|until| Instant::now() < *until)
+    }
+
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn poll(
         &mut self,
         rx: &Receiver<()>,
         timeout: Duration,
         mut current_seq: impl FnMut() -> Option<u32>,
+        mut is_self_write: impl FnMut(u32) -> bool,
         mut current_event: impl FnMut() -> Result<CaptureEvent>,
         mut content_fingerprint: impl FnMut(&CaptureEvent) -> String,
         mut sleep: impl FnMut(Duration),
@@ -449,16 +509,21 @@ impl PollState {
         let mut deferred: Option<Error> = None;
         loop {
             let now = Instant::now();
-            if now >= deadline {
+            // A deferred self-write is read when its deferral ends, not
+            // after a full poll timeout, so its registration is still live.
+            let limit = self
+                .deferral_end()
+                .map_or(deadline, |until| until.min(deadline));
+            if now >= limit {
                 break;
             }
-            match rx.recv_timeout(deadline - now) {
+            match rx.recv_timeout(limit - now) {
                 Ok(()) => {
                     let mut retries = 15;
                     while retries > 0 && Instant::now() < deadline {
                         retries -= 1;
                         let seq = current_seq();
-                        if seq == self.last_seq {
+                        if seq == self.last_seq || self.defers(seq, &mut is_self_write) {
                             sleep(std::time::Duration::from_millis(20));
                             continue;
                         }
@@ -499,8 +564,10 @@ impl PollState {
                 }
             }
         }
-        if deferred.is_none() && events.is_empty() {
-            if let Some(seq) = current_seq() {
+        let idle = deferred.is_none() && events.is_empty();
+        let seq = if idle { current_seq() } else { None };
+        if idle && !self.defers(seq, &mut is_self_write) && self.deferral_end().is_none() {
+            if let Some(seq) = seq {
                 if Some(seq) != self.last_seq {
                     match current_event() {
                         Ok(event) => {
@@ -900,6 +967,7 @@ mod tests {
                     sequence.set(sequence.get() + 1);
                     Some(sequence.get())
                 },
+                |_| false,
                 || {
                     reads.set(reads.get() + 1);
                     if reads.get() == 1 {
@@ -926,6 +994,7 @@ mod tests {
                 &rx,
                 Duration::ZERO,
                 || panic!("read before pending error"),
+                |_| panic!("probe before pending error"),
                 || panic!("read before pending error"),
                 |_| panic!("hash before pending error"),
                 |_| {},
@@ -950,6 +1019,7 @@ mod tests {
                 &rx,
                 Duration::from_secs(1),
                 || Some(9),
+                |_| false,
                 || {
                     Ok(CaptureEvent {
                         native_sequence: None,
@@ -968,6 +1038,7 @@ mod tests {
                 &rx,
                 Duration::ZERO,
                 || None,
+                |_| false,
                 || panic!("no reads"),
                 |_| String::new(),
                 |_| {},
@@ -976,5 +1047,120 @@ mod tests {
         assert!(
             matches!(error, Error::Unavailable(detail) if detail == "monitor pump thread exited")
         );
+    }
+
+    fn text_event(sequence: u32) -> clipmonger_platform::types::CaptureEvent {
+        clipmonger_platform::types::CaptureEvent {
+            native_sequence: Some(sequence),
+            offers: vec![offer("text/plain")],
+            origin: clipmonger_platform::types::CaptureOrigin::Clipboard,
+            sensitive: false,
+        }
+    }
+
+    #[test]
+    fn self_write_wake_leaves_clipboard_closed_until_deferral_ends() {
+        use super::{PollState, SELF_WRITE_DEFER};
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(()).unwrap();
+        let probes = Cell::new(0);
+        let first_read: Cell<Option<Instant>> = Cell::new(None);
+        let mut state = PollState::default();
+        let start = Instant::now();
+        let events = state
+            .poll(
+                &rx,
+                Duration::from_secs(1),
+                || Some(7),
+                |seq| {
+                    probes.set(probes.get() + 1);
+                    seq == 7
+                },
+                || {
+                    if first_read.get().is_none() {
+                        first_read.set(Some(Instant::now()));
+                    }
+                    Ok(text_event(7))
+                },
+                |_| "hash".into(),
+                |_| {},
+            )
+            .unwrap();
+        let read_at = first_read
+            .get()
+            .expect("self-write is still read once deferred");
+        assert!(read_at.duration_since(start) >= SELF_WRITE_DEFER);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "read when deferral ends"
+        );
+        assert_eq!(events.len(), 1, "the capture boundary still sees the write");
+        assert_eq!(state.last_seq, Some(7));
+        assert_eq!(probes.get(), 1, "the probe is asked once per sequence");
+    }
+
+    #[test]
+    fn foreign_write_wake_is_read_without_deferral() {
+        use super::{PollState, SELF_WRITE_DEFER};
+        use std::time::{Duration, Instant};
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(()).unwrap();
+        let mut state = PollState::default();
+        let start = Instant::now();
+        let mut read_after = None;
+        let events = state
+            .poll(
+                &rx,
+                Duration::from_millis(50),
+                || Some(8),
+                |_| false,
+                || {
+                    read_after.get_or_insert_with(|| start.elapsed());
+                    Ok(text_event(8))
+                },
+                |_| "hash".into(),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(read_after.unwrap() < SELF_WRITE_DEFER);
+    }
+
+    #[test]
+    fn idle_poll_does_not_read_a_self_write_during_deferral() {
+        use super::{PollState, SELF_WRITE_DEFER};
+        use std::time::Duration;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut state = PollState::default();
+        for _ in 0..2 {
+            let events = state
+                .poll(
+                    &rx,
+                    Duration::ZERO,
+                    || Some(11),
+                    |seq| seq == 11,
+                    || panic!("clipboard opened during self-write deferral"),
+                    |_| panic!("clipboard fingerprinted during self-write deferral"),
+                    |_| {},
+                )
+                .unwrap();
+            assert_eq!(events.len(), 0);
+        }
+        std::thread::sleep(SELF_WRITE_DEFER);
+        let events = state
+            .poll(
+                &rx,
+                Duration::ZERO,
+                || Some(11),
+                |_| panic!("an expired deferral is not probed again"),
+                || Ok(text_event(11)),
+                |_| "hash".into(),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(state.last_seq, Some(11));
     }
 }

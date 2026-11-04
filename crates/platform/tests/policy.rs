@@ -97,6 +97,23 @@ fn t206_dual_registry_sharing() {
 }
 
 #[test]
+fn t206_sequence_peek_matches_only_completed_writes_and_does_not_consume() {
+    let mut reg = SuppressionRegistry::new();
+    let id = reg.register_pending("h1".to_string(), 1000);
+    assert!(
+        !reg.expects_sequence("42", 1001),
+        "pending write has no sequence yet"
+    );
+    reg.finalize_pending(id, "42".to_string());
+    assert!(reg.expects_sequence("42", 1001));
+    assert!(!reg.expects_sequence("43", 1001));
+    assert!(!reg.expects_sequence("42", 1000 + SUPPRESSION_TTL_MS));
+    // Peeking leaves the capture-boundary suppression intact.
+    assert!(reg.should_suppress("h1", Some("42"), 1002));
+    assert!(!reg.expects_sequence("42", 1002));
+}
+
+#[test]
 fn t206_hash_only_when_no_prestate() {
     let mut reg = SuppressionRegistry::new();
     reg.register("h1".to_string(), None, 1000);
