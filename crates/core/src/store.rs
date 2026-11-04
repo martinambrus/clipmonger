@@ -5242,6 +5242,14 @@ mod tests {
 
     /// Exercise actual public-opening SQL across stages and individual schema
     /// statements. A slow earlier boundary cannot replenish the next wait.
+    ///
+    /// The boundary callback drives the clock instead of fixed sleeps against
+    /// a tight budget: earlier stages do real I/O, and under a loaded parallel
+    /// run they used up a 45 ms budget before the schema stage, so every
+    /// schema reading was 0. With 300 ms the schema stage starts at the 50 ms
+    /// slice cap; schema boundaries sleep 25 ms while capped, then half of
+    /// what is left, so the readings fall inside that stage; the first later
+    /// boundary with time left sleeps past the budget, so a 0 follows.
     #[test]
     fn opening_budget_refreshes_across_stages_and_schema_statements() {
         use std::cell::RefCell;
@@ -5251,16 +5259,22 @@ mod tests {
         drop(blocker);
         let readings = Rc::new(RefCell::new(Vec::new()));
         let output = Rc::clone(&readings);
+        let slice = i64::try_from(super::OPEN_WAIT_SLICE.as_millis()).unwrap();
         let _guard = OpenControlGuard::install(super::OpenTestControl {
-            budget: Some(Duration::from_millis(45)),
+            budget: Some(Duration::from_millis(300)),
             boundary: Some(Box::new(move |conn, stage| {
                 let timeout: i64 = conn
                     .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
                     .unwrap();
                 output.borrow_mut().push((stage, timeout));
-                if stage == super::OpenStage::Header || stage == super::OpenStage::EnsureSchema {
-                    std::thread::sleep(Duration::from_millis(12));
-                }
+                let sleep_ms = match stage {
+                    super::OpenStage::Header => 12,
+                    super::OpenStage::EnsureSchema if timeout >= slice => 25,
+                    super::OpenStage::EnsureSchema => (timeout / 2).max(1),
+                    _ if timeout > 0 => timeout + 2,
+                    _ => 0,
+                };
+                std::thread::sleep(Duration::from_millis(sleep_ms.unsigned_abs()));
             })),
             ..Default::default()
         });
