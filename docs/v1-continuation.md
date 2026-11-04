@@ -113,13 +113,22 @@ Guided Windows pass on 2dabd38 (2026-11-04, dedicated QA profile, Windows
 keyboard has no Scroll Lock key. Results with notes are in
 `/home/zathrus/clipmonger-work/continuation/RESULTS-2dabd38.csv`.
 
-Next: T-409 (UAC/helper) and T-410 (autostart/reboot), then a popup/Settings UI
+T-409 and T-410 (2026-11-04): T-409 legs 1-10 and all T-410 steps PASS; the
+`clipmonger-cli show-popup` half of T-409 leg 5 FAILS (CLI-opened popups have no
+target and lose focus to the admin window); T-409 legs 11-17 not run. The first
+installed run on 65b2b2a exposed a helper-task readback bug (scheduler returns
+account names, registrar expected the SID); fixed on `packaging-qa-20261103` in
+2623046 and re-run from an installer built on 65b2b2a plus that fix. Verdicts are
+in the T-409/T-410 files on that branch; rows in the same results CSV.
+
+Next: fix CLI/tray-opened popup targeting and focus, then a popup/Settings UI
 batch from the pass findings: prominent paste errors; drop the duplicate current-item
 section; disable First Page at the start; place or drop "End of history"; stop the
 footer overlapping the list; no image placeholders for text clips; a configurable
 multiline preview character limit with ellipsis; Settings filter on all tabs;
 `popup.activation_failed` warnings on CLI show-popup; inline red validation errors
-that keep focus; dropdowns for enum settings; remove the stale permanent-hotkey note.
+that keep focus; dropdowns for enum settings; remove the stale permanent-hotkey note;
+disable or explain portable "Start on login" (it reports a misleading failure).
 Rerun the affected W cases on the new build.
 
 The PC may reboot before testing resumes. Treat all prior PIDs, running apps,
