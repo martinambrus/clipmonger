@@ -352,6 +352,13 @@ fn admin_consent_loop(
     use clipmonger_backend_windows::{elevated_task, helper, sys};
     use std::time::{Duration, Instant};
 
+    // An elevated daemon pastes into admin windows itself: no helper, no
+    // consent prompt (the helper refuses an elevated requester).
+    if clipmonger_backend_windows::current_process_integrity()
+        == clipmonger_backend_windows::Integrity::High
+    {
+        return;
+    }
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
     let installed =
         helper::protected_path_ok(&exe, &clipmonger_backend_windows::program_files_dir());

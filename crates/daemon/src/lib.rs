@@ -4316,24 +4316,29 @@ impl DaemonState {
                         "paste.execute: elevation refused (gesture required)".to_string(),
                     ));
                 }
-                let res = self.paste_via_helper(&target, payloads, deadline_ms, settings);
-                if res.is_err() {
-                    daemon_runtime_emit(
-                        clipmonger_core::runtime_log::Severity::Warn,
-                        "paste.failed",
-                        &[
-                            ("operation", "paste_helper_route"),
-                            ("class", "helper_unavailable_or_refused"),
-                        ],
-                    );
+                // An elevated daemon (built-in Administrator, or started as
+                // administrator) already runs at the target's level: it pastes
+                // directly, and the helper would refuse it as requester anyway.
+                if clipmonger_backend_windows::current_process_integrity() != Integrity::High {
+                    let res = self.paste_via_helper(&target, payloads, deadline_ms, settings);
+                    if res.is_err() {
+                        daemon_runtime_emit(
+                            clipmonger_core::runtime_log::Severity::Warn,
+                            "paste.failed",
+                            &[
+                                ("operation", "paste_helper_route"),
+                                ("class", "helper_unavailable_or_refused"),
+                            ],
+                        );
+                    }
+                    if res.is_ok() {
+                        let _ = self
+                            .store_read()?
+                            .as_ref()
+                            .and_then(|st| st.bump_clip(clip.0, now_ms()).ok());
+                    }
+                    return res;
                 }
-                if res.is_ok() {
-                    let _ = self
-                        .store_read()?
-                        .as_ref()
-                        .and_then(|st| st.bump_clip(clip.0, now_ms()).ok());
-                }
-                return res;
             }
             let observer = WindowsWriteObserver(self);
             paste

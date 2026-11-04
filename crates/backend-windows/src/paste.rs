@@ -118,6 +118,8 @@ impl WinPaste {
             let _ = clip;
             if crate::foreground::target_integrity(&target.handle)
                 == crate::foreground::Integrity::High
+                && crate::foreground::current_process_integrity()
+                    != crate::foreground::Integrity::High
             {
                 return Err(Error::Unavailable(
                     "helper unavailable: elevated target needs the helper route".to_string(),
