@@ -66,6 +66,13 @@ pub fn preview_kind(clip: &Clip) -> &'static str {
 /// needed `width-1` scalars. Never slices UTF-8 by byte offsets.
 #[must_use]
 pub fn display_preview(preview: &str, width: u32, lines: u32) -> String {
+    display_preview_cut(preview, width, lines).0
+}
+
+/// [`display_preview`] and whether it cut characters or lines (the ellipsis
+/// was appended).
+#[must_use]
+pub fn display_preview_cut(preview: &str, width: u32, lines: u32) -> (String, bool) {
     let budget = width.max(1) as usize;
     let max_lines = lines.max(1);
     let mut out = String::new();
@@ -106,7 +113,7 @@ pub fn display_preview(preview: &str, width: u32, lines: u32) -> String {
         }
         out.push('…');
     }
-    out
+    (out, cut)
 }
 
 /// Whether a special key reaches the view-model while the search field is
@@ -609,5 +616,20 @@ mod display_preview_tests {
         let out = display_preview(s, 2, 1);
         assert_eq!(out, "a…");
         assert_eq!(out.chars().count(), 2);
+    }
+
+    #[test]
+    fn cut_flag_follows_the_ellipsis() {
+        use super::display_preview_cut;
+        // Normalized but complete previews are not cut.
+        assert_eq!(
+            display_preview_cut("ab\r\ncd\n", 80, 3),
+            ("ab\ncd".into(), false)
+        );
+        assert_eq!(display_preview_cut("", 1, 1), (String::new(), false));
+        // A preview that itself ends in an ellipsis is not cut either.
+        assert_eq!(display_preview_cut("ab…", 80, 1), ("ab…".into(), false));
+        assert_eq!(display_preview_cut("abcdef", 4, 1), ("abc…".into(), true));
+        assert_eq!(display_preview_cut("ab\ncd", 80, 1), ("ab…".into(), true));
     }
 }

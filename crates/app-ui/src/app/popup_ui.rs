@@ -9,6 +9,54 @@ use super::{now_ms, PopupApp};
 /// image thumbnail slot.
 const FIT_MARGIN: f32 = 72.0;
 
+/// One full-width popup list row. The whole row senses clicks and, like a
+/// selectable label, paints its hover or selection background across the
+/// full width and the height of its tallest item. `contents` adds the row's
+/// thumbnail and text and gets the text colour.
+fn list_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    contents: impl FnOnce(&mut egui::Ui, egui::Color32),
+) -> egui::Response {
+    // Register the row as clickable when its child UI is created.
+    // Adding click sense afterward clears focus on the next pass.
+    let row_rect = egui::Rect::from_min_size(
+        ui.next_widget_position(),
+        egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(row_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center))
+            .sense(egui::Sense::click()),
+        |ui| {
+            ui.set_min_size(row_rect.size());
+            let response = ui.response();
+            let visuals = ui.style().interact_selectable(&response, selected);
+            let background = ui.painter().add(egui::Shape::Noop);
+            contents(ui, visuals.text_color());
+            if selected || response.hovered() || response.has_focus() {
+                ui.painter().set(
+                    background,
+                    egui::epaint::RectShape::new(
+                        ui.min_rect(),
+                        visuals.corner_radius,
+                        visuals.weak_bg_fill,
+                        visuals.bg_stroke,
+                        egui::StrokeKind::Inside,
+                    ),
+                );
+            }
+        },
+    )
+    .response
+}
+
+/// The non-interactive text of a list row, so clicks reach the row.
+fn row_text(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    ui.add(egui::Label::new(egui::RichText::new(text).color(color)).selectable(false));
+}
+
 impl PopupApp {
     /// Apply one view-model effect: shell events for the keys that pick,
     /// dismiss or refresh, bridge commands for the rest.
@@ -425,7 +473,9 @@ impl PopupApp {
                     ))
                     .show(ui, |ui| {
                         for (row, name, selected, id) in &rows {
-                            let response = ui.selectable_label(*selected, name);
+                            let response = list_row(ui, *selected, |ui, color| {
+                                row_text(ui, name, color);
+                            });
                             if *selected
                                 && pending.as_ref().is_some_and(
                                     |(source, selected, selected_id)| {
@@ -507,41 +557,31 @@ impl PopupApp {
                                 continue;
                             };
                             let selected = self.vm.selected == row;
-                            let truncated = popup::display_preview(
+                            let (truncated, cut) = popup::display_preview_cut(
                                 &preview,
                                 self.preview_width,
                                 self.preview_lines,
                             );
-                            // Register the row as clickable when its child UI is created.
-                            // Adding click sense afterward clears focus on the next pass.
-                            let row_rect = egui::Rect::from_min_size(
-                                ui.next_widget_position(),
-                                egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
-                            );
-                            let row_ui = ui.scope_builder(
-                                egui::UiBuilder::new()
-                                    .max_rect(row_rect)
-                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
-                                    .sense(egui::Sense::click()),
-                                |ui| {
-                                    if let Some(row) = &compact {
-                                        if row.kind == clipmonger_core::store::CompactKind::Image {
-                                            self.compact_thumbnail_slot(
-                                                ui,
-                                                row,
-                                                &mut thumbnail_demand,
-                                            );
-                                        }
-                                    } else if let Some(clip) = &legacy {
-                                        if popup::preview_kind(clip) == "popup.kind_image" {
-                                            self.thumbnail_slot(ui, clip, &mut thumbnail_demand);
-                                        }
+                            let response = list_row(ui, selected, |ui, color| {
+                                if let Some(row) = &compact {
+                                    if row.kind == clipmonger_core::store::CompactKind::Image {
+                                        self.compact_thumbnail_slot(ui, row, &mut thumbnail_demand);
                                     }
-                                    ui.selectable_label(selected, &truncated)
-                                },
-                            );
-                            let label = row_ui.inner;
-                            let response = row_ui.response;
+                                } else if let Some(clip) = &legacy {
+                                    if popup::preview_kind(clip) == "popup.kind_image" {
+                                        self.thumbnail_slot(ui, clip, &mut thumbnail_demand);
+                                    }
+                                }
+                                // Image rows without text show only the thumbnail.
+                                if !truncated.is_empty() {
+                                    row_text(ui, &truncated, color);
+                                }
+                            });
+                            let response = if cut {
+                                response.on_hover_text(&preview)
+                            } else {
+                                response
+                            };
                             if selected
                                 && pending.as_ref().is_some_and(
                                     |(source, selected, selected_id)| {
@@ -553,7 +593,7 @@ impl PopupApp {
                             {
                                 response.scroll_to_me(None);
                             }
-                            if response.clicked() || label.clicked() {
+                            if response.clicked() {
                                 clicked_row = Some(row);
                             }
                             response.container_context_menu(|ui| {

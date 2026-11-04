@@ -59,7 +59,9 @@ with icons (VERIFY icon source per OS), pinned shortcuts, headers) →
 status line (count, caps warnings, e.g. "monitoring paused").
 v2: plugins holding `ui.contribute` (ADR-001) may add items in a dedicated
 popup section (exact placement frozen at the v2 design-reopen gate).
-Behavior: hover-select + click-paste; right-click item menu
+Behavior: a row reacts across its full width (hover highlight, click
+selects, click on the selected row pastes); a shortened preview shows its
+full text in a tooltip; image rows show only the thumbnail; right-click item menu
 (edit/duplicate/pin/delete); Enter pastes selected; Esc dismisses;
 Delete key = soft-delete (v1 storage; recovery UI v2 — finding 37);
 dismiss-on-focus-loss (configurable); placement per F-207

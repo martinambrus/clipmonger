@@ -39,6 +39,9 @@ reserved for the release that passes all seg-11 §5 gates.
   the current clip), "First page" is disabled on the first page, "End of
   history" follows the last row, and text rows no longer get an empty
   thumbnail box.
+- Popup rows are highlighted and picked anywhere across their full width,
+  a shortened preview shows its full text in a tooltip, and image rows
+  show only the thumbnail.
 - Settings filter searches every tab: matches are grouped under tab
   headings, and picking a tab clears the filter.
 - Settings validation errors show in red under the setting: unparsable text

@@ -4858,6 +4858,172 @@ fn click_popup_widget(rig: &mut Rig, label: &str) {
     );
 }
 
+/// Press and release the primary button at `pos` on the popup.
+fn click_popup_at(rig: &mut Rig, pos: egui::Pos2) {
+    rig.input(egui::Event::PointerMoved(pos));
+    rig.show();
+    for pressed in [true, false] {
+        rig.input(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        rig.show();
+    }
+}
+
+fn picked_clip(rig: &mut Rig) -> Vec<Uuid> {
+    finish_popup_pick(rig);
+    rig.cmds()
+        .into_iter()
+        .filter_map(|cmd| match cmd {
+            UiCmd::PasteClipTo(clip, ..) => Some(clip),
+            _ => None,
+        })
+        .collect()
+}
+
+// A history row and a permanent row are hovered, highlighted and picked
+// anywhere across the row, not only over their text.
+#[test]
+fn rule_list_rows_are_hovered_and_picked_across_their_width() {
+    for permanent in [false, true] {
+        let prefix = if permanent { "Permanent" } else { "History" };
+        let label = format!("{prefix} row 2");
+        let mut rig = active_list_rig(permanent, 3);
+        let pass = rig.show();
+        let text = pass
+            .bounds
+            .iter()
+            .find(|(text, ..)| *text == label)
+            .map(|(_, rect, _)| *rect)
+            .expect("row text painted");
+        let hover_fill = rig
+            .popup
+            .ctx
+            .global_style()
+            .visuals
+            .widgets
+            .hovered
+            .weak_bg_fill;
+        assert!(!pass.fills.contains(&hover_fill), "{prefix}: no hover yet");
+        let row_end = egui::pos2(text.right() + 150.0, text.center().y);
+        assert!(rig.popup.ctx.viewport_rect().contains(row_end));
+        rig.input(egui::Event::PointerMoved(row_end));
+        rig.show();
+        let pass = rig.show();
+        assert!(
+            pass.fills.contains(&hover_fill),
+            "{prefix}: hovering the row end highlights the row: {:?}",
+            pass.fills
+        );
+        let hovered: Vec<egui::Response> = rig
+            .popup
+            .ctx
+            .interaction_snapshot(|s| s.hovered.iter().copied().collect::<Vec<_>>())
+            .into_iter()
+            .filter_map(|id| rig.popup.ctx.read_response(id))
+            .filter(|r| r.sense.senses_click())
+            .collect();
+        assert!(
+            hovered
+                .iter()
+                .any(|r| r.rect.contains(row_end) && r.rect.contains(text.center())),
+            "{prefix}: one clickable row spans its text and its end: {hovered:?}"
+        );
+        // The first click selects the row, the second picks it.
+        click_popup_at(&mut rig, row_end);
+        let selected = if permanent {
+            rig.app.config().lock().expect("config").perm_vm.selected
+        } else {
+            rig.app.vm().selected
+        };
+        assert_eq!(selected, 1, "{prefix}: the first click selects the row");
+        click_popup_at(&mut rig, row_end);
+        finish_popup_pick(&mut rig);
+        let commands = rig.cmds();
+        if permanent {
+            assert_eq!(commands, vec![UiCmd::ExecPermanent(id(1002))]);
+        } else {
+            assert!(
+                matches!(commands.as_slice(), [UiCmd::PasteClipTo(picked, ..)] if *picked == id(2)),
+                "{commands:?}"
+            );
+        }
+    }
+}
+
+// A cut preview shows its full text in a tooltip; a whole one has none.
+#[test]
+fn rule_cut_history_rows_show_their_full_preview_on_hover() {
+    let long = format!("Long row {}", "x".repeat(150));
+    for (preview, tooltip) in [(long.as_str(), true), ("Short row", false)] {
+        let mut rig = Rig::opened();
+        rig.push(history(&[clip(1, preview)]));
+        rig.tick();
+        rig.popup
+            .ctx
+            .all_styles_mut(|style| style.interaction.tooltip_delay = 0.0);
+        let pass = rig.show();
+        let (shown, text) = pass
+            .bounds
+            .iter()
+            .find(|(text, ..)| text.starts_with(&preview[..5]))
+            .map(|(shown, rect, _)| (shown.clone(), *rect))
+            .expect("row painted");
+        assert_eq!(shown != preview, tooltip, "{preview:?} shown as {shown:?}");
+        rig.input(egui::Event::PointerMoved(text.center()));
+        rig.show();
+        rig.show();
+        let pass = rig.show();
+        assert_eq!(
+            pass.texts.iter().filter(|t| t.as_str() == preview).count(),
+            usize::from(preview == shown) + usize::from(tooltip),
+            "{preview:?}: tooltip {tooltip}: {:?}",
+            pass.texts
+        );
+    }
+}
+
+// An image row shows only its thumbnail (no empty text box) and is picked
+// by clicking the thumbnail or the rest of the row.
+#[test]
+fn rule_image_rows_are_picked_through_the_thumbnail() {
+    for x_offset in [20.0, 200.0] {
+        let mut rig = Rig::opened();
+        let mut image = clip(2, "");
+        image.formats = vec!["image/png".to_string()];
+        rig.push(history(&[clip(1, "Text row"), image]));
+        rig.tick();
+        rig.show();
+        let text_row = popup_widget(&mut rig, "Text row");
+        let pass = rig.show();
+        let list_clip = pass
+            .bounds
+            .iter()
+            .find(|(text, ..)| text == "Text row")
+            .map(|(_, _, clip)| *clip)
+            .expect("text row painted");
+        assert!(
+            pass.bounds
+                .iter()
+                .all(|(text, _, clip)| *clip != list_clip || !text.is_empty()),
+            "no empty text in the list: {:?}",
+            pass.bounds
+        );
+        // The image row follows the text row; its thumbnail is 40 points tall.
+        let pos = egui::pos2(
+            text_row.rect.left() + x_offset,
+            text_row.rect.bottom() + 20.0 + rig.popup.ctx.global_style().spacing.item_spacing.y,
+        );
+        click_popup_at(&mut rig, pos);
+        assert_eq!(rig.app.vm().selected, 1, "click at x+{x_offset} selects");
+        click_popup_at(&mut rig, pos);
+        assert_eq!(picked_clip(&mut rig), vec![id(2)], "click at x+{x_offset}");
+    }
+}
+
 #[test]
 fn history_row_context_menu_handles_text_and_thumbnail_clicks() {
     for thumbnail in [false, true] {
