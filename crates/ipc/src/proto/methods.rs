@@ -328,6 +328,10 @@ pub struct CaptureReportResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HotkeyFiredParams {
     pub id: u32,
+    /// Process of the focused window titled like the popup (GNOME): the
+    /// daemon hides the popup when it is the UI's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_popup_pid: Option<u32>,
 }
 /// Hotkey fire output for `hotkey.fired`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -6,6 +6,20 @@ import { chordToAccel } from './config.js';
 import { hotkeyFiredRequest, hotkeyConflictRequest, hotkeyConflictClearedRequest } from './codec.js';
 import type { IpcClient } from './ipc.js';
 
+/** The app-ui popup's fixed window title (crates/app-ui/src/main.rs). */
+const POPUP_TITLE = 'clipmonger';
+
+/** Process of the focused window when it is titled like the popup; the
+ * daemon matches it against the UI's process before hiding anything. */
+function focusedPopupPid(): number | null {
+  try {
+    const win = (globalThis as any).global?.display?.get_focus_window?.();
+    if (!win || win.get_title?.() !== POPUP_TITLE) return null;
+    const pid = win.get_pid?.();
+    return typeof pid === 'number' && pid > 0 ? pid : null;
+  } catch { return null; }
+}
+
 export class Hotkeys {
   private settings: any;
   private ipc: IpcClient;
@@ -47,7 +61,7 @@ export class Hotkeys {
     this.settings.set_strv('popup', [accel]);
     // VERIFY: Meta.KeyBindingFlags.NONE === 0 and Shell.ActionMode.NORMAL|MESSAGE_TRAY values.
     const result = wm.addKeybinding('popup', this.settings, 0, 1 | 2, () => {
-      this.ipc.notify(hotkeyFiredRequest(this.ipc.nextId(), 1));
+      this.ipc.notify(hotkeyFiredRequest(this.ipc.nextId(), 1, focusedPopupPid()));
     });
     if (!result) return false;
     this.registered.push('popup');

@@ -89,8 +89,9 @@ export const pingRequest = (id: string): Envelope => req(id, 'ping', {});
 export const configGetRequest = (id: string): Envelope => req(id, 'config.get', {});
 export const eventsSubscribeRequest = (id: string): Envelope =>
   req(id, 'events.subscribe', { topics: ['config.changed'] });
-export const hotkeyFiredRequest = (id: string, hotkeyId: number): Envelope =>
-  req(id, 'hotkey.fired', { id: hotkeyId });
+export const hotkeyFiredRequest = (id: string, hotkeyId: number, focusedPopupPid: number | null = null): Envelope =>
+  req(id, 'hotkey.fired', focusedPopupPid !== null && Number.isSafeInteger(focusedPopupPid) && focusedPopupPid > 0
+    ? { id: hotkeyId, focused_popup_pid: focusedPopupPid } : { id: hotkeyId });
 export const hotkeyConflictRequest = (id: string, chord: string, reason: string): Envelope =>
   req(id, 'hotkey.conflict', { chord, reason });
 /** `chord` registered after an earlier conflict: the daemon drops its note. */

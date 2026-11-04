@@ -18,6 +18,8 @@ test('envelope roundtrip: hello keys are exactly the wire shape', () => {
 test('builders: ping / hotkey.fired / hotkey.conflict / capture.report (G-F3/G-F4)', () => {
   assert.deepEqual(JSON.parse(encodeEnvelope(pingRequest('e2'))).params, {});
   assert.deepEqual(JSON.parse(encodeEnvelope(hotkeyFiredRequest('e3', 1))).params, { id: 1 });
+  assert.deepEqual(JSON.parse(encodeEnvelope(hotkeyFiredRequest('e3', 1, 4242))).params, { id: 1, focused_popup_pid: 4242 });
+  assert.deepEqual(JSON.parse(encodeEnvelope(hotkeyFiredRequest('e3', 1, 0))).params, { id: 1 });
   const conflict = JSON.parse(encodeEnvelope(hotkeyConflictRequest('e4', 'ctrl+alt+v', 'grabbed')));
   assert.equal(conflict.method, 'hotkey.conflict');
   assert.deepEqual(conflict.params, { chord: 'ctrl+alt+v', reason: 'grabbed' });

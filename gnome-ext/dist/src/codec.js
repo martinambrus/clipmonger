@@ -91,7 +91,8 @@ export const helloRequest = (id, token) => req(id, 'hello', { min: 1, max: 1, to
 export const pingRequest = (id) => req(id, 'ping', {});
 export const configGetRequest = (id) => req(id, 'config.get', {});
 export const eventsSubscribeRequest = (id) => req(id, 'events.subscribe', { topics: ['config.changed'] });
-export const hotkeyFiredRequest = (id, hotkeyId) => req(id, 'hotkey.fired', { id: hotkeyId });
+export const hotkeyFiredRequest = (id, hotkeyId, focusedPopupPid = null) => req(id, 'hotkey.fired', focusedPopupPid !== null && Number.isSafeInteger(focusedPopupPid) && focusedPopupPid > 0
+    ? { id: hotkeyId, focused_popup_pid: focusedPopupPid } : { id: hotkeyId });
 export const hotkeyConflictRequest = (id, chord, reason) => req(id, 'hotkey.conflict', { chord, reason });
 /** `chord` registered after an earlier conflict: the daemon drops its note. */
 export const hotkeyConflictClearedRequest = (id, chord) => req(id, 'hotkey.conflict', { chord, reason: '', cleared: true });

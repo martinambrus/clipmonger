@@ -4598,7 +4598,11 @@ impl DaemonState {
                 {
                     let id = params.get("id").and_then(Value::as_u64);
                     if id.is_none() || id == Some(1) {
-                        let delivered = self.trigger_popup(popup::PopupSource::Press);
+                        let focused_popup_pid = params
+                            .get("focused_popup_pid")
+                            .and_then(Value::as_u64)
+                            .and_then(|pid| u32::try_from(pid).ok());
+                        let delivered = self.trigger_extension_press(focused_popup_pid);
                         return Ok(serde_json::json!({"ok": true, "delivered": delivered}));
                     }
                 }

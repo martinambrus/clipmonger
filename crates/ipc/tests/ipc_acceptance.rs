@@ -513,7 +513,14 @@ fn t201_capture_report() {
 
 #[test]
 fn t201_hotkey_fired() {
-    roundtrip(&HotkeyFiredParams { id: 7 });
+    roundtrip(&HotkeyFiredParams {
+        id: 7,
+        focused_popup_pid: None,
+    });
+    roundtrip(&HotkeyFiredParams {
+        id: 1,
+        focused_popup_pid: Some(4242),
+    });
     roundtrip(&HotkeyFiredResult { ok: true });
 }
 

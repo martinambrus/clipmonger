@@ -82,6 +82,21 @@ impl DaemonState {
         )
     }
 
+    /// The GNOME extension's press report. `focused_popup_pid` is the
+    /// process of the focused Shell window titled like the popup; when it is
+    /// the subscribed UI, the popup is in front and the press hides it
+    /// (`toggle`, as on Windows and X11).
+    pub fn trigger_extension_press(&self, focused_popup_pid: Option<u32>) -> bool {
+        self.trigger_popup_with(
+            PopupSource::Press,
+            Instant::now(),
+            |ui| {
+                extension_press_decision(ui, focused_popup_pid).unwrap_or_else(|| press_target(ui))
+            },
+            &mut clipmonger_core::entropy::random_u64,
+        )
+    }
+
     /// Show a popup for a hotkey carrying optional platform activation metadata.
     pub fn trigger_popup_activation(
         &self,
@@ -678,6 +693,16 @@ fn registered_popup_hwnd(ui: &SubscriberInfo) -> Option<u64> {
         .and_then(serde_json::Value::as_u64)
 }
 
+/// `Some((None, true))` (hide) when the extension saw the subscribed UI's
+/// popup focused; `None` leaves the decision to the platform capture.
+fn extension_press_decision(
+    ui: Option<&SubscriberInfo>,
+    focused_popup_pid: Option<u32>,
+) -> Option<(Option<u64>, bool)> {
+    let ui_pid = ui.and_then(|ui| ui.peer_pid)?;
+    (focused_popup_pid == Some(ui_pid)).then_some((None, true))
+}
+
 #[cfg(all(unix, any(test, feature = "backend-x11")))]
 fn x11_press_decision(target: Option<u64>, popup: Option<u64>) -> (Option<u64>, bool) {
     if target.is_some() && target == popup {
@@ -947,6 +972,53 @@ mod tests {
         assert_eq!(
             (request.source.as_str(), request.gesture),
             ("request", None)
+        );
+    }
+
+    #[test]
+    fn extension_press_hides_only_the_subscribed_ui_popup() {
+        let ui = clipmonger_ipc::server::SubscriberInfo {
+            peer_pid: Some(41),
+            params: json!({}),
+        };
+        assert_eq!(
+            super::extension_press_decision(Some(&ui), Some(41)),
+            Some((None, true))
+        );
+        assert_eq!(super::extension_press_decision(Some(&ui), Some(42)), None);
+        assert_eq!(super::extension_press_decision(Some(&ui), None), None);
+        assert_eq!(super::extension_press_decision(None, Some(41)), None);
+        let unknown = clipmonger_ipc::server::SubscriberInfo {
+            peer_pid: None,
+            params: json!({}),
+        };
+        assert_eq!(super::extension_press_decision(Some(&unknown), None), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_press_with_the_ui_popup_focused_pushes_toggle() {
+        let (state, sock, _) = served("ext-toggle").await;
+        let stream = subscribe(&sock);
+        let ui_pid = std::process::id();
+        state
+            .handle(
+                "hotkey.fired",
+                &json!({"id": 1, "focused_popup_pid": ui_pid}),
+            )
+            .expect("hotkey.fired");
+        let (stream, hide) = next_show(stream, Duration::from_secs(2)).expect("press show");
+        assert!(hide.toggle, "the UI's own popup in front hides it");
+        std::thread::sleep(PRESS_DEBOUNCE);
+        state
+            .handle(
+                "hotkey.fired",
+                &json!({"id": 1, "focused_popup_pid": ui_pid + 1}),
+            )
+            .expect("hotkey.fired");
+        let (_stream, show) = next_show(stream, Duration::from_secs(2)).expect("press show");
+        assert!(
+            !show.toggle,
+            "another process's window never hides the popup"
         );
     }
 
