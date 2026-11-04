@@ -16,10 +16,29 @@ pub struct MergeKey;
 
 impl MergeKey {
     /// Core canonical hash (sorted MIME keys, native `x-os/*` excluded).
+    /// MIME labels are base-normalized first (`text/plain;charset=utf-8`
+    /// and `text/plain` hash alike): the extension and the daemon watchers
+    /// label identical bytes differently, and without this every bridged
+    /// copy is stored twice. Stored `content_hash` values are untouched;
+    /// only the merge-time key is normalized.
     #[must_use]
     pub fn of(payloads: &[(String, Vec<u8>)]) -> String {
-        content_hash(payloads)
+        let normalized: Vec<(String, Vec<u8>)> = payloads
+            .iter()
+            .map(|(mime, bytes)| (base_mime(mime), bytes.clone()))
+            .collect();
+        content_hash(&normalized)
     }
+}
+
+/// Lowercased MIME type without parameters (`Text/Plain; charset=x` ->
+/// `text/plain`).
+fn base_mime(mime: &str) -> String {
+    mime.split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// What the daemon should do with a merge observation.
@@ -144,6 +163,32 @@ mod tests {
         // Wayland offers FEWER formats: not the bridge-loss direction.
         assert_eq!(
             merger.offer("wayland", "k", &mimes(&["text/plain"]), 100),
+            MergeDecision::SuppressDuplicate
+        );
+    }
+
+    #[test]
+    fn t603_charset_suffixed_mime_merges_with_bare_mime() {
+        // Live gap (Step 6 Ubuntu): extension reports `text/plain`, the
+        // daemon x11 watcher reports `text/plain;charset=utf-8` for the same
+        // bytes. Same content must share one merge key or every copy lands
+        // twice (gnome + x11 rows).
+        let gnome: Vec<(String, Vec<u8>)> = vec![("text/plain".to_string(), b"dup".to_vec())];
+        let x11: Vec<(String, Vec<u8>)> =
+            vec![("text/plain;charset=utf-8".to_string(), b"dup".to_vec())];
+        assert_eq!(MergeKey::of(&gnome), MergeKey::of(&x11));
+        let mut merger = Merger::new(2000);
+        assert_eq!(
+            merger.offer("gnome", &MergeKey::of(&gnome), &mimes(&["text/plain"]), 0),
+            MergeDecision::Emit
+        );
+        assert_eq!(
+            merger.offer(
+                "x11",
+                &MergeKey::of(&x11),
+                &mimes(&["text/plain;charset=utf-8"]),
+                400
+            ),
             MergeDecision::SuppressDuplicate
         );
     }
