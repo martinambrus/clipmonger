@@ -174,6 +174,11 @@ pub enum UiEvent {
     },
     /// Config-window error text (never an offline misreport).
     ConfigError(String),
+    /// A `config.set` for one key failed; shown under that setting.
+    ConfigSetFailed {
+        key: String,
+        message: String,
+    },
     /// Daemon push: show the popup (hotkey press or `popup.open`).
     ShowPopup(clipmonger_ipc::proto::methods::ShowPopupEvent),
     /// Another UI instance owns the popup; this one should exit.
@@ -473,7 +478,6 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
             UiCmd::ConfigGet
             | UiCmd::CapsGet
             | UiCmd::HistoryGet(_)
-            | UiCmd::ConfigSet(_, _)
             | UiCmd::MonitorToggle
             | UiCmd::PurgeRemoved
             | UiCmd::ListPermanents
@@ -485,6 +489,10 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
             | UiCmd::PermGroupDelete(_),
             Err(error),
         ) => UiEvent::Error(error.message),
+        (UiCmd::ConfigSet(key, _), Err(error)) => UiEvent::ConfigSetFailed {
+            key,
+            message: error.message,
+        },
         (UiCmd::Stop, Err(error)) => UiEvent::StopFailed(error.message),
         (UiCmd::Status | UiCmd::ListHistory, Err(error)) if is_transport_error(&error) => {
             UiEvent::Offline(error.message)

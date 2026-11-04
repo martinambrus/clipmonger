@@ -37,6 +37,9 @@ reserved for the release that passes all seg-11 §5 gates.
   thumbnail box.
 - Settings filter searches every tab: matches are grouped under tab
   headings, and picking a tab clears the filter.
+- Settings validation errors show in red under the setting: unparsable text
+  unstages the older value, a value the daemon refuses on Apply keeps its
+  text and focus, and the field keeps keyboard focus while errors appear.
 - Windows admin-window paste (ADR-003): the app asks once when an
   elevated window is first focused. Program Files installs then use one
   UAC prompt to register a logon task that starts the elevated helper

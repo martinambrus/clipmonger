@@ -35,6 +35,10 @@ pub struct ConfigWindowState {
     pub perm_confirm_delete: Option<uuid::Uuid>,
     /// The daemon runs portable, where Start on login is unavailable.
     pub autostart_portable: bool,
+    /// Per-setting error text, drawn under the setting's control.
+    pub field_errors: std::collections::HashMap<String, String>,
+    /// Setting whose text field takes keyboard focus on the next frame.
+    pub focus_field: Option<String>,
 }
 
 impl ConfigWindowState {
@@ -74,6 +78,8 @@ impl ConfigWindowState {
             perm_group_new: String::new(),
             perm_confirm_delete: None,
             autostart_portable: false,
+            field_errors: std::collections::HashMap::new(),
+            focus_field: None,
         }
     }
 }
@@ -135,6 +141,7 @@ pub fn render_config_viewport(
     let mut do_restore = false;
     let mut do_logs = false;
     let mut stage_edits: Vec<(String, Value)> = Vec::new();
+    let mut invalid_edits: Vec<String> = Vec::new();
     let mut theme_changed = false;
     let mut perm_send: Vec<ipc_bridge::UiCmd> = Vec::new();
     let mut perm_save = false;
@@ -448,6 +455,7 @@ pub fn render_config_viewport(
                         ));
                         if row.key == "popup.hotkey" {}
                     }
+                    let focus_field = config.focus_field.take();
                     for (heading, key, kind, label, current, _dirty) in &rows {
                         if let Some(heading) = heading {
                             ui.heading(strings::text(heading));
@@ -489,11 +497,22 @@ pub fn render_config_viewport(
                                 .edits
                                 .entry(key.clone())
                                 .or_insert_with(|| current.clone());
-                            if ui.add(egui::TextEdit::singleline(entry)).changed() {
-                                if let Some(value) = config_model::parse_edit(*kind, entry) {
-                                    stage_edits.push((key.clone(), value));
+                            // A stable id keeps focus when rows above change.
+                            let response = ui.add(
+                                egui::TextEdit::singleline(entry).id_salt(("cfg", key.as_str())),
+                            );
+                            if response.changed() {
+                                match config_model::parse_edit(*kind, entry) {
+                                    Some(value) => stage_edits.push((key.clone(), value)),
+                                    None => invalid_edits.push(key.clone()),
                                 }
                             }
+                            if focus_field.as_deref() == Some(key.as_str()) {
+                                response.request_focus();
+                            }
+                        }
+                        if let Some(error) = config.field_errors.get(key) {
+                            ui.colored_label(ui.visuals().error_fg_color, error);
                         }
                         // The Windows daemon applies a new chord live.
                         #[cfg(not(windows))]
@@ -568,10 +587,27 @@ pub fn render_config_viewport(
     for (key, value) in stage_edits.into_iter().filter(|_| accept_edits) {
         if let Some(doc) = &mut config.doc {
             match doc.stage(&key, value) {
-                Ok(()) => config.error.clear(),
-                Err(id) => config.error = strings::text(&id).to_string(),
+                Ok(()) => {
+                    config.error.clear();
+                    config.field_errors.remove(&key);
+                }
+                Err(id) => {
+                    // A rejected value must not leave an older one staged.
+                    doc.unstage(&key);
+                    config
+                        .field_errors
+                        .insert(key, strings::text(&id).to_string());
+                }
             }
         }
+    }
+    for key in invalid_edits.into_iter().filter(|_| accept_edits) {
+        if let Some(doc) = &mut config.doc {
+            doc.unstage(&key);
+        }
+        config
+            .field_errors
+            .insert(key, strings::text("config.invalid_value").to_string());
     }
     if do_purge {
         send(ipc_bridge::UiCmd::PurgeRemoved);
@@ -584,6 +620,7 @@ pub fn render_config_viewport(
         config.restore_notice = None;
         config.pending_apply.clear();
         config.edits.clear();
+        config.field_errors.clear();
         config.doc = None;
         send(ipc_bridge::UiCmd::BackupRestore(config.backup_path.clone()));
     }
@@ -603,6 +640,7 @@ pub fn render_config_viewport(
             doc.revert();
         }
         config.edits.clear();
+        config.field_errors.clear();
     }
     if do_apply && !config.restore_pending {
         if let Some(doc) = config.doc.as_ref() {

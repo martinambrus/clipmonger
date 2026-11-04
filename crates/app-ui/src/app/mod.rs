@@ -436,6 +436,10 @@ impl PopupApp {
     ///   nothing (the popup hid at the pick).
     /// - `Config`: the Settings document is replaced and its edits cleared; the
     ///   shell hears it and answers with `ApplyTheme` and `ApplyKeys` effects.
+    /// - `ConfigSetFailed`: while the Settings window is open the text goes
+    ///   under that setting (or to the error line for a key without a row),
+    ///   its text field takes focus and only its key leaves `pending_apply`;
+    ///   otherwise the shell hears it as `Error`.
     /// - `Error`: while the Settings window is open or an Apply is pending
     ///   (`pending_apply` not empty) the text goes to the Settings error line
     ///   and `pending_apply` is cleared, and the shell does not hear it;
@@ -702,6 +706,36 @@ impl PopupApp {
                         doc.mark_applied(wire_key);
                     }
                     config.edits.remove(&key);
+                    let row_key = if key == "popup.keys" {
+                        "popup.keys.*"
+                    } else {
+                        key.as_str()
+                    };
+                    config.field_errors.remove(row_key);
+                }
+            }
+            UiEvent::ConfigSetFailed { key, message } => {
+                let message = self.restore_error_message(&message);
+                let key = if key == "popup.keys" {
+                    "popup.keys.*".to_string()
+                } else {
+                    key
+                };
+                let settings_open = self.shell.desired().settings_open;
+                let routed = self.config.lock().is_ok_and(|mut config| {
+                    if settings_open {
+                        config.pending_apply.retain(|pending| pending != &key);
+                        if config_model::ROWS.iter().any(|row| row.key == key) {
+                            config.field_errors.insert(key.clone(), message.clone());
+                            config.focus_field = Some(key.clone());
+                        } else {
+                            config.error.clone_from(&message);
+                        }
+                    }
+                    settings_open
+                });
+                if !routed {
+                    self.feed(Event::Bridge(UiEvent::Error(message)));
                 }
             }
             UiEvent::Config(body) => {
@@ -731,8 +765,11 @@ impl PopupApp {
                 };
                 let placement_changed = new_placement != self.placement;
                 if let Ok(mut config) = self.config.lock() {
+                    let config = &mut *config;
                     config.doc = Some(doc);
-                    config.edits.clear();
+                    // Keep the typed text of settings that show an error.
+                    let errors = &config.field_errors;
+                    config.edits.retain(|key, _| errors.contains_key(key));
                 }
                 self.preview_width = width;
                 self.preview_lines = lines;

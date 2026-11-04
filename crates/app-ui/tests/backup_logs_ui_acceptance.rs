@@ -255,3 +255,17 @@ fn restore_warning_codes_and_malformed_payload_remain_successes() {
         );
     }
 }
+
+#[test]
+fn config_set_refusal_names_the_key() {
+    let (tx, rx) = ipc_bridge::Bridge::spawn(Box::new(Fake { respond: denied }));
+    tx.send(UiCmd::ConfigSet("history.max_items".into(), json!(0)))
+        .expect("send config.set");
+    let ev = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("config.set event");
+    assert!(
+        matches!(&ev, UiEvent::ConfigSetFailed { key, message } if key == "history.max_items" && message.contains("dest required")),
+        "config.set error must yield ConfigSetFailed for its key, got {ev:?}"
+    );
+}

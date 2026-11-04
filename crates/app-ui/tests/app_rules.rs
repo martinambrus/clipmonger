@@ -6025,3 +6025,117 @@ fn portable_start_on_login_is_disabled_with_a_reason() {
         );
     }
 }
+
+fn settings_type(rig: &mut Rig, size: egui::Vec2, text: &str) {
+    settings_frame(rig, size, 1.0, vec![egui::Event::Text(text.to_string())]);
+    settings_frame(rig, size, 1.0, Vec::new());
+}
+
+#[test]
+fn settings_invalid_text_shows_inline_error_and_keeps_focus() {
+    let size = egui::vec2(960.0, 680.0);
+    let mut rig = Rig::closed();
+    rig.push(UiEvent::Config(
+        json!({"config": {"history": {"max_items": 100}}}),
+    ));
+    rig.tick();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    rig.app.config().lock().expect("settings").tab = "History".to_string();
+    for _ in 0..3 {
+        settings_frame(&mut rig, size, 1.0, Vec::new());
+    }
+    let invalid = strings::text("config.invalid_value");
+    let texts = settings_texts(&mut rig, size);
+    let (_, rect, _) = texts
+        .iter()
+        .find(|(text, _, _)| text == "100")
+        .unwrap_or_else(|| panic!("missing max_items field: {texts:?}"));
+    settings_click_at(&mut rig, size, rect.right_center() - egui::vec2(1.0, 0.0));
+
+    settings_type(&mut rig, size, "1");
+    let staged = |rig: &Rig| {
+        rig.app
+            .config()
+            .lock()
+            .expect("settings")
+            .doc
+            .as_ref()
+            .expect("doc")
+            .staged("history.max_items")
+            .cloned()
+    };
+    assert_eq!(staged(&rig), Some(json!(1001)));
+
+    settings_type(&mut rig, size, "x");
+    let texts = settings_texts(&mut rig, size);
+    assert!(
+        texts.iter().any(|(text, _, _)| text == invalid),
+        "inline error painted: {texts:?}"
+    );
+    assert_eq!(staged(&rig), None, "the older valid value is unstaged");
+    assert_eq!(rig.config_error(), "", "the top error line stays empty");
+
+    // The field keeps focus even when the top error line appears above it.
+    rig.app.config().lock().expect("settings").error = "daemon note".to_string();
+    settings_type(&mut rig, size, "y");
+    let cfg = rig.app.config().lock().expect("settings");
+    assert_eq!(
+        cfg.edits.get("history.max_items").map(String::as_str),
+        Some("1001xy")
+    );
+}
+
+#[test]
+fn settings_refused_apply_marks_the_field_and_keeps_its_text() {
+    let size = egui::vec2(960.0, 680.0);
+    let mut rig = Rig::closed();
+    let snapshot = json!({"config": {"history": {"max_items": 100}}});
+    rig.push(UiEvent::Config(snapshot.clone()));
+    rig.tick();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    {
+        let mut cfg = rig.app.config().lock().expect("settings");
+        cfg.tab = "History".to_string();
+        cfg.edits
+            .insert("history.max_items".to_string(), "5000".to_string());
+        cfg.pending_apply = vec![
+            "history.max_items".to_string(),
+            "popup.preview_width".to_string(),
+        ];
+    }
+    rig.push(UiEvent::ConfigSetFailed {
+        key: "history.max_items".to_string(),
+        message: "refused by daemon".to_string(),
+    });
+    rig.tick();
+    // The Config reload that follows Apply keeps the refused field's text.
+    rig.push(UiEvent::Config(snapshot));
+    rig.tick();
+    {
+        let cfg = rig.app.config().lock().expect("settings");
+        assert_eq!(cfg.error, "", "not the top error line");
+        assert_eq!(
+            cfg.pending_apply,
+            vec!["popup.preview_width".to_string()],
+            "other keys still apply"
+        );
+        assert_eq!(
+            cfg.edits.get("history.max_items").map(String::as_str),
+            Some("5000")
+        );
+        assert_eq!(cfg.focus_field.as_deref(), Some("history.max_items"));
+    }
+    let texts = settings_texts(&mut rig, size);
+    assert!(
+        texts.iter().any(|(text, _, _)| text == "refused by daemon"),
+        "{texts:?}"
+    );
+    assert_eq!(
+        rig.app.config().lock().expect("settings").focus_field,
+        None,
+        "focus request consumed by the frame"
+    );
+    assert_eq!(rig.error(), None, "the popup error line is not touched");
+}

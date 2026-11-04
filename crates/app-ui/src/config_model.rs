@@ -573,6 +573,11 @@ impl ConfigDoc {
             .collect()
     }
 
+    /// Drop the staged edit for one key.
+    pub fn unstage(&mut self, key: &str) {
+        self.staged.remove(key);
+    }
+
     /// Drop all staged edits.
     pub fn revert(&mut self) {
         self.staged.clear();
