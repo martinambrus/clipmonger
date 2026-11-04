@@ -3902,7 +3902,8 @@ fn r1_legacy_groups_renders_once_in_general_and_excluded_from_permanent_clips() 
             "General filtered 'groups' must show legacy row once"
         );
     }
-    // Filtered rendering: PermanentClips with filter "groups" still excludes
+    // A filter searches every tab: on PermanentClips the legacy row still
+    // shows exactly once (under General), never twice.
     {
         rig.app.config().lock().expect("settings").tab = "PermanentClips".to_string();
         rig.app.config().lock().expect("settings").filter = "groups".to_string();
@@ -3913,10 +3914,41 @@ fn r1_legacy_groups_renders_once_in_general_and_excluded_from_permanent_clips() 
             .filter(|t| *t == strings::text("config.permanents_groups"))
             .count();
         assert_eq!(
-            hits, 0,
-            "PermanentClips filtered 'groups' must not show legacy row"
+            hits, 1,
+            "filtered 'groups' must show legacy row once from any tab"
         );
     }
+}
+
+#[test]
+fn settings_filter_searches_every_tab_under_tab_headings() {
+    let mut rig = Rig::closed();
+    rig.push(UiEvent::Config(json!({"config": {
+        "history": {"max_items": 100},
+        "popup": {"hotkey": "ctrl+alt+h"}
+    }})));
+    rig.tick();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    let _ = rig.cmds();
+    rig.app.config().lock().expect("settings").tab = "History".to_string();
+    let hotkey = strings::text("config.popup_hotkey");
+    let max_items = strings::text("config.history_max_items");
+    let popup = strings::text("config.tab_popup");
+    let count = |texts: &[String], wanted: &str| texts.iter().filter(|t| *t == wanted).count();
+
+    rig.app.config().lock().expect("settings").filter = "HOTKEY".to_string();
+    let pass = rig.show_settings();
+    assert_eq!(count(&pass.texts, hotkey), 1, "{:?}", pass.texts);
+    assert_eq!(count(&pass.texts, max_items), 0, "{:?}", pass.texts);
+    // Tab button plus the group heading.
+    assert_eq!(count(&pass.texts, popup), 2, "{:?}", pass.texts);
+
+    rig.app.config().lock().expect("settings").filter.clear();
+    let pass = rig.show_settings();
+    assert_eq!(count(&pass.texts, hotkey), 0, "{:?}", pass.texts);
+    assert_eq!(count(&pass.texts, max_items), 1, "{:?}", pass.texts);
+    assert_eq!(count(&pass.texts, popup), 1, "{:?}", pass.texts);
 }
 
 #[test]

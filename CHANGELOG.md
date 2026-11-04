@@ -35,6 +35,8 @@ reserved for the release that passes all seg-11 §5 gates.
   the current clip), "First page" is disabled on the first page, "End of
   history" follows the last row, and text rows no longer get an empty
   thumbnail box.
+- Settings filter searches every tab: matches are grouped under tab
+  headings, and picking a tab clears the filter.
 - Windows admin-window paste (ADR-003): the app asks once when an
   elevated window is first focused. Program Files installs then use one
   UAC prompt to register a logon task that starts the elevated helper

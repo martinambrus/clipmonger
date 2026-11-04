@@ -78,6 +78,32 @@ impl ConfigWindowState {
     }
 }
 
+/// One rendered settings row: group heading id (first row of a filtered
+/// group only), key, kind, label, current text, dirty.
+type SettingsRow<'a> = (
+    Option<&'a str>,
+    String,
+    config_model::Kind,
+    String,
+    String,
+    bool,
+);
+
+/// Settings tabs in display order, with their heading string ids.
+const SETTINGS_TABS: &[(config_model::Tab, &str)] = &[
+    (config_model::Tab::History, "config.tab_history"),
+    (config_model::Tab::Popup, "config.tab_popup"),
+    (config_model::Tab::Tray, "config.tab_tray"),
+    (config_model::Tab::Startup, "config.tab_startup"),
+    (config_model::Tab::Privacy, "config.tab_privacy"),
+    (config_model::Tab::Advanced, "config.tab_advanced"),
+    (
+        config_model::Tab::PermanentClips,
+        "config.tab_permanent_clips",
+    ),
+    (config_model::Tab::General, "config.tab_general"),
+];
+
 /// Render the action row identically for measurement and interaction.
 fn config_actions(ui: &mut egui::Ui, dirty: bool) -> (bool, bool) {
     ui.horizontal(|ui| {
@@ -128,6 +154,9 @@ pub fn render_config_viewport(
             egui::TextEdit::singleline(&mut config.filter)
                 .hint_text(strings::text("config.filter_hint")),
         );
+        // A filter searches the settings of every tab, grouped by tab.
+        let filtering = !config.filter.is_empty();
+        let filter_lc = config.filter.to_lowercase();
         let tabs: &[(&str, &str)] = &[
             ("History", "config.tab_history"),
             ("Popup", "config.tab_popup"),
@@ -143,10 +172,11 @@ pub fn render_config_viewport(
         ui.horizontal_wrapped(|ui| {
             for (name, label) in tabs {
                 if ui
-                    .selectable_label(config.tab == *name, strings::text(label))
+                    .selectable_label(!filtering && config.tab == *name, strings::text(label))
                     .clicked()
                 {
                     config.tab = (*name).to_string();
+                    config.filter.clear();
                 }
             }
         });
@@ -154,7 +184,7 @@ pub fn render_config_viewport(
             ui.label(&config.error);
             ui.separator();
         }
-        if config.tab == "databases" {
+        if config.tab == "databases" && !filtering {
             ui.label(strings::text("config.profile_path"));
             ui.label(config.profile.display().to_string());
             if ui.button(strings::text("config.purge_removed")).clicked() {
@@ -174,7 +204,7 @@ pub fn render_config_viewport(
             {
                 do_restore = true;
             }
-        } else if config.tab == "about" {
+        } else if config.tab == "about" && !filtering {
             ui.label(strings::text("config.help_title"));
             ui.label(strings::text("config.about_version"));
             ui.label(&config.version_text);
@@ -239,20 +269,26 @@ pub fn render_config_viewport(
                 .max_height(body_height)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    let matches = |id: &str| {
+                        !filtering || strings::text(id).to_lowercase().contains(&filter_lc)
+                    };
                     // Theme controls persist through the ui.theme extra key.
-                    if ui
-                        .checkbox(&mut config.dark, strings::text("config.theme_dark"))
-                        .changed()
+                    if matches("config.theme_dark")
+                        && ui
+                            .checkbox(&mut config.dark, strings::text("config.theme_dark"))
+                            .changed()
                     {
                         theme_changed = true;
                     }
-                    let scale = egui::Slider::new(&mut config.font_scale, 0.8..=1.6)
-                        .text(strings::text("config.font_scale"));
-                    if ui.add(scale).changed() {
-                        theme_changed = true;
+                    if matches("config.font_scale") {
+                        let scale = egui::Slider::new(&mut config.font_scale, 0.8..=1.6)
+                            .text(strings::text("config.font_scale"));
+                        if ui.add(scale).changed() {
+                            theme_changed = true;
+                        }
                     }
                     ui.label(strings::text("config.non_atomic_note"));
-                    if config.tab == "PermanentClips" {
+                    if config.tab == "PermanentClips" && !filtering {
                         ui.label(strings::text("perm.immediate_note"));
                         ui.label(strings::text("perm.hotkey_note"));
                         ui.horizontal(|ui| {
@@ -369,20 +405,32 @@ pub fn render_config_viewport(
                         "General" => Some(config_model::Tab::General),
                         _ => None,
                     };
-                    let rows_indices = if let Some(tab) = active_tab {
-                        let visible = config_model::visible_rows(tab);
-                        let filtered_set: std::collections::HashSet<usize> =
-                            filtered.into_iter().collect();
-                        visible
+                    let filtered_set: std::collections::HashSet<usize> =
+                        filtered.into_iter().collect();
+                    let tab_rows = |tab: config_model::Tab| {
+                        config_model::visible_rows(tab)
                             .into_iter()
                             .filter(|idx| filtered_set.contains(idx))
                             .collect::<Vec<_>>()
+                    };
+                    // (tab heading id, row indices); headings only while filtering.
+                    let groups: Vec<(Option<&str>, Vec<usize>)> = if filtering {
+                        SETTINGS_TABS
+                            .iter()
+                            .map(|(tab, label)| (Some(*label), tab_rows(*tab)))
+                            .filter(|(_, rows)| !rows.is_empty())
+                            .collect()
+                    } else if let Some(tab) = active_tab {
+                        vec![(None, tab_rows(tab))]
                     } else {
                         Vec::new()
                     };
-                    let mut rows: Vec<(String, config_model::Kind, String, String, bool)> =
-                        Vec::new();
-                    for index in rows_indices {
+                    let mut rows: Vec<SettingsRow<'_>> = Vec::new();
+                    for (index, heading) in groups.iter().flat_map(|(heading, rows)| {
+                        rows.iter()
+                            .enumerate()
+                            .map(move |(n, index)| (*index, heading.filter(|_| n == 0)))
+                    }) {
                         let row = config_model::ROWS[index];
                         let saved = doc.get(row.key);
                         let staged = doc.staged(row.key);
@@ -391,6 +439,7 @@ pub fn render_config_viewport(
                             config_model::value_text(row.kind, value)
                         });
                         rows.push((
+                            heading,
                             row.key.to_string(),
                             row.kind,
                             strings::text(row.label).to_string(),
@@ -399,7 +448,10 @@ pub fn render_config_viewport(
                         ));
                         if row.key == "popup.hotkey" {}
                     }
-                    for (key, kind, label, current, _dirty) in &rows {
+                    for (heading, key, kind, label, current, _dirty) in &rows {
+                        if let Some(heading) = heading {
+                            ui.heading(strings::text(heading));
+                        }
                         ui.label(label);
                         if *kind == config_model::Kind::Bool {
                             let mut flag = current == "true";
