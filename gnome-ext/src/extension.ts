@@ -6,12 +6,14 @@ import { CaptureRelay } from './capture.js';
 import { PollDiff } from './polddiff.js';
 import { Hotkeys } from './hotkeys.js';
 import { PasteAssist } from './paste.js';
+import { PopupPlacer } from './placer.js';
 import { DEFAULT_POPUP_HOTKEY, mergeConfig } from './config.js';
 
 export default class ClipmongerExtension extends Extension {
   private ipc: IpcClient | null = null;
   private capture: CaptureRelay | null = null;
   private hotkeys: Hotkeys | null = null;
+  private placer: PopupPlacer | null = null;
   paste: PasteAssist | null = null;
 
   enable(): void {
@@ -24,6 +26,8 @@ export default class ClipmongerExtension extends Extension {
     this.paste = new PasteAssist(this.capture);
     this.hotkeys = new Hotkeys(settings, this.ipc);
     const hotkeys = this.hotkeys;
+    const placer = new PopupPlacer();
+    this.placer = placer;
     this.ipc.onConfig = (result) => {
       const cfg = mergeConfig(result);
       diff.denylist = [...cfg.privacy.denylist, ...prefDenylist, ...cfg.monitor.ignores];
@@ -32,17 +36,20 @@ export default class ClipmongerExtension extends Extension {
       diff.strict = cfg.privacy.strict;
       this.capture?.setPollMs(cfg.monitor.poll_ms);
       hotkeys.registerPopup(cfg.popup.hotkey);
+      placer.placement = cfg.popup.placement;
     };
     // Pre-config fallback so the popup chord exists before the first resync.
     this.hotkeys.registerPopup(DEFAULT_POPUP_HOTKEY);
     this.ipc.start();
     this.capture.start();
+    placer.enable();
   }
   disable(): void {
+    this.placer?.disable();
     this.capture?.stop();
     this.hotkeys?.unregisterAll();
     this.ipc?.disable();
-    this.capture = null; this.hotkeys = null; this.ipc = null; this.paste = null;
+    this.capture = null; this.hotkeys = null; this.placer = null; this.ipc = null; this.paste = null;
   }
 }
 void notify;

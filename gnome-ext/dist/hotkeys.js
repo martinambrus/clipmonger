@@ -2,10 +2,8 @@
 import { wm, notify } from 'resource:///org/gnome/shell/ui/main.js';
 // VERIFY (T-702): Meta.KeyBindingFlags / Shell.ActionMode import paths and
 // values, and the exact addKeybinding failure signal (expected: returns 0).
-import { chordToAccel } from './config.js';
+import { chordToAccel, POPUP_TITLE } from './config.js';
 import { hotkeyFiredRequest, hotkeyConflictRequest, hotkeyConflictClearedRequest } from './codec.js';
-/** The app-ui popup's fixed window title (crates/app-ui/src/main.rs). */
-const POPUP_TITLE = 'clipmonger';
 /** Process of the focused window when it is titled like the popup; the
  * daemon matches it against the UI's process before hiding anything. */
 function focusedPopupPid() {

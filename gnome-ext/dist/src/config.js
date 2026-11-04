@@ -3,10 +3,12 @@ export const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_POLL_MS = 500;
 export const DEFAULT_FORMATS = ['text/plain;charset=utf-8', 'text/plain', 'text/html', 'text/rtf', 'image/png', 'text/uri-list'];
 export const DEFAULT_POPUP_HOTKEY = 'ctrl+alt+h';
+/** The app-ui popup's fixed window title (crates/app-ui/src/main.rs). */
+export const POPUP_TITLE = 'clipmonger';
 export function defaultConfig() {
     return {
         monitor: { formats: [...DEFAULT_FORMATS], max_bytes: DEFAULT_MAX_BYTES, ignores: [], poll_ms: DEFAULT_POLL_MS },
-        popup: { hotkey: DEFAULT_POPUP_HOTKEY },
+        popup: { hotkey: DEFAULT_POPUP_HOTKEY, placement: 'cursor' },
         privacy: { denylist: [], strict: false },
     };
 }
@@ -34,6 +36,8 @@ export function mergeConfig(partial) {
         out.popup.hotkey = pop.hotkey;
     if (typeof cfg.hotkey === 'string' && cfg.hotkey)
         out.popup.hotkey = cfg.hotkey;
+    if (pop.placement === 'cursor' || pop.placement === 'center')
+        out.popup.placement = pop.placement;
     if (typeof priv.strict === 'boolean')
         out.privacy.strict = priv.strict;
     out.privacy.denylist = strArr(priv.denylist ?? cfg.denylist, out.privacy.denylist);

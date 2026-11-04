@@ -39,5 +39,8 @@ test('config merge: defaults on empty, partial overrides keep other defaults', (
     assert.deepEqual(merged.privacy.denylist, ['a']);
     assert.equal(merged.popup.hotkey, 'ctrl+alt+h');
     assert.equal(mergeConfig(null).monitor.poll_ms, 500);
+    assert.equal(def.popup.placement, 'cursor');
+    assert.equal(mergeConfig({ config: { popup: { placement: 'center' } } }).popup.placement, 'center');
+    assert.equal(mergeConfig({ config: { popup: { placement: 'caret' } } }).popup.placement, 'cursor');
     assert.equal(mergeConfig({ monitor: { max_bytes: -5 } }).monitor.max_bytes, DEFAULT_MAX_BYTES);
 });

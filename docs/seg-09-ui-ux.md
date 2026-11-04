@@ -10,7 +10,10 @@ The eframe/glow and separate Win32 fallback paths are retired.
 The runner creates a frameless popup and a decorated, resizable Settings
 window. Windows and X11 use physical monitor/cursor geometry for Cursor and
 Center placement. Wayland delegates placement to the compositor and remembers
-Settings size only. Settings normal geometry persists on close and exit;
+Settings size only. On GNOME the extension places the popup (window title
+`clipmonger`) at the pointer or the work-area centre per `popup.placement`,
+re-applying it while Mutter places and the UI sizes the window during its first
+1.5 s (`gnome-ext/src/placer.ts`). Settings normal geometry persists on close and exit;
 font zoom does not change its native size.
 
 The popup sizes itself at every show: the height its unfiltered clip list
