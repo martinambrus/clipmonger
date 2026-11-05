@@ -14,7 +14,17 @@ export class CodecError extends Error {
     }
 }
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+/** Native base64 (GLib in the Shell): the pure versions below block the
+ * Shell's main loop for seconds on a multi-megabyte image. */
+let nativeEncode = null;
+let nativeDecode = null;
+export function useNativeBase64(encode, decode) {
+    nativeEncode = encode;
+    nativeDecode = decode;
+}
 export function base64Encode(bytes) {
+    if (nativeEncode)
+        return nativeEncode(bytes);
     let out = '';
     for (let i = 0; i < bytes.length; i += 3) {
         const a = bytes[i], b = i + 1 < bytes.length ? bytes[i + 1] : 0, c = i + 2 < bytes.length ? bytes[i + 2] : 0;
@@ -26,6 +36,8 @@ export function base64Encode(bytes) {
     return out;
 }
 export function base64Decode(text) {
+    if (nativeDecode)
+        return nativeDecode(text);
     const clean = text.replace(/[^A-Za-z0-9+/=]/g, '');
     const out = [];
     for (let i = 0; i < clean.length; i += 4) {

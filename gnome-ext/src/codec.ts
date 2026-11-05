@@ -18,7 +18,15 @@ export class CodecError extends Error {
 }
 
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+/** Native base64 (GLib in the Shell): the pure versions below block the
+ * Shell's main loop for seconds on a multi-megabyte image. */
+let nativeEncode: ((bytes: Uint8Array) => string) | null = null;
+let nativeDecode: ((text: string) => Uint8Array) | null = null;
+export function useNativeBase64(encode: (bytes: Uint8Array) => string, decode: (text: string) => Uint8Array): void {
+  nativeEncode = encode; nativeDecode = decode;
+}
 export function base64Encode(bytes: Uint8Array): string {
+  if (nativeEncode) return nativeEncode(bytes);
   let out = '';
   for (let i = 0; i < bytes.length; i += 3) {
     const a = bytes[i], b = i + 1 < bytes.length ? bytes[i + 1] : 0, c = i + 2 < bytes.length ? bytes[i + 2] : 0;
@@ -30,6 +38,7 @@ export function base64Encode(bytes: Uint8Array): string {
   return out;
 }
 export function base64Decode(text: string): Uint8Array {
+  if (nativeDecode) return nativeDecode(text);
   const clean = text.replace(/[^A-Za-z0-9+/=]/g, '');
   const out: number[] = [];
   for (let i = 0; i < clean.length; i += 4) {

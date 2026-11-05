@@ -329,6 +329,37 @@ fn read_dib_candidates(
     Err(failure)
 }
 
+/// Bitmap formats tried for `image/png`, best first: `CF_DIBV5` states its
+/// alpha, `CF_DIB` is the classic fallback.
+#[cfg(any(windows, test))]
+const DIB_CANDIDATES: [u32; 2] = [17, 8];
+
+/// One raw clipboard copy with the clipboard open (closed again on return).
+#[cfg(any(windows, test))]
+type OpenRead<'a> =
+    &'a dyn Fn(&mut dyn FnMut() -> Result<Option<Vec<u8>>>) -> Result<Option<Vec<u8>>>;
+
+/// `image/png` with the clipboard open only while raw bytes are copied.
+/// `open` runs one copy with the clipboard open (for capture also its
+/// sequence/owner guard), `png_raw` copies a registered PNG, `dib_raw` one
+/// bitmap format. Converting a large bitmap to PNG can take a second, and no
+/// other app can open the clipboard meanwhile (an immediate Ctrl+V fails),
+/// so the conversion runs only after `open` closed the clipboard.
+#[cfg(any(windows, test))]
+fn read_png_outside(
+    max_bytes: u64,
+    open: OpenRead<'_>,
+    png_raw: &dyn Fn() -> Result<Option<Vec<u8>>>,
+    dib_raw: &dyn Fn(u32) -> Result<Option<Vec<u8>>>,
+) -> Result<Vec<u8>> {
+    if let Some(png) = open(&mut || png_raw())? {
+        return Ok(png);
+    }
+    read_dib_candidates(DIB_CANDIDATES, max_bytes, |id| {
+        open(&mut || dib_raw(id)).transpose()
+    })
+}
+
 /// Direct-OS clipboard transfer (seg-04 S2).
 pub struct WinTransfer;
 
@@ -591,31 +622,41 @@ pub(crate) mod imp {
         Ok(())
     }
 
-    /// `image/png`: the "PNG" format when it holds a real PNG, else a
-    /// bitmap converted to PNG (`CF_DIBV5` first: it states its alpha).
+    /// `image/png` for a caller that already holds the clipboard open: the
+    /// "PNG" format when it holds a real PNG, else a bitmap converted to PNG.
+    /// Readers that open the clipboard themselves use `read_png_outside`, so
+    /// the conversion runs with the clipboard closed.
     pub(crate) fn read_png(max_bytes: u64) -> Result<Vec<u8>> {
+        super::read_png_outside(max_bytes, &|body| body(), &|| png_raw(max_bytes), &dib_raw)
+    }
+
+    /// A registered "PNG" format holding a real PNG (clipboard open).
+    pub(crate) fn png_raw(max_bytes: u64) -> Result<Option<Vec<u8>>> {
         let png_id = register(PNG_FORMAT)?;
-        if raw::is_format_avail(png_id) {
-            match read_one(png_id, "image/png", max_bytes) {
-                Ok(png) if png.starts_with(PNG_SIGNATURE) => return Ok(png),
-                Err(e @ Error::TooLarge(_)) => return Err(e),
-                _ => {}
-            }
+        if !raw::is_format_avail(png_id) {
+            return Ok(None);
         }
-        super::read_dib_candidates([CF_DIBV5, CF_DIB], max_bytes, |id| {
-            if !raw::is_format_avail(id) {
-                return None;
-            }
-            // Checked before reading: a bitmap can be hundreds of MB.
-            if raw::size(id).is_some_and(|n| n.get() as u64 > crate::dib::MAX_DIB_BYTES) {
-                return Some(Err(Error::TooLarge(
-                    "clipboard bitmap over the decode limit".to_string(),
-                )));
-            }
-            // Raw DIB size is limited by the 64 MP native allocation guard,
-            // never by the normalized PNG cap: a larger DIB may compress well.
-            Some(read_native_bounded(id, crate::dib::MAX_DIB_BYTES))
-        })
+        match read_one(png_id, "image/png", max_bytes) {
+            Ok(png) if png.starts_with(PNG_SIGNATURE) => Ok(Some(png)),
+            Err(e @ Error::TooLarge(_)) => Err(e),
+            _ => Ok(None),
+        }
+    }
+
+    /// The raw bytes of one bitmap format (clipboard open).
+    pub(crate) fn dib_raw(id: u32) -> Result<Option<Vec<u8>>> {
+        if !raw::is_format_avail(id) {
+            return Ok(None);
+        }
+        // Checked before reading: a bitmap can be hundreds of MB.
+        if raw::size(id).is_some_and(|n| n.get() as u64 > crate::dib::MAX_DIB_BYTES) {
+            return Err(Error::TooLarge(
+                "clipboard bitmap over the decode limit".to_string(),
+            ));
+        }
+        // Raw DIB size is limited by the 64 MP native allocation guard,
+        // never by the normalized PNG cap: a larger DIB may compress well.
+        read_native_bounded(id, crate::dib::MAX_DIB_BYTES).map(Some)
     }
 
     /// `text/uri-list` from the `CF_HDROP` file list.
@@ -743,6 +784,36 @@ impl ClipboardTransfer for WinCaptureTransfer {
     fn read(&self, mime: &str, max_bytes: u64) -> Result<Vec<u8>> {
         #[cfg(windows)]
         {
+            if mime == "image/png" {
+                // Each raw copy holds the clipboard (and passes the guard);
+                // the bitmap conversion runs after it is closed again.
+                let open = |body: &mut dyn FnMut() -> Result<Option<Vec<u8>>>| {
+                    imp::with_open("capture read", || {
+                        let actual = clipboard_win::raw::seq_num().map(std::num::NonZeroU32::get);
+                        let entries = (self.policy)();
+                        let owner = crate::sys::clipboard_owner_executable();
+                        match crate::capture_policy::guarded(
+                            self.sequence,
+                            actual,
+                            owner.as_deref(),
+                            entries.as_deref(),
+                            body,
+                        ) {
+                            Ok(result) => result,
+                            Err(crate::capture_policy::Admission::OwnerDenied) => {
+                                Err(Error::CaptureExcluded)
+                            }
+                            Err(_) => Err(Error::CaptureChanged),
+                        }
+                    })
+                };
+                return read_png_outside(
+                    max_bytes,
+                    &open,
+                    &|| imp::png_raw(max_bytes),
+                    &imp::dib_raw,
+                );
+            }
             imp::with_open("capture read", || {
                 let actual = clipboard_win::raw::seq_num().map(std::num::NonZeroU32::get);
                 let entries = (self.policy)();
@@ -807,6 +878,14 @@ impl ClipboardTransfer for WinTransfer {
     fn read(&self, mime: &str, max_bytes: u64) -> Result<Vec<u8>> {
         #[cfg(windows)]
         {
+            if mime == "image/png" {
+                return read_png_outside(
+                    max_bytes,
+                    &|body| imp::with_open("read", body),
+                    &|| imp::png_raw(max_bytes),
+                    &imp::dib_raw,
+                );
+            }
             imp::with_open("read", || read_open(mime, max_bytes))
         }
         #[cfg(not(windows))]
@@ -1175,6 +1254,65 @@ mod bounded_tests {
             dib.extend_from_slice(&[10, 20, 30, 255]);
         }
         dib
+    }
+
+    /// Model of the clipboard lock for `read_png_outside`: `open` marks it
+    /// held while one raw copy runs; every raw read must see it held.
+    fn png_outside_rig(
+        png: Option<&[u8]>,
+        dibs: &[(u32, Vec<u8>)],
+    ) -> (super::Result<Vec<u8>>, usize) {
+        let held = std::cell::Cell::new(false);
+        let opens = std::cell::Cell::new(0);
+        let open = |body: &mut dyn FnMut() -> super::Result<Option<Vec<u8>>>| {
+            assert!(!held.get(), "opens never nest");
+            held.set(true);
+            opens.set(opens.get() + 1);
+            let result = body();
+            held.set(false);
+            result
+        };
+        let result = read_png_outside(
+            1 << 30,
+            &open,
+            &|| {
+                assert!(held.get(), "PNG copied with the clipboard open");
+                Ok(png.map(<[u8]>::to_vec))
+            },
+            &|id| {
+                assert!(held.get(), "bitmap copied with the clipboard open");
+                Ok(dibs
+                    .iter()
+                    .find(|(dib_id, _)| *dib_id == id)
+                    .map(|(_, b)| b.clone()))
+            },
+        );
+        (result, opens.get())
+    }
+
+    #[test]
+    fn png_read_converts_bitmaps_with_the_clipboard_closed() {
+        let real_png = b"\x89PNG\r\n\x1a\nrest".to_vec();
+        let (result, opens) = png_outside_rig(Some(&real_png), &[]);
+        assert_eq!(result.unwrap(), real_png, "a registered PNG wins");
+        assert_eq!(opens, 1);
+
+        let (result, opens) = png_outside_rig(None, &[(17, solid_dib(2, 2))]);
+        let decoded = image::load_from_memory(&result.unwrap())
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        assert_eq!(
+            opens, 2,
+            "PNG probe, then one CF_DIBV5 copy; the conversion holds nothing"
+        );
+
+        let (result, opens) = png_outside_rig(None, &[(17, vec![1, 2, 3]), (8, solid_dib(1, 1))]);
+        assert!(result.is_ok(), "a malformed CF_DIBV5 falls back to CF_DIB");
+        assert_eq!(opens, 3, "the fallback copy opens the clipboard again");
+
+        let (result, _) = png_outside_rig(None, &[]);
+        assert!(result.is_err(), "no image format");
     }
 
     #[test]

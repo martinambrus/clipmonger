@@ -8,7 +8,8 @@ import { Hotkeys } from './hotkeys.js';
 import { PasteAssist } from './paste.js';
 import { PopupPlacer } from './placer.js';
 import { DEFAULT_POPUP_HOTKEY, mergeConfig } from './config.js';
-import { pasteAssistDoneRequest, permanentListRequest } from './codec.js';
+import { pasteAssistDoneRequest, permanentListRequest, useNativeBase64 } from './codec.js';
+import GLib from 'gi://GLib?version=2.0';
 import { PermanentHotkeys } from './permhotkeys.js';
 import { parsePermanents } from './permbind.js';
 export default class ClipmongerExtension extends Extension {
@@ -19,6 +20,7 @@ export default class ClipmongerExtension extends Extension {
     permanents = null;
     paste = null;
     enable() {
+        useNativeBase64((bytes) => GLib.base64_encode(bytes), (text) => GLib.base64_decode(text));
         const settings = this.getSettings();
         const profileDir = settings.get_string('profile-dir') ?? '';
         const prefDenylist = settings.get_strv('denylist') ?? [];

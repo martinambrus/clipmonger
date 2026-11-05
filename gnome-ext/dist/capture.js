@@ -28,6 +28,17 @@ function windowAppIds(win) {
     catch { /* process gone or not ours */ }
     return ids.filter((id) => typeof id === 'string' && id !== '');
 }
+/** SHA-256 hex of `bytes` in GLib's C code (the pure-JS hash blocks the
+ * Shell's main loop on large payloads); `undefined` lets the pure fallback
+ * run if GLib fails. */
+function nativeSha256(bytes) {
+    try {
+        return GLib.compute_checksum_for_bytes(GLib.ChecksumType.SHA256, GLib.Bytes.new(bytes)) ?? undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
 /** Bytes of one clipboard format through `St.Clipboard.get_content`
  * (callback or promise form, as the Shell version offers); `null` when the
  * read fails or does not answer within 1.5 s. */
@@ -75,6 +86,10 @@ export class CaptureRelay {
      * is read once per change, not on every poll. */
     binaryOffers = new Map();
     ownerChanged = true;
+    /** The sensitive clipboard already reported (one privacy skip per copy,
+     * not per poll): set until the owner changes; the offered formats key it
+     * when the owner-changed signal is missing. */
+    sensitiveReported = null;
     selectionHandler = null;
     pollMs;
     constructor(ipc, diff, pollMs = 500) { this.ipc = ipc; this.diff = diff; this.pollMs = pollMs; }
@@ -86,8 +101,10 @@ export class CaptureRelay {
         try {
             const selection = globalThis.global?.display?.get_selection?.();
             this.selectionHandler = selection?.connect('owner-changed', (_s, type) => {
-                if (type === Meta.SelectionType.SELECTION_CLIPBOARD)
+                if (type === Meta.SelectionType.SELECTION_CLIPBOARD) {
                     this.ownerChanged = true;
+                    this.sensitiveReported = null;
+                }
             }) ?? null;
         }
         catch {
@@ -147,6 +164,12 @@ export class CaptureRelay {
             // Privacy signals precede source-app queries and all ordinary reads.
             const privacy = this.diff.preflight(mimes);
             if (privacy?.kind === 'Sensitive') {
+                const key = mimes.join('\n');
+                if (this.sensitiveReported === key) {
+                    this.ipc.relay.recordSuccess();
+                    return;
+                }
+                this.sensitiveReported = key;
                 await this.ipc.request(captureReportRequest(this.ipc.nextId(), {
                     clip: newClipId(), origin: 'Clipboard', source_app: null,
                     sensitive: true, offers: [],
@@ -198,8 +221,10 @@ export class CaptureRelay {
                         this.loggedFirstRead = true;
                         console.log(`clipmonger: clipboard read ok (${mimes.length} mimes, text=${text.length} chars)`);
                     }
-                    if (text)
-                        offers.push({ mime: 'text/plain', bytes: new TextEncoder().encode(text) });
+                    if (text) {
+                        const bytes = new TextEncoder().encode(text);
+                        offers.push({ mime: 'text/plain', bytes, hash: nativeSha256(bytes) });
+                    }
                 }
                 else {
                     // Images, file lists and rich text: read the bytes, so the extension
@@ -211,7 +236,9 @@ export class CaptureRelay {
                         continue;
                     }
                     const bytes = await readContent(clipboard, mime);
-                    const offer = bytes && bytes.length > 0 ? { mime, bytes } : { mime, sizeHint: 0 };
+                    // Hash once per owner change, natively: the cached offer keeps it,
+                    // so later polls never re-hash a large image.
+                    const offer = bytes && bytes.length > 0 ? { mime, bytes, hash: nativeSha256(bytes) } : { mime, sizeHint: 0 };
                     this.binaryOffers.set(mime, offer);
                     offers.push(offer);
                 }

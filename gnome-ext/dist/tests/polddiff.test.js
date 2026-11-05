@@ -71,3 +71,11 @@ test('owning tick decides while guard flag is set (pollOnce flow)', () => {
         d.setReading(false);
     }
 });
+test('a supplied hash keys the fingerprint: cached large payloads are not re-hashed', async () => {
+    const { fingerprintOffer } = await import('../src/polddiff.js');
+    const big = new Uint8Array(8 * 1024 * 1024);
+    const started = Date.now();
+    const fp = fingerprintOffer({ mime: 'image/png', bytes: big, hash: 'cafe' });
+    assert.equal(fp, 'image/png:8388608:cafe');
+    assert.ok(Date.now() - started < 50, 'no hashing when the hash is known');
+});
