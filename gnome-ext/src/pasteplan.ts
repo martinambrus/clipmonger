@@ -41,3 +41,18 @@ export function assistStep(o: {
   if (o.popupFocused || o.focused === null) return o.waitedMs >= FOCUS_WAIT_MS ? 'toast' : 'wait';
   return o.focused === o.pressTarget ? 'inject' : 'toast';
 }
+
+/** Terminal emulators by any window identity (executable, WM_CLASS, app
+ * id): they paste with Ctrl+Shift+V. Same list as
+ * crates/platform/src/paste_policy.rs SHIFT_PASTE_APPS. */
+const SHIFT_PASTE_APPS = new Set([
+  'gnome-terminal', 'gnome-terminal-server', 'org.gnome.terminal', 'kgx', 'org.gnome.console',
+  'ptyxis', 'org.gnome.ptyxis', 'konsole', 'org.kde.konsole', 'xfce4-terminal', 'tilix',
+  'com.gexperts.tilix', 'terminator', 'alacritty', 'kitty', 'foot', 'footclient', 'wezterm',
+  'wezterm-gui', 'org.wezfurlong.wezterm', 'guake', 'tilda', 'terminology', 'st',
+]);
+
+/** Whether a paste into a window with these identities needs Ctrl+Shift+V. */
+export function pasteNeedsShift(ids: readonly string[]): boolean {
+  return ids.some((id) => SHIFT_PASTE_APPS.has(id.trim().toLowerCase().replace(/\.desktop$/, '')));
+}

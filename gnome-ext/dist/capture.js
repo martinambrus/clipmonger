@@ -8,7 +8,7 @@ import { emitCaptureReport } from './report.js';
 import { POPUP_TITLE, copySource } from './config.js';
 /** Every identity of `win` the denylist may name: GTK app id, WM_CLASS
  * class and instance, and the executable name of its process. */
-function windowAppIds(win) {
+export function windowAppIds(win) {
     if (!win)
         return [];
     const ids = [];

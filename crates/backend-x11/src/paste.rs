@@ -196,7 +196,9 @@ impl X11Paste {
         let written_bytes = payload_bytes(payloads).unwrap_or_default();
 
         refocus_window(self.display.as_deref(), target_window(target));
-        send_ctrl_v()?;
+        send_paste_chord(clipmonger_platform::paste_policy::paste_needs_shift(&[
+            target.app.exe.as_str(),
+        ]))?;
         if !restore {
             return Ok(());
         }
@@ -288,7 +290,8 @@ fn refocus_window(display: Option<&str>, win: u32) {
 }
 
 /// Send the `Ctrl+V` chord over synthetic input (`XTest`).
-fn send_ctrl_v() -> Result<()> {
+/// Ctrl+V, or Ctrl+Shift+V into a terminal.
+fn send_paste_chord(shift: bool) -> Result<()> {
     #[cfg(not(unix))]
     {
         return Err(Error::Unavailable(
@@ -304,7 +307,15 @@ fn send_ctrl_v() -> Result<()> {
         enigo
             .key(Key::Control, Direction::Press)
             .map_err(|e| Error::Io(format!("synthetic Ctrl press failed: {e}")))?;
-        let chord = enigo.key(Key::Unicode('v'), Direction::Click);
+        let shifted = if shift {
+            enigo.key(Key::Shift, Direction::Press)
+        } else {
+            Ok(())
+        };
+        let chord = shifted.and_then(|()| enigo.key(Key::Unicode('v'), Direction::Click));
+        if shift {
+            let _ = enigo.key(Key::Shift, Direction::Release);
+        }
         enigo
             .key(Key::Control, Direction::Release)
             .map_err(|e| Error::Io(format!("synthetic Ctrl release failed: {e}")))?;

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseAssist, isTextMime, assistStep, FOCUS_WAIT_MS, PRESS_TARGET_MAX_AGE_MS } from '../src/pasteplan.js';
+import { parseAssist, isTextMime, assistStep, pasteNeedsShift, FOCUS_WAIT_MS, PRESS_TARGET_MAX_AGE_MS } from '../src/pasteplan.js';
 
 test('parseAssist validates the daemon request', () => {
   assert.deepEqual(parseAssist({ id: 3, mime: 'text/plain', data_b64: 'aGk=', inject: true }),
@@ -27,4 +27,14 @@ test('assistStep injects only into the press target, else toasts or waits', () =
   assert.equal(assistStep({ ...base, pressTarget: null }), 'toast', 'no window before the popup: no target');
   assert.equal(assistStep({ ...base, pressAgeMs: PRESS_TARGET_MAX_AGE_MS + 1 }), 'toast');
   assert.equal(assistStep({ ...base, inject: false }), 'toast');
+});
+
+test('terminals paste with Ctrl+Shift+V, other windows with Ctrl+V', () => {
+  assert.equal(pasteNeedsShift(['org.gnome.Terminal', 'Gnome-terminal', 'gnome-terminal-server']), true);
+  assert.equal(pasteNeedsShift(['org.gnome.Ptyxis.desktop']), true);
+  assert.equal(pasteNeedsShift(['Alacritty']), true);
+  assert.equal(pasteNeedsShift(['org.gnome.TextEditor', 'gnome-text-editor']), false);
+  assert.equal(pasteNeedsShift(['firefox_firefox', 'firefox']), false);
+  assert.equal(pasteNeedsShift(['xterm']), false, 'xterm pastes with Shift+Insert');
+  assert.equal(pasteNeedsShift([]), false);
 });

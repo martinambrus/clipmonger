@@ -329,3 +329,70 @@ impl From<TargetError> for Error {
 pub fn check_target(captured: &PasteTarget, current: Option<&PasteTarget>) -> Result<()> {
     validate_target(captured, current).map_err(Error::from)
 }
+
+/// Terminal emulators, by any identity a window reports (executable,
+/// `WM_CLASS`, GTK/desktop app id). They paste with Ctrl+Shift+V: an
+/// injected Ctrl+V is a control character there and pastes nothing. The
+/// GNOME extension keeps the same list (`gnome-ext/src/pasteplan.ts`).
+const SHIFT_PASTE_APPS: &[&str] = &[
+    "gnome-terminal",
+    "gnome-terminal-server",
+    "org.gnome.terminal",
+    "kgx",
+    "org.gnome.console",
+    "ptyxis",
+    "org.gnome.ptyxis",
+    "konsole",
+    "org.kde.konsole",
+    "xfce4-terminal",
+    "tilix",
+    "com.gexperts.tilix",
+    "terminator",
+    "alacritty",
+    "kitty",
+    "foot",
+    "footclient",
+    "wezterm",
+    "wezterm-gui",
+    "org.wezfurlong.wezterm",
+    "guake",
+    "tilda",
+    "terminology",
+    "st",
+];
+
+/// Whether a paste into a window with these identities needs Ctrl+Shift+V
+/// (a terminal) instead of Ctrl+V. Case and a `.desktop` suffix are ignored.
+#[must_use]
+pub fn paste_needs_shift(app_ids: &[&str]) -> bool {
+    app_ids.iter().any(|id| {
+        let id = id.trim().to_ascii_lowercase();
+        let id = id.strip_suffix(".desktop").unwrap_or(&id);
+        SHIFT_PASTE_APPS.contains(&id)
+    })
+}
+
+#[cfg(test)]
+mod shift_paste_tests {
+    use super::paste_needs_shift;
+
+    #[test]
+    fn terminals_paste_with_shift_and_others_do_not() {
+        assert!(paste_needs_shift(&["gnome-terminal-server"]));
+        assert!(paste_needs_shift(&["org.gnome.Ptyxis.desktop"]));
+        assert!(paste_needs_shift(&["Alacritty"]));
+        assert!(
+            paste_needs_shift(&["firefox", "kitty"]),
+            "any identity counts"
+        );
+        assert!(!paste_needs_shift(&[
+            "gnome-text-editor",
+            "org.gnome.TextEditor"
+        ]));
+        assert!(
+            !paste_needs_shift(&["xterm"]),
+            "xterm pastes with Shift+Insert, not Ctrl+Shift+V"
+        );
+        assert!(!paste_needs_shift(&[]));
+    }
+}

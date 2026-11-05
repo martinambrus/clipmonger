@@ -8,7 +8,8 @@ import Clutter from 'gi://Clutter';
 import { notify } from 'resource:///org/gnome/shell/ui/main.js';
 import { base64Decode } from './codec.js';
 import { POPUP_TITLE } from './config.js';
-import { parseAssist, isTextMime, assistStep } from './pasteplan.js';
+import { parseAssist, isTextMime, assistStep, pasteNeedsShift } from './pasteplan.js';
+import { windowAppIds } from './capture.js';
 /** Pause between the focus settling and the injected Ctrl+V. */
 const INJECT_SETTLE_MS = 60;
 const POLL_MS = 25;
@@ -109,8 +110,9 @@ export class PasteAssist {
                     notify('Clipmonger', 'Copied — press Ctrl+V');
                     return { id, ok: true, injected: false };
                 }
+                // Terminals paste with Ctrl+Shift+V; Ctrl+V would do nothing there.
                 try {
-                    this.pressCtrlV();
+                    this.pressCtrlV(pasteNeedsShift(windowAppIds(focus)));
                     return { id, ok: true, injected: true };
                 }
                 catch { /* fall back to the toast */ }
@@ -130,15 +132,19 @@ export class PasteAssist {
             this.capture?.markSelfWrite([{ mime, bytes }]);
         }
     }
-    pressCtrlV() {
+    pressCtrlV(shift) {
         if (!this.keyboard) {
             const seat = Clutter.get_default_backend().get_default_seat();
             this.keyboard = seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
         }
         const now = () => GLib.get_monotonic_time();
         this.keyboard.notify_keyval(now(), Clutter.KEY_Control_L, Clutter.KeyState.PRESSED);
+        if (shift)
+            this.keyboard.notify_keyval(now(), Clutter.KEY_Shift_L, Clutter.KeyState.PRESSED);
         this.keyboard.notify_keyval(now(), Clutter.KEY_v, Clutter.KeyState.PRESSED);
         this.keyboard.notify_keyval(now(), Clutter.KEY_v, Clutter.KeyState.RELEASED);
+        if (shift)
+            this.keyboard.notify_keyval(now(), Clutter.KEY_Shift_L, Clutter.KeyState.RELEASED);
         this.keyboard.notify_keyval(now(), Clutter.KEY_Control_L, Clutter.KeyState.RELEASED);
     }
     disable() {
