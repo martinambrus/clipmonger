@@ -289,9 +289,11 @@ Found and fixed on the way: duplicate rows from the X11 watcher (charset twins,
 trailing NUL, Latin-1 text, XWayland mirror), a denylist miss when the popup took
 the focus before the copy was seen, and a Shell freeze from hashing a 3 MB image
 in JavaScript on every poll (045fb7c: native hashing, once per clipboard change).
-Known limits: plain terminals paste with Ctrl+Shift+V, so an injected Ctrl+V does
-nothing there; GNOME reports no keybinding conflicts (a duplicate of a Shell
-shortcut takes it over).
+Terminals paste with Ctrl+Shift+V: both the X11 engine and the extension send it
+for known terminal apps (verified in GNOME Terminal on Xorg and Wayland). On Xorg
+the engine waits 200 ms after writing the clipboard, since GTK3 apps drop a paste
+made while their owner-change TARGETS query is in flight. Known limit: GNOME
+reports no keybinding conflicts (a duplicate of a Shell shortcut takes it over).
 
 ## Other release gates: do not silently waive
 

@@ -15,9 +15,13 @@ use crate::session;
 use crate::transfer::{window_exists, X11Transfer};
 use x11rb14::connection::Connection as _;
 use x11rb14::protocol::xproto::{self, ConnectionExt as _, EventMask};
+use x11rb14::wrapper::ConnectionExt as _;
 
 /// Dwell holding the clip on the clipboard before the guarded restore.
 const DWELL_MS: u64 = 1200;
+/// Pause between the clipboard write and the paste chord (GNOME Terminal
+/// pasted nothing without it; 150 ms was enough on GNOME 46 Xorg).
+const CHORD_SETTLE_MS: u64 = 200;
 /// Canonical text MIME preferred for save/restore comparisons.
 const TEXT_MIME: &str = "text/plain;charset=utf-8";
 
@@ -195,10 +199,14 @@ impl X11Paste {
         let written = self.transfer.unchanged_indicator();
         let written_bytes = payload_bytes(payloads).unwrap_or_default();
 
+        // Every GTK app queries TARGETS when the owner changes; GTK3 drops
+        // a paste request made while its own query is still in flight.
+        std::thread::sleep(Duration::from_millis(CHORD_SETTLE_MS));
         refocus_window(self.display.as_deref(), target_window(target));
-        send_paste_chord(clipmonger_platform::paste_policy::paste_needs_shift(&[
-            target.app.exe.as_str(),
-        ]))?;
+        send_paste_chord(
+            self.display.as_deref(),
+            clipmonger_platform::paste_policy::paste_needs_shift(&[target.app.exe.as_str()]),
+        )?;
         if !restore {
             return Ok(());
         }
@@ -263,6 +271,12 @@ fn refocus_window(display: Option<&str>, win: u32) {
     let Ok((conn, _)) = session::connect(display) else {
         return;
     };
+    // Already focused (on the window or inside it): leave it alone. GTK3
+    // keeps the focus on a child of its toplevel, and moving it to the
+    // toplevel itself makes the app drop the synthetic keys.
+    if focus_within(&conn, win) {
+        return;
+    }
     let Ok(atoms) = session::Atoms::intern(&conn) else {
         return;
     };
@@ -289,38 +303,114 @@ fn refocus_window(display: Option<&str>, win: u32) {
     let _ = conn.flush();
 }
 
-/// Send the `Ctrl+V` chord over synthetic input (`XTest`).
-/// Ctrl+V, or Ctrl+Shift+V into a terminal.
-fn send_paste_chord(shift: bool) -> Result<()> {
-    #[cfg(not(unix))]
-    {
-        return Err(Error::Unavailable(
-            "synthetic input needs a Unix X11 session".to_string(),
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use enigo::{Direction, Key, Keyboard as _};
-
-        let mut enigo = enigo::Enigo::new(&enigo::Settings::default())
-            .map_err(|e| Error::Unavailable(format!("synthetic input unavailable: {e}")))?;
-        enigo
-            .key(Key::Control, Direction::Press)
-            .map_err(|e| Error::Io(format!("synthetic Ctrl press failed: {e}")))?;
-        let shifted = if shift {
-            enigo.key(Key::Shift, Direction::Press)
-        } else {
-            Ok(())
-        };
-        let chord = shifted.and_then(|()| enigo.key(Key::Unicode('v'), Direction::Click));
-        if shift {
-            let _ = enigo.key(Key::Shift, Direction::Release);
+/// Whether the input focus is `win` or one of its descendants.
+fn focus_within(conn: &impl x11rb14::connection::Connection, win: u32) -> bool {
+    let Some(mut current) = xproto::get_input_focus(conn)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .map(|reply| reply.focus)
+    else {
+        return false;
+    };
+    // Bounded walk up the tree (nesting is shallow in practice).
+    for _ in 0..32 {
+        if current == win {
+            return true;
         }
-        enigo
-            .key(Key::Control, Direction::Release)
-            .map_err(|e| Error::Io(format!("synthetic Ctrl release failed: {e}")))?;
-        chord.map_err(|e| Error::Io(format!("synthetic paste chord failed: {e}")))?;
-        Ok(())
+        if current <= 1 {
+            return false;
+        }
+        let Some(tree) = xproto::query_tree(conn, current)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+        else {
+            return false;
+        };
+        if tree.parent == 0 || tree.parent == tree.root {
+            return false;
+        }
+        current = tree.parent;
+    }
+    false
+}
+
+const XK_CONTROL_L: u32 = 0xffe3;
+const XK_SHIFT_L: u32 = 0xffe1;
+const XK_V: u32 = 0x0076;
+
+/// The first keycode whose base keysym is `keysym` in a keyboard mapping
+/// that starts at `min` with `per` keysyms per keycode.
+fn keycode_in(min: u8, per: usize, keysyms: &[u32], keysym: u32) -> Option<u8> {
+    if per == 0 {
+        return None;
+    }
+    let index = keysyms
+        .chunks(per)
+        .position(|chunk| chunk.first() == Some(&keysym))?;
+    min.checked_add(u8::try_from(index).ok()?)
+}
+
+/// Send Ctrl+V, or Ctrl+Shift+V into a terminal, as plain `XTest` key
+/// events on the keycodes the current keymap gives those keys.
+fn send_paste_chord(display: Option<&str>, shift: bool) -> Result<()> {
+    use x11rb14::protocol::xtest::ConnectionExt as _;
+
+    let (conn, screen) = session::connect(display)?;
+    let setup = conn.setup();
+    let root = setup.roots[screen].root;
+    let (min, max) = (setup.min_keycode, setup.max_keycode);
+    let map = conn
+        .get_keyboard_mapping(min, max - min + 1)
+        .map_err(|e| Error::Io(format!("x11 keymap query failed: {e}")))?
+        .reply()
+        .map_err(|e| Error::Io(format!("x11 keymap reply failed: {e}")))?;
+    let per = usize::from(map.keysyms_per_keycode);
+    let code = |keysym: u32| {
+        keycode_in(min, per, &map.keysyms, keysym)
+            .ok_or_else(|| Error::Unavailable(format!("no keycode mapped to keysym {keysym:#x}")))
+    };
+    let mut chord = vec![code(XK_CONTROL_L)?];
+    if shift {
+        chord.push(code(XK_SHIFT_L)?);
+    }
+    chord.push(code(XK_V)?);
+    let fake = |kind: u8, keycode: u8| {
+        conn.xtest_fake_input(kind, keycode, x11rb14::CURRENT_TIME, root, 0, 0, 0)
+            .map_err(|e| Error::Io(format!("synthetic key event failed: {e}")))
+    };
+    for &keycode in &chord {
+        fake(xproto::KEY_PRESS_EVENT, keycode)?;
+    }
+    for &keycode in chord.iter().rev() {
+        fake(xproto::KEY_RELEASE_EVENT, keycode)?;
+    }
+    conn.sync()
+        .map_err(|e| Error::Io(format!("synthetic paste chord failed: {e}")))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod chord_tests {
+    use super::*;
+
+    #[test]
+    fn keycode_lookup_uses_the_base_keysym_of_each_keycode() {
+        // Keycodes 8.. with two keysyms each: 8 = a/A, 9 = v/V, 10 = Shift_L.
+        let map = [0x61, 0x41, 0x76, 0x56, XK_SHIFT_L, 0];
+        assert_eq!(keycode_in(8, 2, &map, XK_V), Some(9));
+        assert_eq!(keycode_in(8, 2, &map, XK_SHIFT_L), Some(10));
+        assert_eq!(
+            keycode_in(8, 2, &map, 0x56),
+            None,
+            "a shifted level is not a base"
+        );
+        assert_eq!(keycode_in(8, 2, &map, XK_CONTROL_L), None);
+        assert_eq!(keycode_in(8, 0, &map, XK_V), None);
+        assert_eq!(
+            keycode_in(255, 2, &map, XK_SHIFT_L),
+            None,
+            "keycode overflow"
+        );
     }
 }
 

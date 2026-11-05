@@ -645,7 +645,6 @@ version = "0.1.0"
 dependencies = [
  "clipmonger-core",
  "clipmonger-platform",
- "enigo",
  "serde",
  "serde_json",
  "uuid",
