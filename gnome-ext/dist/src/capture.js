@@ -1,6 +1,7 @@
 // Shell glue: St.Clipboard 500 ms poll feeding PollDiff. Async reads only; a
 // wedged read degrades to capture-paused (3 failures) and never blocks Shell.
 import St from 'gi://St';
+import Meta from 'gi://Meta';
 import GLib from 'gi://GLib?version=2.0';
 import { captureReportRequest, newClipId } from './codec.js';
 import { emitCaptureReport } from './report.js';
@@ -27,6 +28,40 @@ function windowAppIds(win) {
     catch { /* process gone or not ours */ }
     return ids.filter((id) => typeof id === 'string' && id !== '');
 }
+/** Bytes of one clipboard format through `St.Clipboard.get_content`
+ * (callback or promise form, as the Shell version offers); `null` when the
+ * read fails or does not answer within 1.5 s. */
+function readContent(clipboard, mime) {
+    return new Promise((resolve) => {
+        let settled = false;
+        const timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => { finish(null); return GLib.SOURCE_REMOVE; });
+        function finish(bytes) {
+            if (settled)
+                return;
+            settled = true;
+            GLib.source_remove(timer);
+            try {
+                resolve(bytes ? new Uint8Array(bytes.get_data?.() ?? bytes.toArray?.() ?? []) : null);
+            }
+            catch {
+                resolve(null);
+            }
+        }
+        try {
+            if (typeof clipboard.get_content !== 'function') {
+                finish(null);
+                return;
+            }
+            const returned = clipboard.get_content(St.ClipboardType.CLIPBOARD, mime, (_c, bytes) => finish(bytes));
+            if (returned && typeof returned.then === 'function') {
+                returned.then(finish, () => finish(null));
+            }
+        }
+        catch {
+            finish(null);
+        }
+    });
+}
 export class CaptureRelay {
     timer = null;
     diff;
@@ -36,6 +71,11 @@ export class CaptureRelay {
      * last focused window that was not the popup. */
     previousFocus = { ids: [], appId: null };
     lastOtherFocus = { ids: [], appId: null };
+    /** Non-text offers read since the clipboard owner last changed: an image
+     * is read once per change, not on every poll. */
+    binaryOffers = new Map();
+    ownerChanged = true;
+    selectionHandler = null;
     pollMs;
     constructor(ipc, diff, pollMs = 500) { this.ipc = ipc; this.diff = diff; this.pollMs = pollMs; }
     setPollMs(ms) { this.pollMs = ms; }
@@ -43,13 +83,32 @@ export class CaptureRelay {
     start() {
         if (this.timer !== null)
             return;
+        try {
+            const selection = globalThis.global?.display?.get_selection?.();
+            this.selectionHandler = selection?.connect('owner-changed', (_s, type) => {
+                if (type === Meta.SelectionType.SELECTION_CLIPBOARD)
+                    this.ownerChanged = true;
+            }) ?? null;
+        }
+        catch {
+            this.selectionHandler = null;
+        }
         const tick = () => { void this.pollOnce(); return GLib.SOURCE_CONTINUE; };
         this.timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, this.pollMs, tick);
     }
-    stop() { if (this.timer !== null) {
-        GLib.source_remove(this.timer);
-        this.timer = null;
-    } }
+    stop() {
+        if (this.timer !== null) {
+            GLib.source_remove(this.timer);
+            this.timer = null;
+        }
+        if (this.selectionHandler !== null) {
+            try {
+                globalThis.global?.display?.get_selection?.()?.disconnect(this.selectionHandler);
+            }
+            catch { /* shell gone */ }
+            this.selectionHandler = null;
+        }
+    }
     async pollOnce() {
         if (this.diff.isReading || this.ipc.relay.capturePaused)
             return;
@@ -112,10 +171,18 @@ export class CaptureRelay {
                 return;
             }
             const offers = [];
+            let textRead = false;
+            // A change during this read sets the flag again for the next poll.
+            const changed = this.ownerChanged || this.selectionHandler === null;
+            this.ownerChanged = false;
             for (const mime of mimes) {
                 if (!this.diff.wants(mime))
                     continue;
                 if (mime.startsWith('text/plain') || mime === 'UTF8_STRING') {
+                    // Every text target carries the same text: read it once.
+                    if (textRead)
+                        continue;
+                    textRead = true;
                     // get_text may answer via callback or via a returned promise,
                     // depending on Shell version; a callback that never fires must
                     // not wedge isReading.
@@ -135,9 +202,24 @@ export class CaptureRelay {
                         offers.push({ mime: 'text/plain', bytes: new TextEncoder().encode(text) });
                 }
                 else {
-                    // VERIFY: read via MetaSelection transfer; until proven, size-only offer.
-                    offers.push({ mime, sizeHint: 0 });
+                    // Images, file lists and rich text: read the bytes, so the extension
+                    // (the only capture path on GNOME Wayland) stores the whole clip.
+                    // Without the owner-changed signal every poll reads (fallback).
+                    const cached = changed ? undefined : this.binaryOffers.get(mime);
+                    if (cached) {
+                        offers.push(cached);
+                        continue;
+                    }
+                    const bytes = await readContent(clipboard, mime);
+                    const offer = bytes && bytes.length > 0 ? { mime, bytes } : { mime, sizeHint: 0 };
+                    this.binaryOffers.set(mime, offer);
+                    offers.push(offer);
                 }
+            }
+            if (changed) {
+                for (const mime of [...this.binaryOffers.keys()])
+                    if (!mimes.includes(mime))
+                        this.binaryOffers.delete(mime);
             }
             const decision = this.diff.decide({ offers, focusedAppId: focusedAppIds, nowMs: Date.now() });
             if (decision.kind === 'Report') {

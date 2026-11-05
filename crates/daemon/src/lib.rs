@@ -1642,6 +1642,13 @@ fn popup_hotkey_conflict(snapshot: &Value, extension_note: Option<&str>) -> Opti
     })
 }
 
+/// Pure rule behind `DaemonState::xwayland_mirror`: drop X11-watcher
+/// captures on a Wayland session that runs the live Wayland backend.
+#[cfg(all(unix, feature = "backend-x11"))]
+fn skip_x11_capture(origin: &str, x11_session: bool, wayland_backend: bool) -> bool {
+    origin == "x11" && !x11_session && wayland_backend
+}
+
 /// Text payloads without trailing NUL terminators: some X11 apps (GNOME Text
 /// Editor's `text/plain` target) append one. Kept, it is pasted back and
 /// makes the clip differ from the same text captured elsewhere, so copies
@@ -2642,6 +2649,17 @@ impl DaemonState {
         if self.extension_connected() && !x11_session_or_absent() {
             extension_paste_caps(&mut snapshot);
         }
+        #[cfg(all(unix, feature = "backend-x11"))]
+        if self.xwayland_mirror("x11") {
+            let note = if self.extension_connected() {
+                "capture by the GNOME extension (the X11 watcher stays off on Wayland)"
+            } else {
+                "capture paused: the GNOME extension is off"
+            };
+            if let Some(notes) = snapshot.get_mut("notes").and_then(Value::as_array_mut) {
+                notes.push(Value::from(note));
+            }
+        }
         if self.elevation_refused() {
             if let Some(paste) = snapshot.get_mut("paste") {
                 paste["level"] = Value::from("degraded");
@@ -2805,6 +2823,23 @@ impl DaemonState {
         }
     }
 
+    /// Whether an `origin` capture is `XWayland`'s mirror of a Wayland
+    /// clipboard: on a Wayland session (the live Wayland backend
+    /// registered) the X11 watcher cannot tell which app copied, so the
+    /// denylist could not apply; only the GNOME extension captures there.
+    #[cfg_attr(not(all(unix, feature = "backend-x11")), allow(clippy::unused_self))]
+    fn xwayland_mirror(&self, origin: &str) -> bool {
+        #[cfg(all(unix, feature = "backend-x11"))]
+        {
+            skip_x11_capture(origin, x11_session(), self.caps.has_backend("wayland"))
+        }
+        #[cfg(not(all(unix, feature = "backend-x11")))]
+        {
+            let _ = origin;
+            false
+        }
+    }
+
     fn ingest_capture_checked(
         &self,
         origin: &str,
@@ -2813,6 +2848,9 @@ impl DaemonState {
     ) -> Result<bool, IpcError> {
         if sensitive {
             return self.record_capture_privacy_skip();
+        }
+        if self.xwayland_mirror(origin) {
+            return Ok(false);
         }
         let trimmed = trim_text_terminators(payloads);
         let payloads: &[(String, Vec<u8>)] = &trimmed;
@@ -3075,6 +3113,9 @@ impl DaemonState {
         now: i64,
         random: impl FnMut() -> Result<u64, clipmonger_core::entropy::Error>,
     ) -> Result<bool, IpcError> {
+        if self.xwayland_mirror(origin) {
+            return Ok(false);
+        }
         let gate = self
             .profile_op
             .lock()
@@ -6329,6 +6370,26 @@ mod tests {
             super::trim_text_terminators(&[("text/plain".to_string(), b"a\0\0".to_vec())])[0].1,
             b"a"
         );
+    }
+
+    #[cfg(all(unix, feature = "backend-x11"))]
+    #[test]
+    fn x11_watcher_stays_off_on_a_wayland_session() {
+        use super::skip_x11_capture as skip;
+        assert!(
+            skip("x11", false, true),
+            "Wayland session with the live Wayland backend"
+        );
+        assert!(
+            !skip("x11", true, true),
+            "an X11 session keeps the X11 watcher"
+        );
+        assert!(
+            !skip("x11", false, false),
+            "no live Wayland backend (tests, headless)"
+        );
+        assert!(!skip("gnome", false, true), "the extension always captures");
+        assert!(!skip("wayland", false, true));
     }
 
     #[test]

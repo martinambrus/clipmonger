@@ -1,6 +1,7 @@
 // Shell glue: St.Clipboard 500 ms poll feeding PollDiff. Async reads only; a
 // wedged read degrades to capture-paused (3 failures) and never blocks Shell.
 import St from 'gi://St';
+import Meta from 'gi://Meta';
 import GLib from 'gi://GLib?version=2.0';
 import { PollDiff, type OfferInput } from './polddiff.js';
 import { captureReportRequest, newClipId } from './codec.js';
@@ -22,6 +23,29 @@ function windowAppIds(win: any): string[] {
   return ids.filter((id): id is string => typeof id === 'string' && id !== '');
 }
 
+/** Bytes of one clipboard format through `St.Clipboard.get_content`
+ * (callback or promise form, as the Shell version offers); `null` when the
+ * read fails or does not answer within 1.5 s. */
+function readContent(clipboard: any, mime: string): Promise<Uint8Array | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => { finish(null); return GLib.SOURCE_REMOVE; });
+    function finish(bytes: any): void {
+      if (settled) return;
+      settled = true;
+      GLib.source_remove(timer);
+      try { resolve(bytes ? new Uint8Array(bytes.get_data?.() ?? bytes.toArray?.() ?? []) : null); } catch { resolve(null); }
+    }
+    try {
+      if (typeof clipboard.get_content !== 'function') { finish(null); return; }
+      const returned: unknown = clipboard.get_content(St.ClipboardType.CLIPBOARD, mime, (_c: any, bytes: any) => finish(bytes));
+      if (returned && typeof (returned as Promise<unknown>).then === 'function') {
+        (returned as Promise<unknown>).then(finish, () => finish(null));
+      }
+    } catch { finish(null); }
+  });
+}
+
 export class CaptureRelay {
   private timer: number | null = null;
   private diff: PollDiff;
@@ -31,6 +55,11 @@ export class CaptureRelay {
    * last focused window that was not the popup. */
   private previousFocus: FocusIds = { ids: [], appId: null };
   private lastOtherFocus: FocusIds = { ids: [], appId: null };
+  /** Non-text offers read since the clipboard owner last changed: an image
+   * is read once per change, not on every poll. */
+  private binaryOffers = new Map<string, OfferInput>();
+  private ownerChanged = true;
+  private selectionHandler: number | null = null;
   private pollMs: number;
   constructor(ipc: IpcClient, diff: PollDiff, pollMs = 500) { this.ipc = ipc; this.diff = diff; this.pollMs = pollMs; }
   setPollMs(ms: number): void { this.pollMs = ms; }
@@ -38,10 +67,22 @@ export class CaptureRelay {
 
   start(): void {
     if (this.timer !== null) return;
+    try {
+      const selection = (globalThis as any).global?.display?.get_selection?.();
+      this.selectionHandler = selection?.connect('owner-changed', (_s: any, type: number) => {
+        if (type === Meta.SelectionType.SELECTION_CLIPBOARD) this.ownerChanged = true;
+      }) ?? null;
+    } catch { this.selectionHandler = null; }
     const tick = () => { void this.pollOnce(); return GLib.SOURCE_CONTINUE; };
     this.timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, this.pollMs, tick);
   }
-  stop(): void { if (this.timer !== null) { GLib.source_remove(this.timer); this.timer = null; } }
+  stop(): void {
+    if (this.timer !== null) { GLib.source_remove(this.timer); this.timer = null; }
+    if (this.selectionHandler !== null) {
+      try { (globalThis as any).global?.display?.get_selection?.()?.disconnect(this.selectionHandler); } catch { /* shell gone */ }
+      this.selectionHandler = null;
+    }
+  }
 
   private async pollOnce(): Promise<void> {
     if (this.diff.isReading || this.ipc.relay.capturePaused) return;
@@ -91,9 +132,16 @@ export class CaptureRelay {
       if (!current.popup) this.lastOtherFocus = current;
       if (this.diff.preflight(mimes, focusedAppIds)) { this.ipc.relay.recordSuccess(); return; }
       const offers: OfferInput[] = [];
+      let textRead = false;
+      // A change during this read sets the flag again for the next poll.
+      const changed = this.ownerChanged || this.selectionHandler === null;
+      this.ownerChanged = false;
       for (const mime of mimes) {
         if (!this.diff.wants(mime)) continue;
         if (mime.startsWith('text/plain') || mime === 'UTF8_STRING') {
+          // Every text target carries the same text: read it once.
+          if (textRead) continue;
+          textRead = true;
           // get_text may answer via callback or via a returned promise,
           // depending on Shell version; a callback that never fires must
           // not wedge isReading.
@@ -111,9 +159,19 @@ export class CaptureRelay {
           }
           if (text) offers.push({ mime: 'text/plain', bytes: new TextEncoder().encode(text) });
         } else {
-          // VERIFY: read via MetaSelection transfer; until proven, size-only offer.
-          offers.push({ mime, sizeHint: 0 });
+          // Images, file lists and rich text: read the bytes, so the extension
+          // (the only capture path on GNOME Wayland) stores the whole clip.
+          // Without the owner-changed signal every poll reads (fallback).
+          const cached = changed ? undefined : this.binaryOffers.get(mime);
+          if (cached) { offers.push(cached); continue; }
+          const bytes = await readContent(clipboard, mime);
+          const offer: OfferInput = bytes && bytes.length > 0 ? { mime, bytes } : { mime, sizeHint: 0 };
+          this.binaryOffers.set(mime, offer);
+          offers.push(offer);
         }
+      }
+      if (changed) {
+        for (const mime of [...this.binaryOffers.keys()]) if (!mimes.includes(mime)) this.binaryOffers.delete(mime);
       }
       const decision = this.diff.decide({ offers, focusedAppId: focusedAppIds, nowMs: Date.now() });
       if (decision.kind === 'Report') {
