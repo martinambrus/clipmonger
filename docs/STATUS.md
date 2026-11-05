@@ -40,8 +40,9 @@ implemented; Phase 7 packaging/QA and native acceptance remain open.
   2026-11-05: hotkeys, paste, permanent clips, capture, privacy, Shell restart,
   tray and autostart (see
   [the continuation](v1-continuation.md#linux-acceptance-on-gnome-46-2026-11-05)).
-  Other desktops, the GNOME version matrix, the portal rebind and
-  blur-derived generated-protocol licensing remain open.
+  Other desktops, the GNOME version matrix and the portal rebind remain open.
+  The blur-protocol licensing was settled on 2026-11-05 (LGPL-2.1-or-later for
+  those generated bindings, notice in `licenses/wayland/`).
 - [Feature-to-test index](v1-qa-traceability.md) maps the v1 slices and explicit
   evidence gaps. The wider release program still needs the 24-hour soak,
   million-case fuzzing, coverage calibration, per-box caps goldens, applicable

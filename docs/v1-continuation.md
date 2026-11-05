@@ -95,7 +95,7 @@ A delivered source change does not close a native gate.
 | #59 | Real GUI/daemon log output and visible failure diagnostics. |
 | #62 | Windows opt-out markers, capture-pump recovery and wide-image capture through to stored PNG. |
 | #67 | Failed-paste rollback, clipboard owner/sequence checks and Control release through real native paths. |
-| #70 | Actual capture/hotkey startup failure and recovery on Windows and Linux. Linux: a crashed daemon is restarted by the UI (3a5aee1) and a refused popup chord recovers within 5 s (GNOME 46 Xorg); other start-up failures remain. |
+| #70 | Actual capture/hotkey startup failure and recovery on Windows and Linux. Linux: a crashed daemon is restarted by the UI (3a5aee1) and a refused popup chord recovers within 5 s (GNOME 46 Xorg). On a private Xvfb (2026-11-05), a daemon started before its display came up, and one whose X server died and restarted, recovered capture, the popup hotkey and paste caps (re-probed once the display answers) with no restart. Windows start-up failures remain. |
 | #71 | Oversized captures produce the correct user-visible stub on the actual backend/UI. |
 | #72 | Real privacy-marker/fingerprint behavior and bounded wide-image handling. |
 | #74 | Same-user UAC registration, cancellation/alternate-account refusal, ACL/pinning/task readback, cleanup and logon/helper lifecycle. |
@@ -303,11 +303,14 @@ shortcut takes it over).
   [T-607](../tests/manual/T-607-paste-spike-acceptance.md) on KDE/wlroots,
   T-704 (GNOME 46-51) and the portal rebind (ADR-004 item 2). X11 permanent
   hotkeys now honor `popup.restore_clipboard` (8de631a, verified on Xorg).
-- Linux release licensing is unresolved for scanner-generated blur protocol output
-  used by winit through wayland-protocols-plasma. The crate's MIT manifest and the
-  successful dependency scan do not determine the file-specific output boundary.
-  Obtain a supported licensing determination consistent with the existing policy;
-  do not assume a notice alone settles it, waive policy or rewrite Wayland by inference.
+- Linux release licensing for the scanner-generated blur protocol bindings (winit
+  through wayland-protocols-plasma 0.3.12, from KDE's LGPL-2.1-or-later
+  `blur.xml`) was settled by the project owner on 2026-11-05: those bindings are
+  accepted under LGPL-2.1-or-later, the rest stays MIT, and the public source meets
+  the relink terms. The notice and license text are in
+  [licenses/wayland/](../licenses/wayland/README.md); Linux packages must ship them.
+  The published 0.1.0 `.deb` predates the notice, so the next Linux package must
+  carry it. Re-check on winit or wayland-protocols-plasma updates.
 - T-1103's 24-hour daemon/monitor/retention soak has no current completion receipt.
   A search microbenchmark is not that soak.
 - T-1105's specified million-case toolchain fuzz run and source-based coverage

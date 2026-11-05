@@ -231,6 +231,9 @@ these authors and projects:
 - **Fonts** (bundled through egui): Ubuntu Light (Canonical Ltd.), Noto Emoji
   (Google Inc.), Hack (Source Foundry Authors, with DejaVu and Bitstream Vera
   contributions) and emoji-icon-font (John Slegers).
+- **Wayland blur protocol** (Linux only): bindings generated from KDE's
+  `blur.xml` (Martin Gräßlin, Marco Martin) are under LGPL-2.1-or-later; see
+  [licenses/wayland/](licenses/wayland/README.md).
 
 Full license texts and notices for all third-party code and fonts are in
 [licenses/](licenses/).
