@@ -5,7 +5,7 @@ reserved for the release that passes all seg-11 §5 gates.
 
 ## [0.1.0] — 2026-11-04
 
-First public pre-release, Windows only. Linux builds are not published yet.
+First public pre-release, for Windows and Ubuntu (`.deb`).
 
 ### Added
 

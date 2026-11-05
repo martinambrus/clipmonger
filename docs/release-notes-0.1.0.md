@@ -1,7 +1,7 @@
-# Clipmonger 0.1.0 (Windows pre-release)
+# Clipmonger 0.1.0 (pre-release)
 
-First public pre-release of Clipmonger, for 64-bit Windows 10 and Windows 11.
-Linux builds are not part of this release. Changes are listed in
+First public pre-release of Clipmonger, for 64-bit Windows 10 and Windows 11
+and for Ubuntu (GNOME 46-51, X11 and Wayland). Changes are listed in
 [CHANGELOG.md](../CHANGELOG.md) under 0.1.0.
 
 ## Artifacts
@@ -16,7 +16,12 @@ Linux builds are not part of this release. Changes are listed in
   (UI), `clipmonger-daemon.exe` and `clipmonger-cli.exe`. It contains
   `portable.marker`, so the profile is stored beside the programs, and
   portable-use instructions.
-- Both contain the complete `licenses/` directory: font notices and their
+- `clipmonger_0.1.0_amd64.deb`: Ubuntu/Debian package that installs the
+  programs to `/opt/clipmonger`, an applications menu entry and the GNOME Shell
+  extension. On GNOME Wayland enable the extension once with
+  `gnome-extensions enable clipmonger@extensions.clipmonger.dev`, then log out
+  and back in.
+- Both Windows artifacts contain the complete `licenses/` directory: font notices and their
   README, upstream license texts and the generated `RUST-NOTICES.txt`.
 - `SHA256SUMS`: sha256sum-format checksums for the installer and the ZIP.
 

@@ -29,7 +29,8 @@ implemented; Phase 7 packaging/QA and native acceptance remain open.
   the same day. T-409 legs 11-17 remain open. Historical dated passes remain scoped to their old builds.
 - Windows-only 0.1.0 pre-release: artifacts (NSIS setup, portable ZIP,
   SHA256SUMS) are built from 5a5f4e1, see
-  [the release notes](release-notes-0.1.0.md); Linux artifacts are not published.
+  [the release notes](release-notes-0.1.0.md). The published 0.1.0 release
+  (tag at b46698f) also carries an Ubuntu `.deb`.
   T-1204 (install guide on Windows 10 and Windows 11) passed on 2026-11-05.
 - Resolved 2026-11-04: dropped clipboard pastes into elevated windows were
   the daemon's capture reading its own paste write while the target handled
