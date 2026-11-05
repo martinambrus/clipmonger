@@ -36,8 +36,12 @@ implemented; Phase 7 packaging/QA and native acceptance remain open.
   the daemon's capture reading its own paste write while the target handled
   Ctrl+V; fixed and verified on the Windows 10 VM, see
   [the continuation](v1-continuation.md#resolved-dropped-clipboard-paste-into-elevated-windows-2026-11-04).
-- Real Linux X11/Wayland/GNOME acceptance and blur-derived generated-protocol
-  licensing remain open. Artifact checks do not settle either boundary.
+- Linux on GNOME 46 (Xorg and Wayland) passed its user-run acceptance on
+  2026-11-05: hotkeys, paste, permanent clips, capture, privacy, Shell restart,
+  tray and autostart (see
+  [the continuation](v1-continuation.md#linux-acceptance-on-gnome-46-2026-11-05)).
+  Other desktops, the GNOME version matrix, the portal rebind and
+  blur-derived generated-protocol licensing remain open.
 - [Feature-to-test index](v1-qa-traceability.md) maps the v1 slices and explicit
   evidence gaps. The wider release program still needs the 24-hour soak,
   million-case fuzzing, coverage calibration, per-box caps goldens, applicable

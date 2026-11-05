@@ -1,6 +1,6 @@
 # V1 continuation — acceptance candidate
 
-Updated 2026-11-04 (Windows 0.1.0 pre-release). Start here when continuing without the previous conversation.
+Updated 2026-11-05 (Windows 0.1.0 pre-release; GNOME 46 Linux acceptance). Start here when continuing without the previous conversation.
 
 ## Scope and current state
 
@@ -90,12 +90,12 @@ A delivered source change does not close a native gate.
 | #19 | Alt+Tab destination is a documented known limitation (3757fcf); tray focus fixed (2dabd38) and guided tray/focus/lifecycle checks passed. Remaining: DPI/monitor changes and physical-display acceptance. |
 | #22 | Installed autostart enable/disable, canonical executable path and logon/reboot; portable writes no Run value. |
 | #26 | Installer/uninstaller, default-preserving profile UI, recovery, interoperability, manual matrix and release record. |
-| #41 | Real X11/Wayland/GNOME: live hotkey changes, portal rebind, extension/push and activation behavior. |
+| #41 | GNOME 46 X11 and Wayland passed 2026-11-05 (see [Linux acceptance](#linux-acceptance-on-gnome-46-2026-11-05)). Remaining: portal rebind on a portal desktop (KDE Plasma 6, GNOME 48+) and the other desktops. |
 | #49 | CPU runner: native lifecycle, minimized startup, tray, DPI and monitor changes. |
 | #59 | Real GUI/daemon log output and visible failure diagnostics. |
 | #62 | Windows opt-out markers, capture-pump recovery and wide-image capture through to stored PNG. |
 | #67 | Failed-paste rollback, clipboard owner/sequence checks and Control release through real native paths. |
-| #70 | Actual capture/hotkey startup failure and recovery on Windows and Linux. |
+| #70 | Actual capture/hotkey startup failure and recovery on Windows and Linux. Linux: a crashed daemon is restarted by the UI (3a5aee1) and a refused popup chord recovers within 5 s (GNOME 46 Xorg); other start-up failures remain. |
 | #71 | Oversized captures produce the correct user-visible stub on the actual backend/UI. |
 | #72 | Real privacy-marker/fingerprint behavior and bounded wide-image handling. |
 | #74 | Same-user UAC registration, cancellation/alternate-account refusal, ACL/pinning/task readback, cleanup and logon/helper lifecycle. |
@@ -270,15 +270,39 @@ x86_64-pc-windows-gnu host and a MinGW-w64 GCC (WinLibs UCRT) on PATH, then
 process remains, copy the exes into C:\Program Files\Clipmonger and start it
 again.
 
+## Linux acceptance on GNOME 46 (2026-11-05)
+
+User-run checks on Ubuntu 24.04, GNOME 46, development builds of the head named
+per row; recorded results, not signatures.
+
+| Test | Session | Result |
+| --- | --- | --- |
+| Popup hotkey change, refusal, toggle, focus, placement (ADR-004 items 1, 3, 4) | Xorg, Wayland | Pass (404f204, 4a08cda, 642b193, 5badd58) |
+| Popup paste (T-607 GNOME rows, T-508 step 2) | Xorg: X11 engine, restore on/off; Wayland: extension injects Ctrl+V, else a "press Ctrl+V" notification | Pass after 8de631a |
+| Permanent-clip hotkeys | Xorg (daemon grab), Wayland (extension, eabadf8) | Pass, live rebind |
+| T-702 install, capture text/image/files, extension off/on | Wayland | Pass after 0452f30: one row per copy; capture pauses while the extension is off |
+| T-703 Shell restart (Alt+F2 r x3) | Xorg | Pass: the extension reconnects, the daemon keeps running |
+| T-705 image/file-only changes, denylist, password hint, overhead | Wayland, Xorg | Pass; idle 2.6% Shell CPU, 26 copies in 3 min 10.9% |
+| T-508 tray, denylist, autostart enable/disable over reboots | Xorg, Wayland | Pass after 2a7a2e2 (tray Resume label) |
+
+Found and fixed on the way: duplicate rows from the X11 watcher (charset twins,
+trailing NUL, Latin-1 text, XWayland mirror), a denylist miss when the popup took
+the focus before the copy was seen, and a Shell freeze from hashing a 3 MB image
+in JavaScript on every poll (045fb7c: native hashing, once per clipboard change).
+Known limits: plain terminals paste with Ctrl+Shift+V, so an injected Ctrl+V does
+nothing there; GNOME reports no keybinding conflicts (a duplicate of a Shell
+shortcut takes it over).
+
 ## Other release gates: do not silently waive
 
-- Linux desktop acceptance needs actual X11/Wayland/GNOME environments:
-  [T-508](../tests/manual/T-508-x11-real-de.md),
+- Linux desktop acceptance: GNOME 46 on Xorg and Wayland passed on 2026-11-05
+  (T-508 GNOME rows, T-607 GNOME rows, T-702, T-703, T-705; see
+  [Linux acceptance](#linux-acceptance-on-gnome-46-2026-11-05)). Still open:
+  [T-508](../tests/manual/T-508-x11-real-de.md) on KDE and Xfce,
   [T-606](../tests/manual/T-606-wayland-compositor-matrix.md),
-  [T-607](../tests/manual/T-607-paste-spike-acceptance.md), and T-702 through T-705.
-  Pre-existing X11 permanent hotkeys restore the previous clipboard regardless
-  of `popup.restore_clipboard`; this needs a separate fix and Linux acceptance
-  before claiming the Windows preference behavior on X11.
+  [T-607](../tests/manual/T-607-paste-spike-acceptance.md) on KDE/wlroots,
+  T-704 (GNOME 46-51) and the portal rebind (ADR-004 item 2). X11 permanent
+  hotkeys now honor `popup.restore_clipboard` (8de631a, verified on Xorg).
 - Linux release licensing is unresolved for scanner-generated blur protocol output
   used by winit through wayland-protocols-plasma. The crate's MIT manifest and the
   successful dependency scan do not determine the file-specific output boundary.
