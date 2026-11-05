@@ -52,6 +52,16 @@ daemon flips GNOME caps without crashing.
   implementation — part of the spike). Until proven: same honest
   fallback as seg-06 §7 (clipboard-write + toast).
 
+> Implemented 2026-11-05 (verified on GNOME 46 Wayland): a popup paste on
+> GNOME Wayland pushes `paste.assist {id, mime, data_b64, inject}` to the
+> extension and waits up to 3 s for `paste.assist_done {id, ok, injected}`.
+> The extension writes the clip (text preferred, at most 512 KiB, marked
+> as its own write) and presses Ctrl+V through a Clutter virtual keyboard
+> only when the window that had the focus right before the popup took it
+> (hotkey, tray or CLI alike) is focused again; otherwise it toasts "press
+> Ctrl+V". Each popup's target serves one paste. Terminals paste with
+> Ctrl+Shift+V, so an injected Ctrl+V does nothing there.
+
 ## 5. Foreground info (AutoSwitch, v2 feed)
 
 - Full in-Shell access to active window app-id/title → push to daemon

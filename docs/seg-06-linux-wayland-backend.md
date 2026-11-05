@@ -97,6 +97,12 @@ data-control available → daemon write + toast; GNOME extension available
 ONLY if explicitly implemented + proven; otherwise paste `Unavailable`
 with a clear manual-copy action. Spike MUST complete before v1 ships
 Wayland paste beyond the fallback.
+
+> Status 2026-11-05: avenue (iv) is implemented and verified on GNOME 46
+> Wayland (seg-07 §4): real injection into the pre-popup window, toast
+> otherwise. Other compositors keep the data-control write + toast;
+> found not fixed: the UI ignores the returned toast id, so there the user
+> is never told to press Ctrl+V (T-607 on KDE/wlroots).
 Results land in this segment + seg-11 QA scripts.
 
 ## 8. XWayland coexistence (dual-backend merge; T-605)

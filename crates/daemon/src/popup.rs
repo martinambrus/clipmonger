@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use clipmonger_ipc::proto::methods::{
     ShowPopupEvent, CAPS_CHANGED_TOPIC, CONFIG_CHANGED_TOPIC, HISTORY_CHANGED_TOPIC,
-    SHOW_POPUP_TOPIC,
+    PASTE_ASSIST_TOPIC, SHOW_POPUP_TOPIC,
 };
 use clipmonger_ipc::server::{EventHub, SubscriberInfo};
 use clipmonger_platform::traits::HotkeyManager;
@@ -36,6 +36,12 @@ pub enum PopupSource {
 const PRESS_DEBOUNCE: Duration = Duration::from_millis(300);
 /// While no UI subscribes, the daemon starts at most one per this window.
 const SPAWN_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a paste waits for the GNOME extension's answer.
+const ASSIST_WAIT: Duration = Duration::from_secs(3);
+/// Largest clip the extension pastes (base64 must fit one IPC frame).
+const ASSIST_MAX_BYTES: usize = 512 * 1024;
+/// Toast id telling the user to press Ctrl+V (the paste was not injected).
+pub(crate) const PRESS_CTRL_V_TOAST: &str = "paste.press_ctrl_v";
 
 /// Trigger-path state kept by the daemon.
 #[derive(Default)]
@@ -44,6 +50,9 @@ pub(crate) struct PopupTrigger {
     launcher: Option<UiLauncher>,
     last_press: Option<Instant>,
     last_spawn: Option<Instant>,
+    /// Extension pastes waiting for `paste.assist_done`, by request id.
+    assists: std::collections::HashMap<u64, std::sync::mpsc::Sender<serde_json::Value>>,
+    next_assist: u64,
 }
 
 impl DaemonState {
@@ -70,6 +79,96 @@ impl DaemonState {
     /// changed, so a conflict banner appears or clears at once.
     pub(crate) fn notify_caps_changed(&self) {
         self.publish_event(CAPS_CHANGED_TOPIC);
+    }
+
+    /// Paste through the GNOME extension (GNOME Wayland): push the clip on
+    /// `paste.assist` and wait for its `paste.assist_done`. `None` when no
+    /// extension listens (the caller uses its own path). The extension
+    /// writes the clip to the clipboard and presses Ctrl+V when the window
+    /// focused at the popup press is in front again, else it toasts.
+    pub(crate) fn paste_via_extension(
+        &self,
+        payloads: &[(String, Vec<u8>)],
+    ) -> Option<Result<serde_json::Value, clipmonger_ipc::proto::IpcError>> {
+        use clipmonger_ipc::proto::IpcError;
+        let hub = self
+            .popup
+            .lock()
+            .ok()
+            .and_then(|trigger| trigger.hub.clone())?;
+        if hub.subscribers(PASTE_ASSIST_TOPIC).is_empty() {
+            return None;
+        }
+        let (mime, bytes) = assist_payload(payloads)?;
+        if bytes.len() > ASSIST_MAX_BYTES {
+            return Some(Err(IpcError::new(
+                "unavailable",
+                format!(
+                    "paste.execute: clip over {} KiB; copy it manually",
+                    ASSIST_MAX_BYTES / 1024
+                ),
+            )));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let id = {
+            let mut trigger = self.popup.lock().ok()?;
+            trigger.next_assist = trigger.next_assist.wrapping_add(1);
+            let id = trigger.next_assist;
+            trigger.assists.insert(id, tx);
+            id
+        };
+        let params = serde_json::json!({
+            "id": id,
+            "mime": mime,
+            "data_b64": crate::encode_thumbnail_png(bytes),
+            "inject": true,
+        });
+        let delivered = hub.publish(PASTE_ASSIST_TOPIC, params) > 0;
+        let answer = delivered
+            .then(|| rx.recv_timeout(ASSIST_WAIT).ok())
+            .flatten();
+        if let Ok(mut trigger) = self.popup.lock() {
+            trigger.assists.remove(&id);
+        }
+        let Some(answer) = answer else {
+            return Some(Err(IpcError::new(
+                "unavailable",
+                "paste.execute: the GNOME extension did not answer".to_string(),
+            )));
+        };
+        if !answer
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let why = answer
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("extension paste failed");
+            return Some(Err(IpcError::new(
+                "unavailable",
+                format!("paste.execute: {why}"),
+            )));
+        }
+        let injected = answer
+            .get("injected")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let mut result = serde_json::json!({"pasted": true, "injected": injected});
+        if !injected {
+            result["toast"] = serde_json::Value::from(PRESS_CTRL_V_TOAST);
+        }
+        Some(Ok(result))
+    }
+
+    /// The extension's `paste.assist_done`: hand it to the waiting paste.
+    pub(crate) fn assist_done(&self, params: &serde_json::Value) -> serde_json::Value {
+        let waiting = params
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|id| self.popup.lock().ok()?.assists.remove(&id));
+        let known = waiting.is_some_and(|tx| tx.send(params.clone()).is_ok());
+        serde_json::json!({"ok": known})
     }
 
     /// Publish an empty event on `topic` to its current subscribers.
@@ -832,6 +931,16 @@ mod activation_report_tests {
     }
 }
 
+/// The payload the extension pastes: text when the clip has it, else the
+/// first format. `None` for an empty clip.
+fn assist_payload(payloads: &[(String, Vec<u8>)]) -> Option<(&str, &[u8])> {
+    payloads
+        .iter()
+        .find(|(mime, _)| mime.split(';').next().map(str::trim) == Some("text/plain"))
+        .or_else(|| payloads.first())
+        .map(|(mime, bytes)| (mime.as_str(), bytes.as_slice()))
+}
+
 /// Elsewhere the UI raises its own window when the push arrives.
 #[cfg(not(all(windows, feature = "backend-windows")))]
 fn activate_popup(_ui: Option<&SubscriberInfo>, _pressed: bool) {}
@@ -845,7 +954,7 @@ mod tests {
     use clipmonger_ipc::client::{Client, EventStream};
     use clipmonger_ipc::proto::methods::{
         ShowPopupEvent, CAPS_CHANGED_TOPIC, CONFIG_CHANGED_TOPIC, HISTORY_CHANGED_TOPIC,
-        SHOW_POPUP_TOPIC,
+        PASTE_ASSIST_TOPIC, SHOW_POPUP_TOPIC,
     };
     use clipmonger_ipc::server::{EventHub, ServeOptions, Server, TopicRule};
     use serde_json::json;
@@ -877,6 +986,10 @@ mod tests {
             },
             TopicRule {
                 topic: CAPS_CHANGED_TOPIC.to_string(),
+                exclusive: false,
+            },
+            TopicRule {
+                topic: PASTE_ASSIST_TOPIC.to_string(),
                 exclusive: false,
             },
         ]);
@@ -1024,6 +1137,128 @@ mod tests {
             params: json!({}),
         };
         assert_eq!(super::extension_press_decision(Some(&unknown), None), None);
+    }
+
+    /// A fake extension: answer every `paste.assist` with `answer(params)`.
+    fn fake_extension(
+        sock: &std::path::Path,
+        answer: impl Fn(&serde_json::Value) -> Option<serde_json::Value> + Send + 'static,
+    ) -> mpsc::Receiver<serde_json::Value> {
+        let mut stream = Client::connect(sock, TOKEN)
+            .expect("connect")
+            .subscribe(&[PASTE_ASSIST_TOPIC], json!({}))
+            .expect("paste.assist is not exclusive");
+        let replier = Client::connect(sock, TOKEN).expect("reply connect");
+        let (seen_tx, seen_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok((_, params)) = stream.next_event() {
+                let _ = seen_tx.send(params.clone());
+                if let Some(done) = answer(&params) {
+                    let _ = replier.call("paste.assist_done", done);
+                }
+            }
+        });
+        seen_rx
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_paste_round_trips_and_reports_injection() {
+        let (state, sock, _) = served("assist").await;
+        let text = vec![
+            ("text/html".to_string(), b"<b>hi</b>".to_vec()),
+            (
+                "text/plain;charset=utf-8".to_string(),
+                "héllo".as_bytes().to_vec(),
+            ),
+        ];
+        assert!(
+            state.paste_via_extension(&text).is_none(),
+            "no extension listens: the caller keeps its own path"
+        );
+        let seen = fake_extension(&sock, |params| {
+            Some(json!({"id": params["id"], "ok": true, "injected": true}))
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state
+            .popup
+            .lock()
+            .unwrap()
+            .hub
+            .as_ref()
+            .unwrap()
+            .subscribers(PASTE_ASSIST_TOPIC)
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline, "extension subscribes");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let result = state
+            .paste_via_extension(&text)
+            .expect("the extension listens")
+            .expect("pasted");
+        assert_eq!(result, json!({"pasted": true, "injected": true}));
+        let params = seen
+            .recv_timeout(Duration::from_secs(2))
+            .expect("assist pushed");
+        assert_eq!(
+            params["mime"], "text/plain;charset=utf-8",
+            "text is preferred"
+        );
+        assert_eq!(params["inject"], true);
+        assert_eq!(
+            crate::b64_decode(params["data_b64"].as_str().unwrap()).unwrap(),
+            "héllo".as_bytes()
+        );
+        let big = vec![(
+            "text/plain".to_string(),
+            vec![b'x'; super::ASSIST_MAX_BYTES + 1],
+        )];
+        let refused = state
+            .paste_via_extension(&big)
+            .expect("listens")
+            .unwrap_err();
+        assert!(refused.message.contains("copy it manually"), "{refused:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_paste_toasts_when_not_injected_and_times_out_without_answer() {
+        let (state, sock, _) = served("assist-toast").await;
+        let _seen = fake_extension(&sock, |params| {
+            (params["mime"] == "text/plain")
+                .then(|| json!({"id": params["id"], "ok": true, "injected": false}))
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state
+            .popup
+            .lock()
+            .unwrap()
+            .hub
+            .as_ref()
+            .unwrap()
+            .subscribers(PASTE_ASSIST_TOPIC)
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline, "extension subscribes");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let toast = state
+            .paste_via_extension(&[("text/plain".to_string(), b"hi".to_vec())])
+            .expect("listens")
+            .expect("pasted");
+        assert_eq!(
+            toast,
+            json!({"pasted": true, "injected": false, "toast": super::PRESS_CTRL_V_TOAST})
+        );
+        let silent = state
+            .paste_via_extension(&[("image/png".to_string(), b"png".to_vec())])
+            .expect("listens")
+            .unwrap_err();
+        assert!(silent.message.contains("did not answer"), "{silent:?}");
+        assert_eq!(
+            state.assist_done(&json!({"id": 999_999, "ok": true})),
+            json!({"ok": false}),
+            "an unknown id is not a waiting paste"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

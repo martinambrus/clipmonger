@@ -2466,6 +2466,59 @@ fn t507_paste_into_scratch() {
     );
 }
 
+/// `popup.restore_clipboard = false`: the paste leaves the clip on the
+/// clipboard (no save, no restore), while the engine stays alive to serve it
+/// like the daemon's cached engine.
+#[test]
+fn t507_paste_without_restore_keeps_the_clip() {
+    let Some((_guard, xvfb)) = fixture("t507_paste_without_restore_keeps_the_clip") else {
+        return;
+    };
+    let display = xvfb.addr().to_string();
+    let (_scratch_conn, scratch) = make_scratch(&display).expect("scratch window");
+    let transfer = X11Transfer::connect(Some(display.as_str())).expect("transfer connect");
+    transfer
+        .write(&[(
+            "text/plain;charset=utf-8".to_string(),
+            b"previous clipboard".to_vec(),
+        )])
+        .expect("seed clipboard");
+    let paste = X11Paste::connect(Some(display.as_str())).expect("paste connect");
+    let target = PasteTarget {
+        app: AppId {
+            exe: "xvfb-harness".to_string(),
+            title_hash: 0,
+        },
+        window_title_hash: 0,
+        handle: PlatformHandle::X11Window(u64::from(scratch)),
+        captured_ms: now_ms(),
+    };
+    let payloads = vec![(
+        "text/plain;charset=utf-8".to_string(),
+        b"kept-clip".to_vec(),
+    )];
+    paste
+        .paste_payloads_restoring(
+            &target,
+            &ClipRef(uuid::Uuid::now_v7()),
+            &payloads,
+            false,
+            &mut |_, write| write(),
+        )
+        .expect("paste without restore");
+    // Well past the restore dwell, the clip is still what the clipboard holds.
+    thread::sleep(Duration::from_millis(1500));
+    let reader = X11Transfer::connect(Some(display.as_str())).expect("reader connect");
+    assert_eq!(
+        reader
+            .read("text/plain;charset=utf-8", 64 << 20)
+            .expect("clipboard read"),
+        b"kept-clip".to_vec(),
+        "no restore: the pasted clip stays on the clipboard"
+    );
+    drop(paste);
+}
+
 // ---------------------------------------------------------------------------
 // t503: session autostart via desktop entry (no X needed, still serial)
 // ---------------------------------------------------------------------------

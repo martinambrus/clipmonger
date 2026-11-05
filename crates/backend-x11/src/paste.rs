@@ -148,6 +148,23 @@ impl X11Paste {
         payloads: &[(String, Vec<u8>)],
         write: &mut ClipboardWriteHook<'_>,
     ) -> Result<()> {
+        self.paste_payloads_restoring(target, clip, payloads, true, write)
+    }
+
+    /// Paste like [`Self::paste_payloads_with`]; `restore` false
+    /// (`popup.restore_clipboard = false`) leaves the clip on the clipboard
+    /// instead of saving and restoring the previous value.
+    ///
+    /// # Errors
+    /// Returns an error when the target, transfer, or write hook fails.
+    pub fn paste_payloads_restoring(
+        &self,
+        target: &PasteTarget,
+        clip: &ClipRef,
+        payloads: &[(String, Vec<u8>)],
+        restore: bool,
+        write: &mut ClipboardWriteHook<'_>,
+    ) -> Result<()> {
         let _ = clip;
         if payloads.is_empty() {
             return Err(Error::Unsupported("nothing to paste".to_string()));
@@ -170,10 +187,9 @@ impl X11Paste {
             }
         }
 
-        let saved = self
-            .transfer
-            .read(TEXT_MIME, 64 << 20)
-            .ok()
+        let saved = restore
+            .then(|| self.transfer.read(TEXT_MIME, 64 << 20).ok())
+            .flatten()
             .map(|bytes| (TEXT_MIME.to_string(), bytes));
         write(payloads, &mut || self.transfer.write(payloads))?;
         let written = self.transfer.unchanged_indicator();
@@ -181,6 +197,9 @@ impl X11Paste {
 
         refocus_window(self.display.as_deref(), target_window(target));
         send_ctrl_v()?;
+        if !restore {
+            return Ok(());
+        }
         std::thread::sleep(Duration::from_millis(DWELL_MS));
 
         let current_bytes = self.transfer.read(TEXT_MIME, 64 << 20).ok();

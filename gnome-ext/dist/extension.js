@@ -8,6 +8,7 @@ import { Hotkeys } from './hotkeys.js';
 import { PasteAssist } from './paste.js';
 import { PopupPlacer } from './placer.js';
 import { DEFAULT_POPUP_HOTKEY, mergeConfig } from './config.js';
+import { pasteAssistDoneRequest } from './codec.js';
 export default class ClipmongerExtension extends Extension {
     ipc = null;
     capture = null;
@@ -24,6 +25,17 @@ export default class ClipmongerExtension extends Extension {
         this.paste = new PasteAssist(this.capture);
         this.hotkeys = new Hotkeys(settings, this.ipc);
         const hotkeys = this.hotkeys;
+        const paste = this.paste;
+        const ipc = this.ipc;
+        paste.enable();
+        // GNOME Wayland popup paste: the daemon pushes `paste.assist`.
+        ipc.onEvent = (env) => {
+            if (env.method !== 'paste.assist')
+                return;
+            void paste.assist(env.params)
+                .then((done) => ipc.request(pasteAssistDoneRequest(ipc.nextId(), done)))
+                .catch(() => { });
+        };
         const placer = new PopupPlacer();
         this.placer = placer;
         this.ipc.onConfig = (result) => {
@@ -44,6 +56,7 @@ export default class ClipmongerExtension extends Extension {
     }
     disable() {
         this.placer?.disable();
+        this.paste?.disable();
         this.capture?.stop();
         this.hotkeys?.unregisterAll();
         this.ipc?.disable();

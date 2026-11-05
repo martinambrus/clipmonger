@@ -88,7 +88,10 @@ export const helloRequest = (id: string, token: string): Envelope =>
 export const pingRequest = (id: string): Envelope => req(id, 'ping', {});
 export const configGetRequest = (id: string): Envelope => req(id, 'config.get', {});
 export const eventsSubscribeRequest = (id: string): Envelope =>
-  req(id, 'events.subscribe', { topics: ['config.changed'] });
+  req(id, 'events.subscribe', { topics: ['config.changed', 'paste.assist'] });
+/** Answer to the daemon's `paste.assist` (pasteplan.ts AssistDone). */
+export const pasteAssistDoneRequest = (id: string, done: { id: number; ok: boolean; injected: boolean; error?: string }): Envelope =>
+  req(id, 'paste.assist_done', done);
 export const hotkeyFiredRequest = (id: string, hotkeyId: number, focusedPopupPid: number | null = null): Envelope =>
   req(id, 'hotkey.fired', focusedPopupPid !== null && Number.isSafeInteger(focusedPopupPid) && focusedPopupPid > 0
     ? { id: hotkeyId, focused_popup_pid: focusedPopupPid } : { id: hotkeyId });

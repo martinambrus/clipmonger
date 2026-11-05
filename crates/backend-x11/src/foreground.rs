@@ -110,6 +110,28 @@ impl X11Foreground {
         })
     }
 
+    /// The paste target for `win` as it is now (the window a popup press
+    /// captured): its current app and title, so a paste revalidates that
+    /// this window is the one in front again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unavailable`] when the window has no app id (gone).
+    pub fn target_for_window(&self, win: u64) -> Result<PasteTarget> {
+        let window = Window::try_from(win)
+            .map_err(|_| Error::Unavailable("paste target is not an X11 window".to_string()))?;
+        let app = self
+            .app_id(window)
+            .ok_or_else(|| Error::Unavailable("paste target window is gone".to_string()))?;
+        let title_hash = app.title_hash;
+        Ok(PasteTarget {
+            app,
+            window_title_hash: title_hash,
+            handle: PlatformHandle::X11Window(win),
+            captured_ms: now_ms(),
+        })
+    }
+
     /// Capture the current paste target (before the popup opens).
     ///
     /// # Errors

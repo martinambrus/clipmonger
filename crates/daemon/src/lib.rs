@@ -284,12 +284,18 @@ const HELPER_LOST: &str = "helper connection lost";
 #[cfg(all(windows, feature = "backend-windows"))]
 const HELPER_TIMED_OUT: &str = "helper result timed out";
 /// Refusal for a paste whose deadline passed before it could run.
-#[cfg(all(windows, feature = "backend-windows"))]
+#[cfg(any(
+    all(windows, feature = "backend-windows"),
+    all(unix, feature = "backend-x11")
+))]
 const PASTE_EXPIRED: &str = "unavailable: paste request expired";
 /// Paste deadline: a clip picked in the popup (or a paste request without a
 /// pick time) must be delivered within this many ms, else it is refused;
 /// the helper enforces the same absolute deadline before injecting.
-#[cfg(all(windows, feature = "backend-windows"))]
+#[cfg(any(
+    all(windows, feature = "backend-windows"),
+    all(unix, feature = "backend-x11")
+))]
 const PASTE_DEADLINE_MS: i64 = 2_000;
 
 /// Elevated-helper supervisor: an always-listening pipe server for the
@@ -768,6 +774,14 @@ impl CapsAggregator {
     ///
     /// Re-registering the same name replaces that backend's entry only;
     /// other backends are untouched (dual-backend merge, seg-06 S8).
+    /// Whether a live backend registered under `name` (`x11`, `wayland`).
+    #[must_use]
+    pub fn has_backend(&self, name: &str) -> bool {
+        self.backends
+            .lock()
+            .is_ok_and(|backends| backends.contains_key(name))
+    }
+
     pub fn register_backend(&self, name: &str, caps: BackendCaps) {
         if let Ok(mut backends) = self.backends.lock() {
             backends.insert(name.to_string(), caps);
@@ -1378,6 +1392,7 @@ pub fn b64_decode(text: &str) -> Option<Vec<u8>> {
 }
 
 // IPC chunks are independently padded, so use three-byte-aligned segment boundaries.
+/// Standard padded base64 of `png` (any bytes), in frame-sized segments.
 fn encode_thumbnail_png(png: &[u8]) -> String {
     let segment_len = clipmonger_ipc::proto::CHUNK_RAW_BYTES / 3 * 3;
     png.chunks(segment_len)
@@ -1724,11 +1739,60 @@ fn retention_limits(config: &clipmonger_core::Config) -> clipmonger_core::policy
     }
 }
 
+/// How long an X11 popup paste waits for its target to be in front again
+/// after the popup hides.
+#[cfg(all(unix, feature = "backend-x11"))]
+const X11_TARGET_SETTLE: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Whether this is an X11 session (no Wayland compositor): popup paste then
+/// goes through the X11 engine. Under Wayland, `DISPLAY` names `XWayland`.
+#[cfg(all(unix, feature = "backend-x11"))]
+fn x11_session() -> bool {
+    let set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    set("DISPLAY") && !set("WAYLAND_DISPLAY")
+}
+
+/// Whether popup paste skips the extension: an X11 session (the X11 engine
+/// pastes) or a build without the X11 backend's session check.
+#[cfg(all(unix, feature = "backend-wayland"))]
+fn x11_session_or_absent() -> bool {
+    #[cfg(feature = "backend-x11")]
+    {
+        x11_session()
+    }
+    #[cfg(not(feature = "backend-x11"))]
+    {
+        false
+    }
+}
+
+/// On GNOME Wayland with the extension connected, popup paste goes through
+/// the extension (`paste.assist`): report that as the Wayland and top-level
+/// paste instead of "no extension write path" or `XWayland`'s X11 engine.
+#[cfg(all(unix, feature = "backend-wayland"))]
+fn extension_paste_caps(snapshot: &mut Value) {
+    let paste = serde_json::json!({
+        "level": "full",
+        "strategy": "write_and_toast",
+        "reason": "via GNOME extension: Ctrl+V pressed into the window focused at the popup press, else a toast",
+    });
+    if let Some(wayland) = snapshot.pointer_mut("/backends/wayland") {
+        wayland["paste"] = paste.clone();
+        snapshot["paste"] = paste;
+    }
+}
+
 /// Paste target named by `paste.execute` / `permanent.exec`: `target` (an
 /// integer window handle) or its older alias `target_hwnd`. A malformed
 /// value, or the two disagreeing, is refused instead of silently falling
 /// back to whatever window is in front.
-#[cfg_attr(not(all(windows, feature = "backend-windows")), allow(dead_code))]
+#[cfg_attr(
+    not(any(
+        all(windows, feature = "backend-windows"),
+        all(unix, feature = "backend-x11")
+    )),
+    allow(dead_code)
+)]
 fn requested_target(params: &Value) -> Result<Option<u64>, IpcError> {
     let read = |key: &str| match params.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -1850,11 +1914,14 @@ trait PermanentX11Engine: Send {
         id: uuid::Uuid,
         payloads: &[(String, Vec<u8>)],
     ) -> clipmonger_platform::types::Result<()>;
+    /// Deliver with a hook around each clipboard write; `restore` is
+    /// `popup.restore_clipboard`.
     fn deliver_with(
         &self,
         target: &clipmonger_platform::types::PasteTarget,
         id: uuid::Uuid,
         payloads: &[(String, Vec<u8>)],
+        _restore: bool,
         _write: &mut clipmonger_backend_x11::paste::ClipboardWriteHook<'_>,
     ) -> clipmonger_platform::types::Result<()> {
         self.deliver(target, id, payloads)
@@ -1887,12 +1954,14 @@ impl PermanentX11Engine for clipmonger_backend_x11::X11Paste {
         target: &clipmonger_platform::types::PasteTarget,
         id: uuid::Uuid,
         payloads: &[(String, Vec<u8>)],
+        restore: bool,
         write: &mut clipmonger_backend_x11::paste::ClipboardWriteHook<'_>,
     ) -> clipmonger_platform::types::Result<()> {
-        self.paste_payloads_with(
+        self.paste_payloads_restoring(
             target,
             &clipmonger_platform::types::ClipRef(id),
             payloads,
+            restore,
             write,
         )
     }
@@ -2537,6 +2606,10 @@ impl DaemonState {
         snapshot["popup_hotkey_conflict"] =
             popup_hotkey_conflict(&snapshot, extension_note.as_deref())
                 .map_or(Value::Null, Value::from);
+        #[cfg(all(unix, feature = "backend-wayland"))]
+        if self.extension_connected() && !x11_session_or_absent() {
+            extension_paste_caps(&mut snapshot);
+        }
         if self.elevation_refused() {
             if let Some(paste) = snapshot.get_mut("paste") {
                 paste["level"] = Value::from("degraded");
@@ -2642,7 +2715,13 @@ impl DaemonState {
 
     /// Snapshot all settings used by one paste. Restore publishes this tuple
     /// in one assignment, so a delivery cannot combine two configurations.
-    #[cfg_attr(not(all(windows, feature = "backend-windows")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(
+            all(windows, feature = "backend-windows"),
+            all(unix, feature = "backend-x11")
+        )),
+        allow(dead_code)
+    )]
     fn paste_budget(&self) -> (u64, u64, clipmonger_core::PasteDelivery, bool) {
         self.paste_limits.lock().map_or(
             (
@@ -4164,6 +4243,7 @@ impl DaemonState {
         payloads: &[(String, Vec<u8>)],
         factory: impl FnOnce() -> clipmonger_platform::types::Result<Box<dyn PermanentX11Engine>>,
     ) -> clipmonger_platform::types::Result<()> {
+        let restore = self.paste_budget().3;
         let mut engine = self.permanent_x11_engine.lock().map_err(|_| {
             clipmonger_platform::types::Error::Unavailable(
                 "permanent X11 engine state unavailable".into(),
@@ -4186,7 +4266,7 @@ impl DaemonState {
                     "permanent X11 engine unavailable".into(),
                 )
             })?
-            .deliver_with(target, id, payloads, &mut |payload, write| {
+            .deliver_with(target, id, payloads, restore, &mut |payload, write| {
                 self.x11_self_write(payload, write)
             })
     }
@@ -4428,9 +4508,24 @@ impl DaemonState {
                 .and_then(|st| st.bump_clip(clip.0, now_ms()).ok());
             Ok(serde_json::json!({"pasted": true}))
         }
+        // Only a daemon running the live X11 backend pastes through it: a
+        // state without it (tests, headless) must never type into a desktop.
+        #[cfg(all(unix, feature = "backend-x11"))]
+        if x11_session() && self.caps.has_backend("x11") {
+            return self.paste_x11_popup(clip, payloads, params);
+        }
         #[cfg(all(unix, feature = "backend-wayland"))]
         {
-            let _ = (clip, params);
+            let _ = params;
+            if let Some(result) = self.paste_via_extension(payloads) {
+                if result.is_ok() {
+                    let _ = self
+                        .store_read()?
+                        .as_ref()
+                        .and_then(|store| store.bump_clip(clip.0, now_ms()).ok());
+                }
+                return result;
+            }
             self.paste_wayland_payloads(payloads)
         }
         #[cfg(not(any(
@@ -4452,6 +4547,78 @@ impl DaemonState {
                 format!("paste unavailable: {SKELETON_NOTE}"),
             ))
         }
+    }
+
+    /// Popup paste on an X11 session through the cached X11 engine: into the
+    /// window captured at the press (`target`/`target_hwnd`), or the current
+    /// foreground for a targetless paste (CLI), refused once the pick is
+    /// older than the paste deadline. A target that cannot be brought back in
+    /// front is refused (`denied`), never pasted elsewhere.
+    #[cfg(all(unix, feature = "backend-x11"))]
+    fn paste_x11_popup(
+        &self,
+        clip: clipmonger_platform::types::ClipRef,
+        payloads: &[(String, Vec<u8>)],
+        params: &Value,
+    ) -> Result<Value, IpcError> {
+        let failed = |class: &str| {
+            daemon_runtime_emit(
+                clipmonger_core::runtime_log::Severity::Warn,
+                "paste.failed",
+                &[("operation", "paste_delivery"), ("class", class)],
+            );
+        };
+        let now = now_ms();
+        let deadline_ms = params
+            .get("picked_ms")
+            .and_then(Value::as_i64)
+            .map_or(now, |picked| picked.min(now))
+            + PASTE_DEADLINE_MS;
+        if now > deadline_ms {
+            failed("expired");
+            return Err(IpcError::new(
+                "unavailable",
+                format!("paste.execute: {PASTE_EXPIRED}"),
+            ));
+        }
+        let unavailable = |e: clipmonger_platform::types::Error| {
+            failed(runtime_platform_class(&e));
+            IpcError::new("unavailable", format!("paste.execute: {e}"))
+        };
+        let foreground =
+            clipmonger_backend_x11::X11Foreground::connect(None).map_err(unavailable)?;
+        let target = match requested_target(params)? {
+            Some(window) => foreground.target_for_window(window),
+            None => foreground.capture_target(),
+        }
+        .map_err(unavailable)?;
+        // The UI sends the pick as it hides the popup, which may still be in
+        // front: give the target a moment to come back before the engine
+        // revalidates it (and refuses anything else).
+        let settle = std::time::Instant::now() + X11_TARGET_SETTLE;
+        while std::time::Instant::now() < settle
+            && !foreground
+                .capture_target()
+                .is_ok_and(|current| current.handle == target.handle)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        self.deliver_x11_with_factory(clip.0, &target, payloads, || {
+            Ok(Box::new(clipmonger_backend_x11::X11Paste::connect(None)?))
+        })
+        .map_err(|e| {
+            failed(runtime_platform_class(&e));
+            if matches!(e, clipmonger_platform::types::Error::Denied(_)) {
+                IpcError::new("denied", format!("paste.execute: {e}"))
+            } else {
+                IpcError::new("unavailable", format!("paste.execute: {e}"))
+            }
+        })?;
+        let _ = self
+            .store_read()?
+            .as_ref()
+            .and_then(|store| store.bump_clip(clip.0, now_ms()).ok());
+        Ok(serde_json::json!({"pasted": true}))
     }
 
     /// Deliver payloads through the Wayland backend and report its toast.
@@ -4655,6 +4822,7 @@ impl DaemonState {
                 }
                 Ok(serde_json::json!({"ok": true}))
             }
+            "paste.assist_done" => Ok(self.assist_done(params)),
             "popup.open" => {
                 // Only the CLI asks for the target: a second launch would
                 // capture the Start menu or Explorer instead.
@@ -6059,6 +6227,33 @@ mod tests {
         );
     }
 
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[test]
+    fn extension_paste_caps_report_the_extension_path_on_wayland() {
+        let mut snapshot = serde_json::json!({
+            "paste": {"level": "full", "strategy": "clipboard_restore", "reason": ""},
+            "backends": {
+                "wayland": {"paste": {"level": "unavailable", "strategy": "unavailable",
+                    "reason": "no data-control and no extension write path"}},
+                "x11": {"paste": {"level": "full", "strategy": "clipboard_restore", "reason": ""}},
+            },
+        });
+        super::extension_paste_caps(&mut snapshot);
+        assert_eq!(snapshot["backends"]["wayland"]["paste"]["level"], "full");
+        assert_eq!(snapshot["paste"], snapshot["backends"]["wayland"]["paste"]);
+        assert_eq!(
+            snapshot["backends"]["x11"]["paste"]["strategy"], "clipboard_restore",
+            "the X11 backend row is untouched"
+        );
+        let mut x11_only = serde_json::json!({"paste": {"level": "full"}, "backends": {"x11": {}}});
+        super::extension_paste_caps(&mut x11_only);
+        assert_eq!(
+            x11_only["paste"],
+            serde_json::json!({"level": "full"}),
+            "no Wayland backend: unchanged"
+        );
+    }
+
     #[test]
     fn popup_hotkey_conflict_names_only_a_held_chord() {
         use clipmonger_platform::types::{BackendCaps, Level, PasteCaps, PasteStrategy};
@@ -6505,6 +6700,67 @@ mod tests {
             "all three deliveries must share one engine"
         );
         assert_eq!(*deliveries.lock().unwrap(), [1, 1, 1]);
+    }
+
+    #[cfg(all(unix, feature = "backend-x11"))]
+    #[test]
+    fn x11_engine_delivery_follows_popup_restore_clipboard() {
+        use clipmonger_platform::types::{AppId, PasteTarget, PlatformHandle, Result};
+        use std::sync::{Arc, Mutex};
+        struct Engine(Arc<Mutex<Vec<bool>>>);
+        impl super::PermanentX11Engine for Engine {
+            fn serving_health(&self) -> Result<bool> {
+                Ok(true)
+            }
+            fn deliver(
+                &self,
+                _: &PasteTarget,
+                _: uuid::Uuid,
+                _: &[(String, Vec<u8>)],
+            ) -> Result<()> {
+                unreachable!("deliver_with carries the restore flag")
+            }
+            fn deliver_with(
+                &self,
+                _: &PasteTarget,
+                _: uuid::Uuid,
+                _: &[(String, Vec<u8>)],
+                restore: bool,
+                _: &mut clipmonger_backend_x11::paste::ClipboardWriteHook<'_>,
+            ) -> Result<()> {
+                self.0.lock().unwrap().push(restore);
+                Ok(())
+            }
+        }
+        let (_dir, state) = fresh_state("x11-restore-flag");
+        let target = PasteTarget {
+            app: AppId {
+                exe: "editor".into(),
+                title_hash: 0,
+            },
+            window_title_hash: 0,
+            handle: PlatformHandle::X11Window(42),
+            captured_ms: now_ms(),
+        };
+        let payloads = [("text/plain;charset=utf-8".to_string(), b"hello".to_vec())];
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let engine = Arc::clone(&seen);
+        let mut config = clipmonger_core::Config::default();
+        config.popup.restore_clipboard = false;
+        state.set_config(config.clone());
+        state
+            .deliver_x11_with_factory(uuid::Uuid::now_v7(), &target, &payloads, move || {
+                Ok(Box::new(Engine(engine)))
+            })
+            .expect("deliver");
+        config.popup.restore_clipboard = true;
+        state.set_config(config);
+        state
+            .deliver_x11_with_factory(uuid::Uuid::now_v7(), &target, &payloads, || {
+                panic!("the engine stays cached")
+            })
+            .expect("deliver");
+        assert_eq!(*seen.lock().unwrap(), [false, true]);
     }
 
     #[cfg(all(unix, feature = "backend-x11"))]

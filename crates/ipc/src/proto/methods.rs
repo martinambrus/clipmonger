@@ -291,6 +291,10 @@ pub const HISTORY_CHANGED_TOPIC: &str = "history.changed";
 /// (refused, held again, conflict set or cleared); the UI reads the status
 /// and caps again.
 pub const CAPS_CHANGED_TOPIC: &str = "caps.changed";
+/// Event topic the daemon pushes to the GNOME extension to paste a clip on
+/// GNOME Wayland: `{id, mime, data_b64, inject}`; the extension answers with
+/// `paste.assist_done {id, ok, injected, error?}`.
+pub const PASTE_ASSIST_TOPIC: &str = "paste.assist";
 /// Payload of the daemon→UI `ui.show_popup` event.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShowPopupEvent {
