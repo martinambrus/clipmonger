@@ -754,15 +754,25 @@ mod tests {
                 "admitted peer request must have started"
             );
             if let Some((previous, epoch)) = attempts.get(&id) {
-                assert_eq!(current.epoch, *epoch, "repeat must keep the dropped epoch");
+                let between = &events[*previous + 1..index];
+                let dropped = between.iter().position(|event| {
+                    event.event == "result_dropped_full" && event.id == id && event.epoch == *epoch
+                });
                 assert!(
-                    events[*previous + 1..index]
-                        .iter()
-                        .any(|event| event.event == "result_dropped_full"
-                            && event.id == id
-                            && event.epoch == *epoch),
+                    dropped.is_some(),
                     "duplicate admitted before a matching drop for {id}: {events:?}"
                 );
+                // A resubmit of the dropped epoch that meets a full queue is
+                // deferred and abandoned, so the next admission mints a new
+                // epoch; any other epoch change is a stray request.
+                if current.epoch != *epoch {
+                    assert!(
+                        between[dropped.unwrap_or(0)..].iter().any(|event| {
+                            event.event == "deferred" && event.id == id && event.epoch == *epoch
+                        }),
+                        "repeat must keep the dropped epoch unless it was deferred for {id}: {events:?}"
+                    );
+                }
             }
             attempts.insert(id, (index, current.epoch));
             seen.insert(id);

@@ -276,6 +276,8 @@ impl Worker {
             return Admission::Duplicate;
         }
         if state.queue.len() >= QUEUE_CAP {
+            #[cfg(test)]
+            self.shared.trace("deferred", &request);
             return Admission::Deferred;
         }
         state.pending.insert(request.clone());
