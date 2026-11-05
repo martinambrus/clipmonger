@@ -208,8 +208,9 @@ fn default_profile() -> PathBuf {
 
 /// What the platform tray gives the app.
 struct TrayParts {
-    /// Drains the actions clicked since the last call.
-    poll: Box<dyn FnMut() -> Vec<TrayAction>>,
+    /// Shows the current state (pause/resume label) and drains the actions
+    /// clicked since the last call.
+    poll: Box<dyn FnMut(tray_logic::TrayInputs) -> Vec<TrayAction>>,
     /// Kept alive for the life of the app.
     hold: Option<Box<dyn Any>>,
 }
@@ -229,6 +230,7 @@ fn create_tray(wake: push::Wake, online: bool) -> TrayParts {
     let (tx, rx) = mpsc::channel::<TrayAction>();
     let menu = Menu::new();
     let mut ids = std::collections::HashMap::new();
+    let mut pause_item = None;
     for entry in tray_logic::menu_entries(&inputs) {
         match entry {
             tray_logic::MenuEntry::Separator => {
@@ -241,6 +243,9 @@ fn create_tray(wake: push::Wake, online: bool) -> TrayParts {
                     clipmonger_app_ui::linux_tray::action_for_id(id),
                 );
                 let _ = menu.append(&item);
+                if id == "tray.pause" || id == "tray.resume" {
+                    pause_item = Some(item);
+                }
             }
         }
     }
@@ -289,7 +294,7 @@ fn create_tray(wake: push::Wake, online: bool) -> TrayParts {
     });
     if let Some(tray) = built {
         TrayParts {
-            poll: Box::new(move || rx.try_iter().collect()),
+            poll: windows_tray_poll(inputs, pause_item, rx),
             hold: Some(Box::new(tray)),
         }
     } else {
@@ -301,10 +306,33 @@ fn create_tray(wake: push::Wake, online: bool) -> TrayParts {
             &[("class", "tray_build_failed")],
         );
         TrayParts {
-            poll: Box::new(Vec::new),
+            poll: Box::new(|_| Vec::new()),
             hold: Option::None,
         }
     }
+}
+
+/// Tray poll for the tray-icon menu: relabel the pause item when the
+/// paused state changes, then drain the clicked actions.
+#[cfg(any(windows, target_os = "macos"))]
+fn windows_tray_poll(
+    mut shown: tray_logic::TrayInputs,
+    pause_item: Option<tray_icon::menu::MenuItem>,
+    rx: mpsc::Receiver<TrayAction>,
+) -> Box<dyn FnMut(tray_logic::TrayInputs) -> Vec<TrayAction>> {
+    Box::new(move |now| {
+        if now.paused != shown.paused {
+            if let Some(item) = &pause_item {
+                item.set_text(strings::text(if now.paused {
+                    "tray.resume"
+                } else {
+                    "tray.pause"
+                }));
+            }
+        }
+        shown = now;
+        rx.try_iter().collect()
+    })
 }
 
 /// Linux tray over ksni; a click wakes the runner.
@@ -317,7 +345,10 @@ fn create_tray(wake: push::Wake, online: bool) -> TrayParts {
     };
     let mut tray = linux_tray::LinuxTray::spawn(&inputs, wake);
     TrayParts {
-        poll: Box::new(move || tray.poll()),
+        poll: Box::new(move |now| {
+            tray.show(now);
+            tray.poll()
+        }),
         hold: Option::None,
     }
 }
@@ -327,7 +358,7 @@ fn create_tray(wake: push::Wake, online: bool) -> TrayParts {
 fn create_tray(wake: push::Wake, online: bool) -> TrayParts {
     let _ = (wake, online);
     TrayParts {
-        poll: Box::new(Vec::new),
+        poll: Box::new(|_| Vec::new()),
         hold: Option::None,
     }
 }

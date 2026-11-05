@@ -13,7 +13,7 @@ fn placement_waits_for_native_context_with_monitor_size() {
         profile: PathBuf::from("placement-fixture"),
         cmds,
         events,
-        tray: Box::new(Vec::new),
+        tray: Box::new(|_| Vec::new()),
         hold: None,
         open: true,
         status_period: Duration::from_secs(3600),

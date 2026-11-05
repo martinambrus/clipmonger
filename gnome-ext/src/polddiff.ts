@@ -1,6 +1,6 @@
 // Pure poll-diff: offers-set + per-format fingerprint diff -> CaptureDecision. No gi:// imports.
 import { sha256Hex } from './sha256.js';
-import { isDenylisted, withinCap, DEFAULT_MAX_BYTES, DEFAULT_FORMATS } from './config.js';
+import { isDenylisted, withinCap, DEFAULT_MAX_BYTES, DEFAULT_FORMATS, type AppIds } from './config.js';
 
 export interface OfferInput {
   mime: string;
@@ -58,7 +58,7 @@ export class PollDiff {
   wants(mime: string): boolean {
     return this.configuredWants(mime) && (!this.strict || mime.split(';')[0] === 'text/plain' || mime === 'UTF8_STRING');
   }
-  preflight(mimes: string[], focusedAppId: string | null = null): CaptureDecision | null {
+  preflight(mimes: string[], focusedAppId: AppIds = null): CaptureDecision | null {
     if (mimes.includes(PASSWORD_HINT_MIME)) return { kind: 'Sensitive', reason: 'password-hint' };
     if (mimes.length > 32 || mimes.some((mime) => mime.length > 128 || !/^[\x20-\x7e]+$/.test(mime)))
       return { kind: 'Ignore', reason: 'empty' };
@@ -67,7 +67,7 @@ export class PollDiff {
       return { kind: 'Sensitive', reason: 'strict' };
     return null;
   }
-  decide(input: { offers: OfferInput[]; focusedAppId?: string | null; hintValue?: string | null; nowMs: number }): CaptureDecision {
+  decide(input: { offers: OfferInput[]; focusedAppId?: AppIds; hintValue?: string | null; nowMs: number }): CaptureDecision {
     const { offers, focusedAppId = null, nowMs } = input;
     if (offers.some((offer) => offer.mime === PASSWORD_HINT_MIME)) return { kind: 'Sensitive', reason: 'password-hint' };
     if (offers.length > 32 || offers.some((offer) => offer.sizeHint !== undefined &&

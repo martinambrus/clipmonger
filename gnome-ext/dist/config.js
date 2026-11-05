@@ -44,11 +44,27 @@ export function mergeConfig(partial) {
     return out;
 }
 const stripDesktop = (s) => s.trim().toLowerCase().replace(/\.desktop$/, '');
+/** Whether the focused app is denylisted. A window has several identities
+ * (GTK app id `org.gnome.TextEditor`, WM_CLASS / executable
+ * `gnome-text-editor`): any of them matching an entry counts. */
 export function isDenylisted(appId, denylist) {
-    if (!appId)
-        return false;
-    const target = stripDesktop(appId);
-    return denylist.some((entry) => stripDesktop(entry) === target && target !== '');
+    const ids = (Array.isArray(appId) ? appId : [appId])
+        .filter((id) => typeof id === 'string' && id !== '')
+        .map(stripDesktop);
+    return ids.some((target) => target !== '' && denylist.some((entry) => stripDesktop(entry) === target));
+}
+/**
+ * The app a detected clipboard change came from. A poll may notice a copy
+ * after the focus moved on. While the Clipmonger popup is focused the copy
+ * cannot be the popup's (its own writes are marked and skipped), so it is
+ * judged by the last other window focused, however long ago; otherwise by
+ * the windows focused at this poll and the previous one.
+ */
+export function copySource(current, previous, lastOther) {
+    if (current.popup)
+        return { ids: [...lastOther.ids], appId: lastOther.appId };
+    const ids = [...new Set([...current.ids, ...previous.ids])];
+    return { ids, appId: current.appId ?? previous.appId };
 }
 export function withinCap(size, maxBytes) { return size >= 0 && size <= maxBytes; }
 const MODS = {

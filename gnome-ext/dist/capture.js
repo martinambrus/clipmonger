@@ -4,11 +4,38 @@ import St from 'gi://St';
 import GLib from 'gi://GLib?version=2.0';
 import { captureReportRequest, newClipId } from './codec.js';
 import { emitCaptureReport } from './report.js';
+import { POPUP_TITLE, copySource } from './config.js';
+/** Every identity of `win` the denylist may name: GTK app id, WM_CLASS
+ * class and instance, and the executable name of its process. */
+function windowAppIds(win) {
+    if (!win)
+        return [];
+    const ids = [];
+    try {
+        ids.push(win.get_gtk_application_id?.());
+    }
+    catch { /* none */ }
+    try {
+        ids.push(win.get_wm_class?.(), win.get_wm_class_instance?.());
+    }
+    catch { /* none */ }
+    try {
+        const pid = win.get_pid?.();
+        if (typeof pid === 'number' && pid > 0)
+            ids.push(GLib.file_read_link(`/proc/${pid}/exe`).split('/').pop());
+    }
+    catch { /* process gone or not ours */ }
+    return ids.filter((id) => typeof id === 'string' && id !== '');
+}
 export class CaptureRelay {
     timer = null;
     diff;
     ipc;
     loggedFirstRead = false;
+    /** The focused window's identities at the previous poll, and of the
+     * last focused window that was not the popup. */
+    previousFocus = { ids: [], appId: null };
+    lastOtherFocus = { ids: [], appId: null };
     pollMs;
     constructor(ipc, diff, pollMs = 500) { this.ipc = ipc; this.diff = diff; this.pollMs = pollMs; }
     setPollMs(ms) { this.pollMs = ms; }
@@ -68,8 +95,19 @@ export class CaptureRelay {
                 this.ipc.relay.recordSuccess();
                 return;
             }
-            const focusedAppId = globalThis.global?.display?.get_focus_window?.()?.get_gtk_application_id?.() ?? null;
-            if (this.diff.preflight(mimes, focusedAppId)) {
+            const focusWindow = globalThis.global?.display?.get_focus_window?.() ?? null;
+            const current = {
+                ids: windowAppIds(focusWindow),
+                appId: focusWindow?.get_gtk_application_id?.() ?? null,
+                // No focused window (between the popup and the next window) counts
+                // like the popup: the copy came from the last real window.
+                popup: !focusWindow || focusWindow.get_title?.() === POPUP_TITLE,
+            };
+            const { ids: focusedAppIds, appId: focusedAppId } = copySource(current, this.previousFocus, this.lastOtherFocus);
+            this.previousFocus = current;
+            if (!current.popup)
+                this.lastOtherFocus = current;
+            if (this.diff.preflight(mimes, focusedAppIds)) {
                 this.ipc.relay.recordSuccess();
                 return;
             }
@@ -101,7 +139,7 @@ export class CaptureRelay {
                     offers.push({ mime, sizeHint: 0 });
                 }
             }
-            const decision = this.diff.decide({ offers, focusedAppId, nowMs: Date.now() });
+            const decision = this.diff.decide({ offers, focusedAppId: focusedAppIds, nowMs: Date.now() });
             if (decision.kind === 'Report') {
                 console.log(`clipmonger: capture report (${decision.offers.length} offers, app=${focusedAppId ?? '?'})`);
                 await emitCaptureReport(this.ipc.nextId, (frame) => this.ipc.request(frame), decision.offers, decision.truncated, focusedAppId, decision.truncatedOffers);

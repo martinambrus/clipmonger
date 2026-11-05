@@ -165,6 +165,9 @@ pub struct LinuxTray {
     ready: std::sync::mpsc::Receiver<Option<KsniHandle>>,
     handle: Option<KsniHandle>,
     degraded_reported: bool,
+    /// Inputs the tray shows, and the latest the app reported.
+    shown: TrayInputs,
+    wanted: TrayInputs,
 }
 
 #[cfg(target_os = "linux")]
@@ -191,6 +194,23 @@ impl LinuxTray {
             ready,
             handle: None,
             degraded_reported: false,
+            shown: snapshot,
+            wanted: snapshot,
+        }
+    }
+
+    /// Show `inputs` (pause/resume label, paused tint, tooltip); applied
+    /// once the service is up, and only when they changed.
+    pub fn show(&mut self, inputs: TrayInputs) {
+        self.wanted = inputs;
+        if self.wanted == self.shown {
+            return;
+        }
+        if let Some(handle) = &self.handle {
+            let wanted = self.wanted;
+            if handle.update(|tray| tray.inputs = wanted).is_some() {
+                self.shown = wanted;
+            }
         }
     }
 
@@ -198,7 +218,11 @@ impl LinuxTray {
     pub fn poll(&mut self) -> Vec<TrayAction> {
         if self.handle.is_none() && !self.degraded_reported {
             match self.ready.try_recv() {
-                Ok(Some(handle)) => self.handle = Some(handle),
+                Ok(Some(handle)) => {
+                    self.handle = Some(handle);
+                    let wanted = self.wanted;
+                    self.show(wanted);
+                }
                 Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.degraded_reported = true;
                     eprintln!(

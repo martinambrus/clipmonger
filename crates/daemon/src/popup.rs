@@ -5,9 +5,11 @@
 
 use std::time::{Duration, Instant};
 
+#[cfg(all(unix, feature = "backend-wayland"))]
+use clipmonger_ipc::proto::methods::PASTE_ASSIST_TOPIC;
 use clipmonger_ipc::proto::methods::{
     ShowPopupEvent, CAPS_CHANGED_TOPIC, CONFIG_CHANGED_TOPIC, HISTORY_CHANGED_TOPIC,
-    PASTE_ASSIST_TOPIC, SHOW_POPUP_TOPIC,
+    SHOW_POPUP_TOPIC,
 };
 use clipmonger_ipc::server::{EventHub, SubscriberInfo};
 use clipmonger_platform::traits::HotkeyManager;
@@ -37,10 +39,13 @@ const PRESS_DEBOUNCE: Duration = Duration::from_millis(300);
 /// While no UI subscribes, the daemon starts at most one per this window.
 const SPAWN_INTERVAL: Duration = Duration::from_secs(10);
 /// How long a paste waits for the GNOME extension's answer.
+#[cfg(all(unix, feature = "backend-wayland"))]
 const ASSIST_WAIT: Duration = Duration::from_secs(3);
 /// Largest clip the extension pastes (base64 must fit one IPC frame).
+#[cfg(all(unix, feature = "backend-wayland"))]
 const ASSIST_MAX_BYTES: usize = 512 * 1024;
 /// Toast id telling the user to press Ctrl+V (the paste was not injected).
+#[cfg(all(unix, feature = "backend-wayland"))]
 pub(crate) const PRESS_CTRL_V_TOAST: &str = "paste.press_ctrl_v";
 
 /// Trigger-path state kept by the daemon.
@@ -52,6 +57,7 @@ pub(crate) struct PopupTrigger {
     last_spawn: Option<Instant>,
     /// Extension pastes waiting for `paste.assist_done`, by request id.
     assists: std::collections::HashMap<u64, std::sync::mpsc::Sender<serde_json::Value>>,
+    #[cfg(all(unix, feature = "backend-wayland"))]
     next_assist: u64,
 }
 
@@ -86,6 +92,7 @@ impl DaemonState {
     /// extension listens (the caller uses its own path). The extension
     /// writes the clip to the clipboard and presses Ctrl+V when the window
     /// focused at the popup press is in front again, else it toasts.
+    #[cfg(all(unix, feature = "backend-wayland"))]
     pub(crate) fn paste_via_extension(
         &self,
         payloads: &[(String, Vec<u8>)],
@@ -933,6 +940,7 @@ mod activation_report_tests {
 
 /// The payload the extension pastes: text when the clip has it, else the
 /// first format. `None` for an empty clip.
+#[cfg(all(unix, feature = "backend-wayland"))]
 fn assist_payload(payloads: &[(String, Vec<u8>)]) -> Option<(&str, &[u8])> {
     payloads
         .iter()
@@ -1161,6 +1169,7 @@ mod tests {
         seen_rx
     }
 
+    #[cfg(feature = "backend-wayland")]
     #[tokio::test(flavor = "multi_thread")]
     async fn extension_paste_round_trips_and_reports_injection() {
         let (state, sock, _) = served("assist").await;
@@ -1220,6 +1229,7 @@ mod tests {
         assert!(refused.message.contains("copy it manually"), "{refused:?}");
     }
 
+    #[cfg(feature = "backend-wayland")]
     #[tokio::test(flavor = "multi_thread")]
     async fn extension_paste_toasts_when_not_injected_and_times_out_without_answer() {
         let (state, sock, _) = served("assist-toast").await;

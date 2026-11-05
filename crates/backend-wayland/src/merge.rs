@@ -23,16 +23,31 @@ impl MergeKey {
     /// only the merge-time key is normalized.
     #[must_use]
     pub fn of(payloads: &[(String, Vec<u8>)]) -> String {
-        // The X11 watcher offers `text/plain` and `text/plain;charset=utf-8`
-        // with the same bytes; after normalizing they are one entry.
+        // The X11 watcher offers `text/plain` and `text/plain;charset=utf-8`;
+        // after normalizing identical bytes are one entry. Its bare
+        // `text/plain` is a legacy re-encoding (Latin-1 for non-ASCII text),
+        // so where a UTF-8 variant exists only that one keys the text.
+        let has_utf8 = payloads.iter().any(|(mime, _)| is_utf8_text(mime));
         let normalized: Vec<(String, Vec<u8>)> = payloads
             .iter()
+            .filter(|(mime, _)| !(has_utf8 && is_bare_text(mime)))
             .map(|(mime, bytes)| (base_mime(mime), bytes.clone()))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
         content_hash(&normalized)
     }
+}
+
+/// `text/plain` with an explicit UTF-8 charset.
+fn is_utf8_text(mime: &str) -> bool {
+    let lower = mime.to_ascii_lowercase().replace(' ', "");
+    base_mime(&lower) == "text/plain" && lower.contains("charset=utf-8")
+}
+
+/// `text/plain` without any parameters (the legacy X11 target).
+fn is_bare_text(mime: &str) -> bool {
+    !mime.contains(';') && base_mime(mime) == "text/plain"
 }
 
 /// Lowercased MIME type without parameters (`Text/Plain; charset=x` ->
@@ -219,6 +234,26 @@ mod tests {
             MergeKey::of(&different),
             MergeKey::of(&gnome),
             "different bytes stay apart"
+        );
+    }
+
+    #[test]
+    fn t603_x11_latin1_text_plain_does_not_split_a_utf8_copy() {
+        // Live gap (GNOME 46 Xorg): for Hungarian text the X11 watcher's bare
+        // text/plain is Latin-1, its charset target and the extension UTF-8.
+        let utf8 = "Iktatószám".as_bytes().to_vec();
+        let latin1: Vec<u8> = "Iktatószám".chars().map(|c| c as u8).collect();
+        let x11: Vec<(String, Vec<u8>)> = vec![
+            ("text/plain;charset=utf-8".to_string(), utf8.clone()),
+            ("text/plain".to_string(), latin1.clone()),
+        ];
+        let gnome: Vec<(String, Vec<u8>)> = vec![("text/plain".to_string(), utf8)];
+        assert_eq!(MergeKey::of(&x11), MergeKey::of(&gnome));
+        let bare_only: Vec<(String, Vec<u8>)> = vec![("text/plain".to_string(), latin1)];
+        assert_ne!(
+            MergeKey::of(&bare_only),
+            MergeKey::of(&gnome),
+            "without a UTF-8 variant the bare text still keys"
         );
     }
 

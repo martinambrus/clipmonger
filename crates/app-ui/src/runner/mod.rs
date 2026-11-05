@@ -1395,7 +1395,7 @@ mod native_input_tests {
             profile: std::path::PathBuf::from("native-input-fixture"),
             cmds: cmd_tx,
             events: event_rx,
-            tray: Box::new(Vec::new),
+            tray: Box::new(|_| Vec::new()),
             hold: None,
             open: true,
             status_period: Duration::from_secs(3600),

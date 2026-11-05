@@ -46,11 +46,32 @@ export function mergeConfig(partial: unknown): ExtConfig {
 }
 
 const stripDesktop = (s: string) => s.trim().toLowerCase().replace(/\.desktop$/, '');
-export function isDenylisted(appId: string | null | undefined, denylist: string[]): boolean {
-  if (!appId) return false;
-  const target = stripDesktop(appId);
-  return denylist.some((entry) => stripDesktop(entry) === target && target !== '');
+/** Whether the focused app is denylisted. A window has several identities
+ * (GTK app id `org.gnome.TextEditor`, WM_CLASS / executable
+ * `gnome-text-editor`): any of them matching an entry counts. */
+export function isDenylisted(appId: AppIds, denylist: string[]): boolean {
+  const ids = (Array.isArray(appId) ? appId : [appId])
+    .filter((id): id is string => typeof id === 'string' && id !== '')
+    .map(stripDesktop);
+  return ids.some((target) => target !== '' && denylist.some((entry) => stripDesktop(entry) === target));
 }
+/** A focused window's identities at one poll. */
+export interface FocusIds { ids: string[]; appId: string | null; popup?: boolean }
+
+/**
+ * The app a detected clipboard change came from. A poll may notice a copy
+ * after the focus moved on. While the Clipmonger popup is focused the copy
+ * cannot be the popup's (its own writes are marked and skipped), so it is
+ * judged by the last other window focused, however long ago; otherwise by
+ * the windows focused at this poll and the previous one.
+ */
+export function copySource(current: FocusIds, previous: FocusIds, lastOther: FocusIds): { ids: string[]; appId: string | null } {
+  if (current.popup) return { ids: [...lastOther.ids], appId: lastOther.appId };
+  const ids = [...new Set([...current.ids, ...previous.ids])];
+  return { ids, appId: current.appId ?? previous.appId };
+}
+/** One app identity or all of a window's identities. */
+export type AppIds = string | null | undefined | ReadonlyArray<string | null | undefined>;
 export function withinCap(size: number, maxBytes: number): boolean { return size >= 0 && size <= maxBytes; }
 
 const MODS: Record<string, string> = {

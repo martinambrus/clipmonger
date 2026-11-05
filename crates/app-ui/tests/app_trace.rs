@@ -600,7 +600,7 @@ impl Rig {
             profile: PathBuf::from("trace-profile"),
             cmds: cmd_tx,
             events: event_rx,
-            tray: Box::new(move || std::mem::take(&mut *queue.lock().expect("tray queue"))),
+            tray: Box::new(move |_| std::mem::take(&mut *queue.lock().expect("tray queue"))),
             hold: None,
             open,
             status_period: Duration::from_secs(3600),

@@ -1642,6 +1642,38 @@ fn popup_hotkey_conflict(snapshot: &Value, extension_note: Option<&str>) -> Opti
     })
 }
 
+/// Text payloads without trailing NUL terminators: some X11 apps (GNOME Text
+/// Editor's `text/plain` target) append one. Kept, it is pasted back and
+/// makes the clip differ from the same text captured elsewhere, so copies
+/// neither merge nor deduplicate.
+fn trim_text_terminators(
+    payloads: &[(String, Vec<u8>)],
+) -> std::borrow::Cow<'_, [(String, Vec<u8>)]> {
+    let is_text = |mime: &str| mime.trim_start().to_ascii_lowercase().starts_with("text/");
+    if !payloads
+        .iter()
+        .any(|(mime, bytes)| is_text(mime) && bytes.last() == Some(&0))
+    {
+        return std::borrow::Cow::Borrowed(payloads);
+    }
+    std::borrow::Cow::Owned(
+        payloads
+            .iter()
+            .map(|(mime, bytes)| {
+                let end = if is_text(mime) {
+                    bytes
+                        .iter()
+                        .rposition(|byte| *byte != 0)
+                        .map_or(0, |last| last + 1)
+                } else {
+                    bytes.len()
+                };
+                (mime.clone(), bytes[..end].to_vec())
+            })
+            .collect(),
+    )
+}
+
 fn store_payloads(
     store: &Store,
     origin: &str,
@@ -2782,6 +2814,8 @@ impl DaemonState {
         if sensitive {
             return self.record_capture_privacy_skip();
         }
+        let trimmed = trim_text_terminators(payloads);
+        let payloads: &[(String, Vec<u8>)] = &trimmed;
         let gate = self
             .profile_op
             .lock()
@@ -6251,6 +6285,35 @@ mod tests {
             x11_only["paste"],
             serde_json::json!({"level": "full"}),
             "no Wayland backend: unchanged"
+        );
+    }
+
+    #[test]
+    fn nul_terminated_x11_text_merges_with_the_extension_copy() {
+        // Live gap (GNOME 46 Xorg): GNOME Text Editor's X11 text/plain
+        // carries a trailing NUL, its charset target and the extension do not.
+        let (_dir, state) = fresh_state("nul-terminated");
+        let x11 = [
+            ("text/plain;charset=utf-8".to_string(), b"jklsajlk".to_vec()),
+            ("text/plain".to_string(), b"jklsajlk\0".to_vec()),
+        ];
+        let gnome = [("text/plain".to_string(), b"jklsajlk".to_vec())];
+        assert!(state.ingest_capture("x11", false, &x11));
+        let stored = history_texts(&state).len();
+        let merged = !state.ingest_capture("gnome", false, &gnome);
+        #[cfg(all(unix, feature = "backend-wayland"))]
+        assert!(merged, "the extension copy merges into the X11 row");
+        let _ = merged;
+        assert_eq!(history_texts(&state).len(), stored, "one row for one copy");
+        let binary = [("image/png".to_string(), b"png\0".to_vec())];
+        assert_eq!(
+            super::trim_text_terminators(&binary).as_ref(),
+            &binary[..],
+            "non-text bytes are untouched"
+        );
+        assert_eq!(
+            super::trim_text_terminators(&[("text/plain".to_string(), b"a\0\0".to_vec())])[0].1,
+            b"a"
         );
     }
 

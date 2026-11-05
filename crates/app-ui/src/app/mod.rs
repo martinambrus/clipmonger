@@ -55,7 +55,7 @@ pub struct AppParts {
     /// Events from the bridge thread: replies and daemon pushes.
     pub events: mpsc::Receiver<UiEvent>,
     /// Drains the tray actions clicked since the last call.
-    pub tray: Box<dyn FnMut() -> Vec<TrayAction>>,
+    pub tray: Box<dyn FnMut(crate::tray_logic::TrayInputs) -> Vec<TrayAction>>,
     /// Kept alive for the life of the app (the OS tray icon).
     pub hold: Option<Box<dyn Any>>,
     /// Start with the popup open (no `--minimized`, no `--popup`).
@@ -90,7 +90,7 @@ pub struct PopupApp {
     events: mpsc::Receiver<UiEvent>,
     /// One event peeked after the drain cap; handled first on the next pass.
     pending_event: Option<UiEvent>,
-    tray: Box<dyn FnMut() -> Vec<TrayAction>>,
+    tray: Box<dyn FnMut(crate::tray_logic::TrayInputs) -> Vec<TrayAction>>,
     _hold: Option<Box<dyn Any>>,
     allow_foreground: Box<dyn Fn()>,
     trace: Option<Trace>,
@@ -1163,7 +1163,12 @@ impl runner::App for PopupApp {
                 if self.pending_event.is_some() {
                     ctx.request_repaint();
                 }
-                for action in (self.tray)() {
+                let tray_inputs = crate::tray_logic::TrayInputs {
+                    paused: self.paused,
+                    degraded: false,
+                    attached: !self.shell.offline(),
+                };
+                for action in (self.tray)(tray_inputs) {
                     self.on_tray(&action);
                 }
                 self.track_focus(ctx);
@@ -1352,7 +1357,7 @@ mod tests {
             profile: PathBuf::from("deadline-rig"),
             cmds,
             events,
-            tray: Box::new(Vec::new),
+            tray: Box::new(|_| Vec::new()),
             hold: None,
             open: false,
             status_period: Duration::from_secs(3600),
@@ -1388,7 +1393,7 @@ mod tests {
                 profile: PathBuf::from("tray-rig"),
                 cmds,
                 events,
-                tray: Box::new(Vec::new),
+                tray: Box::new(|_| Vec::new()),
                 hold: None,
                 open: true,
                 status_period: STATUS_PERIOD,
@@ -1429,10 +1434,10 @@ mod tests {
         let fired = focus.observe(true, Some(false), 2);
         assert_eq!(
             fired,
-            GRACE == 0,
+            cfg!(windows),
             "a loss fires at once only without a grace"
         );
-        if GRACE > 0 {
+        if !cfg!(windows) {
             assert_eq!(focus.deadline(), Some(2 + GRACE));
             assert!(
                 !focus.observe(true, Some(true), 3),

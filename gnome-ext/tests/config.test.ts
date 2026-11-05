@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chordToAccel, accelToChord, isDenylisted, withinCap, mergeConfig, DEFAULT_MAX_BYTES } from '../src/config.js';
+import { chordToAccel, accelToChord, isDenylisted, withinCap, mergeConfig, copySource, DEFAULT_MAX_BYTES } from '../src/config.js';
 
 test('chord -> accel conversion', () => {
   assert.equal(chordToAccel('ctrl+alt+v'), '<Control><Alt>v');
@@ -27,6 +27,12 @@ test('denylist match: exact, .desktop suffix, case-insensitive', () => {
   assert.equal(isDenylisted('org.gnome.Secrets.desktop', ['org.gnome.secrets']), true);
   assert.equal(isDenylisted('firefox', ['keepassxc']), false);
   assert.equal(isDenylisted(null, ['keepassxc']), false);
+  // GNOME Xorg live gap: the denylist names the executable, the extension
+  // sees the GTK app id; any identity of the window matches.
+  assert.equal(isDenylisted(['org.gnome.TextEditor', 'gnome-text-editor'], ['gnome-text-editor']), true);
+  assert.equal(isDenylisted(['org.gnome.TextEditor', 'gnome-text-editor'], ['org.gnome.TextEditor.desktop']), true);
+  assert.equal(isDenylisted(['org.gnome.TextEditor', 'gnome-text-editor'], ['firefox']), false);
+  assert.equal(isDenylisted([], ['firefox']), false);
 });
 
 test('size cap boundary: ==max ok, max+1 skip', () => {
@@ -49,4 +55,18 @@ test('config merge: defaults on empty, partial overrides keep other defaults', (
   assert.equal(mergeConfig({ config: { popup: { placement: 'center' } } }).popup.placement, 'center');
   assert.equal(mergeConfig({ config: { popup: { placement: 'caret' } } }).popup.placement, 'cursor');
   assert.equal(mergeConfig({ monitor: { max_bytes: -5 } }).monitor.max_bytes, DEFAULT_MAX_BYTES);
+});
+
+test('a copy noticed after the focus moved to the popup keeps its source', () => {
+  // Live gap (GNOME 46 Xorg): Ctrl+C in Text Editor, then the popup opens;
+  // the poll noticing the change can come several polls later.
+  const editor = { ids: ['org.gnome.TextEditor', 'gnome-text-editor'], appId: 'org.gnome.TextEditor' };
+  const popup = { ids: ['clipmonger'], appId: null, popup: true };
+  const source = copySource(popup, popup, editor);
+  assert.equal(isDenylisted(source.ids, ['gnome-text-editor']), true, 'the denylist still sees the editor');
+  assert.equal(source.appId, 'org.gnome.TextEditor', 'the source is the editor, not the popup');
+  const terminal = { ids: ['org.gnome.Terminal'], appId: 'org.gnome.Terminal' };
+  assert.equal(copySource(terminal, terminal, terminal).appId, 'org.gnome.Terminal');
+  assert.deepEqual(copySource(terminal, editor, editor).ids, ['org.gnome.Terminal', 'org.gnome.TextEditor', 'gnome-text-editor'],
+    'a switch right after a copy: both windows count');
 });

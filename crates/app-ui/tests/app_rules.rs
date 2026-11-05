@@ -28,6 +28,7 @@ use clipmonger_app_ui::app::{now_ms, AppParts, PopupApp, Trace, DRAIN_CAP, FOCUS
 use clipmonger_app_ui::ipc_bridge::{UiCmd, UiEvent};
 use clipmonger_app_ui::runner::{App, Desired, WindowKind};
 use clipmonger_app_ui::shell::Context as PasteContext;
+use clipmonger_app_ui::tray_logic;
 use clipmonger_app_ui::tray_logic::TrayAction;
 use clipmonger_app_ui::{config_model, placement, strings};
 use clipmonger_core::model::Clip;
@@ -180,6 +181,8 @@ struct Rig {
     events: mpsc::Sender<UiEvent>,
     tray: Arc<Mutex<Vec<TrayAction>>>,
     tray_polls: Arc<AtomicUsize>,
+    /// The tray state the app reported at its last poll.
+    tray_shown: Arc<Mutex<Option<tray_logic::TrayInputs>>>,
     trace: Arc<Mutex<Vec<u8>>>,
     foreground: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<Request>>>,
@@ -202,6 +205,8 @@ impl Rig {
         let foreground = Arc::new(AtomicUsize::new(0));
         let queue = Arc::clone(&tray);
         let polls = Arc::clone(&tray_polls);
+        let tray_shown = Arc::new(Mutex::new(None));
+        let shown = Arc::clone(&tray_shown);
         let hook = Arc::clone(&foreground);
         let hook_commands = Arc::clone(&cmd_rx);
         let hook_backlog = Arc::clone(&backlog);
@@ -210,8 +215,9 @@ impl Rig {
             profile: PathBuf::from("rig-profile"),
             cmds: cmd_tx,
             events: event_rx,
-            tray: Box::new(move || {
+            tray: Box::new(move |inputs| {
                 polls.fetch_add(1, Ordering::SeqCst);
+                *shown.lock().expect("tray shown") = Some(inputs);
                 std::mem::take(&mut *queue.lock().expect("tray queue"))
             }),
             hold: setup.hold,
@@ -248,6 +254,7 @@ impl Rig {
             events: event_tx,
             tray,
             tray_polls,
+            tray_shown,
             trace,
             foreground,
             requests,
@@ -328,7 +335,7 @@ impl Rig {
     /// Let a pending focus loss outlast its grace (none on Windows).
     fn outlast_focus_grace(&self) {
         let _ = self;
-        if FOCUS_LOSS_GRACE_MS > 0 {
+        if !cfg!(windows) {
             thread::sleep(Duration::from_millis(FOCUS_LOSS_GRACE_MS + 20));
         }
     }
@@ -1286,6 +1293,22 @@ fn rule_status_updates_paused_status_line_and_version() {
     );
 }
 
+// rule 4: the tray is told the paused state, so its menu offers Resume
+#[test]
+fn rule_tray_shows_the_paused_state() {
+    let mut rig = Rig::opened();
+    rig.push(UiEvent::MonitorPaused(true));
+    rig.tick();
+    rig.tick();
+    let shown = rig.tray_shown.lock().unwrap().expect("tray polled");
+    assert!(shown.paused, "paused reaches the tray");
+    assert!(tray_logic::menu_entries(&shown).contains(&tray_logic::MenuEntry::Item("tray.resume")));
+    rig.push(UiEvent::MonitorPaused(false));
+    rig.tick();
+    rig.tick();
+    assert!(!rig.tray_shown.lock().unwrap().unwrap().paused);
+}
+
 // rule 4: MonitorPaused sets the paused flag shown by the status line
 #[test]
 fn rule_monitor_paused_updates_the_status_line() {
@@ -1990,7 +2013,7 @@ fn rule_focus_loss_is_seen_on_visible_passes() {
 // after it focuses the popup on GNOME Xorg) hides nothing
 #[test]
 fn rule_focus_loss_that_returns_within_the_grace_keeps_the_popup() {
-    if FOCUS_LOSS_GRACE_MS == 0 {
+    if cfg!(windows) {
         return;
     }
     let mut rig = Rig::opened();
