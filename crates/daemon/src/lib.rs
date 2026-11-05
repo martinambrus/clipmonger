@@ -137,6 +137,8 @@ fn runtime_origin(origin: &str) -> &'static str {
 
 /// Protocol tag written to the rendezvous file.
 pub const PROTOCOL: &str = "ipc/v1";
+#[cfg(all(unix, feature = "backend-wayland"))]
+mod notify;
 pub mod popup;
 #[cfg(all(unix, feature = "backend-wayland"))]
 pub mod portal;
@@ -2712,6 +2714,27 @@ impl DaemonState {
         });
     }
 
+    /// Refresh only the paste capability from a fresh probe (`fresh`), e.g.
+    /// once a display that was down at start-up comes up: the delivery
+    /// strategy already chosen and every other capability stay intact.
+    pub fn refresh_paste_caps(&self, name: &str, fresh: &BackendCaps) {
+        self.caps.update_backend(name, |caps| {
+            let strategy = caps.paste.strategy;
+            caps.paste = fresh.paste.clone();
+            caps.paste.strategy = strategy;
+            caps.notes
+                .retain(|note| !note.starts_with("paste Degraded:"));
+            caps.notes.extend(
+                fresh
+                    .notes
+                    .iter()
+                    .filter(|note| note.starts_with("paste Degraded:"))
+                    .cloned(),
+            );
+        });
+        self.notify_caps_changed();
+    }
+
     /// Publish the popup registration result without replacing other caps.
     pub fn set_hotkey_status(&self, name: &str, status: &popup::ChordStatus) {
         self.caps.update_backend(name, |caps| {
@@ -2840,17 +2863,24 @@ impl DaemonState {
         }
     }
 
+    /// Captures settled before any read: `XWayland`'s mirror is dropped
+    /// first, since it repeats a Wayland copy (privacy hints included) the
+    /// GNOME extension already reported; a sensitive copy is counted once.
+    fn mirror_or_sensitive(&self, origin: &str, sensitive: bool) -> Option<Result<bool, IpcError>> {
+        if self.xwayland_mirror(origin) {
+            return Some(Ok(false));
+        }
+        sensitive.then(|| self.record_capture_privacy_skip())
+    }
+
     fn ingest_capture_checked(
         &self,
         origin: &str,
         sensitive: bool,
         payloads: &[(String, Vec<u8>)],
     ) -> Result<bool, IpcError> {
-        if sensitive {
-            return self.record_capture_privacy_skip();
-        }
-        if self.xwayland_mirror(origin) {
-            return Ok(false);
+        if let Some(skipped) = self.mirror_or_sensitive(origin, sensitive) {
+            return skipped;
         }
         let trimmed = trim_text_terminators(payloads);
         let payloads: &[(String, Vec<u8>)] = &trimmed;
@@ -2965,8 +2995,8 @@ impl DaemonState {
         transfer: &T,
         mut log: impl FnMut(&str),
     ) -> Result<bool, IpcError> {
-        if event.sensitive {
-            return self.record_capture_privacy_skip();
+        if let Some(skipped) = self.mirror_or_sensitive(origin, event.sensitive) {
+            return skipped;
         }
         let cfg = self
             .config
@@ -4718,6 +4748,7 @@ impl DaemonState {
             })?;
         let mut result = serde_json::json!({"pasted": true});
         if let Some(toast) = outcome.toast {
+            notify::press_ctrl_v();
             result["toast"] = Value::from(toast);
         }
         Ok(result)
@@ -6369,6 +6400,57 @@ mod tests {
         assert_eq!(
             super::trim_text_terminators(&[("text/plain".to_string(), b"a\0\0".to_vec())])[0].1,
             b"a"
+        );
+    }
+
+    #[test]
+    fn paste_refresh_lifts_a_start_up_degrade_and_keeps_the_rest() {
+        use clipmonger_platform::types::{BackendCaps, Level, PasteCaps, PasteStrategy};
+        let backend = |paste: Level, notes: &[&str]| BackendCaps {
+            monitor: Level::Full,
+            transfer: Level::Full,
+            hotkey: Level::Full,
+            paste: PasteCaps {
+                level: paste,
+                strategy: PasteStrategy::ClipboardRestore,
+                reason: String::new(),
+            },
+            tray: Level::Unavailable,
+            autostart: false,
+            primary_selection: true,
+            notes: notes.iter().map(ToString::to_string).collect(),
+        };
+        let (tray, xtest) = (
+            "tray hosted by app-ui via KSNI",
+            "paste Degraded: XTest missing, no synthetic input",
+        );
+        let (_dir, state) = fresh_state("paste-refresh");
+        state.register_backend("x11", backend(Level::Degraded, &[tray, xtest]));
+        state
+            .caps
+            .set_paste_strategy("x11", PasteStrategy::UnicodeInject);
+        state.set_hotkey_status(
+            "x11",
+            &crate::popup::ChordStatus::Refused("starting".into()),
+        );
+        state.refresh_paste_caps("x11", &backend(Level::Full, &[tray]));
+        let caps = state.caps_snapshot();
+        assert_eq!(caps["paste"]["level"], "full");
+        assert_eq!(
+            caps["paste"]["strategy"], "unicode_inject",
+            "the chosen strategy stays"
+        );
+        assert_eq!(caps["monitor"]["level"], "full");
+        let notes = caps["notes"].to_string();
+        assert!(!notes.contains("XTest missing"), "{notes}");
+        assert!(notes.contains("hotkey Degraded: starting"), "{notes}");
+        assert_eq!(notes.matches("tray hosted").count(), 1, "{notes}");
+        state.refresh_paste_caps("x11", &backend(Level::Degraded, &[tray, xtest]));
+        let caps = state.caps_snapshot();
+        assert_eq!(caps["paste"]["level"], "degraded");
+        assert_eq!(
+            caps["notes"].to_string().matches("XTest missing").count(),
+            1
         );
     }
 

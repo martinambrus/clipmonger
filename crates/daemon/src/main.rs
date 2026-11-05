@@ -547,6 +547,7 @@ fn setup_x11_backend(
     {
         let shutdown = Arc::clone(shutdown);
         let state = Arc::clone(state);
+        let display = display.clone();
         std::thread::spawn(move || {
             clipmonger_daemon::popup::run_hotkeys_with_activation(
                 None,
@@ -559,6 +560,9 @@ fn setup_x11_backend(
                         eprintln!("daemon: x11 popup hotkey unavailable: {why}");
                     } else {
                         eprintln!("daemon: x11 popup hotkey available");
+                        // The display answers now: re-probe paste (XTest),
+                        // which start-up may have probed with no display.
+                        state.refresh_paste_caps("x11", &backend_caps(display.as_deref()));
                     }
                     state.set_hotkey_status("x11", &status);
                 },
