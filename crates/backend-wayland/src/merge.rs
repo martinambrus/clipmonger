@@ -23,9 +23,13 @@ impl MergeKey {
     /// only the merge-time key is normalized.
     #[must_use]
     pub fn of(payloads: &[(String, Vec<u8>)]) -> String {
+        // The X11 watcher offers `text/plain` and `text/plain;charset=utf-8`
+        // with the same bytes; after normalizing they are one entry.
         let normalized: Vec<(String, Vec<u8>)> = payloads
             .iter()
             .map(|(mime, bytes)| (base_mime(mime), bytes.clone()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect();
         content_hash(&normalized)
     }
@@ -190,6 +194,31 @@ mod tests {
                 400
             ),
             MergeDecision::SuppressDuplicate
+        );
+    }
+
+    #[test]
+    fn t603_x11_charset_twins_merge_with_the_extension_single_text() {
+        // Live gap (GNOME 46 Xorg): the X11 watcher stores text/plain plus
+        // text/plain;charset=utf-8 with identical bytes, the extension
+        // text/plain alone, 139 ms apart: one clip, not two rows.
+        let x11: Vec<(String, Vec<u8>)> = vec![
+            ("text/plain".to_string(), b"t703 test".to_vec()),
+            (
+                "text/plain;charset=utf-8".to_string(),
+                b"t703 test".to_vec(),
+            ),
+        ];
+        let gnome: Vec<(String, Vec<u8>)> = vec![("text/plain".to_string(), b"t703 test".to_vec())];
+        assert_eq!(MergeKey::of(&x11), MergeKey::of(&gnome));
+        let different: Vec<(String, Vec<u8>)> = vec![
+            ("text/plain".to_string(), b"t703 test".to_vec()),
+            ("text/plain;charset=utf-8".to_string(), b"other".to_vec()),
+        ];
+        assert_ne!(
+            MergeKey::of(&different),
+            MergeKey::of(&gnome),
+            "different bytes stay apart"
         );
     }
 
