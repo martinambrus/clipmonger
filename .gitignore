@@ -5,3 +5,4 @@ dist-release/
 # Windows monitor debug artifacts (transient)
 **/monitor.log
 *.log
+/dist-linux/
