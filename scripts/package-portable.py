@@ -15,7 +15,7 @@ from notice_provenance import verified_notices
 ROOT = Path(__file__).resolve().parent.parent
 FONTS = ('Hack-Regular.txt', 'OFL.txt', 'README.md', 'UFL.txt', 'egui-icons.txt', 'emoji-icon-font-mit-license.txt')
 BINS = ('clipmonger', 'clipmonger-daemon', 'clipmonger-cli')
-EXTENSION = tuple(name + '.js' for name in ('capture', 'codec', 'config', 'extension', 'hotkeys', 'ipc', 'paste', 'pasteplan', 'placement', 'placer', 'polddiff', 'prefs', 'relay', 'report', 'sha256')) + ('metadata.json', 'stylesheet.css', 'schemas/org.gnome.shell.extensions.clipmonger.gschema.xml')
+EXTENSION = tuple(name + '.js' for name in ('capture', 'codec', 'config', 'extension', 'hotkeys', 'ipc', 'paste', 'pasteplan', 'permbind', 'permhotkeys', 'placement', 'placer', 'polddiff', 'prefs', 'relay', 'report', 'sha256')) + ('metadata.json', 'stylesheet.css', 'schemas/org.gnome.shell.extensions.clipmonger.gschema.xml')
 SCHEMA_XML = 'schemas/org.gnome.shell.extensions.clipmonger.gschema.xml'
 SCHEMA_COMPILED = 'schemas/gschemas.compiled'
 SCHEMA_ID = 'org.gnome.shell.extensions.clipmonger'

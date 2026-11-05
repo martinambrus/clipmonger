@@ -19,7 +19,7 @@ test('builders: ping / hotkey.fired / hotkey.conflict / capture.report (G-F3/G-F
     const conflict = JSON.parse(encodeEnvelope(hotkeyConflictRequest('e4', 'ctrl+alt+v', 'grabbed')));
     assert.equal(conflict.method, 'hotkey.conflict');
     assert.deepEqual(conflict.params, { chord: 'ctrl+alt+v', reason: 'grabbed' });
-    assert.deepEqual(JSON.parse(encodeEnvelope(eventsSubscribeRequest('e7'))).params, { topics: ['config.changed', 'paste.assist'] });
+    assert.deepEqual(JSON.parse(encodeEnvelope(eventsSubscribeRequest('e7'))).params, { topics: ['config.changed', 'paste.assist', 'permanents.changed'] });
     const done = JSON.parse(encodeEnvelope(pasteAssistDoneRequest('e8', { id: 4, ok: true, injected: false })));
     assert.equal(done.method, 'paste.assist_done');
     assert.deepEqual(done.params, { id: 4, ok: true, injected: false });

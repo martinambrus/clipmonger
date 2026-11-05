@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use clipmonger_ipc::proto::methods::PASTE_ASSIST_TOPIC;
 use clipmonger_ipc::proto::methods::{
     ShowPopupEvent, CAPS_CHANGED_TOPIC, CONFIG_CHANGED_TOPIC, HISTORY_CHANGED_TOPIC,
-    SHOW_POPUP_TOPIC,
+    PERMANENTS_CHANGED_TOPIC, SHOW_POPUP_TOPIC,
 };
 use clipmonger_ipc::server::{EventHub, SubscriberInfo};
 use clipmonger_platform::traits::HotkeyManager;
@@ -79,6 +79,12 @@ impl DaemonState {
     /// stored. Nothing is held: the popup lists the history when it opens.
     pub(crate) fn notify_history_changed(&self) {
         self.publish_event(HISTORY_CHANGED_TOPIC);
+    }
+
+    /// Tell `permanents.changed` subscribers (the GNOME extension) to
+    /// re-read the permanent clips and their hotkeys.
+    pub(crate) fn notify_permanents_changed(&self) {
+        self.publish_event(PERMANENTS_CHANGED_TOPIC);
     }
 
     /// Tell `caps.changed` subscribers (the UI) the popup-hotkey state
@@ -962,7 +968,7 @@ mod tests {
     use clipmonger_ipc::client::{Client, EventStream};
     use clipmonger_ipc::proto::methods::{
         ShowPopupEvent, CAPS_CHANGED_TOPIC, CONFIG_CHANGED_TOPIC, HISTORY_CHANGED_TOPIC,
-        PASTE_ASSIST_TOPIC, SHOW_POPUP_TOPIC,
+        PASTE_ASSIST_TOPIC, PERMANENTS_CHANGED_TOPIC, SHOW_POPUP_TOPIC,
     };
     use clipmonger_ipc::server::{EventHub, ServeOptions, Server, TopicRule};
     use serde_json::json;
@@ -998,6 +1004,10 @@ mod tests {
             },
             TopicRule {
                 topic: PASTE_ASSIST_TOPIC.to_string(),
+                exclusive: false,
+            },
+            TopicRule {
+                topic: PERMANENTS_CHANGED_TOPIC.to_string(),
                 exclusive: false,
             },
         ]);
@@ -1268,6 +1278,43 @@ mod tests {
             state.assist_done(&json!({"id": 999_999, "ok": true})),
             json!({"ok": false}),
             "an unknown id is not a waiting paste"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn permanent_changes_push_permanents_changed() {
+        let (state, sock, _) = served("permanents-changed").await;
+        let mut stream = Client::connect(&sock, TOKEN)
+            .expect("connect")
+            .subscribe(&[PERMANENTS_CHANGED_TOPIC], json!({}))
+            .expect("permanents.changed is not exclusive");
+        let created = state
+            .handle(
+                "permanent.create",
+                &json!({"group": "Work", "name": "Sig", "hotkey": "ctrl+alt+1", "body": "hi"}),
+            )
+            .expect("create");
+        let id = created["permanent"]["id"].as_str().unwrap().to_string();
+        state.handle("permanent.list", &json!({})).expect("list");
+        state
+            .handle("permanent.delete", &json!({"id": id}))
+            .expect("delete");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                let _ = tx.send(stream.next_event().map(|(method, _)| method));
+            }
+        });
+        for which in ["create", "delete"] {
+            let method = rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("{which} pushes permanents.changed"))
+                .expect("event");
+            assert_eq!(method, PERMANENTS_CHANGED_TOPIC, "{which}");
+        }
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "reading the list changes nothing"
         );
     }
 

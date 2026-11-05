@@ -295,6 +295,9 @@ pub const CAPS_CHANGED_TOPIC: &str = "caps.changed";
 /// GNOME Wayland: `{id, mime, data_b64, inject}`; the extension answers with
 /// `paste.assist_done {id, ok, injected, error?}`.
 pub const PASTE_ASSIST_TOPIC: &str = "paste.assist";
+/// Event topic the daemon pushes after permanent clips or groups changed;
+/// the GNOME extension re-reads them to bind per-clip hotkeys on Wayland.
+pub const PERMANENTS_CHANGED_TOPIC: &str = "permanents.changed";
 /// Payload of the daemon→UI `ui.show_popup` event.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShowPopupEvent {

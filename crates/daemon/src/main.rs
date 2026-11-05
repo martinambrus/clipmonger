@@ -1035,6 +1035,10 @@ async fn async_main(args: Vec<String>) {
             topic: clipmonger_ipc::proto::methods::PASTE_ASSIST_TOPIC.to_string(),
             exclusive: false,
         },
+        clipmonger_ipc::server::TopicRule {
+            topic: clipmonger_ipc::proto::methods::PERMANENTS_CHANGED_TOPIC.to_string(),
+            exclusive: false,
+        },
     ])
     .with_guard(ui_subscribe_guard());
     state.attach_event_hub(hub.clone());

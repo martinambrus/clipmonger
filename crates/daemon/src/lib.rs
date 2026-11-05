@@ -4835,7 +4835,21 @@ impl DaemonState {
             "ping" => Ok(serde_json::json!({"pong": true})),
             "paste.execute" => self.handle_paste_execute(params),
             method if method.starts_with("history.") => self.handle_history(method, params),
-            method if method.starts_with("permanent.") => self.handle_permanent(method, params),
+            method if method.starts_with("permanent.") => {
+                let result = self.handle_permanent(method, params);
+                if result.is_ok()
+                    && matches!(
+                        method,
+                        "permanent.create"
+                            | "permanent.update"
+                            | "permanent.delete"
+                            | "permanent.group_delete"
+                    )
+                {
+                    self.notify_permanents_changed();
+                }
+                result
+            }
             "monitor.set" => self.handle_monitor(params),
             "capture.report" => self.handle_capture(params),
             "blob.put" => self.handle_blob_put(params),

@@ -90,7 +90,9 @@ const req = (id, method, params) => ({ v: IPC_VERSION, id, kind: 'req', method, 
 export const helloRequest = (id, token) => req(id, 'hello', { min: 1, max: 1, token, client: 'gnome-ext' });
 export const pingRequest = (id) => req(id, 'ping', {});
 export const configGetRequest = (id) => req(id, 'config.get', {});
-export const eventsSubscribeRequest = (id) => req(id, 'events.subscribe', { topics: ['config.changed', 'paste.assist'] });
+export const eventsSubscribeRequest = (id) => req(id, 'events.subscribe', { topics: ['config.changed', 'paste.assist', 'permanents.changed'] });
+export const permanentListRequest = (id) => req(id, 'permanent.list', {});
+export const permanentExecRequest = (id, permanent) => req(id, 'permanent.exec', { id: permanent });
 /** Answer to the daemon's `paste.assist` (pasteplan.ts AssistDone). */
 export const pasteAssistDoneRequest = (id, done) => req(id, 'paste.assist_done', done);
 export const hotkeyFiredRequest = (id, hotkeyId, focusedPopupPid = null) => req(id, 'hotkey.fired', focusedPopupPid !== null && Number.isSafeInteger(focusedPopupPid) && focusedPopupPid > 0

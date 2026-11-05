@@ -88,7 +88,10 @@ export const helloRequest = (id: string, token: string): Envelope =>
 export const pingRequest = (id: string): Envelope => req(id, 'ping', {});
 export const configGetRequest = (id: string): Envelope => req(id, 'config.get', {});
 export const eventsSubscribeRequest = (id: string): Envelope =>
-  req(id, 'events.subscribe', { topics: ['config.changed', 'paste.assist'] });
+  req(id, 'events.subscribe', { topics: ['config.changed', 'paste.assist', 'permanents.changed'] });
+export const permanentListRequest = (id: string): Envelope => req(id, 'permanent.list', {});
+export const permanentExecRequest = (id: string, permanent: string): Envelope =>
+  req(id, 'permanent.exec', { id: permanent });
 /** Answer to the daemon's `paste.assist` (pasteplan.ts AssistDone). */
 export const pasteAssistDoneRequest = (id: string, done: { id: number; ok: boolean; injected: boolean; error?: string }): Envelope =>
   req(id, 'paste.assist_done', done);

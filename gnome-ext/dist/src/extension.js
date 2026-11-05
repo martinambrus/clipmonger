@@ -8,12 +8,15 @@ import { Hotkeys } from './hotkeys.js';
 import { PasteAssist } from './paste.js';
 import { PopupPlacer } from './placer.js';
 import { DEFAULT_POPUP_HOTKEY, mergeConfig } from './config.js';
-import { pasteAssistDoneRequest } from './codec.js';
+import { pasteAssistDoneRequest, permanentListRequest } from './codec.js';
+import { PermanentHotkeys } from './permhotkeys.js';
+import { parsePermanents } from './permbind.js';
 export default class ClipmongerExtension extends Extension {
     ipc = null;
     capture = null;
     hotkeys = null;
     placer = null;
+    permanents = null;
     paste = null;
     enable() {
         const settings = this.getSettings();
@@ -28,8 +31,23 @@ export default class ClipmongerExtension extends Extension {
         const paste = this.paste;
         const ipc = this.ipc;
         paste.enable();
-        // GNOME Wayland popup paste: the daemon pushes `paste.assist`.
+        const permanents = new PermanentHotkeys(ipc, paste);
+        this.permanents = permanents;
+        permanents.enable();
+        const loadPermanents = () => {
+            if (!permanents.active)
+                return;
+            void ipc.request(permanentListRequest(ipc.nextId()))
+                .then((result) => permanents.sync(parsePermanents(result)))
+                .catch(() => { });
+        };
+        // GNOME Wayland popup paste: the daemon pushes `paste.assist`; per-clip
+        // hotkeys follow `permanents.changed`.
         ipc.onEvent = (env) => {
+            if (env.method === 'permanents.changed') {
+                loadPermanents();
+                return;
+            }
             if (env.method !== 'paste.assist')
                 return;
             void paste.assist(env.params)
@@ -47,6 +65,7 @@ export default class ClipmongerExtension extends Extension {
             this.capture?.setPollMs(cfg.monitor.poll_ms);
             hotkeys.registerPopup(cfg.popup.hotkey);
             placer.placement = cfg.popup.placement;
+            loadPermanents();
         };
         // Pre-config fallback so the popup chord exists before the first resync.
         this.hotkeys.registerPopup(DEFAULT_POPUP_HOTKEY);
@@ -56,6 +75,7 @@ export default class ClipmongerExtension extends Extension {
     }
     disable() {
         this.placer?.disable();
+        this.permanents?.disable();
         this.paste?.disable();
         this.capture?.stop();
         this.hotkeys?.unregisterAll();
@@ -63,6 +83,7 @@ export default class ClipmongerExtension extends Extension {
         this.capture = null;
         this.hotkeys = null;
         this.placer = null;
+        this.permanents = null;
         this.ipc = null;
         this.paste = null;
     }

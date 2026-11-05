@@ -19,6 +19,20 @@ const sleep = (ms: number) => new Promise<void>((resolve) => {
   GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => { resolve(); return GLib.SOURCE_REMOVE; });
 });
 
+/** Wait up to a second for Ctrl/Alt/Shift/Super to be released. */
+async function modifiersReleased(): Promise<boolean> {
+  const held = Clutter.ModifierType.CONTROL_MASK | Clutter.ModifierType.MOD1_MASK
+    | Clutter.ModifierType.SHIFT_MASK | Clutter.ModifierType.SUPER_MASK | Clutter.ModifierType.MOD4_MASK;
+  for (let waited = 0; waited <= 1000; waited += POLL_MS) {
+    try {
+      const [, , mods] = (globalThis as any).global.get_pointer();
+      if ((mods & held) === 0) return true;
+    } catch { return true; }
+    await sleep(POLL_MS);
+  }
+  return false;
+}
+
 export class PasteAssist {
   private capture: CaptureRelay | null;
   private keyboard: any = null;
@@ -35,6 +49,13 @@ export class PasteAssist {
     const display = (globalThis as any).global?.display;
     this.focusHandler = display?.connect('notify::focus-window', () => this.onFocus()) ?? null;
     this.onFocus();
+  }
+
+  /** A per-clip hotkey press: paste into the window focused now. */
+  targetFocused(): void {
+    const focus = (globalThis as any).global?.display?.get_focus_window?.();
+    if (!focus || focus.get_title?.() === POPUP_TITLE) return;
+    try { this.popupTarget = { id: focus.get_stable_sequence(), at: Date.now() }; } catch { /* toast */ }
   }
 
   private onFocus(): void {
@@ -75,6 +96,12 @@ export class PasteAssist {
       if (step === 'wait') { await sleep(POLL_MS); continue; }
       if (step === 'inject') {
         await sleep(INJECT_SETTLE_MS);
+        // A per-clip hotkey's own Ctrl/Alt may still be held: wait, or the
+        // injected Ctrl+V would arrive as Ctrl+Alt+V.
+        if (!(await modifiersReleased())) {
+          notify('Clipmonger', 'Copied — press Ctrl+V');
+          return { id, ok: true, injected: false };
+        }
         try { this.pressCtrlV(); return { id, ok: true, injected: true }; } catch { /* fall back to the toast */ }
       }
       notify('Clipmonger', 'Copied — press Ctrl+V');

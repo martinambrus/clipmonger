@@ -28,7 +28,7 @@ for binary in ('clipmonger', 'clipmonger-daemon', 'clipmonger-cli'):
 notices = root / 'notices.txt'
 subprocess.run([sys.executable, str(script.with_name('render-rust-notices.py')), str(args.scan_data), str(notices), '--receipt', str(args.scan_receipt), '--scan-tool', str(args.scan_tool)], check=True)
 ext = root / 'extension'
-for name in tuple(name + '.js' for name in ('capture', 'codec', 'config', 'extension', 'hotkeys', 'ipc', 'paste', 'pasteplan', 'placement', 'placer', 'polddiff', 'prefs', 'relay', 'report', 'sha256')) + ('metadata.json', 'stylesheet.css', 'schemas/org.gnome.shell.extensions.clipmonger.gschema.xml'):
+for name in tuple(name + '.js' for name in ('capture', 'codec', 'config', 'extension', 'hotkeys', 'ipc', 'paste', 'pasteplan', 'permbind', 'permhotkeys', 'placement', 'placer', 'polddiff', 'prefs', 'relay', 'report', 'sha256')) + ('metadata.json', 'stylesheet.css', 'schemas/org.gnome.shell.extensions.clipmonger.gschema.xml'):
     path = ext / name
     path.parent.mkdir(parents=True, exist_ok=True)
     if name.endswith('.gschema.xml'):
