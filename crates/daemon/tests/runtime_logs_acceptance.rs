@@ -249,9 +249,19 @@ fn runtime_api_and_failed_ingestion_observe_actual_production_behavior() {
         )
         .expect_err("capture report must surface storage failure");
     assert_eq!(report_error.code, "backend");
-    let blob_error = state
+    // A finished blob is stored with the report that names it, so the
+    // storage failure surfaces there.
+    state
         .handle("blob.put", &json!({"clip":"secret-job-excluded","mime":"text/plain","seq":0,"eof":true,"data_b64":b64(&third_payload)}))
-        .expect_err("blob EOF must surface storage failure");
+        .expect("blob EOF waits for its report");
+    let blob_error = state
+        .handle(
+            "capture.report",
+            &json!({"event":{"sensitive":false,"clip":"secret-job-excluded",
+                     "offers":[{"mime":"text/plain","bytes_hint":third_payload.len(),"blob":true}]},
+                    "payloads":{}}),
+        )
+        .expect_err("the blob's report must surface storage failure");
     assert_eq!(blob_error.code, "backend");
     let after = lines(&state, &json!({"source":"daemon","lines":1000}));
     let failures = after

@@ -486,6 +486,8 @@ pub fn run_hotkeys_with_activation<H: HotkeyManager>(
     let mut delay = Duration::from_millis(100);
     let mut permanent_chords = PermanentChords::default();
     let mut last_bindings: Option<(String, Vec<(uuid::Uuid, String)>)> = None;
+    // Log a failed start once per streak, not on every retry.
+    let mut init_failing = false;
     while !shutdown.load(Ordering::Relaxed) {
         let mut report = |status: ChordStatus| {
             if last_status.as_ref() != Some(&status) {
@@ -496,6 +498,7 @@ pub fn run_hotkeys_with_activation<H: HotkeyManager>(
         if hotkeys.is_none() {
             match factory() {
                 Ok(mut replacement) => {
+                    init_failing = false;
                     if shutdown.load(Ordering::Relaxed) {
                         break;
                     }
@@ -522,11 +525,14 @@ pub fn run_hotkeys_with_activation<H: HotkeyManager>(
                     hotkeys = Some(replacement);
                 }
                 Err(error) => {
-                    crate::daemon_runtime_emit(
-                        clipmonger_core::runtime_log::Severity::Warn,
-                        "hotkey.init_failed",
-                        &[("class", crate::runtime_platform_class(&error))],
-                    );
+                    if !init_failing {
+                        crate::daemon_runtime_emit(
+                            clipmonger_core::runtime_log::Severity::Warn,
+                            "hotkey.init_failed",
+                            &[("class", crate::runtime_platform_class(&error))],
+                        );
+                        init_failing = true;
+                    }
                     report(ChordStatus::Refused(error.to_string()));
                     ready();
                     sleep(delay);

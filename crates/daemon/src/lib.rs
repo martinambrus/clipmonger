@@ -1018,6 +1018,75 @@ fn valid_capture_mime(mime: &str) -> bool {
             .all(|byte| byte.is_ascii_graphic() || byte == b' ')
 }
 
+/// The wanted capture formats an observation offers, one entry per MIME
+/// with its largest size hint.
+fn wanted_offers(
+    event: &clipmonger_platform::types::CaptureEvent,
+    cfg: &clipmonger_core::Config,
+) -> Vec<OversizeEntry> {
+    let mut wanted: Vec<OversizeEntry> = Vec::new();
+    for offer in &event.offers {
+        if !valid_capture_mime(&offer.mime)
+            || !capture::wanted_format(&offer.mime, &cfg.monitor.formats)
+            || (cfg.privacy.strict && !capture::plain_text(&offer.mime))
+        {
+            continue;
+        }
+        if let Some(entry) = wanted.iter_mut().find(|entry| entry.mime == offer.mime) {
+            entry.bytes_hint = entry.bytes_hint.max(offer.bytes_hint);
+        } else {
+            wanted.push(OversizeEntry {
+                mime: offer.mime.clone(),
+                bytes_hint: offer.bytes_hint,
+            });
+        }
+    }
+    wanted
+}
+
+/// Drop reads that cannot be what their format says ([`plausible_payload`])
+/// and report whether nothing is left. Windows makes its PNGs itself; other
+/// paths relay what an app served.
+fn nothing_plausible(origin: &str, payloads: &mut Vec<(String, Vec<u8>)>) -> bool {
+    if origin != "windows" {
+        payloads.retain(|(mime, bytes)| plausible_payload(mime, bytes));
+    }
+    payloads.is_empty()
+}
+
+/// Whether captured `bytes` can be what `mime` says. A PNG must start
+/// with its signature: a broken X11 INCR read once stored the tail of an
+/// image as if it were the whole one.
+fn plausible_payload(mime: &str, bytes: &[u8]) -> bool {
+    const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    mime != "image/png" || bytes.starts_with(PNG_SIGNATURE)
+}
+
+/// Window in which another capture path's stub is the same copy (the
+/// dual-backend merge window, seg-06 S8).
+const STUB_REPEAT_MS: i64 = 2_000;
+
+/// One stored oversize stub: who reported it, its sorted formats, when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StubSeen {
+    origin: String,
+    mimes: Vec<String>,
+    at_ms: i64,
+}
+
+/// Whether `next` is another capture path's report of the last stub's copy.
+/// On GNOME Xorg one oversized copy is seen by the X11 watcher and by the
+/// extension; a stub has no content for the payload merge to compare, so
+/// formats, origin and timing decide. The same path reporting again is a
+/// new copy and keeps its own row.
+fn repeat_stub(last: Option<&StubSeen>, next: &StubSeen) -> bool {
+    last.is_some_and(|last| {
+        last.origin != next.origin
+            && last.mimes == next.mimes
+            && (0..STUB_REPEAT_MS).contains(&next.at_ms.saturating_sub(last.at_ms))
+    })
+}
+
 fn stub_preview(entries: &[OversizeEntry], max_bytes: u64) -> String {
     let details = entries
         .iter()
@@ -1551,6 +1620,8 @@ struct BlobAsm {
     data: Vec<u8>,
     next_seq: u64,
     updated_ms: i64,
+    /// All chunks arrived and verified; waits for its `capture.report`.
+    done: bool,
 }
 
 /// Apply one dotted config key (`section.field`) to `config`.
@@ -2055,6 +2126,8 @@ pub struct DaemonState {
     /// Dual-backend merge window state (seg-06 S8, W-F5: 2000 ms).
     #[cfg(all(unix, feature = "backend-wayland"))]
     merger: Mutex<clipmonger_backend_wayland::merge::Merger>,
+    /// Origin, formats and time of the last stored stub ([`repeat_stub`]).
+    last_stub: Mutex<Option<StubSeen>>,
     thumbnail: crate::thumbnail::ThumbnailService,
     #[cfg(test)]
     thumbnail_snapshot_hook: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
@@ -2322,6 +2395,7 @@ impl DaemonState {
             permanent_x11_engine: Mutex::new(PermanentX11Cache { engine: None }),
             #[cfg(all(unix, feature = "backend-wayland"))]
             merger: Mutex::new(clipmonger_backend_wayland::merge::Merger::new(2000)),
+            last_stub: Mutex::new(None),
             thumbnail: crate::thumbnail::ThumbnailService::new_for_daemon(),
             #[cfg(test)]
             thumbnail_snapshot_hook: Mutex::new(None),
@@ -3015,23 +3089,7 @@ impl DaemonState {
                 "too many capture formats".to_string(),
             ));
         }
-        let mut wanted: Vec<OversizeEntry> = Vec::new();
-        for offer in &event.offers {
-            if !valid_capture_mime(&offer.mime)
-                || !capture::wanted_format(&offer.mime, &cfg.monitor.formats)
-                || (cfg.privacy.strict && !capture::plain_text(&offer.mime))
-            {
-                continue;
-            }
-            if let Some(entry) = wanted.iter_mut().find(|entry| entry.mime == offer.mime) {
-                entry.bytes_hint = entry.bytes_hint.max(offer.bytes_hint);
-            } else {
-                wanted.push(OversizeEntry {
-                    mime: offer.mime.clone(),
-                    bytes_hint: offer.bytes_hint,
-                });
-            }
-        }
+        let wanted = wanted_offers(event, &cfg);
         let known_oversize: Vec<_> = wanted
             .iter()
             .filter(|entry| {
@@ -3089,7 +3147,9 @@ impl DaemonState {
                 }
             }
         }
-        if payloads.is_empty() || short_windows_capture(origin, cfg.monitor.min_len, &payloads) {
+        if nothing_plausible(origin, &mut payloads)
+            || short_windows_capture(origin, cfg.monitor.min_len, &payloads)
+        {
             return Ok(false);
         }
         if !read_failed && self.suppress_capture(origin, event, &payloads) {
@@ -3201,7 +3261,24 @@ impl DaemonState {
             .as_ref()
             .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?;
         drop(gate);
+        let mut mimes: Vec<String> = bounded.iter().map(|entry| entry.mime.clone()).collect();
+        mimes.sort();
+        let seen = StubSeen {
+            origin: origin.to_string(),
+            mimes,
+            at_ms: now,
+        };
+        if self
+            .last_stub
+            .lock()
+            .is_ok_and(|last| repeat_stub(last.as_ref(), &seen))
+        {
+            return Ok(false);
+        }
         store_stub(store, origin, &bounded, cfg.monitor.max_bytes, now, random)?;
+        if let Ok(mut last) = self.last_stub.lock() {
+            *last = Some(seen);
+        }
         store
             .enforce_retention(&retention_limits(&cfg))
             .map_err(|error| IpcError::new(error.code(), error.to_string()))?;
@@ -3676,7 +3753,12 @@ impl DaemonState {
             let accepted = self.ingest_oversize_checked("gnome", &oversize)?;
             return Ok(serde_json::json!({"accepted": accepted}));
         }
-        let payloads = decode_report_payloads(meta.payloads, &cfg)?;
+        let mut payloads = decode_report_payloads(meta.payloads, &cfg)?;
+        let clip = event
+            .get("clip")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        payloads.extend(self.claim_report_blobs(clip, meta.offers, &cfg)?);
         if payloads.is_empty() {
             return Ok(serde_json::json!({"accepted": false}));
         }
@@ -3687,7 +3769,57 @@ impl DaemonState {
     /// Dispatch `blob.put`: assemble chunks keyed by `(clip, mime)`; on
     /// `eof`, verify the total SHA-256 when present and ingest the assembled
     /// payload as one capture.
+    /// Take the finished `blob.put` payloads that a report's offers name
+    /// (`"blob": true`) for its `clip`. Formats the config does not want, or
+    /// a blob that never finished, contribute nothing.
+    fn claim_report_blobs(
+        &self,
+        clip: &str,
+        offers: &[Value],
+        cfg: &clipmonger_core::Config,
+    ) -> Result<Vec<(String, Vec<u8>)>, IpcError> {
+        let mut guard = self
+            .blob_buf
+            .lock()
+            .map_err(|_| IpcError::new("internal", "blob state poisoned".to_string()))?;
+        let mut claimed = Vec::new();
+        for offer in offers {
+            if offer.get("blob").and_then(Value::as_bool) != Some(true) {
+                continue;
+            }
+            let Some(mime) = offer.get("mime").and_then(Value::as_str) else {
+                continue;
+            };
+            let key = (clip.to_string(), mime.to_string());
+            if guard.get(&key).is_some_and(|asm| asm.done) {
+                if let Some(asm) = guard.remove(&key) {
+                    if wanted_capture_mime(mime, cfg) {
+                        claimed.push((key.1, asm.data));
+                    }
+                }
+            }
+        }
+        Ok(claimed)
+    }
+
     fn handle_blob_put(&self, params: &Value) -> Result<Value, IpcError> {
+        // Refuse while the store is down or read-only, like every capture
+        // write: a blob accepted now could never be stored with its report.
+        match self.store_read()?.as_ref() {
+            None => {
+                return Err(IpcError::new(
+                    "unavailable",
+                    "store unavailable".to_string(),
+                ))
+            }
+            Some(store) if store.is_read_only() => {
+                return Err(IpcError::new(
+                    "unsupported",
+                    "store is open read-only for recovery".to_string(),
+                ));
+            }
+            Some(_) => {}
+        }
         let clip = params
             .get("clip")
             .and_then(Value::as_str)
@@ -3722,18 +3854,22 @@ impl DaemonState {
             .config
             .lock()
             .map_or(16 * 1024 * 1024, |config| config.monitor.max_bytes);
-        let key = (clip, mime.clone());
-        let assembled: Option<Vec<u8>> = {
+        let key = (clip, mime);
+        {
             let mut guard = self
                 .blob_buf
                 .lock()
                 .map_err(|_| IpcError::new("internal", "blob state poisoned".to_string()))?;
             let now = now_ms();
             guard.retain(|_, asm| now >= asm.updated_ms && now - asm.updated_ms <= 60_000);
+            if guard.get(&key).is_some_and(|asm| asm.done) {
+                guard.remove(&key);
+            }
             let asm = guard.entry(key.clone()).or_insert_with(|| BlobAsm {
                 data: Vec::new(),
                 next_seq: 0,
                 updated_ms: now,
+                done: false,
             });
             if seq != asm.next_seq {
                 guard.remove(&key);
@@ -3752,27 +3888,22 @@ impl DaemonState {
                     "blob.put: assembled blob exceeds max_bytes".to_string(),
                 ));
             }
-            if eof {
-                guard.remove(&key).map(|done| done.data)
-            } else {
-                None
+            if !eof {
+                return Ok(serde_json::json!({"ok": true}));
             }
-        };
-        if let Some(data) = assembled {
             if let Some(expected) = sha256 {
-                if !expected.eq_ignore_ascii_case(&sha256_hex(&data)) {
+                if !expected.eq_ignore_ascii_case(&sha256_hex(&asm.data)) {
+                    guard.remove(&key);
                     return Err(IpcError::new(
                         "backend",
                         "blob.put: sha256 mismatch".to_string(),
                     ));
                 }
             }
-            if !self.ingest_capture_checked("gnome", false, &[(mime, data)])? {
-                return Err(IpcError::new(
-                    "backend",
-                    "blob.put: capture was not stored".to_string(),
-                ));
-            }
+            // Stored with the rest of its copy when the capture.report
+            // naming this clip arrives (handle_capture), so an image and
+            // the HTML around it become one row, not one row each.
+            asm.done = true;
         }
         Ok(serde_json::json!({"ok": true}))
     }
@@ -6190,6 +6321,52 @@ mod tests {
     }
 
     #[test]
+    fn a_blob_and_the_inline_payloads_of_one_report_are_one_row() {
+        let (_dir, state) = fresh_state("blob-join");
+        let clip = "01900000-0000-7000-8000-0000000000aa";
+        let png = b"\x89PNG\r\n\x1a\nimage-bytes".to_vec();
+        state
+            .handle(
+                "blob.put",
+                &serde_json::json!({"clip": clip, "mime": "image/png", "seq": 0,
+                                    "data_b64": "iVBORw0KGgppbWFnZS1ieXRlcw==", "eof": true}),
+            )
+            .expect("blob");
+        assert_eq!(
+            state
+                .handle("history.list", &serde_json::json!({}))
+                .unwrap()["clips"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let html = "<img src=x>";
+        state
+            .handle(
+                "capture.report",
+                &serde_json::json!({
+                    "event": {"clip": clip, "origin": "Clipboard", "source_app": null,
+                              "sensitive": false, "truncated": [],
+                              "offers": [{"mime": "image/png", "bytes_hint": png.len(), "blob": true},
+                                         {"mime": "text/html", "bytes_hint": html.len(),
+                                          "inline_b64": "PGltZyBzcmM9eD4="}]},
+                    "payloads": {"text/html": "PGltZyBzcmM9eD4="}
+                }),
+            )
+            .expect("report");
+        let clips = state
+            .handle("history.list", &serde_json::json!({}))
+            .unwrap()["clips"]
+            .clone();
+        let clips = clips.as_array().unwrap();
+        assert_eq!(clips.len(), 1, "one row for the copy: {clips:?}");
+        let mut formats: Vec<String> = serde_json::from_value(clips[0]["formats"].clone()).unwrap();
+        formats.sort();
+        assert_eq!(formats, ["image/png", "text/html"]);
+    }
+
+    #[test]
     fn blob_put_assembles_and_verifies_sha() {
         let (_dir, state) = fresh_state("blob-asm");
         let clip = "01900000-0000-7000-8000-000000000001";
@@ -6207,8 +6384,23 @@ mod tests {
             )
             .expect("chunk 1");
         assert!(
+            history_texts(&state).is_empty(),
+            "a finished blob waits for its capture.report"
+        );
+        state
+            .handle(
+                "capture.report",
+                &serde_json::json!({
+                    "event": {"clip": clip, "origin": "Clipboard", "source_app": null,
+                              "sensitive": false, "truncated": [],
+                              "offers": [{"mime": "text/plain", "bytes_hint": 10, "blob": true}]},
+                    "payloads": {}
+                }),
+            )
+            .expect("report");
+        assert!(
             history_texts(&state).iter().any(|t| t == "hello blob"),
-            "assembled payload must be ingested"
+            "assembled payload must be ingested with its report"
         );
         // Bad seq and bad hash are backend errors, not silent ok.
         let bad_seq = state.handle(
@@ -8039,6 +8231,78 @@ mod oversize_source_controls {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["created_ms"], rows[1]["created_ms"]);
         assert_ne!(rows[0]["id"], rows[1]["id"]);
+    }
+
+    #[test]
+    fn one_oversized_copy_reported_twice_stores_one_stub() {
+        let (_path, state) = state();
+        let ids = Cell::new(10);
+        let draw = || {
+            ids.set(ids.get() + 1);
+            Ok(ids.get())
+        };
+        let ingest = |origin: &str, mime: &str, now: i64| {
+            state
+                .ingest_oversize_with(origin, &entry(mime), now, draw)
+                .unwrap()
+        };
+        assert!(ingest("x11", "image/png", 1_000));
+        assert!(
+            !ingest("gnome", "image/png", 1_150),
+            "the extension's report of the same copy"
+        );
+        assert!(
+            ingest("x11", "image/png", 1_300),
+            "the same path again is a new copy"
+        );
+        assert!(
+            ingest("gnome", "text/html", 1_400),
+            "other formats are another copy"
+        );
+        assert!(ingest("gnome", "image/png", 9_000), "outside the window");
+        assert_eq!(
+            state
+                .handle("history.list", &serde_json::json!({}))
+                .unwrap()["clips"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn a_png_read_without_its_signature_is_refused() {
+        assert!(plausible_payload("image/png", b"\x89PNG\r\n\x1a\nrest"));
+        assert!(!plausible_payload("image/png", &[0x9d, 0x66, 0xd4, 0x9b]));
+        assert!(!plausible_payload("image/png", b""));
+        assert!(plausible_payload("text/plain", b"anything"));
+    }
+
+    #[test]
+    fn repeat_stub_needs_another_path_the_same_formats_and_the_window() {
+        let seen = |origin: &str, mime: &str, at_ms: i64| StubSeen {
+            origin: origin.to_string(),
+            mimes: vec![mime.to_string()],
+            at_ms,
+        };
+        let last = seen("x11", "image/png", 1_000);
+        assert!(!repeat_stub(None, &seen("gnome", "image/png", 1_000)));
+        assert!(repeat_stub(Some(&last), &seen("gnome", "image/png", 1_000)));
+        assert!(repeat_stub(Some(&last), &seen("gnome", "image/png", 2_999)));
+        assert!(!repeat_stub(
+            Some(&last),
+            &seen("gnome", "image/png", 3_000)
+        ));
+        assert!(!repeat_stub(Some(&last), &seen("x11", "image/png", 1_100)));
+        assert!(!repeat_stub(
+            Some(&last),
+            &seen("gnome", "text/html", 1_100)
+        ));
+        assert!(
+            !repeat_stub(Some(&last), &seen("gnome", "image/png", 999)),
+            "clock step back"
+        );
     }
 
     #[test]

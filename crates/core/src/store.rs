@@ -2282,6 +2282,12 @@ impl Store {
     }
 
     /// Coverage is conservative until a complete sweep has observed no failures.
+    /// Whether this handle refuses writes (opened for recovery).
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     pub fn uri_search_incomplete(&self) -> bool {
         self.uri_incomplete.load(Ordering::SeqCst)
     }

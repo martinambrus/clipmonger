@@ -116,6 +116,24 @@ pub fn subscribed<M: ClipboardMonitor>(
     Ok(monitor)
 }
 
+/// [`subscribed`] for the recovery loop's reconnect attempts: the same
+/// transaction without a log line per attempt. `run_opt` logs the failure
+/// once per streak (`capture.monitor_failed`) and its recovery, so a
+/// monitor that cannot start (no data-control, display down) no longer
+/// writes a warning every two seconds and pushes everything else out of
+/// the bounded log.
+///
+/// # Errors
+/// Returns the factory or subscription error without admitting the monitor.
+pub fn resubscribed<M: ClipboardMonitor>(
+    factory: impl FnOnce() -> Result<M>,
+    kinds: &[clipmonger_platform::types::SubscribeKind],
+) -> Result<M> {
+    let mut monitor = factory()?;
+    monitor.subscribe(kinds)?;
+    Ok(monitor)
+}
+
 /// Keep backend backoff responsive to daemon shutdown.
 pub fn sleep_interruptible(
     shutdown: &AtomicBool,

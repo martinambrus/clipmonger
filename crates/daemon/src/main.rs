@@ -273,7 +273,7 @@ fn setup_windows_backend(
                 &shutdown,
                 &state,
                 "windows",
-                || clipmonger_daemon::capture::subscribed(&monitor, &[SubscribeKind::Clipboard]),
+                || clipmonger_daemon::capture::resubscribed(&monitor, &[SubscribeKind::Clipboard]),
                 |events| {
                     for event in events {
                         let transfer =
@@ -513,7 +513,7 @@ fn setup_x11_backend(
                     if missing_transfer {
                         *transfer.borrow_mut() = Some(Arc::new(X11Transfer::connect(None)?));
                     }
-                    clipmonger_daemon::capture::subscribed(
+                    clipmonger_daemon::capture::resubscribed(
                         || X11Monitor::connect(None, monitor_opts_clone.clone()),
                         &kinds_clone,
                     )
@@ -670,7 +670,7 @@ fn setup_wayland_backend(
                     if missing_transfer {
                         *transfer.borrow_mut() = Some(Arc::new(WlTransfer::connect()?));
                     }
-                    clipmonger_daemon::capture::subscribed(
+                    clipmonger_daemon::capture::resubscribed(
                         || WlMonitor::connect(monitor_opts),
                         &kinds,
                     )

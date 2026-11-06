@@ -629,7 +629,7 @@ fn readonly_stub_and_blob_eof_storage_errors_are_truthfully_published() {
         .expect_err("IPC storage failure");
     for _ in 0..2 {
         readonly.handle("blob.put", &json!({"clip":"test", "mime":"text/plain", "seq":0, "eof":true, "data_b64":"b2s="}))
-            .expect_err("blob EOF cannot acknowledge failed storage or a false merger result");
+            .expect_err("blob EOF cannot acknowledge a read-only store");
     }
     fixture.assert_empty(0);
 }
