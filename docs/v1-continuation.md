@@ -361,7 +361,7 @@ sessions; the user checked the fixes, the root app and autostart.
 | Paste of a ~300 KB image into LibreOffice (X11 INCR send) | Pass after eda251e | n/a |
 | Permanent-clip hotkey with modifiers still held | Pass | Pass after d7c10c0 |
 | Klipper refill (old text must not jump above a newer image; a refill is kept when the original could not be read) | Pass after eda251e | Pass |
-| Root app: popup paste and permanent hotkey | Not run | Pass |
+| Root app: popup paste and permanent hotkey | Pass | Pass |
 | Autostart at login, hotkeys without a dialog | Pass | Pass after d7c10c0 |
 | Portal restart while the daemon runs | n/a | Pass after d7c10c0 |
 | Switching sessions: the old daemon stops, the new one has the new session's environment | Pass after d7c10c0 | Pass after d7c10c0 |
