@@ -77,32 +77,72 @@ pub fn parse_activated(payload: &Value) -> Option<String> {
 
 /// Build the portal bind plan for platform chords.
 ///
-/// Each chord yields one [`BindRequest`] whose trigger normalizes modifiers
-/// (`win` → `super`, lowercase, `+`-joined); the plan is idempotent, so a
+/// Each chord yields one [`BindRequest`] whose trigger follows the XDG
+/// shortcut format: `CTRL`/`ALT`/`SHIFT`/`LOGO` modifiers (`win`, `super`
+/// and `meta` → `LOGO`) joined by `+`, then an xkb keysym name. KDE shows
+/// "None" for a trigger it cannot parse. The plan is idempotent, so a
 /// rebind after `SessionClosed`/`ShortcutsChanged` replays the same vector.
 #[must_use]
 pub fn bind_requested(chords: &[String]) -> Vec<BindRequest> {
     chords
         .iter()
-        .map(|chord| {
-            let trigger = chord
-                .split('+')
-                .map(|token| {
-                    let token = token.trim();
-                    if token.eq_ignore_ascii_case("win") {
-                        "super".to_string()
-                    } else {
-                        token.to_ascii_lowercase()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("+");
-            BindRequest {
-                id: shortcut_id(chord),
-                trigger,
-            }
+        .map(|chord| BindRequest {
+            id: shortcut_id(chord),
+            trigger: xdg_trigger(chord),
         })
         .collect()
+}
+
+/// One platform chord as an XDG shortcut trigger.
+fn xdg_trigger(chord: &str) -> String {
+    chord
+        .split('+')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| match token.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => "CTRL".to_string(),
+            "alt" => "ALT".to_string(),
+            "shift" => "SHIFT".to_string(),
+            "win" | "super" | "meta" | "logo" => "LOGO".to_string(),
+            _ => keysym_name(token),
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// The xkb keysym name for a chord key: letters lowercase, `F1`..`F24`
+/// uppercase, common named keys in their xkb spelling.
+fn keysym_name(key: &str) -> String {
+    let lower = key.to_ascii_lowercase();
+    if let Some(digit) = lower.strip_prefix("digit").filter(|d| d.len() == 1) {
+        return digit.to_string();
+    }
+    if lower.len() > 1 && lower.starts_with('f') && lower[1..].bytes().all(|b| b.is_ascii_digit()) {
+        return lower.to_ascii_uppercase();
+    }
+    let named = match lower.as_str() {
+        "enter" | "return" => "Return",
+        "esc" | "escape" => "Escape",
+        "tab" => "Tab",
+        "space" => "space",
+        "backspace" => "BackSpace",
+        "delete" | "del" => "Delete",
+        "insert" | "ins" => "Insert",
+        "home" => "Home",
+        "end" => "End",
+        "pageup" | "pgup" => "Page_Up",
+        "pagedown" | "pgdn" => "Page_Down",
+        "up" | "arrowup" => "Up",
+        "down" | "arrowdown" => "Down",
+        "left" | "arrowleft" => "Left",
+        "right" | "arrowright" => "Right",
+        "quote" => "apostrophe",
+        "backquote" => "grave",
+        "comma" | "period" | "slash" | "semicolon" | "backslash" | "minus" | "equal"
+        | "bracketleft" | "bracketright" => return lower,
+        _ => return if key.chars().count() == 1 { lower } else { key.to_string() },
+    };
+    named.to_string()
 }
 
 #[cfg(test)]
@@ -149,10 +189,25 @@ mod tests {
         let first = bind_requested(&chords);
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].id, "super-v");
-        assert_eq!(first[0].trigger, "super+v");
+        assert_eq!(first[0].trigger, "LOGO+v");
         assert_eq!(first[1].id, "ctrl-shift-p");
-        assert_eq!(first[1].trigger, "ctrl+shift+p");
+        assert_eq!(first[1].trigger, "CTRL+SHIFT+p");
         // Double bind replays the same vector.
         assert_eq!(bind_requested(&chords), first);
+    }
+
+    #[test]
+    fn bind_plan_uses_xdg_modifier_and_keysym_names() {
+        let chords = vec![
+            "ctrl+alt+h".to_string(),
+            "Super+F12".to_string(),
+            "Ctrl+Shift+Space".to_string(),
+            "Alt+PageDown".to_string(),
+            "Ctrl+Digit1".to_string(),
+            "Ctrl+ArrowUp".to_string(),
+            "Ctrl+Backquote".to_string(),
+        ];
+        let triggers: Vec<String> = bind_requested(&chords).into_iter().map(|r| r.trigger).collect();
+        assert_eq!(triggers, ["CTRL+ALT+h", "LOGO+F12", "CTRL+SHIFT+space", "ALT+Page_Down", "CTRL+1", "CTRL+Up", "CTRL+grave"]);
     }
 }

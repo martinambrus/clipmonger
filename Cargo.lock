@@ -596,6 +596,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wayland-client",
+ "wayland-protocols-plasma",
  "wl-clipboard-rs",
 ]
 

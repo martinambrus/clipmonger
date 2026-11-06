@@ -14,6 +14,8 @@ pub mod primary;
 pub mod probe;
 
 #[cfg(unix)]
+pub mod fake_input;
+#[cfg(unix)]
 pub mod monitor;
 #[cfg(unix)]
 pub mod paste;

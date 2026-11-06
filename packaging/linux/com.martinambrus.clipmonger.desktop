@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Clipmonger
+Comment=Clipboard history
+Exec=/opt/clipmonger/clipmonger
+Icon=edit-paste
+Terminal=false
+Categories=Utility;
+StartupWMClass=com.martinambrus.clipmonger

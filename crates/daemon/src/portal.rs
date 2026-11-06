@@ -78,6 +78,11 @@ const EXTENSION_GONE_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// How often the thread re-reads the chord and the extension link.
 const PORTAL_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// The desktop app id the daemon registers with the portal. Host (not
+/// sandboxed) processes have none, and KDE's portal refuses a
+/// `GlobalShortcuts` session without one ("An app id is required").
+pub const APP_ID: &str = clipmonger_core::DESKTOP_APP_ID;
+
 /// Whether the portal should hold off for the extension: connected now, or
 /// on a GNOME desktop within the grace since start or since last seen.
 fn extension_holds(
@@ -100,6 +105,15 @@ async fn run_session(state: Arc<crate::DaemonState>) {
     use clipmonger_backend_wayland::portal::parse_activated;
     use std::time::Instant;
 
+    // Must precede every other portal call on the shared connection. A
+    // portal older than 1.19 has no Registry; it then derives the id itself.
+    let registered = match ashpd::AppID::try_from(APP_ID) {
+        Ok(app_id) => ashpd::register_host_app(app_id).await.map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    if let Err(e) = &registered {
+        eprintln!("daemon: portal app id {APP_ID} not registered: {e}");
+    }
     let shortcuts = match GlobalShortcuts::new().await {
         Ok(shortcuts) => shortcuts,
         Err(e) => {

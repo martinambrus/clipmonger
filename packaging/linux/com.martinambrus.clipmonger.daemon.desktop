@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Clipmonger daemon
+Exec=/opt/clipmonger/clipmonger-daemon
+NoDisplay=true
+Terminal=false
+X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input

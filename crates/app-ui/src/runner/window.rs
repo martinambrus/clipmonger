@@ -13,12 +13,12 @@ pub const SETTINGS_CLASS: &str = "ClipmongerSettings";
 /// Viewport builder of the popup, sizes in points. Undecorated, always on top,
 /// without taskbar entry, not resizable, active, created hidden, X11 window
 /// type normal (Mutter refuses focus to a parentless utility window), app id
-/// "clipmonger". `position` is set only when given.
+/// [`clipmonger_core::DESKTOP_APP_ID`]. `position` is set only when given.
 #[must_use]
 pub fn popup_builder(title: &str, size: [f32; 2], position: Option<[f32; 2]>) -> ViewportBuilder {
     let mut builder = ViewportBuilder::default()
         .with_title(title)
-        .with_app_id("clipmonger")
+        .with_app_id(clipmonger_core::DESKTOP_APP_ID)
         .with_inner_size(size)
         .with_decorations(false)
         .with_window_level(egui::WindowLevel::AlwaysOnTop)
@@ -34,12 +34,12 @@ pub fn popup_builder(title: &str, size: [f32; 2], position: Option<[f32; 2]>) ->
 }
 
 /// Viewport builder of the settings window, size in points: decorated,
-/// resizable, taskbar entry, active, visible at creation, app id "clipmonger".
+/// resizable, taskbar entry, active, visible at creation, app id [`clipmonger_core::DESKTOP_APP_ID`].
 #[must_use]
 pub fn settings_builder(title: &str, size: [f32; 2]) -> ViewportBuilder {
     ViewportBuilder::default()
         .with_title(title)
-        .with_app_id("clipmonger")
+        .with_app_id(clipmonger_core::DESKTOP_APP_ID)
         .with_inner_size(size)
         .with_decorations(true)
         .with_resizable(true)

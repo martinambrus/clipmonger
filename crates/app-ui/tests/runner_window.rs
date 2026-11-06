@@ -566,7 +566,7 @@ fn popup_builder_describes_a_hidden_undecorated_utility_window() {
     // Normal, not utility: Mutter refuses focus to a parentless utility
     // window mapped over another app (GNOME Xorg).
     assert_eq!(b.window_type, Some(X11WindowType::Normal));
-    assert_eq!(b.app_id.as_deref(), Some("clipmonger"));
+    assert_eq!(b.app_id.as_deref(), Some(clipmonger_core::DESKTOP_APP_ID));
 }
 
 #[test]
@@ -605,7 +605,7 @@ fn settings_builder_describes_a_normal_visible_window() {
     assert!(is_unset_or(b.visible, true), "visible: {:?}", b.visible);
     assert!(is_unset_or(b.window_level, WindowLevel::Normal));
     assert!(is_unset_or(b.window_type, X11WindowType::Normal));
-    assert_eq!(b.app_id.as_deref(), Some("clipmonger"));
+    assert_eq!(b.app_id.as_deref(), Some(clipmonger_core::DESKTOP_APP_ID));
 }
 
 #[test]

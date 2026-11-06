@@ -704,6 +704,8 @@ fn setup_wayland_backend(
     // Portal session owns the popup hotkey (first bind may show a system
     // dialog; `status.portal_bind_pending` forewarns the UI per W-F4).
     clipmonger_daemon::portal::spawn_portal_session(Arc::clone(state), capture_primary);
+    // KWin: track the active window for auto-paste (no-op elsewhere).
+    clipmonger_daemon::kwin::spawn_focus_tracker(Arc::clone(state));
 }
 
 /// Start the session backends selected by `want_backends` (X11 and/or
@@ -1068,6 +1070,14 @@ async fn async_main(args: Vec<String>) {
                 ],
             );
         }
+    }
+    // Desktop entries give the app id the portal and KWin need. Test
+    // daemons (profiles under the temp folder) never write them.
+    #[cfg(target_os = "linux")]
+    if !profile.starts_with(std::env::temp_dir()) {
+        let daemon_exe =
+            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
+        clipmonger_daemon::desktop_entry::ensure(&sibling_ui_exe(), &daemon_exe);
     }
     let backend_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     setup_session_backends(&profile, &state, &config, &backend_shutdown);

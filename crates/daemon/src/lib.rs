@@ -18,6 +18,8 @@ use serde_json::Value;
 
 pub mod autostart;
 pub mod capture;
+#[cfg(target_os = "linux")]
+pub mod desktop_entry;
 pub mod thumbnail;
 
 struct ConfigStage {
@@ -137,6 +139,8 @@ fn runtime_origin(origin: &str) -> &'static str {
 
 /// Protocol tag written to the rendezvous file.
 pub const PROTOCOL: &str = "ipc/v1";
+#[cfg(all(unix, feature = "backend-wayland"))]
+pub mod kwin;
 #[cfg(all(unix, feature = "backend-wayland"))]
 mod notify;
 pub mod popup;
@@ -1279,6 +1283,16 @@ fn wanted_capture_mime(mime: &str, cfg: &clipmonger_core::Config) -> bool {
         && (!cfg.privacy.strict || capture::plain_text(mime))
 }
 
+/// Klipper marks the copy it puts on an empty clipboard (after the owning
+/// app quit or the screen unlocked) with this type.
+const KLIPPER_REFILL_MIME: &str = "application/x-kde-onlyReplaceEmpty";
+
+/// Klipper refilling an empty clipboard with an older item: not a new copy.
+/// Capturing it would move that item back to the top of the history.
+fn klipper_refill(event: &clipmonger_platform::types::CaptureEvent) -> bool {
+    event.offers.iter().any(|offer| offer.mime == KLIPPER_REFILL_MIME)
+}
+
 fn strict_capture_requires_skip(
     event: &clipmonger_platform::types::CaptureEvent,
     cfg: &clipmonger_core::Config,
@@ -2142,6 +2156,9 @@ pub struct DaemonState {
     last_stub: Mutex<Option<StubSeen>>,
     /// SHA-256 of the text of the last sensitive copy (never stored).
     sensitive_text: Mutex<Option<String>>,
+    /// Active window as reported by the `KWin` script ([`kwin`]).
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    kwin_focus: Mutex<crate::kwin::Focus>,
     thumbnail: crate::thumbnail::ThumbnailService,
     #[cfg(test)]
     thumbnail_snapshot_hook: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
@@ -2411,6 +2428,8 @@ impl DaemonState {
             merger: Mutex::new(clipmonger_backend_wayland::merge::Merger::new(2000)),
             last_stub: Mutex::new(None),
             sensitive_text: Mutex::new(None),
+            #[cfg(all(unix, feature = "backend-wayland"))]
+            kwin_focus: Mutex::new(crate::kwin::Focus::default()),
             thumbnail: crate::thumbnail::ThumbnailService::new_for_daemon(),
             #[cfg(test)]
             thumbnail_snapshot_hook: Mutex::new(None),
@@ -2980,6 +2999,14 @@ impl DaemonState {
     }
 
     /// Whether `payloads` carry the text of the last sensitive copy.
+    /// One window activation reported by the `KWin` script.
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    pub(crate) fn kwin_activated(&self, ids: Vec<String>) {
+        if let Ok(mut focus) = self.kwin_focus.lock() {
+            focus.activated(ids);
+        }
+    }
+
     fn sensitive_text_echo(&self, payloads: &[(String, Vec<u8>)]) -> bool {
         let Ok(slot) = self.sensitive_text.lock() else {
             return false;
@@ -3122,6 +3149,9 @@ impl DaemonState {
         }
         if let Some(skipped) = self.mirror_or_sensitive(origin, event.sensitive) {
             return skipped;
+        }
+        if klipper_refill(event) {
+            return Ok(false);
         }
         let cfg = self
             .config
@@ -4828,7 +4858,14 @@ impl DaemonState {
                 }
                 return result;
             }
-            self.paste_wayland_payloads(payloads)
+            let result = self.paste_wayland_payloads(payloads);
+            if result.is_ok() {
+                let _ = self
+                    .store_read()?
+                    .as_ref()
+                    .and_then(|store| store.bump_clip(clip.0, now_ms()).ok());
+            }
+            result
         }
         #[cfg(not(any(
             all(windows, feature = "backend-windows"),
@@ -4944,6 +4981,18 @@ impl DaemonState {
                 IpcError::new("unavailable", format!("paste.execute: {e}"))
             })?;
         let mut result = serde_json::json!({"pasted": true});
+        match crate::kwin::auto_paste(&self.kwin_focus, payloads) {
+            Ok(true) => return Ok(result),
+            Ok(false) => {}
+            Err(reason) => {
+                eprintln!("daemon: kwin auto-paste skipped: {reason}");
+                daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "paste.failed",
+                    &[("operation", "paste_kwin_chord"), ("class", "focus")],
+                );
+            }
+        }
         if let Some(toast) = outcome.toast {
             notify::press_ctrl_v();
             result["toast"] = Value::from(toast);
@@ -5462,6 +5511,39 @@ mod tests {
         );
         assert!(state
             .capture_event("wayland", &event, &transfer, |_| {})
+            .unwrap());
+    }
+
+    #[test]
+    fn klipper_refill_is_not_captured() {
+        use clipmonger_platform::fakes::FakeTransfer;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
+        let (_dir, state) = fresh_state("klipper-refill");
+        let payloads = vec![("text/plain".to_string(), b"older item".to_vec())];
+        let transfer = FakeTransfer::new(
+            vec!["text/plain".into(), "application/x-kde-onlyReplaceEmpty".into()],
+            payloads.into_iter().collect(),
+            None,
+        );
+        let offer = |mime: &str| FormatOffer {
+            mime: mime.into(),
+            bytes_hint: None,
+        };
+        let refill = CaptureEvent {
+            native_sequence: None,
+            offers: vec![offer("text/plain"), offer("application/x-kde-onlyReplaceEmpty")],
+            origin: CaptureOrigin::Clipboard,
+            sensitive: false,
+        };
+        assert!(!state
+            .capture_event("wayland", &refill, &transfer, |_| {})
+            .unwrap());
+        let copy = CaptureEvent {
+            offers: vec![offer("text/plain")],
+            ..refill
+        };
+        assert!(state
+            .capture_event("wayland", &copy, &transfer, |_| {})
             .unwrap());
     }
 
