@@ -3759,7 +3759,7 @@ impl DaemonState {
             .and_then(Value::as_str)
             .unwrap_or_default();
         payloads.extend(self.claim_report_blobs(clip, meta.offers, &cfg)?);
-        if payloads.is_empty() {
+        if payloads.is_empty() || self.report_is_paste_echo(&payloads) {
             return Ok(serde_json::json!({"accepted": false}));
         }
         let accepted = self.ingest_capture_checked("gnome", false, &payloads)?;
@@ -3769,6 +3769,21 @@ impl DaemonState {
     /// Dispatch `blob.put`: assemble chunks keyed by `(clip, mime)`; on
     /// `eof`, verify the total SHA-256 when present and ingest the assembled
     /// payload as one capture.
+    /// Whether an extension report is the extension reading back its own
+    /// paste (GNOME Wayland); other builds have no extension paste.
+    #[allow(clippy::unused_self)]
+    fn report_is_paste_echo(&self, payloads: &[(String, Vec<u8>)]) -> bool {
+        #[cfg(all(unix, feature = "backend-wayland"))]
+        {
+            self.assist_echo(payloads)
+        }
+        #[cfg(not(all(unix, feature = "backend-wayland")))]
+        {
+            let _ = payloads;
+            false
+        }
+    }
+
     /// Take the finished `blob.put` payloads that a report's offers name
     /// (`"blob": true`) for its `clip`. Formats the config does not want, or
     /// a blob that never finished, contribute nothing.
@@ -5074,6 +5089,8 @@ impl DaemonState {
                 Ok(serde_json::json!({"ok": true}))
             }
             "paste.assist_done" => Ok(self.assist_done(params)),
+            #[cfg(all(unix, feature = "backend-wayland"))]
+            "paste.assist_chunk" => self.assist_chunk(params),
             "popup.open" => {
                 // Only the CLI asks for the target: a second launch would
                 // capture the Start menu or Explorer instead.

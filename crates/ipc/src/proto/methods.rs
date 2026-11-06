@@ -292,8 +292,10 @@ pub const HISTORY_CHANGED_TOPIC: &str = "history.changed";
 /// and caps again.
 pub const CAPS_CHANGED_TOPIC: &str = "caps.changed";
 /// Event topic the daemon pushes to the GNOME extension to paste a clip on
-/// GNOME Wayland: `{id, mime, data_b64, inject}`; the extension answers with
-/// `paste.assist_done {id, ok, injected, error?}`.
+/// GNOME Wayland: `{id, mime, data_b64, inject}`, or for a clip too large
+/// for one frame `{id, mime, size, chunks, inject}`, whose bytes the
+/// extension pulls with `paste.assist_chunk {id, seq}` (`{data_b64}`); the
+/// extension answers with `paste.assist_done {id, ok, injected, error?}`.
 pub const PASTE_ASSIST_TOPIC: &str = "paste.assist";
 /// Event topic the daemon pushes after permanent clips or groups changed;
 /// the GNOME extension re-reads them to bind per-clip hotkeys on Wayland.

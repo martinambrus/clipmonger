@@ -41,9 +41,13 @@ const SPAWN_INTERVAL: Duration = Duration::from_secs(10);
 /// How long a paste waits for the GNOME extension's answer.
 #[cfg(all(unix, feature = "backend-wayland"))]
 const ASSIST_WAIT: Duration = Duration::from_secs(3);
-/// Largest clip the extension pastes (base64 must fit one IPC frame).
+/// Largest clip sent inline in the `paste.assist` push (base64 must fit
+/// one IPC frame); larger ones are pulled with `paste.assist_chunk`.
 #[cfg(all(unix, feature = "backend-wayland"))]
-const ASSIST_MAX_BYTES: usize = 512 * 1024;
+const ASSIST_INLINE_BYTES: usize = 512 * 1024;
+/// Raw bytes per `paste.assist_chunk` reply (base64 fits one frame).
+#[cfg(all(unix, feature = "backend-wayland"))]
+pub(crate) const ASSIST_CHUNK_BYTES: usize = 256 * 1024;
 /// Toast id telling the user to press Ctrl+V (the paste was not injected).
 #[cfg(all(unix, feature = "backend-wayland"))]
 pub(crate) const PRESS_CTRL_V_TOAST: &str = "paste.press_ctrl_v";
@@ -57,6 +61,13 @@ pub(crate) struct PopupTrigger {
     last_spawn: Option<Instant>,
     /// Extension pastes waiting for `paste.assist_done`, by request id.
     assists: std::collections::HashMap<u64, std::sync::mpsc::Sender<serde_json::Value>>,
+    /// Content hash, as the extension reports it, of the last clip it
+    /// pasted, and when: its capture of that write is not a new copy.
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    last_assist: Option<(String, Instant)>,
+    /// Bytes of a chunked extension paste, served by `paste.assist_chunk`.
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    assist_data: std::collections::HashMap<u64, std::sync::Arc<Vec<u8>>>,
     #[cfg(all(unix, feature = "backend-wayland"))]
     next_assist: u64,
 }
@@ -113,35 +124,34 @@ impl DaemonState {
             return None;
         }
         let (mime, bytes) = assist_payload(payloads)?;
-        if bytes.len() > ASSIST_MAX_BYTES {
-            return Some(Err(IpcError::new(
-                "unavailable",
-                format!(
-                    "paste.execute: clip over {} KiB; copy it manually",
-                    ASSIST_MAX_BYTES / 1024
-                ),
-            )));
-        }
+        let chunked = bytes.len() > ASSIST_INLINE_BYTES;
         let (tx, rx) = std::sync::mpsc::channel();
         let id = {
             let mut trigger = self.popup.lock().ok()?;
             trigger.next_assist = trigger.next_assist.wrapping_add(1);
             let id = trigger.next_assist;
             trigger.assists.insert(id, tx);
+            if chunked {
+                trigger
+                    .assist_data
+                    .insert(id, std::sync::Arc::new(bytes.to_vec()));
+            }
             id
         };
-        let params = serde_json::json!({
-            "id": id,
-            "mime": mime,
-            "data_b64": crate::encode_thumbnail_png(bytes),
-            "inject": true,
-        });
+        let mut params = serde_json::json!({"id": id, "mime": mime, "inject": true});
+        if chunked {
+            params["size"] = serde_json::Value::from(bytes.len());
+            params["chunks"] = serde_json::Value::from(bytes.len().div_ceil(ASSIST_CHUNK_BYTES));
+        } else {
+            params["data_b64"] = serde_json::Value::from(crate::encode_thumbnail_png(bytes));
+        }
         let delivered = hub.publish(PASTE_ASSIST_TOPIC, params) > 0;
         let answer = delivered
-            .then(|| rx.recv_timeout(ASSIST_WAIT).ok())
+            .then(|| rx.recv_timeout(assist_wait(bytes.len())).ok())
             .flatten();
         if let Ok(mut trigger) = self.popup.lock() {
             trigger.assists.remove(&id);
+            trigger.assist_data.remove(&id);
         }
         let Some(answer) = answer else {
             return Some(Err(IpcError::new(
@@ -163,6 +173,9 @@ impl DaemonState {
                 format!("paste.execute: {why}"),
             )));
         }
+        if let Ok(mut trigger) = self.popup.lock() {
+            trigger.last_assist = Some((assist_report_hash(mime, bytes), Instant::now()));
+        }
         let injected = answer
             .get("injected")
             .and_then(serde_json::Value::as_bool)
@@ -172,6 +185,51 @@ impl DaemonState {
             result["toast"] = serde_json::Value::from(PRESS_CTRL_V_TOAST);
         }
         Some(Ok(result))
+    }
+
+    /// The extension's `paste.assist_chunk {id, seq}`: chunk `seq` of a
+    /// chunked paste still in flight, as `{data_b64}`.
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    pub(crate) fn assist_chunk(
+        &self,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, clipmonger_ipc::proto::IpcError> {
+        use clipmonger_ipc::proto::IpcError;
+        let unknown = || IpcError::new("backend", "paste.assist_chunk: no such paste".to_string());
+        let id = params
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(unknown)?;
+        let seq = params
+            .get("seq")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|seq| usize::try_from(seq).ok())
+            .ok_or_else(unknown)?;
+        let data = self
+            .popup
+            .lock()
+            .ok()
+            .and_then(|trigger| trigger.assist_data.get(&id).cloned())
+            .ok_or_else(unknown)?;
+        let chunk = assist_chunk_slice(&data, seq).ok_or_else(unknown)?;
+        Ok(serde_json::json!({"data_b64": crate::encode_thumbnail_png(chunk)}))
+    }
+
+    /// Whether an extension report of `payloads` is the extension reading
+    /// back the clip it just pasted (one-shot, [`ASSIST_ECHO_WINDOW`]).
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    pub(crate) fn assist_echo(&self, payloads: &[(String, Vec<u8>)]) -> bool {
+        let Ok(mut trigger) = self.popup.lock() else {
+            return false;
+        };
+        let echo = trigger.last_assist.as_ref().is_some_and(|(hash, at)| {
+            at.elapsed() < ASSIST_ECHO_WINDOW
+                && *hash == clipmonger_core::hash::content_hash(payloads)
+        });
+        if echo {
+            trigger.last_assist = None;
+        }
+        echo
     }
 
     /// The extension's `paste.assist_done`: hand it to the waiting paste.
@@ -950,13 +1008,53 @@ mod activation_report_tests {
     }
 }
 
-/// The payload the extension pastes: text when the clip has it, else the
-/// first format. `None` for an empty clip.
+/// How long after an extension paste its read-back counts as the paste.
+#[cfg(all(unix, feature = "backend-wayland"))]
+const ASSIST_ECHO_WINDOW: Duration = Duration::from_secs(10);
+
+/// The content hash of a pasted clip in the form the extension reports
+/// it: text as `text/plain`, anything else under its own type.
+#[cfg(all(unix, feature = "backend-wayland"))]
+fn assist_report_hash(mime: &str, bytes: &[u8]) -> String {
+    let reported = if mime.split(';').next().map(str::trim) == Some("text/plain") {
+        "text/plain"
+    } else {
+        mime
+    };
+    clipmonger_core::hash::content_hash(&[(reported.to_string(), bytes.to_vec())])
+}
+
+/// How long a paste waits for the extension: the base wait plus a second
+/// per started MiB it has to pull, at most 20 s.
+#[cfg(all(unix, feature = "backend-wayland"))]
+fn assist_wait(len: usize) -> Duration {
+    let mib = u64::try_from(len.div_ceil(1024 * 1024)).unwrap_or(u64::MAX);
+    (ASSIST_WAIT + Duration::from_secs(mib)).min(Duration::from_secs(20))
+}
+
+/// Chunk `seq` of `data`, `None` past the end.
+#[cfg(all(unix, feature = "backend-wayland"))]
+fn assist_chunk_slice(data: &[u8], seq: usize) -> Option<&[u8]> {
+    data.chunks(ASSIST_CHUNK_BYTES).nth(seq)
+}
+
+/// The one payload the extension pastes (Shell's clipboard holds a single
+/// format): text when the clip has it, then an image, then a file list,
+/// else the first format. A browser image copy carries `text/html` (the
+/// `<img>` tag) first; pasting that gave image editors no image. `None` for
+/// an empty clip.
 #[cfg(all(unix, feature = "backend-wayland"))]
 fn assist_payload(payloads: &[(String, Vec<u8>)]) -> Option<(&str, &[u8])> {
-    payloads
+    let base = |mime: &str| {
+        mime.split(';')
+            .next()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string()
+    };
+    ["text/plain", "image/png", "text/uri-list"]
         .iter()
-        .find(|(mime, _)| mime.split(';').next().map(str::trim) == Some("text/plain"))
+        .find_map(|wanted| payloads.iter().find(|(mime, _)| base(mime) == *wanted))
         .or_else(|| payloads.first())
         .map(|(mime, bytes)| (mime.as_str(), bytes.as_slice()))
 }
@@ -1234,15 +1332,128 @@ mod tests {
             crate::b64_decode(params["data_b64"].as_str().unwrap()).unwrap(),
             "héllo".as_bytes()
         );
+        // A clip too large for one frame is announced, then pulled in chunks.
         let big = vec![(
-            "text/plain".to_string(),
-            vec![b'x'; super::ASSIST_MAX_BYTES + 1],
+            "image/png".to_string(),
+            vec![b'x'; super::ASSIST_INLINE_BYTES + 1],
         )];
-        let refused = state
+        state
             .paste_via_extension(&big)
             .expect("listens")
-            .unwrap_err();
-        assert!(refused.message.contains("copy it manually"), "{refused:?}");
+            .expect("pasted");
+        let params = seen
+            .recv_timeout(Duration::from_secs(2))
+            .expect("assist pushed");
+        assert_eq!(params["size"], super::ASSIST_INLINE_BYTES + 1);
+        assert_eq!(params["chunks"], 3);
+        assert!(params.get("data_b64").is_none(), "{params}");
+        assert!(
+            state.popup.lock().unwrap().assist_data.is_empty(),
+            "the bytes are dropped once the paste finished"
+        );
+    }
+
+    #[cfg(feature = "backend-wayland")]
+    #[test]
+    fn the_extension_reading_back_its_paste_is_not_a_new_copy() {
+        let dir = std::env::temp_dir().join(format!("cm-assist-echo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = DaemonState::new(clipmonger_core::Store::open(&dir).expect("store"));
+        let pasted = |mime: &str, bytes: &[u8]| {
+            state.popup.lock().unwrap().last_assist =
+                Some((super::assist_report_hash(mime, bytes), Instant::now()));
+        };
+        let png = (String::from("image/png"), b"\x89PNGdata".to_vec());
+        pasted("image/png", &png.1);
+        assert!(state.assist_echo(std::slice::from_ref(&png)));
+        assert!(!state.assist_echo(std::slice::from_ref(&png)), "one-shot");
+        pasted("text/plain;charset=utf-8", b"hi");
+        assert!(
+            state.assist_echo(&[("text/plain".to_string(), b"hi".to_vec())]),
+            "the extension reports text as text/plain"
+        );
+        pasted("image/png", &png.1);
+        assert!(!state.assist_echo(&[("image/png".to_string(), b"other".to_vec())]));
+        state.popup.lock().unwrap().last_assist = Some((
+            super::assist_report_hash("image/png", &png.1),
+            Instant::now()
+                .checked_sub(super::ASSIST_ECHO_WINDOW)
+                .unwrap(),
+        ));
+        assert!(!state.assist_echo(std::slice::from_ref(&png)), "too late");
+    }
+
+    #[cfg(feature = "backend-wayland")]
+    #[test]
+    fn large_extension_pastes_are_served_in_chunks_while_in_flight() {
+        use super::{assist_chunk_slice, assist_wait, ASSIST_CHUNK_BYTES, ASSIST_WAIT};
+        let data: Vec<u8> = (0..(ASSIST_CHUNK_BYTES * 2 + 10))
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        assert_eq!(
+            assist_chunk_slice(&data, 0).unwrap().len(),
+            ASSIST_CHUNK_BYTES
+        );
+        assert_eq!(
+            assist_chunk_slice(&data, 2).unwrap(),
+            &data[ASSIST_CHUNK_BYTES * 2..]
+        );
+        assert!(assist_chunk_slice(&data, 3).is_none());
+        assert_eq!(assist_wait(100), ASSIST_WAIT + Duration::from_secs(1));
+        assert_eq!(
+            assist_wait(3 * 1024 * 1024),
+            ASSIST_WAIT + Duration::from_secs(3)
+        );
+        assert_eq!(assist_wait(usize::MAX), Duration::from_secs(20));
+
+        let dir = std::env::temp_dir().join(format!("cm-assist-chunks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = DaemonState::new(clipmonger_core::Store::open(&dir).expect("store"));
+        state
+            .popup
+            .lock()
+            .unwrap()
+            .assist_data
+            .insert(7, std::sync::Arc::new(data.clone()));
+        let chunk = state.assist_chunk(&json!({"id": 7, "seq": 1})).unwrap();
+        let bytes = crate::b64_decode(chunk["data_b64"].as_str().unwrap()).unwrap();
+        assert_eq!(bytes, &data[ASSIST_CHUNK_BYTES..ASSIST_CHUNK_BYTES * 2]);
+        assert!(
+            state.assist_chunk(&json!({"id": 7, "seq": 3})).is_err(),
+            "past the end"
+        );
+        assert!(
+            state.assist_chunk(&json!({"id": 8, "seq": 0})).is_err(),
+            "no such paste"
+        );
+    }
+
+    #[cfg(feature = "backend-wayland")]
+    #[test]
+    fn extension_pastes_text_then_image_then_files_then_the_first_format() {
+        let clip = |mimes: &[&str]| -> Vec<(String, Vec<u8>)> {
+            mimes
+                .iter()
+                .map(|m| ((*m).to_string(), m.as_bytes().to_vec()))
+                .collect()
+        };
+        let pick =
+            |mimes: &[&str]| super::assist_payload(&clip(mimes)).map(|(mime, _)| mime.to_string());
+        assert_eq!(
+            pick(&["text/html", "image/png"]).as_deref(),
+            Some("image/png"),
+            "browser image"
+        );
+        assert_eq!(
+            pick(&["text/html", "text/plain;charset=utf-8", "image/png"]).as_deref(),
+            Some("text/plain;charset=utf-8")
+        );
+        assert_eq!(
+            pick(&["text/html", "text/uri-list"]).as_deref(),
+            Some("text/uri-list")
+        );
+        assert_eq!(pick(&["text/html"]).as_deref(), Some("text/html"));
+        assert_eq!(pick(&[]), None);
     }
 
     #[cfg(feature = "backend-wayland")]
