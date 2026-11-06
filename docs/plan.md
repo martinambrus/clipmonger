@@ -303,7 +303,7 @@ it does not close the native gates or the Linux release.
   macOS release/signoff begins here. Same gates.
 - **9. v3 (after design-reopen gate).** Re-validate trust/keys/merge/
   manifest/quota/file-list semantics, then: sync LAN (v3a) + user-cloud
-  (v3b) (seg-10), extras (seg-01 §10), Flathub evaluation (seg-12 §7),
+  (v3b) (seg-10), extras (seg-01 §10),
   curated plugin-list evaluation (F-802, ADR-001).
   Never open live SQLite from a synced folder. Same gates.
 
