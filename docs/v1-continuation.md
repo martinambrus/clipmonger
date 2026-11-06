@@ -92,12 +92,12 @@ A delivered source change does not close a native gate.
 | #26 | Installer/uninstaller, default-preserving profile UI, recovery, interoperability, manual matrix and release record. |
 | #41 | GNOME 46 X11 and Wayland passed 2026-11-05 (see [Linux acceptance](#linux-acceptance-on-gnome-46-2026-11-05)). Remaining: portal rebind on a portal desktop (KDE Plasma 6, GNOME 48+) and the other desktops. |
 | #49 | CPU runner: native lifecycle, minimized startup, tray, DPI and monitor changes. |
-| #59 | Real GUI/daemon log output and visible failure diagnostics. |
+| #59 | Real GUI/daemon log output and visible failure diagnostics. Linux (GNOME 46 Xorg, 2026-11-06): a monitor or hotkey that cannot start now logs once per failure streak plus its recovery, instead of every 2 s (4,501 repeats had filled the bounded log); a paste whose target window closed shows a visible error. Windows remains. |
 | #62 | Windows opt-out markers, capture-pump recovery and wide-image capture through to stored PNG. |
-| #67 | Failed-paste rollback, clipboard owner/sequence checks and Control release through real native paths. |
+| #67 | Failed-paste rollback, clipboard owner/sequence checks and Control release through real native paths. Linux X11 (2026-11-06): a failed paste chord restores the saved clipboard while it is still ours, and every pressed key is released even when a later key event fails (unit-tested); a paste into a closed target fails visibly and leaves the clipboard untouched (user-verified). Windows remains. |
 | #70 | Actual capture/hotkey startup failure and recovery on Windows and Linux. Linux: a crashed daemon is restarted by the UI (3a5aee1) and a refused popup chord recovers within 5 s (GNOME 46 Xorg). On a private Xvfb (2026-11-05), a daemon started before its display came up, and one whose X server died and restarted, recovered capture, the popup hotkey and paste caps (re-probed once the display answers) with no restart. Windows start-up failures remain. |
-| #71 | Oversized captures produce the correct user-visible stub on the actual backend/UI. |
-| #72 | Real privacy-marker/fingerprint behavior and bounded wide-image handling. |
+| #71 | Oversized captures produce the correct user-visible stub on the actual backend/UI. Linux (GNOME 46 Xorg, 2026-11-06): oversized text and images give one "Too large" stub; a stub reported by both the X11 watcher and the extension within 2 s is stored once. Known limit: when the copying app quits, GNOME's clipboard manager re-owns the selection and a second stub can follow. Windows remains. |
+| #72 | Real privacy-marker/fingerprint behavior and bounded wide-image handling. Linux (2026-11-06): a 20000x40 image is stored intact and shown in the popup; large X11 images (browser copies) no longer store an empty or tail-only PNG (INCR end detection fixed, PNG signature checked), and a browser image plus its HTML is one row. Windows remains. |
 | #74 | Same-user UAC registration, cancellation/alternate-account refusal, ACL/pinning/task readback, cleanup and logon/helper lifecycle. |
 
 ## Resume point and possible reboot
