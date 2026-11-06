@@ -8,6 +8,7 @@ import Shell from 'gi://Shell';
 import { wm } from 'resource:///org/gnome/shell/ui/main.js';
 import { permanentExecRequest } from './codec.js';
 import { bindPlan } from './permbind.js';
+import { isWaylandSession } from './session.js';
 export class PermanentHotkeys {
     ipc;
     paste;
@@ -18,7 +19,7 @@ export class PermanentHotkeys {
     ids = new Map();
     constructor(ipc, paste) { this.ipc = ipc; this.paste = paste; }
     /** Only a Wayland session needs the Shell to bind these. */
-    get active() { return Boolean(Meta.is_wayland_compositor?.()); }
+    get active() { return isWaylandSession(Meta); }
     enable() {
         if (!this.active)
             return;

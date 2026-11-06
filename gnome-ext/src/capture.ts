@@ -26,6 +26,20 @@ export function windowAppIds(win: any): string[] {
 /** SHA-256 hex of `bytes` in GLib's C code (the pure-JS hash blocks the
  * Shell's main loop on large payloads); `undefined` lets the pure fallback
  * run if GLib fails. */
+/** The clipboard text. get_text may answer via callback or via a returned
+ * promise, depending on Shell version; a callback that never fires must
+ * not wedge the poll, so it gives up after 1.5 s with ''. */
+function readText(clipboard: any): Promise<string> {
+  return new Promise((resolve) => {
+    const timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => { resolve(''); return GLib.SOURCE_REMOVE; });
+    const done = (t: string | null) => { GLib.source_remove(timer); resolve(t ?? ''); };
+    const returned: unknown = clipboard.get_text(St.ClipboardType.CLIPBOARD, (_c: any, t: string | null) => done(t));
+    if (returned && typeof (returned as Promise<string>).then === 'function') {
+      (returned as Promise<string>).then(done, () => done(''));
+    }
+  });
+}
+
 function nativeSha256(bytes: Uint8Array): string | undefined {
   try { return GLib.compute_checksum_for_bytes(GLib.ChecksumType.SHA256, GLib.Bytes.new(bytes)) ?? undefined; } catch { return undefined; }
 }
@@ -70,6 +84,10 @@ export class CaptureRelay {
    * not per poll): set until the owner changes; the offered formats key it
    * when the owner-changed signal is missing. */
   private sensitiveReported: string | null = null;
+  /** SHA-256 of the text of the last sensitive copy, kept only in memory.
+   * When the copying app quits, GNOME's clipboard manager offers the same
+   * text again without the password hint; that copy is sensitive too. */
+  private sensitiveTextHash: string | null = null;
   private selectionHandler: number | null = null;
   private pollMs: number;
   constructor(ipc: IpcClient, diff: PollDiff, pollMs = 500) { this.ipc = ipc; this.diff = diff; this.pollMs = pollMs; }
@@ -132,6 +150,8 @@ export class CaptureRelay {
         const key = mimes.join('\n');
         if (this.sensitiveReported === key) { this.ipc.relay.recordSuccess(); return; }
         this.sensitiveReported = key;
+        const secret = new TextEncoder().encode(await readText(clipboard));
+        this.sensitiveTextHash = secret.length > 0 ? nativeSha256(secret) ?? null : null;
         await this.ipc.request(captureReportRequest(this.ipc.nextId(), {
           clip: newClipId(), origin: 'Clipboard', source_app: null,
           sensitive: true, offers: [],
@@ -165,21 +185,17 @@ export class CaptureRelay {
           // get_text may answer via callback or via a returned promise,
           // depending on Shell version; a callback that never fires must
           // not wedge isReading.
-          const text: string = await new Promise((resolve) => {
-            const timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => { resolve(''); return GLib.SOURCE_REMOVE; });
-            const done = (t: string | null) => { GLib.source_remove(timer); resolve(t ?? ''); };
-            const returned: unknown = clipboard.get_text(St.ClipboardType.CLIPBOARD, (_c: any, t: string | null) => done(t));
-            if (returned && typeof (returned as Promise<string>).then === 'function') {
-              (returned as Promise<string>).then(done, () => done(''));
-            }
-          });
+          const text = await readText(clipboard);
           if (!this.loggedFirstRead) {
             this.loggedFirstRead = true;
             console.log(`clipmonger: clipboard read ok (${mimes.length} mimes, text=${text.length} chars)`);
           }
           if (text) {
             const bytes = new TextEncoder().encode(text);
-            offers.push({ mime: 'text/plain', bytes, hash: nativeSha256(bytes) });
+            const hash = nativeSha256(bytes);
+            // The re-offered text of a sensitive copy: skip the whole copy.
+            if (this.sensitiveTextHash !== null && hash === this.sensitiveTextHash) { this.ipc.relay.recordSuccess(); return; }
+            offers.push({ mime: 'text/plain', bytes, hash });
           }
         } else {
           // Images, file lists and rich text: read the bytes, so the extension

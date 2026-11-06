@@ -5,6 +5,7 @@ import GLib from 'gi://GLib?version=2.0';
 import Meta from 'gi://Meta';
 import { POPUP_TITLE } from './config.js';
 import { placePopup, type Placement } from './placement.js';
+import { isWaylandSession } from './session.js';
 
 /** How long after the first placement Mutter's own moves are undone. */
 const SETTLE_MS = 1500;
@@ -14,7 +15,7 @@ export class PopupPlacer {
   private handler: number | null = null;
 
   enable(): void {
-    if (!Meta.is_wayland_compositor?.()) return;
+    if (!isWaylandSession(Meta as any)) return;
     const display = (globalThis as any).global?.display;
     this.handler = display?.connect('window-created', (_display: any, win: any) => this.watch(win)) ?? null;
   }

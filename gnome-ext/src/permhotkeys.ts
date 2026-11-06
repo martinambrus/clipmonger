@@ -10,6 +10,7 @@ import { permanentExecRequest } from './codec.js';
 import type { IpcClient } from './ipc.js';
 import type { PasteAssist } from './paste.js';
 import { bindPlan, type PermanentChord } from './permbind.js';
+import { isWaylandSession } from './session.js';
 
 export class PermanentHotkeys {
   private ipc: IpcClient;
@@ -22,7 +23,7 @@ export class PermanentHotkeys {
   constructor(ipc: IpcClient, paste: PasteAssist) { this.ipc = ipc; this.paste = paste; }
 
   /** Only a Wayland session needs the Shell to bind these. */
-  get active(): boolean { return Boolean(Meta.is_wayland_compositor?.()); }
+  get active(): boolean { return isWaylandSession(Meta as any); }
 
   enable(): void {
     if (!this.active) return;
