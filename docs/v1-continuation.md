@@ -425,6 +425,47 @@ name (autostart file renamed); KWin 5 script paths and names; the daemon
 outlived logouts when started from a terminal; stale Xvfb locks made every
 X11 test skip silently.
 
+## Windows acceptance in KVM VMs (2026-11-06)
+
+Automated run on two VMs converted from the user's VMware machines, with real
+input through QEMU (keys, absolute pointer, UAC clicks on the secure desktop),
+screenshots, SSH, and helpers in `~/clipmonger-vm-tools/` (deploy, launch in
+the desktop session, clipboard copy/read, test editor/console). Candidate:
+HEAD with 1693674.
+
+- `cm-win11`: Windows 11 build 21996, standard admin account `martin` (UAC
+  split token), portable test folder `C:\clipmonger-test`.
+- `cm-win10`: Windows 10 22H2 (19045), built-in Administrator only (full
+  token, every window elevated), installed copy in `C:\Program Files\Clipmonger`
+  upgraded to the candidate for the autostart leg.
+
+| Test | Windows 11 | Windows 10 |
+| --- | --- | --- |
+| Capture and paste of Unicode text (Japanese, emoji, accents), bytes identical | Pass | Pass |
+| Pasting an older entry keeps it on the clipboard (`restore_clipboard = false`) | Pass | Pass |
+| `restore_clipboard = true`: older entry pasted, previous clipboard back after the dwell | Pass | Not run |
+| Image capture (small, 7.7 MB re-encoded PNG) and paste into WordPad; PNG, CF_DIB and CF_DIBV5 checked byte for byte | Pass | Pass |
+| Paste into a PowerShell console | Pass | Pass |
+| Permanent-clip hotkey with Ctrl+Alt still held | Pass | Pass |
+| Password-manager format (`ExcludeClipboardContentFromMonitorProcessing`) not stored | Pass | Pass |
+| Elevated window: "enable in admin windows" prompt, UAC, helper; popup paste | Pass | n/a (all windows elevated, direct paste) |
+| Permanent hotkey into an elevated window | Pass after 1693674 | n/a |
+| Tray menu, settings window, permanent-clip delete with confirmation | Pass | Pass |
+| Autostart: setting writes the Run entry; reboot; starts at login and pastes | Pass | Pass (installed copy) |
+| Tray Quit ends both processes | Pass | Pass |
+
+Found and fixed: a per-clip hotkey pressed in an elevated window pasted
+nothing, because GetAsyncKeyState reads all keys as up across the integrity
+boundary; the elevated helper now waits for the modifiers itself (1693674).
+
+Notes: an existing Run entry pointing at an installed copy is kept when a
+portable/test build runs with autostart enabled; WordPad draws a scaled-down
+large noise image very dark (a direct paste without Clipmonger looks the same);
+a permanent chord equal to the popup chord degrades the hotkey capability
+until removed (seen on the Windows 10 profile, whose popup chord is
+Ctrl+Alt+J); the settings text "not on Wayland" for permanent-clip hotkeys is
+outdated since the GNOME extension and the KDE portal support them.
+
 ## Other release gates: do not silently waive
 
 - Linux desktop acceptance: GNOME 46 on Xorg and Wayland passed on 2026-11-05
