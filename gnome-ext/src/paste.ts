@@ -139,7 +139,11 @@ export class PasteAssist {
 
   private pressCtrlV(shift: boolean): void {
     if (!this.keyboard) {
-      const seat = Clutter.get_default_backend().get_default_seat();
+      // GNOME 51 dropped Clutter.get_default_backend(); the stage's
+      // context has the backend since GNOME 46.
+      const backend = (globalThis as any).global?.stage?.context?.get_backend?.()
+        ?? (Clutter as any).get_default_backend?.();
+      const seat = backend.get_default_seat();
       this.keyboard = seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
     }
     const now = () => GLib.get_monotonic_time();
