@@ -324,6 +324,28 @@ with a libwayland "not a valid new object id ... data_offer" protocol error afte
 clipboard changes, taking the UI down (egui-winit now uses arboard only, through
 XWayland). GNOME 47-49 and 51 are not covered by this run.
 
+## Linux acceptance on GNOME 51 (2026-11-06)
+
+Run in the `cm-ubuntu2610-gnome` VM (Ubuntu 26.10, GNOME Shell 51.0, Wayland,
+glibc 2.44) with the same harness; the user ran the root app.
+
+| Test | Result |
+| --- | --- |
+| Extension loads (metadata lists 51) and connects | Pass |
+| Capture: text, a 2.4 MB image (chunked through the extension) | Pass |
+| Popup hotkey and placement at the pointer, thumbnails | Pass |
+| Auto-paste into Ptyxis (Ctrl+Shift+V) | Pass after 7133b1a |
+| Permanent-clip hotkey with Ctrl+Alt still held | Pass |
+| Password hint, then GNOME's clipboard manager re-offers the text | Pass, nothing stored |
+| Paste of the 2.4 MB image (chunked pull), clipboard size matches | Pass |
+| Root app (GTK window via sudo): popup paste and permanent hotkey | Pass |
+| Daemon stops at logout | Pass |
+
+Found and fixed: GNOME 51 removed `Clutter.get_default_backend()`, so the
+extension's virtual keyboard could not be created and every popup paste fell
+back to the "press Ctrl+V" notification (7133b1a; the fallback still serves
+GNOME 46, rechecked on the user's host).
+
 ## Linux acceptance on KDE Plasma 6.8 Wayland (2026-11-06)
 
 Run in the `cm-fedora45-kde` VM (Fedora 45, KDE Plasma 6.8.2, KWin Wayland;
@@ -387,8 +409,9 @@ X11 test skip silently.
   [T-607](../tests/manual/T-607-paste-spike-acceptance.md) on wlroots (KDE
   Plasma 6.8 Wayland passed, see
   [KDE](#linux-acceptance-on-kde-plasma-68-wayland-2026-11-06)),
-  T-704 for GNOME 47-49 and 51 (46 and 50 passed, see
-  [GNOME 50](#linux-acceptance-on-gnome-50-2026-11-06)). The portal rebind
+  T-704 for GNOME 47-49 (46, 50 and 51 passed, see
+  [GNOME 50](#linux-acceptance-on-gnome-50-2026-11-06) and
+  [GNOME 51](#linux-acceptance-on-gnome-51-2026-11-06)). The portal rebind
   (ADR-004 item 2) passed on KDE. X11 permanent
   hotkeys now honor `popup.restore_clipboard` (8de631a, verified on Xorg).
 - Linux release licensing for the scanner-generated blur protocol bindings (winit
