@@ -1,10 +1,20 @@
-//! X11 autostart over `~/.config/autostart/clipmonger.desktop`
+//! X11 autostart over `~/.config/autostart/com.martinambrus.clipmonger.desktop`
 //! (rendered/parsed by the pure `desktop` module; never shells out).
+//!
+//! The file is named after the desktop app id: Plasma 5 starts autostart
+//! entries as `app-<file name>@autostart.service`, and its portal takes the
+//! app id from that unit name. Older versions wrote `clipmonger.desktop`;
+//! enabling moves it to the new name and disabling removes both.
 
 use std::path::{Path, PathBuf};
 
 use clipmonger_platform::traits::AutostartManager;
 use clipmonger_platform::types::{Affinity, Error, Result};
+
+/// Autostart file name: the desktop app id.
+pub const AUTOSTART_FILE: &str = "com.martinambrus.clipmonger.desktop";
+/// File name written by earlier versions.
+pub const LEGACY_AUTOSTART_FILE: &str = "clipmonger.desktop";
 
 /// Desktop-entry autostart manager.
 pub struct X11Autostart {
@@ -25,7 +35,7 @@ impl X11Autostart {
     #[must_use]
     pub fn new(exe: PathBuf, mut root: PathBuf, portable: bool) -> Self {
         root.push("autostart");
-        root.push("clipmonger.desktop");
+        root.push(AUTOSTART_FILE);
         Self {
             exe,
             file: root,
@@ -54,7 +64,7 @@ impl X11Autostart {
             Some(path_str(&profile_dir)?),
         )?;
         root.push("autostart");
-        root.push("clipmonger.desktop");
+        root.push(AUTOSTART_FILE);
         Ok(Self {
             exe,
             file: root,
@@ -83,7 +93,7 @@ impl X11Autostart {
         )?;
         let mut file = root.to_path_buf();
         file.push("autostart");
-        file.push("clipmonger.desktop");
+        file.push(AUTOSTART_FILE);
         Ok(Self {
             exe: exe.to_path_buf(),
             file,
@@ -108,31 +118,53 @@ impl AutostartManager for X11Autostart {
         }
         std::fs::write(&self.file, text)
             .map_err(|e| Error::Io(format!("autostart write failed: {e}")))?;
-        Ok(())
+        remove_if_present(&self.legacy_file())
     }
 
     fn disable(&mut self) -> Result<()> {
         if self.portable {
             return Ok(());
         }
-        match std::fs::remove_file(&self.file) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::Io(format!("autostart remove failed: {e}"))),
-        }
+        remove_if_present(&self.file)?;
+        remove_if_present(&self.legacy_file())
     }
 
     fn is_enabled(&self) -> Result<bool> {
         if self.portable {
             return Ok(false);
         }
-        let text = match std::fs::read_to_string(&self.file) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(Error::Io(format!("autostart read failed: {e}"))),
-        };
-        Ok(crate::desktop::parse_desktop(&text).is_ok_and(|entry| !entry.hidden))
+        if let Some(enabled) = entry_enabled(&self.file)? {
+            return Ok(enabled);
+        }
+        Ok(entry_enabled(&self.legacy_file())?.unwrap_or(false))
     }
+}
+
+impl X11Autostart {
+    /// The file earlier versions wrote, next to the current one.
+    fn legacy_file(&self) -> PathBuf {
+        self.file.with_file_name(LEGACY_AUTOSTART_FILE)
+    }
+}
+
+fn remove_if_present(file: &Path) -> Result<()> {
+    match std::fs::remove_file(file) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::Io(format!("autostart remove failed: {e}"))),
+    }
+}
+
+/// `Some(enabled)` for an existing entry, `None` when the file is absent.
+fn entry_enabled(file: &Path) -> Result<Option<bool>> {
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::Io(format!("autostart read failed: {e}"))),
+    };
+    Ok(Some(
+        crate::desktop::parse_desktop(&text).is_ok_and(|entry| !entry.hidden),
+    ))
 }
 
 #[cfg(test)]
@@ -179,7 +211,7 @@ mod tests {
         )
         .unwrap();
         m.enable().expect("enable should write");
-        let file = root.join("autostart").join("clipmonger.desktop");
+        let file = root.join("autostart").join(AUTOSTART_FILE);
         let text = std::fs::read_to_string(&file).expect("file written");
         let entry = crate::desktop::parse_desktop(&text).expect("parse written");
         assert_eq!(entry.exec, exe.to_string_lossy());
@@ -210,7 +242,7 @@ mod tests {
         )
         .unwrap();
         m.enable().unwrap();
-        let file = root.join("autostart").join("clipmonger.desktop");
+        let file = root.join("autostart").join(AUTOSTART_FILE);
         let text = std::fs::read_to_string(&file).unwrap();
         assert_eq!(
             text,
@@ -248,7 +280,7 @@ Terminal=false
         )
         .unwrap();
         m.enable().unwrap();
-        assert!(!root.join("autostart").join("clipmonger.desktop").exists());
+        assert!(!root.join("autostart").join(AUTOSTART_FILE).exists());
         assert!(!m.is_enabled().unwrap());
         m.disable().unwrap();
         let _ = std::fs::remove_dir_all(&root);
@@ -264,7 +296,30 @@ Terminal=false
             false,
         );
         assert!(bad.is_err());
-        assert!(!root.join("autostart").join("clipmonger.desktop").exists());
+        assert!(!root.join("autostart").join(AUTOSTART_FILE).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_file_counts_as_enabled_and_moves_on_enable() {
+        let root = tempfile_like_root();
+        let dir = root.join("autostart");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join(LEGACY_AUTOSTART_FILE);
+        std::fs::write(
+            &legacy,
+            "[Desktop Entry]\nType=Application\nName=Clipmonger\nExec=/old/clipmonger --minimized\nHidden=false\nTerminal=false\n",
+        )
+        .unwrap();
+        let mut m = X11Autostart::new(Path::new("/usr/bin/clipmonger").to_path_buf(), root.clone(), false);
+        assert!(m.is_enabled().unwrap(), "an old entry still means enabled");
+        m.enable().unwrap();
+        assert!(dir.join(AUTOSTART_FILE).is_file());
+        assert!(!legacy.exists(), "enable moves the entry to the new name");
+        std::fs::write(&legacy, "[Desktop Entry]\nExec=/old\n").unwrap();
+        m.disable().unwrap();
+        assert!(!dir.join(AUTOSTART_FILE).exists() && !legacy.exists());
+        assert!(!m.is_enabled().unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -75,8 +75,9 @@ fn script_source(bus_name: &str) -> String {
          \x20       String(w.resourceClass || \"\"), String(w.resourceName || \"\"),\n\
          \x20       String(w.desktopFileName || \"\"));\n\
          }}\n\
-         workspace.windowActivated.connect(report);\n\
-         report(workspace.activeWindow);\n"
+         // KWin 6 names; KWin 5 calls them clientActivated/activeClient.\n\
+         (workspace.windowActivated || workspace.clientActivated).connect(report);\n\
+         report(workspace.activeWindow || workspace.activeClient);\n"
     )
 }
 
@@ -121,14 +122,18 @@ async fn track(state: &crate::DaemonState) -> zbus::Result<()> {
     if id < 0 {
         return Err(zbus::Error::Failure("kwin refused the script".to_string()));
     }
-    let script = zbus::Proxy::new(
-        &conn,
-        "org.kde.KWin",
-        format!("/Scripting/Script{id}"),
-        "org.kde.kwin.Script",
-    )
-    .await?;
-    script.call::<_, _, ()>("run", &()).await?;
+    // `KWin` 6 exports a loaded script at `/Scripting/Script<id>`, `KWin` 5
+    // at `/<id>`.
+    let mut ran = Err(zbus::Error::Failure("no script path".to_string()));
+    for path in [format!("/Scripting/Script{id}"), format!("/{id}")] {
+        let script =
+            zbus::Proxy::new(&conn, "org.kde.KWin", path, "org.kde.kwin.Script").await?;
+        ran = script.call::<_, _, ()>("run", &()).await;
+        if ran.is_ok() {
+            break;
+        }
+    }
+    ran?;
     while let Some(message) = stream.next().await {
         let Ok(message) = message else { continue };
         let header = message.header();
@@ -237,6 +242,7 @@ mod tests {
     fn script_calls_back_to_our_bus_name() {
         let source = script_source(":1.42");
         assert!(source.contains("callDBus(\":1.42\", \"/com/martinambrus/clipmonger/KWin\""));
-        assert!(source.contains("workspace.windowActivated.connect(report)"));
+        assert!(source.contains("(workspace.windowActivated || workspace.clientActivated)"));
+        assert!(source.contains("workspace.activeWindow || workspace.activeClient"));
     }
 }

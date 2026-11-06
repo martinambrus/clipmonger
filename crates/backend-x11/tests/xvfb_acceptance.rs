@@ -180,12 +180,29 @@ impl Xvfb {
     }
 }
 
+/// Remove the lock file and socket a killed Xvfb leaves behind (SIGKILL
+/// gives it no chance to). Only when the lock still names our process:
+/// left in place they make later runs find no free display and skip.
+fn remove_display_files(display_no: u32, pid: u32) {
+    let lock = format!("/tmp/.X{display_no}-lock");
+    let ours = std::fs::read_to_string(&lock)
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        == Some(pid);
+    if ours {
+        let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{display_no}"));
+        let _ = std::fs::remove_file(lock);
+    }
+}
+
 impl Drop for Xvfb {
     fn drop(&mut self) {
+        let pid = self.child.id();
         // A gracefully stopped child has already been reaped; do not signal a
         // PID that could now belong to a different process.
         match self.child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
+            Ok(Some(_)) => return remove_display_files(self.display_no, pid),
+            Err(_) => return,
             Ok(None) => {}
         }
         let _ = self.child.kill();
@@ -193,7 +210,8 @@ impl Drop for Xvfb {
         while Instant::now() < deadline {
             match self.child.try_wait() {
                 Ok(None) => thread::sleep(Duration::from_millis(50)),
-                Ok(Some(_)) | Err(_) => return,
+                Ok(Some(_)) => return remove_display_files(self.display_no, pid),
+                Err(_) => return,
             }
         }
         eprintln!(
@@ -1195,7 +1213,7 @@ fn t505_incr_send_as_owner() {
     png.extend((0..(1200 * 1024)).map(|i: u32| (i % 251) as u8));
     let owner = X11Transfer::connect(Some(display.as_str())).expect("owner connect");
     owner
-        .write(&vec![("image/png".to_string(), png.clone())])
+        .write(&[("image/png".to_string(), png.clone())])
         .expect("owner write");
     let reader = X11Transfer::connect(Some(display.as_str())).expect("reader connect");
     let read = reader
@@ -2566,7 +2584,9 @@ fn t503_session_autostart() {
         autostart.is_enabled().expect("is_enabled"),
         "enabled must read back true"
     );
-    let desktop = root.join("autostart").join("clipmonger.desktop");
+    let desktop = root
+        .join("autostart")
+        .join(clipmonger_backend_x11::autostart::AUTOSTART_FILE);
     assert!(desktop.is_file(), "enable must write {}", desktop.display());
     let body = std::fs::read_to_string(&desktop).expect("read desktop entry");
     assert!(
@@ -2591,7 +2611,7 @@ fn t503_session_autostart() {
     assert!(
         !portable_root
             .join("autostart")
-            .join("clipmonger.desktop")
+            .join(clipmonger_backend_x11::autostart::AUTOSTART_FILE)
             .exists(),
         "portable mode must not write a desktop entry"
     );

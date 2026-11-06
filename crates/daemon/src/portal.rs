@@ -168,6 +168,8 @@ fn extension_holds(
             })
 }
 
+// One event loop: binding, activation, release and session-loss handling.
+#[allow(clippy::too_many_lines)]
 #[cfg(all(unix, feature = "backend-wayland"))]
 async fn run_session(state: Arc<crate::DaemonState>) {
     use ashpd::desktop::global_shortcuts::GlobalShortcuts;
@@ -192,12 +194,15 @@ async fn run_session(state: Arc<crate::DaemonState>) {
             return;
         }
     };
-    let (Ok(mut activated), Ok(mut deactivated)) = (
-        shortcuts.receive_activated().await,
-        shortcuts.receive_deactivated().await,
-    ) else {
+    let Ok(mut signals) = crate::portal_raw::shortcut_signals(shortcuts.connection()).await else {
         note_failed(&state, "portal activation signal unavailable");
         return;
+    };
+    // The portal may close our session or restart (desktop crash, new
+    // login while the daemon lives on): drop the binding so it is redone.
+    let mut lost = match crate::portal_raw::lost_events(shortcuts.connection()).await {
+        Ok(lost) => lost,
+        Err(_) => Box::pin(futures_util::stream::pending()),
     };
     let gnome = std::env::var("XDG_CURRENT_DESKTOP")
         .is_ok_and(|desktop| desktop.split(':').any(|d| d.eq_ignore_ascii_case("gnome")));
@@ -224,7 +229,7 @@ async fn run_session(state: Arc<crate::DaemonState>) {
         let step = portal_step(&wanted, holds, bound.as_deref(), refused.as_deref());
         if step != PortalStep::Idle {
             if let Some(old) = session.take() {
-                let _ = ashpd::desktop::Session::close(&old).await;
+                crate::portal_raw::close_session(shortcuts.connection(), &old).await;
             }
             bound = None;
         }
@@ -249,22 +254,27 @@ async fn run_session(state: Arc<crate::DaemonState>) {
         }
         let poll = pending.as_ref().map_or(PORTAL_POLL, |_| PENDING_POLL);
         tokio::select! {
-            signal = futures_util::StreamExt::next(&mut activated) => {
+            signal = futures_util::StreamExt::next(&mut signals) => {
                 let Some(signal) = signal else {
                     note_failed(&state, "portal activation signal ended");
                     return;
                 };
-                on_activated(&state, bound.as_deref(), &mut pending, &signal);
-            }
-            signal = futures_util::StreamExt::next(&mut deactivated) => {
-                let Some(signal) = signal else {
-                    note_failed(&state, "portal activation signal ended");
-                    return;
-                };
-                if pending.as_ref().is_some_and(|(b, _)| b.id == signal.shortcut_id()) {
+                if session.as_ref() != Some(&signal.session) {
+                    continue;
+                }
+                if !signal.released {
+                    on_activated(&state, bound.as_deref(), &mut pending, &signal);
+                } else if pending.as_ref().is_some_and(|(b, _)| b.id == signal.id) {
                     if let Some((binding, _)) = pending.take() {
                         fire_permanent(&state, &binding);
                     }
+                }
+            }
+            event = futures_util::StreamExt::next(&mut lost) => {
+                if event.is_some_and(|event| event.ends(session.as_ref())) {
+                    session = None;
+                    bound = None;
+                    refused = None;
                 }
             }
             () = tokio::time::sleep(poll) => {}
@@ -279,15 +289,15 @@ fn on_activated(
     state: &crate::DaemonState,
     bound: Option<&[Binding]>,
     pending: &mut Option<(Binding, std::time::Instant)>,
-    signal: &ashpd::desktop::global_shortcuts::Activated,
+    signal: &crate::portal_raw::ShortcutSignal,
 ) {
-    let Some(binding) = bound.and_then(|set| set.iter().find(|b| b.id == signal.shortcut_id()))
+    let Some(binding) = bound.and_then(|set| set.iter().find(|b| b.id == signal.id))
     else {
         return;
     };
     match binding.action {
         Action::Popup => {
-            let activation_token = shortcut_activation_token(signal.options());
+            let activation_token = shortcut_activation_token(&signal.options);
             state.trigger_popup_activation(clipmonger_platform::types::HotkeyActivation {
                 x11_time: None,
                 activation_token,
@@ -320,19 +330,24 @@ fn fire_permanent(state: &Arc<crate::DaemonState>, binding: &Binding) {
 
 /// Bind `set` in a new portal session (the desktop may ask the user).
 /// Publishes the portal hotkey result; `None` when the session or the bind
-/// failed (the session is closed again).
+/// failed (the session is closed again). The shortcuts go in both
+/// `CreateSession` and `BindShortcuts` ([`crate::portal_raw`]).
 #[cfg(all(unix, feature = "backend-wayland"))]
 async fn bind_set(
     shortcuts: &ashpd::desktop::global_shortcuts::GlobalShortcuts,
     state: &crate::DaemonState,
     set: &[Binding],
-) -> Option<ashpd::desktop::Session<ashpd::desktop::global_shortcuts::GlobalShortcuts>> {
-    use ashpd::desktop::global_shortcuts::{BindShortcutsOptions, NewShortcut};
+) -> Option<ashpd::zvariant::OwnedObjectPath> {
     use clipmonger_backend_wayland::portal::xdg_trigger;
 
-    // ashpd's CreateSessionOptions type is private; Default is the only spelling.
-    #[allow(clippy::default_trait_access)]
-    let session = match shortcuts.create_session(Default::default()).await {
+    let conn = shortcuts.connection();
+    let triggers: Vec<String> = set.iter().map(|b| xdg_trigger(&b.chord)).collect();
+    let specs: Vec<crate::portal_raw::Spec<'_>> = set
+        .iter()
+        .zip(&triggers)
+        .map(|(b, trigger)| (b.id.as_str(), b.label.as_str(), trigger.as_str()))
+        .collect();
+    let session = match crate::portal_raw::create_session(conn, &specs).await {
         Ok(session) => session,
         Err(e) => {
             note_failed(
@@ -342,22 +357,11 @@ async fn bind_set(
             return None;
         }
     };
-    let triggers: Vec<String> = set.iter().map(|b| xdg_trigger(&b.chord)).collect();
-    let requests: Vec<NewShortcut> = set
-        .iter()
-        .zip(&triggers)
-        .map(|(binding, trigger)| {
-            NewShortcut::new(binding.id.clone(), binding.label.as_str())
-                .preferred_trigger(Some(trigger.as_str()))
-        })
-        .collect();
     state.set_portal_bind_pending(true);
-    let outcome = shortcuts
-        .bind_shortcuts(&session, &requests, None, BindShortcutsOptions::default())
-        .await;
+    let outcome = crate::portal_raw::bind_shortcuts(conn, &session, &specs).await;
     state.set_portal_bind_pending(false);
     if let Err(e) = outcome {
-        let _ = ashpd::desktop::Session::close(&session).await;
+        crate::portal_raw::close_session(conn, &session).await;
         note_failed(
             state,
             &format!("portal bind failed, use compositor-native recipes: {e}"),

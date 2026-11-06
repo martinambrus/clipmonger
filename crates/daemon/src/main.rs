@@ -59,6 +59,38 @@ fn x11_hotkeys_wanted() -> bool {
     }
 }
 
+/// Stop the daemon once the session's display server closes: Wayland when
+/// the session is Wayland, else X11. Without a reachable display (headless,
+/// tests without one) nothing is watched.
+#[cfg(unix)]
+fn watch_session_end(
+    stop: Arc<tokio::sync::Notify>,
+    backend_shutdown: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let x11 = std::env::var_os("DISPLAY").is_some();
+    if !wayland && !x11 {
+        return;
+    }
+    std::thread::spawn(move || {
+        #[allow(unused_mut)]
+        let mut closed: Option<bool> = None;
+        #[cfg(feature = "backend-wayland")]
+        if wayland {
+            closed = Some(clipmonger_backend_wayland::wait_compositor_closed().is_ok());
+        }
+        #[cfg(feature = "backend-x11")]
+        if closed.is_none() && x11 {
+            closed = Some(clipmonger_backend_x11::wait_display_closed(None).is_ok());
+        }
+        if closed == Some(true) {
+            eprintln!("daemon: the graphical session ended; stopping");
+            backend_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            stop.notify_one();
+        }
+    });
+}
+
 /// The popup UI binary next to this daemon.
 fn sibling_ui_exe() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
@@ -1101,6 +1133,11 @@ async fn async_main(args: Vec<String>) {
     let stop: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
     let stop_handler = Arc::clone(&stop);
     let backend_stop = Arc::clone(&backend_shutdown);
+    // Stop with the graphical session this daemon started in: a daemon
+    // left running after a logout keeps the old session's display,
+    // portal and environment, and the next UI would attach to it.
+    #[cfg(unix)]
+    watch_session_end(Arc::clone(&stop), Arc::clone(&backend_shutdown));
     let handler_state = Arc::clone(&state);
     let handler: clipmonger_ipc::server::Handler = Arc::new(move |method, params| {
         if method == "daemon.stop" {

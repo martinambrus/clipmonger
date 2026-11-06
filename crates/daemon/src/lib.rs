@@ -146,6 +146,8 @@ mod notify;
 pub mod popup;
 #[cfg(all(unix, feature = "backend-wayland"))]
 pub mod portal;
+#[cfg(all(unix, feature = "backend-wayland"))]
+mod portal_raw;
 
 /// Daemon crate version reported by `status`.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -40,6 +40,23 @@ pub use paste::X11Paste;
 #[cfg(unix)]
 pub use transfer::X11Transfer;
 
+/// Block until the X server for `display` (`None` = `$DISPLAY`) closes our
+/// connection, as it does when the session ends. The daemon uses this to
+/// stop with the session it started in.
+///
+/// # Errors
+///
+/// [`clipmonger_platform::types::Error::Unavailable`] when the display
+/// cannot be reached at all.
+#[cfg(unix)]
+pub fn wait_display_closed(display: Option<&str>) -> clipmonger_platform::types::Result<()> {
+    use x11rb14::connection::Connection as _;
+    let (conn, _) = session::connect(display)?;
+    // No events are selected, so this only returns once the server goes.
+    while conn.wait_for_event().is_ok() {}
+    Ok(())
+}
+
 /// Capability probe for `display` (`None` = `$DISPLAY`): the `XTest`
 /// extension decides whether paste is `Full` or `Degraded`.
 ///
