@@ -324,17 +324,44 @@ with a libwayland "not a valid new object id ... data_offer" protocol error afte
 clipboard changes, taking the UI down (egui-winit now uses arboard only, through
 XWayland). GNOME 47-49 and 51 are not covered by this run.
 
+## Linux acceptance on KDE Plasma 6.8 Wayland (2026-11-06)
+
+Run in the `cm-fedora45-kde` VM (Fedora 45, KDE Plasma 6.8.2, KWin Wayland;
+Plasma 6.8 has no X11 session) with the same harness as GNOME 50; the user
+answered the KDE dialogs, started the root app and checked each fix.
+
+| Test | Result |
+| --- | --- |
+| Capture without an extension (ext-data-control): text from Wayland and X11 apps, images, a 3.2 MB image | Pass |
+| Popup hotkey through the GlobalShortcuts portal | Pass after registering the app id `com.martinambrus.clipmonger` and sending XDG trigger names (6af0607) |
+| Auto-paste from the popup (KWin fake input): KWrite, Konsole (Ctrl+Shift+V), an image and a 3.2 MB image into LibreOffice Writer | Pass (6af0607) |
+| Permanent-clip hotkeys, including chord edits (KDE asks once per new chord) | Pass after binding them in the portal session and waiting for released modifiers (c20444c) |
+| No duplicate row after a paste | Pass after writing exactly the registered formats (c20444c) |
+| Password hint, then Klipper re-offers the text without it | Pass, nothing stored |
+| Klipper refill after the copying app quits | Pass, ignored (6af0607) |
+| Tray menu, applications-menu entry, autostart at login (UI starts, then a fresh daemon in the session) | Pass |
+| Root app (GTK window run with `sudo -E`): popup paste and permanent hotkey | Pass; KWrite and Kate refuse to run as root |
+
+Known limits: KWin places the popup itself (centre of the screen, not at the
+pointer). KWin 6.8 did not ask before granting fake input; the daemon's hidden
+`.desktop` entry declares it in case a later KWin does. The X11 hotkey thread is
+off on KWin Wayland, because KWin forwards modifier chords to X11 clients and the
+X11 route then hit KWin's "control input devices" prompt.
+
 ## Other release gates: do not silently waive
 
 - Linux desktop acceptance: GNOME 46 on Xorg and Wayland passed on 2026-11-05
   (T-508 GNOME rows, T-607 GNOME rows, T-702, T-703, T-705; see
   [Linux acceptance](#linux-acceptance-on-gnome-46-2026-11-05)). Still open:
-  [T-508](../tests/manual/T-508-x11-real-de.md) on KDE and Xfce,
+  [T-508](../tests/manual/T-508-x11-real-de.md) on KDE X11 (Plasma 5.27,
+  e.g. Kubuntu 24.04) and Xfce,
   [T-606](../tests/manual/T-606-wayland-compositor-matrix.md),
-  [T-607](../tests/manual/T-607-paste-spike-acceptance.md) on KDE/wlroots,
+  [T-607](../tests/manual/T-607-paste-spike-acceptance.md) on wlroots (KDE
+  Plasma 6.8 Wayland passed, see
+  [KDE](#linux-acceptance-on-kde-plasma-68-wayland-2026-11-06)),
   T-704 for GNOME 47-49 and 51 (46 and 50 passed, see
-  [GNOME 50](#linux-acceptance-on-gnome-50-2026-11-06)) and the portal rebind
-  (ADR-004 item 2). X11 permanent
+  [GNOME 50](#linux-acceptance-on-gnome-50-2026-11-06)). The portal rebind
+  (ADR-004 item 2) passed on KDE. X11 permanent
   hotkeys now honor `popup.restore_clipboard` (8de631a, verified on Xorg).
 - Linux release licensing for the scanner-generated blur protocol bindings (winit
   through wayland-protocols-plasma 0.3.12, from KDE's LGPL-2.1-or-later
