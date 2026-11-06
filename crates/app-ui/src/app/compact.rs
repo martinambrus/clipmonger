@@ -39,7 +39,7 @@ impl Compact {
             done: false,
             error: false,
             error_code: None,
-            uri_search_incomplete: true,
+            uri_search_incomplete: false,
         }
     }
     fn cancel(&self, cursor: String, query: String, generation: u64) -> Option<UiCmd> {

@@ -3503,7 +3503,9 @@ impl DaemonState {
                 done: chunk.done,
                 bytes_read: chunk.bytes_read,
                 candidates: chunk.candidates,
-                uri_search_incomplete: chunk.uri_search_incomplete || store.uri_search_incomplete(),
+                // Only a failed sweep is reported: a sweep that is still
+                // catching up with new clips (a few seconds) is not news.
+                uri_search_incomplete: store.uri_search_failed(),
             };
             serde_json::to_value(result)
                 .map_err(|_| IpcError::new("backend", "compact serialization failed".into()))

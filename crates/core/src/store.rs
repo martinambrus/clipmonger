@@ -288,6 +288,8 @@ pub struct Store {
     compact_snapshots: Mutex<compact_registry::Registry>,
     uri_epoch: AtomicU64,
     uri_incomplete: std::sync::atomic::AtomicBool,
+    /// The last full sweep could not index some clip ([`Store::uri_search_failed`]).
+    uri_failed: std::sync::atomic::AtomicBool,
     uri_maintenance: Mutex<UriMaintenance>,
 }
 
@@ -1752,6 +1754,7 @@ impl Store {
             compact_snapshots: Mutex::new(compact_registry::Registry::default()),
             uri_epoch: AtomicU64::new(0),
             uri_incomplete: std::sync::atomic::AtomicBool::new(true),
+            uri_failed: std::sync::atomic::AtomicBool::new(false),
             uri_maintenance: Mutex::new(UriMaintenance::default()),
         })
     }
@@ -1806,6 +1809,7 @@ impl Store {
             compact_snapshots,
             uri_epoch,
             uri_incomplete,
+            uri_failed,
             uri_maintenance,
         } = self;
         let connection = conn
@@ -1822,6 +1826,7 @@ impl Store {
                     compact_snapshots,
                     uri_epoch,
                     uri_incomplete,
+                    uri_failed,
                     uri_maintenance,
                 },
                 db_err(&error),
@@ -2292,6 +2297,14 @@ impl Store {
         self.uri_incomplete.load(Ordering::SeqCst)
     }
 
+    /// Whether the last full sweep of the file-name index left a clip
+    /// unindexed (unreadable or malformed `text/uri-list`). Unlike
+    /// [`Self::uri_search_incomplete`] this stays false while the sweep is
+    /// only catching up with new clips, so it is what users are told about.
+    pub fn uri_search_failed(&self) -> bool {
+        self.uri_failed.load(Ordering::SeqCst)
+    }
+
     /// Perform one bounded attempt and retain a fair sweep cursor per store.
     ///
     /// # Errors
@@ -2323,6 +2336,7 @@ impl Store {
                 let epoch = self.uri_epoch.load(Ordering::SeqCst);
                 self.uri_incomplete
                     .store(state.failed || state.epoch != epoch, Ordering::SeqCst);
+                self.uri_failed.store(state.failed, Ordering::SeqCst);
                 state.after = None;
                 state.failed = false;
                 state.epoch = epoch;
@@ -4386,6 +4400,39 @@ mod tests {
             .unwrap()
             .iter()
             .all(|c| c.id != id));
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn uri_search_failed_only_after_a_sweep_that_could_not_index() {
+        let profile = unique_dir("uri-failed");
+        let store = Store::open(&profile).unwrap();
+        store
+            .insert_metadata_capture(&sample_clip(Uuid::now_v7(), "", "plain", 1))
+            .unwrap();
+        assert!(store.uri_search_incomplete(), "new clip: sweep pending");
+        assert!(!store.uri_search_failed(), "pending is not a failure");
+        for _ in 0..4 {
+            store.maintain_uri_search().unwrap();
+        }
+        assert!(!store.uri_search_incomplete());
+        assert!(!store.uri_search_failed());
+        let broken = Uuid::now_v7();
+        store
+            .insert_metadata_capture(&sample_clip(broken, "", "broken", 2))
+            .unwrap();
+        store
+            .lock()
+            .execute(
+                "INSERT INTO clip_payloads(clip_id,mime,data) VALUES(?1,'text/uri-list',NULL)",
+                [broken.to_string()],
+            )
+            .unwrap();
+        for _ in 0..8 {
+            store.maintain_uri_search().unwrap();
+        }
+        assert!(store.uri_search_incomplete());
+        assert!(store.uri_search_failed(), "an unindexable clip is reported");
         let _ = std::fs::remove_dir_all(profile);
     }
 
