@@ -812,7 +812,17 @@ pub(crate) fn serve_selection_request(
         let _ = send_selection_notify(conn, req.requestor, req.selection, req.target, req.property);
         return;
     }
-    // INCR send: announce, then feed chunks as the requestor deletes.
+    // INCR send: announce, then feed chunks as the requestor deletes. The
+    // deletes are PropertyNotify events on the requestor's window, which
+    // reach us only once we select them there; without this the send
+    // stalls after the announcement.
+    let _ = xproto::change_window_attributes(
+        conn,
+        req.requestor,
+        &xproto::ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+    )
+    .ok()
+    .and_then(|cookie| cookie.check().ok());
     let total = u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_ne_bytes();
     let chunks: Vec<Vec<u8>> = bytes
         .chunks(max_request_bytes(conn).max(1024))

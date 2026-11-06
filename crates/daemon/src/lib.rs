@@ -1011,6 +1011,8 @@ fn format_bytes(bytes: u64) -> String {
 
 // Bound metadata before cloning any producer-controlled names or vectors.
 const MAX_CAPTURE_FORMATS: usize = 32;
+/// Sanity cap on the formats an owner advertises, before filtering.
+const MAX_CAPTURE_OFFERS: usize = 256;
 const MAX_CAPTURE_MIME_BYTES: usize = 128;
 
 fn valid_capture_mime(mime: &str) -> bool {
@@ -1289,8 +1291,11 @@ const KLIPPER_REFILL_MIME: &str = "application/x-kde-onlyReplaceEmpty";
 
 /// Klipper refilling an empty clipboard with an older item: not a new copy.
 /// Capturing it would move that item back to the top of the history.
+/// On X11 the marker arrives as an unknown target, `x-os/`-prefixed.
 fn klipper_refill(event: &clipmonger_platform::types::CaptureEvent) -> bool {
-    event.offers.iter().any(|offer| offer.mime == KLIPPER_REFILL_MIME)
+    event.offers.iter().any(|offer| {
+        offer.mime.strip_prefix("x-os/").unwrap_or(&offer.mime) == KLIPPER_REFILL_MIME
+    })
 }
 
 fn strict_capture_requires_skip(
@@ -2156,6 +2161,8 @@ pub struct DaemonState {
     last_stub: Mutex<Option<StubSeen>>,
     /// SHA-256 of the text of the last sensitive copy (never stored).
     sensitive_text: Mutex<Option<String>>,
+    /// Whether the last capture read its payload ([`klipper_refill`]).
+    last_capture_read: std::sync::atomic::AtomicBool,
     /// Active window as reported by the `KWin` script ([`kwin`]).
     #[cfg(all(unix, feature = "backend-wayland"))]
     kwin_focus: Mutex<crate::kwin::Focus>,
@@ -2428,6 +2435,7 @@ impl DaemonState {
             merger: Mutex::new(clipmonger_backend_wayland::merge::Merger::new(2000)),
             last_stub: Mutex::new(None),
             sensitive_text: Mutex::new(None),
+            last_capture_read: std::sync::atomic::AtomicBool::new(true),
             #[cfg(all(unix, feature = "backend-wayland"))]
             kwin_focus: Mutex::new(crate::kwin::Focus::default()),
             thumbnail: crate::thumbnail::ThumbnailService::new_for_daemon(),
@@ -2999,6 +3007,17 @@ impl DaemonState {
     }
 
     /// Whether `payloads` carry the text of the last sensitive copy.
+    /// A Klipper refill is skipped once the copy it replaces was read; if
+    /// that read failed (the app quit at once), the refill is the copy.
+    fn refill_of_read_copy(&self, event: &clipmonger_platform::types::CaptureEvent) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        if klipper_refill(event) && self.last_capture_read.load(SeqCst) {
+            return true;
+        }
+        self.last_capture_read.store(true, SeqCst);
+        false
+    }
+
     /// One window activation reported by the `KWin` script.
     #[cfg(all(unix, feature = "backend-wayland"))]
     pub(crate) fn kwin_activated(&self, ids: Vec<String>) {
@@ -3150,7 +3169,7 @@ impl DaemonState {
         if let Some(skipped) = self.mirror_or_sensitive(origin, event.sensitive) {
             return skipped;
         }
-        if klipper_refill(event) {
+        if self.refill_of_read_copy(event) {
             return Ok(false);
         }
         let cfg = self
@@ -3164,13 +3183,21 @@ impl DaemonState {
         if strict_capture_requires_skip(event, &cfg) {
             return self.record_capture_privacy_skip();
         }
-        if event.offers.len() > MAX_CAPTURE_FORMATS {
+        // Qt offers an image in some 35 formats; only the wanted ones count
+        // against MAX_CAPTURE_FORMATS, the raw list only against a sanity cap.
+        if event.offers.len() > MAX_CAPTURE_OFFERS {
             return Err(IpcError::new(
                 "backend",
                 "too many capture formats".to_string(),
             ));
         }
         let wanted = wanted_offers(event, &cfg);
+        if wanted.len() > MAX_CAPTURE_FORMATS {
+            return Err(IpcError::new(
+                "backend",
+                "too many capture formats".to_string(),
+            ));
+        }
         let known_oversize: Vec<_> = wanted
             .iter()
             .filter(|entry| {
@@ -3228,9 +3255,11 @@ impl DaemonState {
                 }
             }
         }
-        if nothing_plausible(origin, &mut payloads)
-            || short_windows_capture(origin, cfg.monitor.min_len, &payloads)
-        {
+        let implausible = nothing_plausible(origin, &mut payloads);
+        if implausible || payloads.is_empty() {
+            self.last_capture_read.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        if implausible || short_windows_capture(origin, cfg.monitor.min_len, &payloads) {
             return Ok(false);
         }
         if !read_failed && self.suppress_capture(origin, event, &payloads) {
@@ -5580,6 +5609,39 @@ mod tests {
     }
 
     #[test]
+    fn many_advertised_formats_still_capture_the_wanted_ones() {
+        use clipmonger_platform::fakes::FakeTransfer;
+        use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
+        let (_dir, state) = fresh_state("qt-image-offers");
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[0; 32]);
+        let mut offers: Vec<FormatOffer> = (0..36)
+            .map(|i| FormatOffer {
+                mime: format!("x-os/image/variant{i}"),
+                bytes_hint: None,
+            })
+            .collect();
+        offers.push(FormatOffer {
+            mime: "image/png".into(),
+            bytes_hint: None,
+        });
+        let transfer = FakeTransfer::new(
+            vec!["image/png".into()],
+            vec![("image/png".to_string(), png)].into_iter().collect(),
+            None,
+        );
+        let event = CaptureEvent {
+            native_sequence: None,
+            offers,
+            origin: CaptureOrigin::Clipboard,
+            sensitive: false,
+        };
+        assert!(state
+            .capture_event("x11", &event, &transfer, |_| {})
+            .unwrap());
+    }
+
+    #[test]
     fn klipper_refill_is_not_captured() {
         use clipmonger_platform::fakes::FakeTransfer;
         use clipmonger_platform::types::{CaptureEvent, CaptureOrigin, FormatOffer};
@@ -5609,6 +5671,40 @@ mod tests {
         };
         assert!(state
             .capture_event("wayland", &copy, &transfer, |_| {})
+            .unwrap());
+        let x11_refill = CaptureEvent {
+            offers: vec![
+                offer("text/plain"),
+                offer("x-os/application/x-kde-onlyReplaceEmpty"),
+            ],
+            ..copy
+        };
+        assert!(super::klipper_refill(&x11_refill), "X11 spelling of the marker");
+        // The copy before the refill could not be read (its app quit at
+        // once): the refill is then the only copy, and it is stored.
+        let unreadable = FakeTransfer::new(
+            vec!["image/png".into()],
+            vec![("image/png".to_string(), b"cut short".to_vec())]
+                .into_iter()
+                .collect(),
+            None,
+        );
+        let lost = CaptureEvent {
+            offers: vec![offer("image/png")],
+            ..refill.clone()
+        };
+        assert!(!state
+            .capture_event("x11", &lost, &unreadable, |_| {})
+            .unwrap());
+        let screenshot = FakeTransfer::new(
+            vec!["text/plain".into(), "application/x-kde-onlyReplaceEmpty".into()],
+            vec![("text/plain".to_string(), b"only via klipper".to_vec())]
+                .into_iter()
+                .collect(),
+            None,
+        );
+        assert!(state
+            .capture_event("wayland", &refill, &screenshot, |_| {})
             .unwrap());
     }
 

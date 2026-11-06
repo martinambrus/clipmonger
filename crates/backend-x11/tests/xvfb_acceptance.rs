@@ -1181,6 +1181,31 @@ fn t505_capture_and_readback() {
 }
 
 // ---------------------------------------------------------------------------
+// t505: we own the clipboard and serve a payload larger than one request
+// (INCR send); another client reads it back
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t505_incr_send_as_owner() {
+    let Some((_guard, xvfb)) = fixture("t505_incr_send_as_owner") else {
+        return;
+    };
+    let display = xvfb.addr().to_string();
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend((0..(1200 * 1024)).map(|i: u32| (i % 251) as u8));
+    let owner = X11Transfer::connect(Some(display.as_str())).expect("owner connect");
+    owner
+        .write(&vec![("image/png".to_string(), png.clone())])
+        .expect("owner write");
+    let reader = X11Transfer::connect(Some(display.as_str())).expect("reader connect");
+    let read = reader
+        .read("image/png", 64 << 20)
+        .expect("INCR read of our own large selection");
+    assert_eq!(read.len(), png.len(), "whole payload must arrive");
+    assert_eq!(read, png, "bytes must match");
+}
+
+// ---------------------------------------------------------------------------
 // t505 SAVE_TARGETS: dying owner asks the backend-as-manager to persist
 // ---------------------------------------------------------------------------
 
