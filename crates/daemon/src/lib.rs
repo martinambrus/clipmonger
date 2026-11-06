@@ -1054,6 +1054,18 @@ fn nothing_plausible(origin: &str, payloads: &mut Vec<(String, Vec<u8>)>) -> boo
     payloads.is_empty()
 }
 
+/// Largest sensitive text whose hash is kept.
+const SENSITIVE_TEXT_MAX: u64 = 1024 * 1024;
+
+/// Hash of a text payload with trailing NULs dropped, as it is stored.
+fn sensitive_text_hash(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |last| last + 1);
+    sha256_hex(&bytes[..end])
+}
+
 /// Whether captured `bytes` can be what `mime` says. A PNG must start
 /// with its signature: a broken X11 INCR read once stored the tail of an
 /// image as if it were the whole one.
@@ -2128,6 +2140,8 @@ pub struct DaemonState {
     merger: Mutex<clipmonger_backend_wayland::merge::Merger>,
     /// Origin, formats and time of the last stored stub ([`repeat_stub`]).
     last_stub: Mutex<Option<StubSeen>>,
+    /// SHA-256 of the text of the last sensitive copy (never stored).
+    sensitive_text: Mutex<Option<String>>,
     thumbnail: crate::thumbnail::ThumbnailService,
     #[cfg(test)]
     thumbnail_snapshot_hook: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
@@ -2396,6 +2410,7 @@ impl DaemonState {
             #[cfg(all(unix, feature = "backend-wayland"))]
             merger: Mutex::new(clipmonger_backend_wayland::merge::Merger::new(2000)),
             last_stub: Mutex::new(None),
+            sensitive_text: Mutex::new(None),
             thumbnail: crate::thumbnail::ThumbnailService::new_for_daemon(),
             #[cfg(test)]
             thumbnail_snapshot_hook: Mutex::new(None),
@@ -2947,6 +2962,36 @@ impl DaemonState {
         sensitive.then(|| self.record_capture_privacy_skip())
     }
 
+    /// Keep the hash of a sensitive copy's text (read once, never stored).
+    /// When the copying app quits, GNOME's clipboard manager offers the
+    /// same text again without the password hint; [`Self::sensitive_text_echo`]
+    /// recognises it.
+    fn remember_sensitive_text<T: clipmonger_platform::traits::ClipboardTransfer>(
+        &self,
+        transfer: &T,
+    ) {
+        let text = ["text/plain;charset=utf-8", "text/plain"]
+            .iter()
+            .find_map(|mime| transfer.read(mime, SENSITIVE_TEXT_MAX).ok())
+            .filter(|bytes| !bytes.is_empty());
+        if let Ok(mut slot) = self.sensitive_text.lock() {
+            *slot = text.map(|bytes| sensitive_text_hash(&bytes));
+        }
+    }
+
+    /// Whether `payloads` carry the text of the last sensitive copy.
+    fn sensitive_text_echo(&self, payloads: &[(String, Vec<u8>)]) -> bool {
+        let Ok(slot) = self.sensitive_text.lock() else {
+            return false;
+        };
+        slot.as_ref().is_some_and(|secret| {
+            payloads.iter().any(|(mime, bytes)| {
+                mime.split(';').next().map(str::trim) == Some("text/plain")
+                    && sensitive_text_hash(bytes) == *secret
+            })
+        })
+    }
+
     fn ingest_capture_checked(
         &self,
         origin: &str,
@@ -2958,6 +3003,9 @@ impl DaemonState {
         }
         let trimmed = trim_text_terminators(payloads);
         let payloads: &[(String, Vec<u8>)] = &trimmed;
+        if self.sensitive_text_echo(payloads) {
+            return Ok(false);
+        }
         let gate = self
             .profile_op
             .lock()
@@ -3069,6 +3117,9 @@ impl DaemonState {
         transfer: &T,
         mut log: impl FnMut(&str),
     ) -> Result<bool, IpcError> {
+        if event.sensitive && origin != "windows" && !self.xwayland_mirror(origin) {
+            self.remember_sensitive_text(transfer);
+        }
         if let Some(skipped) = self.mirror_or_sensitive(origin, event.sensitive) {
             return skipped;
         }
@@ -8286,6 +8337,23 @@ mod oversize_source_controls {
                 .len(),
             4
         );
+    }
+
+    #[test]
+    fn the_text_of_a_sensitive_copy_is_not_stored_when_offered_again() {
+        let (_path, state) = state();
+        *state.sensitive_text.lock().unwrap() = Some(sensitive_text_hash(b"hunter2\0"));
+        let text = |t: &[u8]| vec![("text/plain;charset=utf-8".to_string(), t.to_vec())];
+        assert!(state.sensitive_text_echo(&text(b"hunter2")));
+        assert!(!state
+            .ingest_capture_checked("gnome", false, &text(b"hunter2"))
+            .unwrap());
+        assert!(!state
+            .ingest_capture_checked("x11", false, &text(b"hunter2\0"))
+            .unwrap());
+        assert!(state
+            .ingest_capture_checked("x11", false, &text(b"ordinary"))
+            .unwrap());
     }
 
     #[test]
