@@ -295,6 +295,35 @@ the engine waits 200 ms after writing the clipboard, since GTK3 apps drop a past
 made while their owner-change TARGETS query is in flight. Known limit: GNOME
 reports no keybinding conflicts (a duplicate of a Shell shortcut takes it over).
 
+## Linux acceptance on GNOME 50 (2026-11-06)
+
+Automated run in the `cm-ubuntu-2604-gnome` VM (Ubuntu 26.04.1, GNOME Shell 50.1,
+Wayland): real key presses with `virsh send-key`, absolute pointer moves with QMP
+`input-send-event`, checks by screenshot, clipboard read-back and the store; the
+user started the root apps.
+
+| Test | Result |
+| --- | --- |
+| Extension loads (metadata lists 50) | Pass |
+| Popup hotkey, placement at the pointer, size fitted to the clips | Pass after the GNOME 50 session fix |
+| Capture: text, images, a 20000x40 image, a 1 MB image, an oversized stub | Pass, one row each |
+| Terminal paste (Ptyxis, Ctrl+Shift+V) | Pass |
+| Paste of a 1 MB image (chunked pull), no echo row | Pass, clipboard bytes equal the stored PNG |
+| Permanent-clip hotkey (Ctrl+Alt+2 into Ptyxis) | Pass after the GNOME 50 session fix |
+| Password hint, then the copying app quits | Pass after the fix: one skip, nothing stored |
+| Extension off/on: capture pauses, then resumes | Pass |
+| Root apps: paste into and copy from a root Wayland app; paste into a root X11 (XWayland) app | Pass; no privilege barrier like Windows UIPI. A `--standalone` root app has no app id, so app-id denylist entries do not match it |
+| UI under repeated clipboard changes and pastes | Pass after replacing smithay-clipboard |
+
+Found and fixed: GNOME 50 removed `Meta.is_wayland_compositor`, which silently
+disabled popup placement and the extension's permanent hotkeys; a copy with the
+password hint was stored once GNOME's clipboard manager re-offered its text
+without the hint after the copying app quit (now remembered by hash, in the
+extension and the daemon); the UI's Wayland clipboard (smithay-clipboard) died
+with a libwayland "not a valid new object id ... data_offer" protocol error after
+clipboard changes, taking the UI down (egui-winit now uses arboard only, through
+XWayland). GNOME 47-49 and 51 are not covered by this run.
+
 ## Other release gates: do not silently waive
 
 - Linux desktop acceptance: GNOME 46 on Xorg and Wayland passed on 2026-11-05
@@ -303,7 +332,9 @@ reports no keybinding conflicts (a duplicate of a Shell shortcut takes it over).
   [T-508](../tests/manual/T-508-x11-real-de.md) on KDE and Xfce,
   [T-606](../tests/manual/T-606-wayland-compositor-matrix.md),
   [T-607](../tests/manual/T-607-paste-spike-acceptance.md) on KDE/wlroots,
-  T-704 (GNOME 46-51) and the portal rebind (ADR-004 item 2). X11 permanent
+  T-704 for GNOME 47-49 and 51 (46 and 50 passed, see
+  [GNOME 50](#linux-acceptance-on-gnome-50-2026-11-06)) and the portal rebind
+  (ADR-004 item 2). X11 permanent
   hotkeys now honor `popup.restore_clipboard` (8de631a, verified on Xorg).
 - Linux release licensing for the scanner-generated blur protocol bindings (winit
   through wayland-protocols-plasma 0.3.12, from KDE's LGPL-2.1-or-later
