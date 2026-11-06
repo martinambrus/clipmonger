@@ -63,6 +63,12 @@ enum Cmd {
         #[arg(long)]
         hotkey: Option<String>,
     },
+    /// Delete a permanent clip by id (its hotkey is released).
+    #[command(name = "permanent-delete")]
+    PermanentDelete {
+        /// Permanent clip id.
+        id: String,
+    },
     /// Purge soft-deleted clips.
     #[command(name = "purge-removed")]
     PurgeRemoved,
@@ -178,6 +184,7 @@ fn main() -> ExitCode {
             },
             false,
         ),
+        Cmd::PermanentDelete { id } => ("permanent.delete", serde_json::json!({"id": id}), false),
         Cmd::PurgeRemoved => ("history.purge_removed", serde_json::json!({}), false),
         Cmd::Stop => ("daemon.stop", serde_json::json!({}), true),
     };

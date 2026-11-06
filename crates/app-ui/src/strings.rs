@@ -148,7 +148,7 @@ const ENTRIES: &[(&str, &str)] = &[
     ("perm.invalid_group", "Choose or name a group"),
     ("perm.invalid_body", "Enter the text to paste"),
     ("perm.hotkey_conflict", "That hotkey is already used by another permanent clip"),
-    ("perm.hotkey_note", "A clip's hotkey works as soon as the clip is saved (Windows and X11; not on Wayland)."),
+    ("perm.hotkey_note", "A clip's hotkey works as soon as the clip is saved. On Wayland it goes through the GNOME extension or the desktop's shortcut service, which may ask once to allow a new hotkey."),
     ("perm.immediate_note", "Permanent clips save immediately"),
     ("perm.empty_group", "No clips in this group yet"),
     ("perm.tab_history", "History"),
