@@ -21,7 +21,7 @@ pub(crate) const TRANSFER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Sleep backing a bounded poll only.
 const POLL_STEP: Duration = Duration::from_millis(5);
 /// Scratch property name for requestor conversions.
-const TMP_PROP: &[u8] = b"CLIPMONGER_TMP";
+pub(crate) const TMP_PROP: &[u8] = b"CLIPMONGER_TMP";
 
 /// Bounded FIFO that preserves monitor events consumed during a synchronous
 /// conversion so the outer pump can handle them exactly once, in order.
@@ -574,6 +574,12 @@ fn incr_receive(
                         max_bytes.saturating_sub(buf.len() as u64),
                     )?;
                     if chunk.is_empty() {
+                        // The end is a zero-length value the owner wrote; a
+                        // property that does not exist (type None) is a
+                        // stray notification, not the end of the data.
+                        if kind == u32::from(AtomEnum::NONE) {
+                            continue;
+                        }
                         return Ok((kind, buf));
                     }
                     if (buf.len() as u64) + (chunk.len() as u64) > max_bytes {

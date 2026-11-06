@@ -159,6 +159,23 @@ fn is_terminal(error: &Error) -> bool {
     matches!(error, Error::Unavailable(msg) if msg.contains("monitor disconnected"))
 }
 
+/// Read properties rotate through this many names.
+const PROP_POOL: u8 = 32;
+
+/// Name of read property `generation` (0 is the original property).
+fn property_name(generation: u8) -> String {
+    if generation == 0 {
+        String::from_utf8_lossy(session::TMP_PROP).into_owned()
+    } else {
+        format!("CLIPMONGER_TMP_{generation}")
+    }
+}
+
+/// Whether a failed read left the owner mid-transfer on our property.
+fn abandons_property<T>(result: &Result<T>) -> bool {
+    matches!(result, Err(Error::TooLarge(_) | Error::Timeout(_)))
+}
+
 fn conversion_result<T>(deferred: &session::DeferredQueue, result: Result<T>) -> Result<Option<T>> {
     deferred.check_terminal()?;
     match result {
@@ -192,6 +209,9 @@ struct Worker {
     debouncer: PrimaryDebouncer,
     primary_armed: bool,
     deferred: session::DeferredQueue,
+    /// Property our reads land in; replaced after an abandoned transfer.
+    prop: Atom,
+    prop_generation: u8,
 }
 
 fn run_worker(
@@ -230,6 +250,7 @@ fn run_worker(
     .and_then(|cookie| cookie.check().ok());
     let _ = conn.flush();
     let debounce_ms = opts.debounce_ms;
+    let prop = atoms.tmp_prop;
     let mut worker = Worker {
         conn,
         win,
@@ -243,6 +264,8 @@ fn run_worker(
         debouncer: PrimaryDebouncer::new(debounce_ms, PRIMARY_MIN_LEN),
         primary_armed: false,
         deferred: session::DeferredQueue::new(),
+        prop,
+        prop_generation: 0,
     };
     while !worker.stop.load(Ordering::Relaxed) {
         if worker.pump_events().is_err() {
@@ -260,6 +283,34 @@ fn run_worker(
 }
 
 impl Worker {
+    /// Classify a read like [`conversion_result`], first retiring the read
+    /// property when the transfer was abandoned (too large or timed out).
+    fn converted<T>(&mut self, result: Result<T>) -> Result<Option<T>> {
+        if abandons_property(&result) {
+            self.retire_property();
+        }
+        conversion_result(&self.deferred, result)
+    }
+
+    /// Move reads to a fresh property. The owner of an abandoned INCR
+    /// transfer still writes its next chunk into the old one, and a later
+    /// read that reused it took that chunk as its answer (a corrupt image
+    /// row after an oversized copy on GNOME Xorg).
+    fn retire_property(&mut self) {
+        self.prop_generation = self.prop_generation.wrapping_add(1) % PROP_POOL;
+        let name = property_name(self.prop_generation);
+        let fresh = xproto::intern_atom(&self.conn, false, name.as_bytes())
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| reply.atom);
+        if let Some(fresh) = fresh {
+            // A leftover from this name's previous turn must not leak in.
+            let _ = xproto::delete_property(&self.conn, self.win, fresh);
+            let _ = self.conn.flush();
+            self.prop = fresh;
+        }
+    }
+
     fn subscribed(&self) -> Vec<SubscribeKind> {
         self.shared
             .lock()
@@ -381,12 +432,12 @@ impl Worker {
             selection,
             self.atoms.targets,
             self.win,
-            self.atoms.tmp_prop,
+            self.prop,
             TRANSFER_TIMEOUT,
             &mut serve,
             &mut self.deferred,
         );
-        let Some(targets) = conversion_result(&self.deferred, result)? else {
+        let Some(targets) = self.converted(result)? else {
             return Ok(None);
         };
         let mut names = Vec::new();
@@ -479,14 +530,14 @@ impl Worker {
             self.atoms.primary,
             target,
             self.win,
-            self.atoms.tmp_prop,
+            self.prop,
             self.opts.max_bytes,
             TRANSFER_TIMEOUT,
             &mut serve,
             &mut self.deferred,
         )
         .map(|(_, value)| value);
-        let bytes = conversion_result(&self.deferred, bytes)?.unwrap_or_default();
+        let bytes = self.converted(bytes)?.unwrap_or_default();
         let at = now_ms();
         if self.debouncer.offer(bytes.len() as u64, at) {
             self.emit_primary()?;
@@ -559,13 +610,14 @@ impl Worker {
             self.atoms.clipboard,
             self.atoms.save_targets,
             self.win,
-            self.atoms.tmp_prop,
+            self.prop,
             64 << 10,
             TRANSFER_TIMEOUT,
             &mut serve,
             &mut self.deferred,
         );
-        let targets = conversion_result(&self.deferred, result)?
+        let targets = self
+            .converted(result)?
             .map(|(_, value)| value)
             .unwrap_or_default();
         if !targets.len().is_multiple_of(4) {
@@ -608,13 +660,13 @@ impl Worker {
                 self.atoms.clipboard,
                 atom,
                 self.win,
-                self.atoms.tmp_prop,
+                self.prop,
                 self.opts.max_bytes,
                 TRANSFER_TIMEOUT,
                 &mut serve,
                 &mut self.deferred,
             );
-            match conversion_result(&self.deferred, result)? {
+            match self.converted(result)? {
                 Some((_, bytes)) => {
                     if let Some(canonical) = mime::x11_to_canonical(name) {
                         saved.push((canonical, bytes));
@@ -909,6 +961,33 @@ mod lifecycle_tests {
         })
         .is_err());
         assert_eq!(polls, 2);
+    }
+
+    #[test]
+    fn abandoned_reads_rotate_through_a_bounded_property_pool() {
+        assert_eq!(property_name(0), "CLIPMONGER_TMP");
+        assert_eq!(property_name(7), "CLIPMONGER_TMP_7");
+        let mut generation = 0u8;
+        let mut names = std::collections::HashSet::new();
+        for _ in 0..PROP_POOL {
+            generation = generation.wrapping_add(1) % PROP_POOL;
+            names.insert(property_name(generation));
+        }
+        assert_eq!(
+            names.len(),
+            usize::from(PROP_POOL),
+            "every name used once per cycle"
+        );
+        assert_eq!(
+            generation, 0,
+            "the pool wraps back to the original property"
+        );
+        assert!(abandons_property::<()>(&Err(Error::TooLarge("cap".into()))));
+        assert!(abandons_property::<()>(&Err(Error::Timeout("slow".into()))));
+        assert!(!abandons_property::<()>(&Err(Error::Denied(
+            "refused".into()
+        ))));
+        assert!(!abandons_property(&Ok(())));
     }
 
     #[test]

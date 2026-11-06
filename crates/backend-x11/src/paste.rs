@@ -203,10 +203,21 @@ impl X11Paste {
         // a paste request made while its own query is still in flight.
         std::thread::sleep(Duration::from_millis(CHORD_SETTLE_MS));
         refocus_window(self.display.as_deref(), target_window(target));
-        send_paste_chord(
+        let chord = send_paste_chord(
             self.display.as_deref(),
             clipmonger_platform::paste_policy::paste_needs_shift(&[target.app.exe.as_str()]),
-        )?;
+        );
+        if let Err(error) = chord {
+            // Roll back: put the saved clipboard back while it is still ours.
+            if let Some(original) = saved.filter(|_| restore) {
+                let still_ours = self.transfer.unchanged_indicator() == written;
+                if still_ours {
+                    let payload = std::slice::from_ref(&original);
+                    let _ = write(payload, &mut || self.transfer.write(payload));
+                }
+            }
+            return Err(error);
+        }
         if !restore {
             return Ok(());
         }
@@ -374,24 +385,75 @@ fn send_paste_chord(display: Option<&str>, shift: bool) -> Result<()> {
         chord.push(code(XK_SHIFT_L)?);
     }
     chord.push(code(XK_V)?);
-    let fake = |kind: u8, keycode: u8| {
+    let sent = press_and_release(&chord, |press, keycode| {
+        let kind = if press {
+            xproto::KEY_PRESS_EVENT
+        } else {
+            xproto::KEY_RELEASE_EVENT
+        };
         conn.xtest_fake_input(kind, keycode, x11rb14::CURRENT_TIME, root, 0, 0, 0)
+            .map(drop)
             .map_err(|e| Error::Io(format!("synthetic key event failed: {e}")))
-    };
-    for &keycode in &chord {
-        fake(xproto::KEY_PRESS_EVENT, keycode)?;
+    });
+    let synced = conn
+        .sync()
+        .map_err(|e| Error::Io(format!("synthetic paste chord failed: {e}")));
+    sent.and(synced)
+}
+
+/// Press `keys` in order, then release them in reverse. Every key that was
+/// pressed is released even when a later event fails, so a failed chord
+/// never leaves Ctrl or Shift held down. Returns the first failure.
+fn press_and_release(keys: &[u8], mut send: impl FnMut(bool, u8) -> Result<()>) -> Result<()> {
+    let mut pressed = 0;
+    let mut outcome = Ok(());
+    for &keycode in keys {
+        match send(true, keycode) {
+            Ok(()) => pressed += 1,
+            Err(error) => {
+                outcome = Err(error);
+                break;
+            }
+        }
     }
-    for &keycode in chord.iter().rev() {
-        fake(xproto::KEY_RELEASE_EVENT, keycode)?;
+    for &keycode in keys[..pressed].iter().rev() {
+        let released = send(false, keycode);
+        if outcome.is_ok() {
+            outcome = released;
+        }
     }
-    conn.sync()
-        .map_err(|e| Error::Io(format!("synthetic paste chord failed: {e}")))?;
-    Ok(())
+    outcome
 }
 
 #[cfg(test)]
 mod chord_tests {
     use super::*;
+
+    #[test]
+    fn a_failed_chord_releases_every_pressed_key() {
+        let mut events = Vec::new();
+        let result = press_and_release(&[37, 50, 55], |press, keycode| {
+            events.push((press, keycode));
+            if press && keycode == 55 {
+                Err(Error::Io("v press failed".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            events,
+            [(true, 37), (true, 50), (true, 55), (false, 50), (false, 37)],
+            "Shift and Ctrl are released; the key that failed is not"
+        );
+        let mut events = Vec::new();
+        assert!(press_and_release(&[37, 55], |press, keycode| {
+            events.push((press, keycode));
+            Ok(())
+        })
+        .is_ok());
+        assert_eq!(events, [(true, 37), (true, 55), (false, 55), (false, 37)]);
+    }
 
     #[test]
     fn keycode_lookup_uses_the_base_keysym_of_each_keycode() {
