@@ -346,6 +346,34 @@ extension's virtual keyboard could not be created and every popup paste fell
 back to the "press Ctrl+V" notification (7133b1a; the fallback still serves
 GNOME 46, rechecked on the user's host).
 
+## Linux acceptance on GNOME 48 (2026-11-06)
+
+Run in the `cm-debian13-gnome` VM (Debian 13.7, GNOME Shell 48.7, Wayland,
+glibc 2.41) with the same harness and the HEAD build of b8b647c; the terminal was
+gnome-terminal (Debian 13 has no Ptyxis). The user is not in sudoers, so the root
+app ran through `su`; the user started it.
+
+| Test | Result |
+| --- | --- |
+| Extension loads (metadata lists 48), ACTIVE, `extension_connected` | Pass |
+| Capture: two texts, a 2.4 MB image (chunked), a 20000x40 image, 1 MB, 6.8 MB and 11.4 MB images, an 18.8 MB image as one "Too large" stub | Pass, one row each (one miss, see below) |
+| Popup hotkey, placement at the pointer, image thumbnail | Pass |
+| Auto-paste into gnome-terminal (filter, Enter) | Pass, exact bytes |
+| Permanent-clip hotkey with Ctrl+Alt still held | Pass, no stray bytes |
+| Password hint, then GNOME's clipboard manager re-offers the text | Pass, nothing stored |
+| Paste of the 2.4 MB image (chunked pull) | Pass, clipboard bytes equal the stored blob (SHA-256) |
+| Extension off/on: capture pauses, then resumes | Pass; on re-enable the first poll stores the text still on the clipboard |
+| 30 rapid copies, then 5 popup pastes | Pass, 30 rows, pastes in order, UI and daemon stay up |
+| Root app (GTK window via `su`): popup paste, permanent hotkey, copy out of it | Pass |
+| Daemon and UI stop at logout | Pass |
+
+Open, not reproduced: in the first multi-image run, a 1 MB image copied 8 s
+after the 20000x40 image produced no extension capture report and no row. The
+same sequence repeated three times, and alone, captured every image; 6.8 MB and
+11.4 MB images were read within the extension's 1.5 s read timeout, so that
+timeout is not the obvious cause. The CLI has no command to delete a permanent
+clip.
+
 ## Linux acceptance on KDE Plasma 6.8 Wayland (2026-11-06)
 
 Run in the `cm-fedora45-kde` VM (Fedora 45, KDE Plasma 6.8.2, KWin Wayland;
@@ -409,7 +437,8 @@ X11 test skip silently.
   [T-607](../tests/manual/T-607-paste-spike-acceptance.md) on wlroots (KDE
   Plasma 6.8 Wayland passed, see
   [KDE](#linux-acceptance-on-kde-plasma-68-wayland-2026-11-06)),
-  T-704 for GNOME 47-49 (46, 50 and 51 passed, see
+  T-704 for GNOME 47 and 49 (46, 48, 50 and 51 passed, see
+  [GNOME 48](#linux-acceptance-on-gnome-48-2026-11-06),
   [GNOME 50](#linux-acceptance-on-gnome-50-2026-11-06) and
   [GNOME 51](#linux-acceptance-on-gnome-51-2026-11-06)). The portal rebind
   (ADR-004 item 2) passed on KDE. X11 permanent
