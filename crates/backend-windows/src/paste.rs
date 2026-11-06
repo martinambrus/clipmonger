@@ -217,6 +217,13 @@ pub fn worker_send_input_batch(payload: &str) -> std::result::Result<(), String>
 pub fn worker_press_paste_chord() -> std::result::Result<(), String> {
     #[cfg(windows)]
     {
+        // A per-clip hotkey's Ctrl/Alt may still be held. The requesting
+        // daemon cannot see that while an elevated window has the focus
+        // (GetAsyncKeyState reads all keys as up across the integrity
+        // boundary), so the helper, at the target's level, waits itself:
+        // the chord would otherwise arrive as Ctrl+Alt+V.
+        crate::sys::wait_modifiers_released(std::time::Duration::from_millis(1500))
+            .map_err(|e| format!("refused: {e}"))?;
         let mut driver = crate::clip_orchestrator::EnigoChordDriver::new();
         crate::clip_orchestrator::run_chord(&mut driver)
     }
