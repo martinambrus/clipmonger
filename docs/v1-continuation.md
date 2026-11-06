@@ -348,13 +348,41 @@ pointer). KWin 6.8 did not ask before granting fake input; the daemon's hidden
 off on KWin Wayland, because KWin forwards modifier chords to X11 clients and the
 X11 route then hit KWin's "control input devices" prompt.
 
+## Linux acceptance on KDE Plasma 5.27, X11 and Wayland (2026-11-06)
+
+Run in the `cm-debian12-kde` VM (Debian 12, Plasma 5.27.5, glibc 2.36) in both
+sessions; the user checked the fixes, the root app and autostart.
+
+| Test | X11 | Wayland |
+| --- | --- | --- |
+| Binaries on glibc 2.36 (built against 2.39; the two newer symbols are weak) | Pass | Pass |
+| Capture: text, 1.9 and 3.2 MB images, Spectacle screenshots (Qt offers ~35 targets) | Pass after eda251e | Pass |
+| Popup hotkey and auto-paste (Konsole with Ctrl+Shift+V, KWrite, LibreOffice) | Pass | Pass after d7c10c0 |
+| Paste of a ~300 KB image into LibreOffice (X11 INCR send) | Pass after eda251e | n/a |
+| Permanent-clip hotkey with modifiers still held | Pass | Pass after d7c10c0 |
+| Klipper refill (old text must not jump above a newer image; a refill is kept when the original could not be read) | Pass after eda251e | Pass |
+| Root app: popup paste and permanent hotkey | Not run | Pass |
+| Autostart at login, hotkeys without a dialog | Pass | Pass after d7c10c0 |
+| Portal restart while the daemon runs | n/a | Pass after d7c10c0 |
+| Switching sessions: the old daemon stops, the new one has the new session's environment | Pass after d7c10c0 | Pass after d7c10c0 |
+
+Found and fixed: X11 INCR send never selected PropertyChange on the requestor,
+so every paste above ~256 KB hung (all X11 desktops); capture refused Qt images
+for advertising more than 32 targets; the Klipper marker has an `x-os/` prefix
+on X11; Plasma 5.27's portal registers shortcuts only from `CreateSession`
+and, being xdg-desktop-portal 1.16, takes the app id from the systemd unit
+name (autostart file renamed); KWin 5 script paths and names; the daemon
+outlived logouts when started from a terminal; stale Xvfb locks made every
+X11 test skip silently.
+
 ## Other release gates: do not silently waive
 
 - Linux desktop acceptance: GNOME 46 on Xorg and Wayland passed on 2026-11-05
   (T-508 GNOME rows, T-607 GNOME rows, T-702, T-703, T-705; see
   [Linux acceptance](#linux-acceptance-on-gnome-46-2026-11-05)). Still open:
-  [T-508](../tests/manual/T-508-x11-real-de.md) on KDE X11 (Plasma 5.27,
-  e.g. Kubuntu 24.04) and Xfce,
+  [T-508](../tests/manual/T-508-x11-real-de.md) on Xfce (KDE X11 passed on
+  Plasma 5.27, see
+  [Plasma 5.27](#linux-acceptance-on-kde-plasma-527-x11-and-wayland-2026-11-06)),
   [T-606](../tests/manual/T-606-wayland-compositor-matrix.md),
   [T-607](../tests/manual/T-607-paste-spike-acceptance.md) on wlroots (KDE
   Plasma 6.8 Wayland passed, see
