@@ -4486,6 +4486,66 @@ impl DaemonState {
             .map_err(|e| IpcError::new(e.code(), e.to_string()))
     }
 
+    /// Permanent clips with a chord, with their names, for the portal
+    /// session (`(id, chord, name)`); empty when the store is unavailable.
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    pub(crate) fn portal_permanents(&self) -> Vec<(uuid::Uuid, String, String)> {
+        let Ok(rows) = self.permanent_hotkeys() else {
+            return Vec::new();
+        };
+        let Ok(guard) = self.store_read() else {
+            return Vec::new();
+        };
+        let Some(store) = guard.as_ref() else {
+            return Vec::new();
+        };
+        rows.into_iter()
+            .map(|(id, chord)| {
+                let name = store
+                    .get_permanent(id)
+                    .ok()
+                    .flatten()
+                    .map(|perm| perm.name)
+                    .unwrap_or_default();
+                (id, chord, name)
+            })
+            .collect()
+    }
+
+    /// Paste a permanent clip whose portal shortcut fired. Its key was
+    /// released, but its modifiers may still be held, and a Wayland client
+    /// cannot read them. `KWin` forwards modifier keys to X11 clients by
+    /// default, so `XWayland` reports them: wait until they are released,
+    /// and skip the paste if they stay held. Without `XWayland` a short
+    /// fixed pause stands in.
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    pub(crate) fn press_permanent_portal(&self, id: uuid::Uuid, chord: &str) {
+        #[cfg(feature = "backend-x11")]
+        {
+            use clipmonger_platform::types::Error;
+            match clipmonger_backend_x11::paste::wait_modifiers_released(
+                None,
+                std::time::Duration::from_millis(1500),
+            ) {
+                Ok(()) => {}
+                Err(Error::Denied(_)) => {
+                    eprintln!("daemon: permanent hotkey paste skipped: modifiers stayed held");
+                    return;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(300)),
+            }
+        }
+        #[cfg(not(feature = "backend-x11"))]
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let params = serde_json::json!({"picked_ms": now_ms()});
+        let result = self.execute_permanent_with(id, Some(chord), |payloads| {
+            self.paste_payloads_nonempty(clipmonger_platform::types::ClipRef(id), payloads, &params)
+        });
+        if let Err(e) = result {
+            eprintln!("daemon: permanent hotkey paste failed: {}", e.message);
+        }
+    }
+
     /// Deliver a permanent from a trusted native hotkey owner.
     pub fn press_permanent(
         &self,
@@ -4848,7 +4908,6 @@ impl DaemonState {
         }
         #[cfg(all(unix, feature = "backend-wayland"))]
         {
-            let _ = params;
             if let Some(result) = self.paste_via_extension(payloads) {
                 if result.is_ok() {
                     let _ = self
@@ -4858,6 +4917,7 @@ impl DaemonState {
                 }
                 return result;
             }
+            let _ = params;
             let result = self.paste_wayland_payloads(payloads);
             if result.is_ok() {
                 let _ = self
@@ -4967,8 +5027,11 @@ impl DaemonState {
         let has_data =
             probe_current().protocol != clipmonger_backend_wayland::probe::Protocol::None;
         let paste = WlPaste::new(has_data);
+        // Register and write the same set, so the capture of this write is
+        // recognised as ours.
+        let offered = clipmonger_backend_wayland::transfer::with_text_twin(payloads);
         let outcome = self
-            .wayland_self_write(payloads, || paste.paste_payloads(payloads))
+            .wayland_self_write(&offered, || paste.paste_payloads(&offered))
             .map_err(|e| {
                 daemon_runtime_emit(
                     clipmonger_core::runtime_log::Severity::Warn,

@@ -46,6 +46,19 @@ fn flag_value(args: &[String], name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Whether the X11 hotkey thread should run: not on `KWin` Wayland.
+#[cfg(all(unix, feature = "backend-x11"))]
+fn x11_hotkeys_wanted() -> bool {
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    {
+        !clipmonger_daemon::kwin::is_kwin_wayland()
+    }
+    #[cfg(not(all(unix, feature = "backend-wayland")))]
+    {
+        true
+    }
+}
+
 /// The popup UI binary next to this daemon.
 fn sibling_ui_exe() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clipmonger-daemon"));
@@ -544,7 +557,11 @@ fn setup_x11_backend(
         });
     }
 
-    {
+    // On KWin Wayland the portal holds every chord. KWin also forwards
+    // modifier chords to X11 clients, so an XWayland grab would fire too:
+    // a second popup toggle, or an X11 paste that KWin stops with a
+    // "control input devices" prompt.
+    if x11_hotkeys_wanted() {
         let shutdown = Arc::clone(shutdown);
         let state = Arc::clone(state);
         let display = display.clone();

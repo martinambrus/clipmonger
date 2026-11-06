@@ -1,5 +1,6 @@
 //! Wayland `GlobalShortcuts` portal session (seg-06 S4, W-F4).
 //!
+//! The session holds the popup chord and every permanent clip chord.
 //! The live session is `ashpd`-async on a daemon-owned thread running its
 //! own current-thread tokio runtime; the backend crate stays tokio-free.
 //! Pure shortcut ids, `Activated` parsing, and bind planning come from
@@ -36,26 +37,94 @@ pub fn spawn_portal_session(state: Arc<crate::DaemonState>, _capture_primary: bo
     });
 }
 
+/// One shortcut the portal session holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Binding {
+    /// Portal shortcut id (stable per popup chord or per permanent clip).
+    pub id: String,
+    /// Platform chord, as configured.
+    pub chord: String,
+    /// Description the desktop shows in its shortcut settings.
+    pub label: String,
+    /// What a press does.
+    pub action: Action,
+}
+
+/// What a portal shortcut does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Action {
+    /// Open the popup.
+    Popup,
+    /// Paste this permanent clip.
+    Permanent(uuid::Uuid),
+}
+
+/// Shortcut id of a permanent clip and its chord. The chord is part of
+/// the id: KDE keeps the key it assigned to a known id and ignores a new
+/// preferred trigger, so an edited chord must be a new shortcut.
+fn permanent_id(id: uuid::Uuid, chord: &str) -> String {
+    format!(
+        "permanent-{}-{}",
+        id.simple(),
+        clipmonger_backend_wayland::portal::shortcut_id(chord)
+    )
+}
+
+/// The shortcuts to hold: the popup chord, then each permanent clip with a
+/// chord (`(id, chord, name)`). A permanent chord equal to the popup chord
+/// or to an earlier permanent is left out; the popup wins.
+pub(crate) fn plan_bindings(popup: &str, permanents: &[(uuid::Uuid, String, String)]) -> Vec<Binding> {
+    let norm = |chord: &str| {
+        clipmonger_platform::chord::parse(chord)
+            .map_or_else(|_| chord.trim().to_ascii_lowercase(), |c| c.to_string())
+    };
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    if !popup.trim().is_empty() {
+        seen.push(norm(popup));
+        out.push(Binding {
+            id: clipmonger_backend_wayland::portal::shortcut_id(popup),
+            chord: popup.to_string(),
+            label: "Clipmonger popup".to_string(),
+            action: Action::Popup,
+        });
+    }
+    for (id, chord, name) in permanents {
+        let key = norm(chord);
+        if chord.trim().is_empty() || seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        out.push(Binding {
+            id: permanent_id(*id, chord),
+            chord: chord.clone(),
+            label: format!("Clipmonger: paste {name}"),
+            action: Action::Permanent(*id),
+        });
+    }
+    out
+}
+
 /// What the portal thread does next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PortalStep {
     /// Nothing to change.
     Idle,
-    /// Close any session and bind this chord in a new one.
-    Bind(String),
-    /// Close the session: the GNOME extension owns the chord.
+    /// Close any session and bind these shortcuts in a new one.
+    Bind(Vec<Binding>),
+    /// Close the session: the GNOME extension owns the chords.
     Release,
 }
 
 /// Plan the next portal step. `extension` holds off the portal while the
 /// GNOME extension is connected or may still connect (start-up and
-/// reconnect grace); `bound` is the chord of the live session; `refused`
-/// is the last chord the portal refused, not retried until it changes.
+/// reconnect grace); `bound` is the set of the live session; `refused`
+/// is the last set the portal refused, not retried until it changes.
 fn portal_step(
-    wanted: &str,
+    wanted: &[Binding],
     extension: bool,
-    bound: Option<&str>,
-    refused: Option<&str>,
+    bound: Option<&[Binding]>,
+    refused: Option<&[Binding]>,
 ) -> PortalStep {
     if extension {
         return if bound.is_some() {
@@ -67,7 +136,7 @@ fn portal_step(
     if wanted.is_empty() || bound == Some(wanted) || refused == Some(wanted) {
         return PortalStep::Idle;
     }
-    PortalStep::Bind(wanted.to_string())
+    PortalStep::Bind(wanted.to_vec())
 }
 
 /// How long the portal waits for the GNOME extension on a GNOME desktop:
@@ -102,7 +171,6 @@ fn extension_holds(
 #[cfg(all(unix, feature = "backend-wayland"))]
 async fn run_session(state: Arc<crate::DaemonState>) {
     use ashpd::desktop::global_shortcuts::GlobalShortcuts;
-    use clipmonger_backend_wayland::portal::parse_activated;
     use std::time::Instant;
 
     // Must precede every other portal call on the shared connection. A
@@ -124,7 +192,10 @@ async fn run_session(state: Arc<crate::DaemonState>) {
             return;
         }
     };
-    let Ok(mut activated) = shortcuts.receive_activated().await else {
+    let (Ok(mut activated), Ok(mut deactivated)) = (
+        shortcuts.receive_activated().await,
+        shortcuts.receive_deactivated().await,
+    ) else {
         note_failed(&state, "portal activation signal unavailable");
         return;
     };
@@ -133,8 +204,11 @@ async fn run_session(state: Arc<crate::DaemonState>) {
     let started = Instant::now();
     let mut extension_seen: Option<Instant> = None;
     let mut session = None;
-    let mut bound: Option<String> = None;
-    let mut refused: Option<String> = None;
+    let mut bound: Option<Vec<Binding>> = None;
+    let mut refused: Option<Vec<Binding>> = None;
+    // A permanent press waits for its key to be released (`Deactivated`),
+    // so the paste chord is not mixed with the keys still held.
+    let mut pending: Option<(Binding, Instant)> = None;
     loop {
         let connected = state.extension_connected();
         if connected {
@@ -146,61 +220,115 @@ async fn run_session(state: Arc<crate::DaemonState>) {
             started.elapsed(),
             extension_seen.map(|seen| seen.elapsed()),
         );
-        let wanted = state.popup_hotkey();
-        match portal_step(&wanted, holds, bound.as_deref(), refused.as_deref()) {
-            PortalStep::Idle => {}
-            PortalStep::Release => {
-                if let Some(old) = session.take() {
-                    let _ = ashpd::desktop::Session::close(&old).await;
-                }
-                bound = None;
-                note_extension(&state);
+        let wanted = plan_bindings(&state.popup_hotkey(), &state.portal_permanents());
+        let step = portal_step(&wanted, holds, bound.as_deref(), refused.as_deref());
+        if step != PortalStep::Idle {
+            if let Some(old) = session.take() {
+                let _ = ashpd::desktop::Session::close(&old).await;
             }
-            PortalStep::Bind(chord) => {
-                if let Some(old) = session.take() {
-                    let _ = ashpd::desktop::Session::close(&old).await;
-                }
-                bound = None;
-                if let Some(new) = bind_chord(&shortcuts, &state, &chord).await {
+            bound = None;
+        }
+        match step {
+            PortalStep::Idle => {}
+            PortalStep::Release => note_extension(&state),
+            PortalStep::Bind(set) => {
+                session = bind_set(&shortcuts, &state, &set).await;
+                if session.is_some() {
                     refused = None;
-                    bound = Some(chord);
-                    session = Some(new);
+                    bound = Some(set);
                 } else {
-                    refused = Some(chord);
+                    refused = Some(set);
                 }
             }
         }
+        if let Some((binding, at)) = &pending {
+            if at.elapsed() >= PERMANENT_RELEASE_WAIT {
+                fire_permanent(&state, binding);
+                pending = None;
+            }
+        }
+        let poll = pending.as_ref().map_or(PORTAL_POLL, |_| PENDING_POLL);
         tokio::select! {
             signal = futures_util::StreamExt::next(&mut activated) => {
                 let Some(signal) = signal else {
                     note_failed(&state, "portal activation signal ended");
                     return;
                 };
-                let payload = serde_json::json!({"shortcut_id": signal.shortcut_id()});
-                if bound.is_some() && parse_activated(&payload).is_some() {
-                    let activation_token = shortcut_activation_token(signal.options());
-                    state.trigger_popup_activation(clipmonger_platform::types::HotkeyActivation {
-                        x11_time: None,
-                        activation_token,
-                    });
+                on_activated(&state, bound.as_deref(), &mut pending, &signal);
+            }
+            signal = futures_util::StreamExt::next(&mut deactivated) => {
+                let Some(signal) = signal else {
+                    note_failed(&state, "portal activation signal ended");
+                    return;
+                };
+                if pending.as_ref().is_some_and(|(b, _)| b.id == signal.shortcut_id()) {
+                    if let Some((binding, _)) = pending.take() {
+                        fire_permanent(&state, &binding);
+                    }
                 }
             }
-            () = tokio::time::sleep(PORTAL_POLL) => {}
+            () = tokio::time::sleep(poll) => {}
         }
     }
 }
 
-/// Bind `chord` in a new portal session (the desktop may ask the user).
+/// A shortcut fired: open the popup now, or hold a permanent paste until
+/// its key is released.
+#[cfg(all(unix, feature = "backend-wayland"))]
+fn on_activated(
+    state: &crate::DaemonState,
+    bound: Option<&[Binding]>,
+    pending: &mut Option<(Binding, std::time::Instant)>,
+    signal: &ashpd::desktop::global_shortcuts::Activated,
+) {
+    let Some(binding) = bound.and_then(|set| set.iter().find(|b| b.id == signal.shortcut_id()))
+    else {
+        return;
+    };
+    match binding.action {
+        Action::Popup => {
+            let activation_token = shortcut_activation_token(signal.options());
+            state.trigger_popup_activation(clipmonger_platform::types::HotkeyActivation {
+                x11_time: None,
+                activation_token,
+            });
+        }
+        Action::Permanent(_) => {
+            if pending.is_none() {
+                *pending = Some((binding.clone(), std::time::Instant::now()));
+            }
+        }
+    }
+}
+
+/// Poll interval while a permanent press waits for its key release.
+const PENDING_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Longest wait for a permanent hotkey's key release before pasting anyway.
+const PERMANENT_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Paste a permanent clip on a worker thread (delivery may sleep).
+#[cfg(all(unix, feature = "backend-wayland"))]
+fn fire_permanent(state: &Arc<crate::DaemonState>, binding: &Binding) {
+    let Action::Permanent(id) = binding.action else {
+        return;
+    };
+    let state = Arc::clone(state);
+    let chord = binding.chord.clone();
+    std::thread::spawn(move || state.press_permanent_portal(id, &chord));
+}
+
+/// Bind `set` in a new portal session (the desktop may ask the user).
 /// Publishes the portal hotkey result; `None` when the session or the bind
 /// failed (the session is closed again).
 #[cfg(all(unix, feature = "backend-wayland"))]
-async fn bind_chord(
+async fn bind_set(
     shortcuts: &ashpd::desktop::global_shortcuts::GlobalShortcuts,
     state: &crate::DaemonState,
-    chord: &str,
+    set: &[Binding],
 ) -> Option<ashpd::desktop::Session<ashpd::desktop::global_shortcuts::GlobalShortcuts>> {
     use ashpd::desktop::global_shortcuts::{BindShortcutsOptions, NewShortcut};
-    use clipmonger_backend_wayland::portal::bind_requested;
+    use clipmonger_backend_wayland::portal::xdg_trigger;
 
     // ashpd's CreateSessionOptions type is private; Default is the only spelling.
     #[allow(clippy::default_trait_access)]
@@ -214,11 +342,13 @@ async fn bind_chord(
             return None;
         }
     };
-    let requests: Vec<NewShortcut> = bind_requested(&[chord.to_string()])
+    let triggers: Vec<String> = set.iter().map(|b| xdg_trigger(&b.chord)).collect();
+    let requests: Vec<NewShortcut> = set
         .iter()
-        .map(|request| {
-            NewShortcut::new(request.id.clone(), "Clipmonger popup")
-                .preferred_trigger(Some(request.trigger.as_str()))
+        .zip(&triggers)
+        .map(|(binding, trigger)| {
+            NewShortcut::new(binding.id.clone(), binding.label.as_str())
+                .preferred_trigger(Some(trigger.as_str()))
         })
         .collect();
     state.set_portal_bind_pending(true);
@@ -295,41 +425,62 @@ fn publish_hotkey(state: &crate::DaemonState, failure: Option<&str>) {
 mod tests {
     #[test]
     fn portal_step_binds_follows_changes_and_yields_to_the_extension() {
-        use super::{portal_step, PortalStep};
-        let bind = |chord: &str| PortalStep::Bind(chord.to_string());
+        use super::{plan_bindings, portal_step, PortalStep};
+        let set = |chord: &str| plan_bindings(chord, &[]);
+        let h = set("ctrl+alt+h");
+        let j = set("ctrl+alt+j");
+        let k = set("ctrl+alt+k");
+        assert_eq!(portal_step(&h, false, None, None), PortalStep::Bind(h.clone()));
         assert_eq!(
-            portal_step("ctrl+alt+h", false, None, None),
-            bind("ctrl+alt+h")
-        );
-        assert_eq!(
-            portal_step("ctrl+alt+h", false, Some("ctrl+alt+h"), None),
+            portal_step(&h, false, Some(&h), None),
             PortalStep::Idle,
             "bound: nothing to do"
         );
         assert_eq!(
-            portal_step("ctrl+alt+j", false, Some("ctrl+alt+h"), None),
-            bind("ctrl+alt+j"),
+            portal_step(&j, false, Some(&h), None),
+            PortalStep::Bind(j.clone()),
             "a changed chord rebinds live"
         );
         assert_eq!(
-            portal_step("ctrl+alt+j", false, None, Some("ctrl+alt+j")),
+            portal_step(&j, false, None, Some(&j)),
             PortalStep::Idle,
-            "a refused chord waits for a change: no dialog loop"
+            "a refused set waits for a change: no dialog loop"
         );
+        assert_eq!(portal_step(&k, false, None, Some(&j)), PortalStep::Bind(k.clone()));
         assert_eq!(
-            portal_step("ctrl+alt+k", false, None, Some("ctrl+alt+j")),
-            bind("ctrl+alt+k")
-        );
-        assert_eq!(
-            portal_step("ctrl+alt+h", true, Some("ctrl+alt+h"), None),
+            portal_step(&h, true, Some(&h), None),
             PortalStep::Release,
             "the extension takes over a bound chord"
         );
-        assert_eq!(
-            portal_step("ctrl+alt+h", true, None, None),
-            PortalStep::Idle
+        assert_eq!(portal_step(&h, true, None, None), PortalStep::Idle);
+        assert_eq!(portal_step(&[], false, None, None), PortalStep::Idle);
+    }
+
+    #[test]
+    fn bindings_hold_popup_and_permanents_without_duplicates() {
+        use super::{plan_bindings, Action};
+        let a = uuid::Uuid::from_u128(1);
+        let b = uuid::Uuid::from_u128(2);
+        let c = uuid::Uuid::from_u128(3);
+        let rows = vec![
+            (a, "Ctrl+Alt+J".to_string(), "Sig".to_string()),
+            (b, "ctrl+alt+h".to_string(), "Clash".to_string()),
+            (c, "ctrl+alt+j".to_string(), "Dup".to_string()),
+        ];
+        let set = plan_bindings("Ctrl+Alt+H", &rows);
+        assert_eq!(set.len(), 2, "popup clash and duplicate dropped: {set:?}");
+        assert_eq!(set[0].action, Action::Popup);
+        assert_eq!(set[0].id, "ctrl-alt-h");
+        assert_eq!(set[1].action, Action::Permanent(a));
+        assert_eq!(set[1].id, format!("permanent-{}-ctrl-alt-j", a.simple()));
+        let edited = vec![(a, "Ctrl+Alt+L".to_string(), "Sig".to_string())];
+        assert_ne!(
+            plan_bindings("Ctrl+Alt+H", &edited)[1].id,
+            set[1].id,
+            "an edited chord is a new shortcut"
         );
-        assert_eq!(portal_step("", false, None, None), PortalStep::Idle);
+        assert_eq!(set[1].label, "Clipmonger: paste Sig");
+        assert!(plan_bindings("", &rows).iter().all(|b| b.action != Action::Popup));
     }
 
     #[test]

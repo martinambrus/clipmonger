@@ -65,6 +65,10 @@ impl WlTransfer {
         }
         let mut options = wl_clipboard_rs::copy::Options::new();
         options.clipboard(wl_clipboard_rs::copy::ClipboardType::Regular);
+        // Offer exactly `payload`. By default wl-clipboard-rs adds plain-text
+        // types to any `text/*` source (HTML would be offered as plain text),
+        // and the capture of our own write would then not match it.
+        options.omit_additional_text_mime_types(true);
         let sources = payload
             .iter()
             .map(|(mime, bytes)| wl_clipboard_rs::copy::MimeSource {
@@ -80,6 +84,25 @@ impl WlTransfer {
         }
         Ok(())
     }
+}
+
+/// The payload set a Wayland write offers: `payload`, plus `text/plain`
+/// when only `text/plain;charset=utf-8` is present (or the reverse), so
+/// apps that ask for either type find the text.
+#[must_use]
+pub fn with_text_twin(payload: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
+    const UTF8: &str = "text/plain;charset=utf-8";
+    const PLAIN: &str = "text/plain";
+    let mut out = payload.to_vec();
+    let has = |mime: &str| payload.iter().any(|(m, _)| m == mime);
+    if let Some((_, bytes)) = payload.iter().find(|(m, _)| m == UTF8) {
+        if !has(PLAIN) {
+            out.push((PLAIN.to_string(), bytes.clone()));
+        }
+    } else if let Some((_, bytes)) = payload.iter().find(|(m, _)| m == PLAIN) {
+        out.push((UTF8.to_string(), bytes.clone()));
+    }
+    out
 }
 
 impl ClipboardTransfer for WlTransfer {
@@ -148,5 +171,30 @@ mod bounded_tests {
         assert!(matches!(read_bounded(reader, 4), Err(Error::TooLarge(_))));
         assert_eq!(read.get(), 5);
         assert_eq!(read_bounded(&b"abcd"[..], 4).unwrap(), b"abcd");
+    }
+}
+
+#[cfg(test)]
+mod twin_tests {
+    use super::with_text_twin;
+
+    fn p(items: &[(&str, &str)]) -> Vec<(String, Vec<u8>)> {
+        items.iter().map(|(m, b)| ((*m).to_string(), b.as_bytes().to_vec())).collect()
+    }
+
+    #[test]
+    fn text_gets_its_twin_and_nothing_else_changes() {
+        assert_eq!(
+            with_text_twin(&p(&[("text/plain;charset=utf-8", "hi")])),
+            p(&[("text/plain;charset=utf-8", "hi"), ("text/plain", "hi")])
+        );
+        assert_eq!(
+            with_text_twin(&p(&[("text/plain", "hi")])),
+            p(&[("text/plain", "hi"), ("text/plain;charset=utf-8", "hi")])
+        );
+        let both = p(&[("text/plain", "a"), ("text/plain;charset=utf-8", "b")]);
+        assert_eq!(with_text_twin(&both), both);
+        let html = p(&[("text/html", "<b>x</b>")]);
+        assert_eq!(with_text_twin(&html), html);
     }
 }

@@ -94,7 +94,8 @@ pub fn bind_requested(chords: &[String]) -> Vec<BindRequest> {
 }
 
 /// One platform chord as an XDG shortcut trigger.
-fn xdg_trigger(chord: &str) -> String {
+#[must_use]
+pub fn xdg_trigger(chord: &str) -> String {
     chord
         .split('+')
         .map(str::trim)
