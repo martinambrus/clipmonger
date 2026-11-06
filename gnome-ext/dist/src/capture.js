@@ -94,7 +94,13 @@ export class CaptureRelay {
     pollMs;
     constructor(ipc, diff, pollMs = 500) { this.ipc = ipc; this.diff = diff; this.pollMs = pollMs; }
     setPollMs(ms) { this.pollMs = ms; }
-    markSelfWrite(offers) { this.diff.markSelfWrite(offers, Date.now()); }
+    /** Remember a paste's own clipboard write. Hashed natively, like the
+     * capture: a JS hash of a large image would block the Shell and outlive
+     * the self-write window. */
+    markSelfWrite(offers) {
+        const hashed = offers.map((offer) => (offer.hash || !offer.bytes ? offer : { ...offer, hash: nativeSha256(offer.bytes) }));
+        this.diff.markSelfWrite(hashed, Date.now());
+    }
     start() {
         if (this.timer !== null)
             return;

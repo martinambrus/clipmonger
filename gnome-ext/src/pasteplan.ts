@@ -1,9 +1,36 @@
 // Pure paste-assist plan (daemon `paste.assist` on GNOME Wayland). No gi:// imports.
 
-/** A validated `paste.assist` request from the daemon. */
-export interface AssistRequest { id: number; mime: string; data_b64: string; inject: boolean }
+/** A validated `paste.assist` request from the daemon: the clip inline
+ * (`data_b64`), or for a clip too large for one frame its `size` and the
+ * number of `paste.assist_chunk` pulls (`chunks`). */
+export interface AssistRequest { id: number; mime: string; data_b64?: string; size?: number; chunks?: number; inject: boolean }
 /** The `paste.assist_done` answer. */
 export interface AssistDone { id: number; ok: boolean; injected: boolean; error?: string }
+
+/** Largest chunked paste accepted (the daemon's default capture cap). */
+export const MAX_ASSIST_BYTES = 64 * 1024 * 1024;
+/** Most chunks one paste may take. */
+export const MAX_ASSIST_CHUNKS = 1024;
+
+/** Join pulled chunks; `null` unless they add up to exactly `size`. */
+export function joinChunks(parts: readonly Uint8Array[], size: number): Uint8Array | null {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  if (total !== size) return null;
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const part of parts) { out.set(part, at); at += part.length; }
+  return out;
+}
+
+/** Pause between the clipboard write and Ctrl+V once the target is
+ * focused. Apps learn of the new clipboard asynchronously: with 60 ms
+ * Firefox (Photopea) first pasted the previous image, then replaced it.
+ * Short text keeps the quick pause, where the wait would be felt. */
+export function injectSettleMs(mime: string, size: number): number {
+  return isTextMime(mime) && size < SMALL_TEXT_BYTES ? 60 : 200;
+}
+/** Text below this size pastes with the short pause. */
+export const SMALL_TEXT_BYTES = 64 * 1024;
 
 /** How long a popup's target stays valid while the popup is open. */
 export const PRESS_TARGET_MAX_AGE_MS = 10 * 60 * 1000;
@@ -14,9 +41,14 @@ export const FOCUS_WAIT_MS = 600;
 export function parseAssist(params: unknown): AssistRequest | null {
   if (typeof params !== 'object' || params === null) return null;
   const p = params as Record<string, unknown>;
-  if (!Number.isSafeInteger(p.id) || typeof p.mime !== 'string' || !p.mime
-    || typeof p.data_b64 !== 'string') return null;
-  return { id: p.id as number, mime: p.mime, data_b64: p.data_b64, inject: p.inject === true };
+  if (!Number.isSafeInteger(p.id) || typeof p.mime !== 'string' || !p.mime) return null;
+  const base = { id: p.id as number, mime: p.mime, inject: p.inject === true };
+  if (typeof p.data_b64 === 'string') return { ...base, data_b64: p.data_b64 };
+  const size = p.size as number;
+  const chunks = p.chunks as number;
+  if (!Number.isSafeInteger(size) || size <= 0 || size > MAX_ASSIST_BYTES
+    || !Number.isSafeInteger(chunks) || chunks <= 0 || chunks > MAX_ASSIST_CHUNKS) return null;
+  return { ...base, size, chunks };
 }
 
 /** Whether `mime` is written as text (`St.Clipboard.set_text`). */

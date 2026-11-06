@@ -102,6 +102,8 @@ export const permanentListRequest = (id: string): Envelope => req(id, 'permanent
 export const permanentExecRequest = (id: string, permanent: string): Envelope =>
   req(id, 'permanent.exec', { id: permanent });
 /** Answer to the daemon's `paste.assist` (pasteplan.ts AssistDone). */
+export const pasteAssistChunkRequest = (id: string, assist: number, seq: number): Envelope =>
+  req(id, 'paste.assist_chunk', { id: assist, seq });
 export const pasteAssistDoneRequest = (id: string, done: { id: number; ok: boolean; injected: boolean; error?: string }): Envelope =>
   req(id, 'paste.assist_done', done);
 export const hotkeyFiredRequest = (id: string, hotkeyId: number, focusedPopupPid: number | null = null): Envelope =>

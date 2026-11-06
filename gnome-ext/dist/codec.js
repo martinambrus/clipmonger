@@ -106,6 +106,7 @@ export const eventsSubscribeRequest = (id) => req(id, 'events.subscribe', { topi
 export const permanentListRequest = (id) => req(id, 'permanent.list', {});
 export const permanentExecRequest = (id, permanent) => req(id, 'permanent.exec', { id: permanent });
 /** Answer to the daemon's `paste.assist` (pasteplan.ts AssistDone). */
+export const pasteAssistChunkRequest = (id, assist, seq) => req(id, 'paste.assist_chunk', { id: assist, seq });
 export const pasteAssistDoneRequest = (id, done) => req(id, 'paste.assist_done', done);
 export const hotkeyFiredRequest = (id, hotkeyId, focusedPopupPid = null) => req(id, 'hotkey.fired', focusedPopupPid !== null && Number.isSafeInteger(focusedPopupPid) && focusedPopupPid > 0
     ? { id: hotkeyId, focused_popup_pid: focusedPopupPid } : { id: hotkeyId });

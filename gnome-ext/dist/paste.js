@@ -8,10 +8,9 @@ import Clutter from 'gi://Clutter';
 import { notify } from 'resource:///org/gnome/shell/ui/main.js';
 import { base64Decode } from './codec.js';
 import { POPUP_TITLE } from './config.js';
-import { parseAssist, isTextMime, assistStep, pasteNeedsShift } from './pasteplan.js';
+import { parseAssist, isTextMime, assistStep, pasteNeedsShift, joinChunks, injectSettleMs } from './pasteplan.js';
 import { windowAppIds } from './capture.js';
 /** Pause between the focus settling and the injected Ctrl+V. */
-const INJECT_SETTLE_MS = 60;
 const POLL_MS = 25;
 const sleep = (ms) => new Promise((resolve) => {
     GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => { resolve(); return GLib.SOURCE_REMOVE; });
@@ -73,14 +72,35 @@ export class PasteAssist {
         }
         catch { /* no focus info: the paste toasts */ }
     }
-    /** Handle one daemon `paste.assist`; never throws. */
-    async assist(params) {
+    /** Handle one daemon `paste.assist`; never throws. `fetchChunk` pulls
+     * chunk `seq` of a clip too large to arrive inline (base64). */
+    async assist(params, fetchChunk) {
         const req = parseAssist(params);
         const id = req?.id ?? 0;
         if (!req)
             return { id, ok: false, injected: false, error: 'malformed paste request' };
+        let bytes;
+        if (req.data_b64 !== undefined) {
+            bytes = base64Decode(req.data_b64);
+        }
+        else {
+            if (!fetchChunk)
+                return { id, ok: false, injected: false, error: 'clip too large for this extension' };
+            const parts = [];
+            try {
+                for (let seq = 0; seq < (req.chunks ?? 0); seq++)
+                    parts.push(base64Decode(await fetchChunk(id, seq)));
+            }
+            catch (e) {
+                return { id, ok: false, injected: false, error: `paste data unavailable: ${e instanceof Error ? e.message : String(e)}` };
+            }
+            const joined = joinChunks(parts, req.size ?? 0);
+            if (!joined)
+                return { id, ok: false, injected: false, error: 'paste data incomplete' };
+            bytes = joined;
+        }
         try {
-            this.write(req.mime, base64Decode(req.data_b64));
+            this.write(req.mime, bytes);
         }
         catch (e) {
             return { id, ok: false, injected: false, error: `clipboard write failed: ${e instanceof Error ? e.message : String(e)}` };
@@ -103,7 +123,7 @@ export class PasteAssist {
                 continue;
             }
             if (step === 'inject') {
-                await sleep(INJECT_SETTLE_MS);
+                await sleep(injectSettleMs(req.mime, bytes.length));
                 // A per-clip hotkey's own Ctrl/Alt may still be held: wait, or the
                 // injected Ctrl+V would arrive as Ctrl+Alt+V.
                 if (!(await modifiersReleased())) {

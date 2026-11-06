@@ -25,8 +25,13 @@ export class PopupPlacer {
         let pointer = null;
         let settle = null;
         const ids = [];
-        const done = () => {
+        let actor = null;
+        // Once the window is unmanaged its actor is already disposed: touching
+        // it logs a GJS error, and its handlers went with it anyway.
+        const done = (unmanaged = false) => {
             for (const [obj, id] of ids) {
+                if (unmanaged && obj === actor)
+                    continue;
                 try {
                     obj.disconnect(id);
                 }
@@ -50,7 +55,7 @@ export class PopupPlacer {
                 settle = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SETTLE_MS, () => { settle = null; done(); return GLib.SOURCE_REMOVE; });
             }
         };
-        const actor = win?.get_compositor_private?.();
+        actor = win?.get_compositor_private?.() ?? null;
         const signals = [[win, 'shown'], [win, 'notify::title'], [win, 'size-changed'], [win, 'position-changed'], [actor, 'first-frame']];
         for (const [obj, signal] of signals) {
             if (obj) {
@@ -61,7 +66,7 @@ export class PopupPlacer {
             }
         }
         try {
-            ids.push([win, win.connect('unmanaged', done)]);
+            ids.push([win, win.connect('unmanaged', () => done(true))]);
         }
         catch { /* signal absent */ }
         attempt();

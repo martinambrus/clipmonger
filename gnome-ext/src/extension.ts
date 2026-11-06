@@ -8,7 +8,7 @@ import { Hotkeys } from './hotkeys.js';
 import { PasteAssist } from './paste.js';
 import { PopupPlacer } from './placer.js';
 import { DEFAULT_POPUP_HOTKEY, mergeConfig } from './config.js';
-import { pasteAssistDoneRequest, permanentListRequest, useNativeBase64 } from './codec.js';
+import { pasteAssistChunkRequest, pasteAssistDoneRequest, permanentListRequest, useNativeBase64 } from './codec.js';
 import GLib from 'gi://GLib?version=2.0';
 import { PermanentHotkeys } from './permhotkeys.js';
 import { parsePermanents } from './permbind.js';
@@ -49,7 +49,12 @@ export default class ClipmongerExtension extends Extension {
     ipc.onEvent = (env) => {
       if (env.method === 'permanents.changed') { loadPermanents(); return; }
       if (env.method !== 'paste.assist') return;
-      void paste.assist(env.params)
+      const fetchChunk = async (assist: number, seq: number): Promise<string> => {
+        const result = await ipc.request(pasteAssistChunkRequest(ipc.nextId(), assist, seq)) as { data_b64?: unknown } | null;
+        if (typeof result?.data_b64 !== 'string') throw new Error('no chunk data');
+        return result.data_b64;
+      };
+      void paste.assist(env.params, fetchChunk)
         .then((done) => ipc.request(pasteAssistDoneRequest(ipc.nextId(), done)))
         .catch(() => { /* the daemon times out and reports it */ });
     };
