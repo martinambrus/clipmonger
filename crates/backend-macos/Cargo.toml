@@ -1,0 +1,46 @@
+[package]
+name = "clipmonger-backend-macos"
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clipmonger-core = { path = "../core" }
+clipmonger-platform = { path = "../platform" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSData",
+    "NSDictionary",
+    "NSEnumerator",
+    "NSObject",
+    "NSString",
+    "NSURL",
+    "NSValue",
+] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "bitflags",
+    "libc",
+    "NSApplication",
+    "NSBitmapImageRep",
+    "NSImageRep",
+    "NSPasteboard",
+    "NSPasteboardItem",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSWorkspace",
+] }
+dispatch2 = { version = "0.3.1", default-features = false, features = ["std", "objc2"] }
+global-hotkey = "0.9.0"
+
+[dev-dependencies]
+uuid = { workspace = true }
+
+[lints]
+workspace = true
