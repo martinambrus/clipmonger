@@ -26,7 +26,9 @@ fi
 # Clear version-mismatch check against the metadata shell-version list.
 if command -v gnome-shell >/dev/null 2>&1; then
   SHELL_VER=$(gnome-shell --version | sed -n 's/[^0-9]*\([0-9][0-9]*\)\..*/\1/p' | head -n 1)
-  SUPPORTED=$(sed -n 's/.*"shell-version"[[:space:]]*:[[:space:]]*\[\(.*\)\].*/\1/p' dist/metadata.json)
+  # Spaces removed: the list is written as "46", "47", ... and the match
+  # below looks for ,"NN", between commas.
+  SUPPORTED=$(sed -n 's/.*"shell-version"[[:space:]]*:[[:space:]]*\[\(.*\)\].*/\1/p' dist/metadata.json | tr -d ' ')
   case ",$SUPPORTED," in
     *",\"$SHELL_VER\","*|*,'"'$SHELL_VER'"',*) : ;;
     *)

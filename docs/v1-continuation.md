@@ -488,6 +488,29 @@ Harness: the VM tools and guest helpers live in `~/clipmonger-vm-tools/`
 (`vmctl.py`, `build-linux.sh`, `deploy-linux.sh`, `guest/`). Raw-mode terminal
 checks need `timeout --foreground`.
 
+## Linux acceptance on GNOME 47 and 49 (2026-11-07)
+
+Ubuntu 24.10 (GNOME Shell 47.0) and 25.10 (GNOME Shell 49.0) were built from
+the official cloud images plus `ubuntu-desktop-minimal` without recommends
+(`cm-ubuntu2410-gnome`, `cm-ubuntu2510-gnome`; cloud-init NoCloud seed in
+`~/vm-images/`), then run through `~/clipmonger-vm-tools/gnome-suite.sh` on
+Wayland with the HEAD build.
+
+| Test | GNOME 47 | GNOME 49 |
+| --- | --- | --- |
+| Extension active and connected; caps monitor, hotkey, paste full | Pass | Pass |
+| Capture: text and image | Pass | Pass |
+| Popup text and image paste into a GTK editor | Pass | Pass |
+| Permanent-clip hotkey into the editor | Pass | Pass |
+| Popup and permanent paste into gnome-terminal (Ctrl+Shift+V) | Pass | Pass |
+| Password hint not stored | Pass | Pass |
+| Popup and permanent paste into a root window | Pass | Pass |
+| Start on login across a reboot, extension reconnects | Pass | Pass |
+
+Found and fixed: `gnome-ext/install-extension.sh` refused every GNOME version
+except the first in `shell-version` (the list is written `"46", "47", ...` and
+the comma match did not allow the space), so it rejected GNOME 47 to 51.
+
 ## Windows acceptance in KVM VMs (2026-11-06)
 
 Automated run on two VMs converted from the user's VMware machines, with real
@@ -541,8 +564,9 @@ outdated since the GNOME extension and the KDE portal support them.
   [the 2026-11-07 runs](#linux-acceptance-on-ubuntu-2404-xfce-cinnamon-sway-hyprland-and-cosmic-2026-11-07));
   KDE X11 and Wayland passed earlier (see
   [Plasma 5.27](#linux-acceptance-on-kde-plasma-527-x11-and-wayland-2026-11-06)
-  and [KDE](#linux-acceptance-on-kde-plasma-68-wayland-2026-11-06)). Still
-  open: T-704 for GNOME 47 and 49 (46, 48, 50 and 51 passed, see
+  and [KDE](#linux-acceptance-on-kde-plasma-68-wayland-2026-11-06)). T-704
+  passed on GNOME 46 to 51 (see
+  [GNOME 47 and 49](#linux-acceptance-on-gnome-47-and-49-2026-11-07),
   [GNOME 48](#linux-acceptance-on-gnome-48-2026-11-06),
   [GNOME 50](#linux-acceptance-on-gnome-50-2026-11-06) and
   [GNOME 51](#linux-acceptance-on-gnome-51-2026-11-06)). The portal rebind
