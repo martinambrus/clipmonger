@@ -74,6 +74,13 @@ enum Cmd {
     PurgeRemoved,
     /// Stop the serving daemon.
     Stop,
+    /// macOS: stop Clipmonger, remove its start-on-login agent and, with
+    /// --delete-history, the profile; then drag Clipmonger.app to the Trash.
+    Uninstall {
+        /// Also delete the profile (history, settings, permanent clips).
+        #[arg(long)]
+        delete_history: bool,
+    },
 }
 
 /// Exit-1 refusal used whenever the daemon cannot be reached.
@@ -145,6 +152,9 @@ fn find_token(profile: &Path) -> Option<String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let profile = cli.profile_dir;
+    if let Cmd::Uninstall { delete_history } = cli.cmd {
+        return uninstall(&profile, delete_history);
+    }
 
     let rendezvous = find_rendezvous(&profile).unwrap_or_else(|| daemon_down());
     let socket = rendezvous
@@ -187,6 +197,7 @@ fn main() -> ExitCode {
         Cmd::PermanentDelete { id } => ("permanent.delete", serde_json::json!({"id": id}), false),
         Cmd::PurgeRemoved => ("history.purge_removed", serde_json::json!({}), false),
         Cmd::Stop => ("daemon.stop", serde_json::json!({}), true),
+        Cmd::Uninstall { .. } => unreachable!("handled before connecting"),
     };
 
     match client.call(method, params) {
@@ -214,4 +225,91 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// Files only a Clipmonger profile has; `--delete-history` refuses any
+/// other folder.
+#[cfg(target_os = "macos")]
+fn is_profile(dir: &Path) -> bool {
+    dir.join("clipstore.sqlite3").is_file()
+        && (dir.join("config.toml").exists() || dir.join("blobs").is_dir())
+}
+
+/// Stop the daemon if it answers; a stopped daemon is fine.
+#[cfg(target_os = "macos")]
+fn stop_daemon(profile: &Path) {
+    let Some(socket) = find_rendezvous(profile)
+        .and_then(|r| r.get("socket").and_then(Value::as_str).map(str::to_string))
+    else {
+        return;
+    };
+    let Some(token) = find_token(profile) else {
+        return;
+    };
+    if let Ok(client) = clipmonger_ipc::client::Client::connect(Path::new(&socket), &token) {
+        let _ = client.call("daemon.stop", serde_json::json!({}));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall(profile: &Path, delete_history: bool) -> ExitCode {
+    const LABEL: &str = "com.martinambrus.clipmonger";
+    stop_daemon(profile);
+    // The UI and any daemon that did not answer.
+    for name in ["clipmonger", "clipmonger-daemon"] {
+        let _ = std::process::Command::new("/usr/bin/pkill")
+            .args(["-x", name])
+            .status();
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let agent = home.join(format!("Library/LaunchAgents/{LABEL}.plist"));
+    if agent.exists() {
+        let uid = std::process::Command::new("/usr/bin/id")
+            .arg("-u")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let _ = std::process::Command::new("/bin/launchctl")
+            .args(["bootout", &format!("gui/{uid}/{LABEL}")])
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Err(e) = std::fs::remove_file(&agent) {
+            eprintln!("could not remove {}: {e}", agent.display());
+            return ExitCode::from(1);
+        }
+        println!("Removed the start-on-login agent.");
+    }
+    if delete_history {
+        if !is_profile(profile) {
+            eprintln!(
+                "{} is not a Clipmonger profile; nothing deleted",
+                profile.display()
+            );
+            return ExitCode::from(1);
+        }
+        if let Err(e) = std::fs::remove_dir_all(profile) {
+            eprintln!("could not delete {}: {e}", profile.display());
+            return ExitCode::from(1);
+        }
+        println!("Deleted the profile {}.", profile.display());
+    } else {
+        println!("Kept your history in {}.", profile.display());
+    }
+    println!(
+        "Clipmonger is stopped. Drag Clipmonger.app from Applications to the Trash to finish."
+    );
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(target_os = "macos"))]
+fn uninstall(profile: &Path, delete_history: bool) -> ExitCode {
+    let _ = (profile, delete_history);
+    eprintln!(
+        "uninstall is for macOS; use the Windows uninstaller, your package manager, \
+         or install.sh --uninstall on Linux"
+    );
+    ExitCode::from(2)
 }
