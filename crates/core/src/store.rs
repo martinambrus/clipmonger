@@ -975,6 +975,17 @@ fn safe_blob_read_capped(
             .custom_flags(O_NONBLOCK | O_NOFOLLOW)
             .open(&path)
     };
+    #[cfg(target_os = "macos")]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Darwin <sys/fcntl.h> values.
+        const O_NONBLOCK: i32 = 0x0004;
+        const O_NOFOLLOW: i32 = 0x0100;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK | O_NOFOLLOW)
+            .open(&path)
+    };
     #[cfg(windows)]
     let file = {
         use std::os::windows::fs::OpenOptionsExt;
@@ -986,6 +997,7 @@ fn safe_blob_read_capped(
     };
     #[cfg(not(any(
         windows,
+        target_os = "macos",
         all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")

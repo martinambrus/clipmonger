@@ -1,0 +1,81 @@
+name: macOS
+
+# Builds, lints and tests Clipmonger on Intel and Apple Silicon macOS, and
+# uploads the binaries built for the oldest supported macOS (Intel 10.12,
+# Apple Silicon 11.0) for testing on the VMs (docs/macos-v1-plan.md).
+on:
+  push:
+    branches: [macos, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: check (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15-intel, macos-15, macos-26]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.runner }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: macOS details
+        if: always()
+        run: sw_vers; uname -m
+
+  build:
+    name: build (oldest supported macOS)
+    runs-on: macos-15
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Build Intel (macOS 10.12+)
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.12"
+        run: cargo build --release --locked --target x86_64-apple-darwin -p clipmonger-daemon -p clipmonger-app-ui -p clipmonger-app-cli
+      - name: Build Apple Silicon (macOS 11+)
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: cargo build --release --locked --target aarch64-apple-darwin -p clipmonger-daemon -p clipmonger-app-ui -p clipmonger-app-cli
+      - name: Universal binaries
+        run: |
+          mkdir -p out
+          for b in clipmonger clipmonger-daemon clipmonger-cli; do
+            lipo -create -output "out/$b" \
+              "target/x86_64-apple-darwin/release/$b" "target/aarch64-apple-darwin/release/$b"
+            lipo -info "out/$b"
+            otool -l "target/x86_64-apple-darwin/release/$b" | grep -A3 -E 'LC_VERSION_MIN_MACOSX|LC_BUILD_VERSION' | head -4
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipmonger-macos-universal-${{ github.sha }}
+          path: out/
+          retention-days: 14
