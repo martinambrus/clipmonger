@@ -99,6 +99,14 @@ impl MacForeground {
         os::frontmost().map(|app| app.pid).filter(|pid| *pid > 0)
     }
 
+    /// Pid of the application with the keyboard focus, asked live through
+    /// Accessibility when trusted (`NSWorkspace` can lag behind an activation
+    /// on macOS 10.15), else [`Self::frontmost_pid`].
+    #[must_use]
+    pub fn focused_pid() -> Option<i32> {
+        os::ax_focused_app_pid().or_else(Self::frontmost_pid)
+    }
+
     /// The frontmost application.
     #[must_use]
     pub fn frontmost_app() -> Option<RunningApp> {
@@ -111,7 +119,9 @@ impl MacForeground {
     ///
     /// [`Error::Unavailable`] when no application is frontmost.
     pub fn capture_target(&self) -> Result<PasteTarget> {
-        os::frontmost()
+        os::ax_focused_app_pid()
+            .and_then(os::app_for_pid)
+            .or_else(os::frontmost)
             .filter(|app| app.pid > 0)
             .map(|app| target_of(&app))
             .ok_or_else(|| Error::Unavailable("no frontmost application".to_string()))

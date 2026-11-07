@@ -21,6 +21,11 @@ const HID_EVENT_TAP: u32 = 0;
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRelease(cf: CFTypeRef);
+    fn CFStringCreateWithCString(
+        alloc: *const c_void,
+        s: *const std::ffi::c_char,
+        encoding: u32,
+    ) -> CFStringRef;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -36,6 +41,14 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn AXIsProcessTrustedWithOptions(options: *const c_void) -> u8;
     static kAXTrustedCheckOptionPrompt: CFStringRef;
+    fn AXUIElementCreateSystemWide() -> CFTypeRef;
+    fn AXUIElementSetMessagingTimeout(element: CFTypeRef, seconds: f32) -> i32;
+    fn AXUIElementCopyAttributeValue(
+        element: CFTypeRef,
+        attribute: CFStringRef,
+        value: *mut CFTypeRef,
+    ) -> i32;
+    fn AXUIElementGetPid(element: CFTypeRef, pid: *mut i32) -> i32;
 }
 
 #[link(name = "Carbon", kind = "framework")]
@@ -72,6 +85,41 @@ pub(crate) fn ax_prompt_key() -> CFStringRef {
 pub(crate) fn ax_trusted_with(options: *const c_void) -> bool {
     // Safety: the caller keeps `options` alive across the call.
     unsafe { AXIsProcessTrustedWithOptions(options) != 0 }
+}
+
+/// Pid of the application that has the keyboard focus, asked live through
+/// the Accessibility API (needs Accessibility trust). Unlike
+/// `NSWorkspace.frontmostApplication`, which some macOS versions (10.15)
+/// refresh only late in a background process, this reflects an activation
+/// as soon as the window server has done it.
+pub(crate) fn ax_focused_app_pid() -> Option<i32> {
+    const UTF8: u32 = 0x0800_0100;
+    // Safety: every CF object created here is checked for null and released
+    // once; the out pointers are locals that live across the calls.
+    unsafe {
+        let attr =
+            CFStringCreateWithCString(std::ptr::null(), c"AXFocusedApplication".as_ptr(), UTF8);
+        if attr.is_null() {
+            return None;
+        }
+        let system = AXUIElementCreateSystemWide();
+        if system.is_null() {
+            CFRelease(attr);
+            return None;
+        }
+        AXUIElementSetMessagingTimeout(system, 0.25);
+        let mut app: CFTypeRef = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(system, attr, &raw mut app);
+        CFRelease(attr);
+        CFRelease(system);
+        if err != 0 || app.is_null() {
+            return None;
+        }
+        let mut pid = 0;
+        let err = AXUIElementGetPid(app, &raw mut pid);
+        CFRelease(app);
+        (err == 0 && pid > 0).then_some(pid)
+    }
 }
 
 /// Whether Secure Event Input is on (password field, Secure Keyboard Entry).

@@ -4726,7 +4726,7 @@ impl DaemonState {
     /// hotkey's modifiers are released.
     #[cfg(macos_backend)]
     fn press_permanent_macos(&self, id: uuid::Uuid, chord: &str, pause: &mut dyn FnMut() -> bool) {
-        let Some(pid) = clipmonger_backend_macos::MacForeground::frontmost_pid() else {
+        let Some(pid) = clipmonger_backend_macos::MacForeground::focused_pid() else {
             return;
         };
         if !pause() {

@@ -940,7 +940,7 @@ fn press_target(ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
 /// the UI itself the popup is in front and the press toggles it.
 #[cfg(macos_backend)]
 fn press_target(ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
-    let Some(pid) = clipmonger_backend_macos::MacForeground::frontmost_pid() else {
+    let Some(pid) = clipmonger_backend_macos::MacForeground::focused_pid() else {
         return (None, false);
     };
     let pid = u32::try_from(pid).ok();

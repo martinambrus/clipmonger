@@ -72,3 +72,6 @@ pub(crate) fn post_key(_code: u16, _down: bool, _flags: u64) -> Result<()> {
 pub(crate) fn post_unicode(_units: &[u16]) -> Result<()> {
     unavailable()
 }
+pub(crate) fn ax_focused_app_pid() -> Option<i32> {
+    None
+}

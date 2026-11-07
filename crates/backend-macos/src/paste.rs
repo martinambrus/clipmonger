@@ -135,13 +135,13 @@ impl MacPaste {
 
     /// Reactivate `pid` and wait until it is frontmost.
     fn bring_to_front(&self, pid: i32) -> Result<()> {
-        if MacForeground::frontmost_pid() == Some(pid) {
+        if MacForeground::focused_pid() == Some(pid) {
             return Ok(());
         }
         let _ = self.foreground.activate(pid);
         let deadline = Instant::now() + Duration::from_millis(ACTIVATE_TIMEOUT_MS);
         loop {
-            if MacForeground::frontmost_pid() == Some(pid) {
+            if MacForeground::focused_pid() == Some(pid) {
                 std::thread::sleep(Duration::from_millis(CHORD_SETTLE_MS));
                 return Ok(());
             }
