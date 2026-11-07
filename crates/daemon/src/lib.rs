@@ -133,6 +133,7 @@ fn runtime_origin(origin: &str) -> &'static str {
         "x11" => "x11",
         "wayland" => "wayland",
         "gnome" => "gnome",
+        "macos" => "macos",
         _ => "other",
     }
 }
@@ -302,12 +303,12 @@ const HELPER_LOST: &str = "helper connection lost";
 #[cfg(all(windows, feature = "backend-windows"))]
 const HELPER_TIMED_OUT: &str = "helper result timed out";
 /// Refusal for a paste whose deadline passed before it could run.
-#[cfg(any(all(windows, feature = "backend-windows"), linux_x11))]
+#[cfg(any(all(windows, feature = "backend-windows"), linux_x11, macos_backend))]
 const PASTE_EXPIRED: &str = "unavailable: paste request expired";
 /// Paste deadline: a clip picked in the popup (or a paste request without a
 /// pick time) must be delivered within this many ms, else it is refused;
 /// the helper enforces the same absolute deadline before injecting.
-#[cfg(any(all(windows, feature = "backend-windows"), linux_x11))]
+#[cfg(any(all(windows, feature = "backend-windows"), linux_x11, macos_backend))]
 const PASTE_DEADLINE_MS: i64 = 2_000;
 
 /// Elevated-helper supervisor: an always-listening pipe server for the
@@ -2042,7 +2043,7 @@ fn manual_hotkey_caps(snapshot: &mut Value, command: &str) {
 /// value, or the two disagreeing, is refused instead of silently falling
 /// back to whatever window is in front.
 #[cfg_attr(
-    not(any(all(windows, feature = "backend-windows"), linux_x11)),
+    not(any(all(windows, feature = "backend-windows"), linux_x11, macos_backend)),
     allow(dead_code)
 )]
 fn requested_target(params: &Value) -> Result<Option<u64>, IpcError> {
@@ -2397,7 +2398,7 @@ impl Drop for CompactMaintenance {
 }
 
 impl DaemonState {
-    #[cfg(any(linux_wayland, linux_x11))]
+    #[cfg(any(linux_wayland, linux_x11, macos_backend))]
     fn self_write_with<T, E>(
         &self,
         payloads: &[(String, Vec<u8>)],
@@ -3025,7 +3026,7 @@ impl DaemonState {
     /// Snapshot all settings used by one paste. Restore publishes this tuple
     /// in one assignment, so a delivery cannot combine two configurations.
     #[cfg_attr(
-        not(any(all(windows, feature = "backend-windows"), linux_x11)),
+        not(any(all(windows, feature = "backend-windows"), linux_x11, macos_backend)),
         allow(dead_code)
     )]
     fn paste_budget(&self) -> (u64, u64, clipmonger_core::PasteDelivery, bool) {
@@ -4721,6 +4722,31 @@ impl DaemonState {
         }
     }
 
+    /// macOS permanent hotkey: paste into the frontmost app once the
+    /// hotkey's modifiers are released.
+    #[cfg(macos_backend)]
+    fn press_permanent_macos(&self, id: uuid::Uuid, chord: &str, pause: &mut dyn FnMut() -> bool) {
+        let Some(pid) = clipmonger_backend_macos::MacForeground::frontmost_pid() else {
+            return;
+        };
+        if !pause() {
+            return;
+        }
+        if clipmonger_backend_macos::wait_modifiers_released(std::time::Duration::from_millis(1500))
+            .is_err()
+        {
+            eprintln!("daemon: permanent hotkey paste skipped: modifiers stayed held");
+            return;
+        }
+        let params = serde_json::json!({"target": pid, "picked_ms": now_ms()});
+        let result = self.execute_permanent_with(id, Some(chord), |payloads| {
+            self.paste_payloads_nonempty(clipmonger_platform::types::ClipRef(id), payloads, &params)
+        });
+        if let Err(e) = result {
+            eprintln!("daemon: permanent hotkey paste failed: {}", e.message);
+        }
+    }
+
     /// Deliver a permanent from a trusted native hotkey owner.
     pub fn press_permanent(
         &self,
@@ -4729,7 +4755,14 @@ impl DaemonState {
         backend: &str,
         pause: &mut dyn FnMut() -> bool,
     ) {
+        #[cfg(macos_backend)]
+        if backend == "macos" {
+            self.press_permanent_macos(id, chord, pause);
+            return;
+        }
         let pause = std::cell::RefCell::new(pause);
+        #[cfg(macos_backend)]
+        let _ = &pause;
         Self::route_permanent(
             backend,
             || {
@@ -4890,7 +4923,11 @@ impl DaemonState {
     /// with `unavailable` when no live backend is compiled in.
     #[allow(clippy::unused_self)] // self used only in backend cfg branches
     fn handle_paste_execute(&self, params: &Value) -> Result<Value, IpcError> {
-        #[cfg(any(all(windows, feature = "backend-windows"), linux_wayland))]
+        #[cfg(any(
+            all(windows, feature = "backend-windows"),
+            linux_wayland,
+            macos_backend
+        ))]
         {
             let found = self.requested_clip(params)?.ok_or_else(|| {
                 IpcError::new("backend", "paste.execute: unknown clip".to_string())
@@ -4909,7 +4946,11 @@ impl DaemonState {
                 params,
             )
         }
-        #[cfg(not(any(all(windows, feature = "backend-windows"), linux_wayland)))]
+        #[cfg(not(any(
+            all(windows, feature = "backend-windows"),
+            linux_wayland,
+            macos_backend
+        )))]
         {
             let _ = params;
             Err(IpcError::new(
@@ -5096,6 +5137,11 @@ impl DaemonState {
             }
             result
         }
+        // Only a daemon running the live macOS backend pastes through it.
+        #[cfg(macos_backend)]
+        if self.caps.has_backend("macos") {
+            return self.paste_macos_popup(clip, payloads, params);
+        }
         #[cfg(not(any(all(windows, feature = "backend-windows"), linux_wayland)))]
         {
             let _ = (self, clip, payloads, params);
@@ -5112,6 +5158,89 @@ impl DaemonState {
                 format!("paste unavailable: {SKELETON_NOTE}"),
             ))
         }
+    }
+
+    /// Popup paste on macOS: into the app that was frontmost at the press
+    /// (`target` = its pid), or the current frontmost app for a targetless
+    /// paste (CLI), refused once the pick is older than the paste deadline.
+    /// An app that cannot be brought back in front is refused (`denied`).
+    #[cfg(macos_backend)]
+    fn paste_macos_popup(
+        &self,
+        clip: clipmonger_platform::types::ClipRef,
+        payloads: &[(String, Vec<u8>)],
+        params: &Value,
+    ) -> Result<Value, IpcError> {
+        use clipmonger_backend_macos::{MacForeground, MacPaste};
+        let failed = |class: &str| {
+            daemon_runtime_emit(
+                clipmonger_core::runtime_log::Severity::Warn,
+                "paste.failed",
+                &[("operation", "paste_delivery"), ("class", class)],
+            );
+        };
+        let now = now_ms();
+        let deadline_ms = params
+            .get("picked_ms")
+            .and_then(Value::as_i64)
+            .map_or(now, |picked| picked.min(now))
+            + PASTE_DEADLINE_MS;
+        if now > deadline_ms {
+            failed("expired");
+            return Err(IpcError::new(
+                "unavailable",
+                format!("paste.execute: {PASTE_EXPIRED}"),
+            ));
+        }
+        let unavailable = |e: clipmonger_platform::types::Error| {
+            failed(runtime_platform_class(&e));
+            if matches!(e, clipmonger_platform::types::Error::Denied(_)) {
+                IpcError::new("denied", format!("paste.execute: {e}"))
+            } else {
+                IpcError::new("unavailable", format!("paste.execute: {e}"))
+            }
+        };
+        let foreground = MacForeground::new().map_err(unavailable)?;
+        let target = match requested_target(params)? {
+            Some(pid) => {
+                let pid = i32::try_from(pid).map_err(|_| {
+                    IpcError::new("invalid_params", "paste.execute: bad target".to_string())
+                })?;
+                foreground.target_for_pid(pid)
+            }
+            None => foreground.capture_target(),
+        }
+        .map_err(unavailable)?;
+        let (unicode_limit, _dwell, delivery, restore) = self.paste_budget();
+        let paste = MacPaste::new().map_err(unavailable)?;
+        let text = payloads
+            .iter()
+            .find(|(mime, _)| mime.starts_with("text/plain"))
+            .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok());
+        let inject = delivery == clipmonger_core::PasteDelivery::UnicodeInject
+            && payloads.len() == 1
+            && text.is_some_and(|t| t.chars().count() as u64 <= unicode_limit);
+        if let (true, Some(text)) = (inject, text) {
+            foreground
+                .activate(clipmonger_backend_macos::pid_of(&target).unwrap_or_default())
+                .map_err(unavailable)?;
+            paste.type_unicode(text).map_err(unavailable)?;
+        } else {
+            paste
+                .paste_payloads_restoring(
+                    &target,
+                    &clip,
+                    payloads,
+                    restore,
+                    &mut |payload, write| self.self_write_with(payload, None, "macos", write),
+                )
+                .map_err(unavailable)?;
+        }
+        let _ = self
+            .store_read()?
+            .as_ref()
+            .and_then(|store| store.bump_clip(clip.0, now_ms()).ok());
+        Ok(serde_json::json!({"pasted": true}))
     }
 
     /// Popup paste on an X11 session through the cached X11 engine: into the

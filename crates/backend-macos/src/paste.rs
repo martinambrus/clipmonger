@@ -41,6 +41,23 @@ const UNICODE_GAP_MS: u64 = 5;
 pub type ClipboardWriteHook<'a> =
     dyn FnMut(&[(String, Vec<u8>)], &mut dyn FnMut() -> Result<()>) -> Result<()> + 'a;
 
+/// Wait until the user has let go of Shift, Control, Option and Command
+/// (a hotkey's own modifiers would otherwise join the synthetic Cmd+V).
+///
+/// # Errors
+///
+/// [`Error::Denied`] when a modifier is still held after `timeout`.
+pub fn wait_modifiers_released(timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while os::held_modifier_flags() != 0 {
+        if Instant::now() >= deadline {
+            return Err(Error::Denied("modifier keys stayed held".to_string()));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
 /// Whether this process may post synthetic input; `prompt` shows the
 /// system Accessibility prompt when not yet trusted.
 #[must_use]

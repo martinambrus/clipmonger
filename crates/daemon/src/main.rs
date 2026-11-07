@@ -777,6 +777,138 @@ fn setup_wayland_backend(
     clipmonger_daemon::wlr::spawn_focus_tracker(Arc::clone(state));
 }
 
+/// Construct the live macOS backend: caps (Accessibility and pasteboard
+/// access), the changeCount capture thread, and the hotkey thread
+/// (hotkeys live on the main thread's `NSApplication` loop).
+#[cfg(macos_backend)]
+#[allow(clippy::too_many_lines)]
+fn setup_macos_backend(
+    profile: &Path,
+    state: &Arc<DaemonState>,
+    config: &Config,
+    shutdown: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    use clipmonger_backend_macos::{MacHotkeys, MacMonitor, MacTransfer, MonitorOpts};
+    use clipmonger_platform::types::SubscribeKind;
+
+    // A LaunchAgent left behind by an app that was moved to the Trash.
+    if let Some(agents) = clipmonger_backend_macos::autostart::default_agents_dir() {
+        let _ = clipmonger_backend_macos::remove_stale_agent(&agents);
+    }
+    let _ = profile;
+    // Ask once for Accessibility (the system shows its prompt); paste reports
+    // Degraded until it is granted.
+    let trusted = clipmonger_backend_macos::accessibility_trusted(true);
+    state.register_backend(
+        "macos",
+        clipmonger_backend_macos::caps::caps_for(
+            trusted,
+            clipmonger_backend_macos::pasteboard_access(),
+        ),
+    );
+    let transfer = match MacTransfer::new() {
+        Ok(transfer) => Some(Arc::new(transfer)),
+        Err(e) => {
+            eprintln!("daemon: macos transfer unavailable: {e}");
+            None
+        }
+    };
+    let mut denylist = config.monitor.ignores.clone();
+    denylist.extend(config.privacy.denylist.iter().cloned());
+    let monitor_opts = MonitorOpts {
+        poll_ms: config.monitor.poll_ms,
+        denylist,
+        max_bytes: config.monitor.max_bytes,
+    };
+    let kinds = vec![SubscribeKind::Clipboard];
+    let monitor =
+        clipmonger_daemon::capture::subscribed(|| MacMonitor::new(monitor_opts.clone()), &kinds)
+            .map_err(|e| eprintln!("daemon: macos monitor unavailable: {e}"))
+            .ok();
+    let monitor = if transfer.is_some() { monitor } else { None };
+    state.set_monitor_available("macos", monitor.is_some());
+    state.set_hotkey_status(
+        "macos",
+        &clipmonger_daemon::popup::ChordStatus::Refused("popup hotkey starting".into()),
+    );
+
+    {
+        let state = Arc::clone(state);
+        let poll_ms = config.monitor.poll_ms;
+        let shutdown = Arc::clone(shutdown);
+        std::thread::spawn(move || {
+            let poll_timeout = std::time::Duration::from_millis(poll_ms.clamp(50, 5000));
+            let transfer = std::cell::RefCell::new(transfer);
+            clipmonger_daemon::capture::run_backend(
+                monitor,
+                poll_timeout,
+                &shutdown,
+                &state,
+                "macos",
+                || {
+                    let missing_transfer = transfer.borrow().is_none();
+                    if missing_transfer {
+                        *transfer.borrow_mut() = Some(Arc::new(MacTransfer::new()?));
+                    }
+                    clipmonger_daemon::capture::resubscribed(
+                        || MacMonitor::new(monitor_opts.clone()),
+                        &kinds,
+                    )
+                },
+                |events| {
+                    let transfer = transfer.borrow();
+                    let Some(transfer) = transfer.as_ref() else {
+                        return;
+                    };
+                    for event in events {
+                        if let Err(error) =
+                            state.capture_event("macos", event, transfer.as_ref(), |line| {
+                                eprintln!("daemon: macos {line}");
+                            })
+                        {
+                            eprintln!("daemon: macos capture unavailable: {error}");
+                        }
+                    }
+                },
+                |line| eprintln!("daemon: macos {line}"),
+            );
+        });
+    }
+
+    // Hotkeys need the main thread's NSApplication loop (main_loop::run).
+    if clipmonger_backend_macos::main_loop::is_running() {
+        let shutdown = Arc::clone(shutdown);
+        let state = Arc::clone(state);
+        std::thread::spawn(move || {
+            clipmonger_daemon::popup::run_hotkeys_with_activation(
+                None,
+                &shutdown,
+                MacHotkeys::new,
+                || state.popup_hotkey(),
+                || {},
+                |status| {
+                    if let clipmonger_daemon::popup::ChordStatus::Refused(why) = &status {
+                        eprintln!("daemon: macos popup hotkey unavailable: {why}");
+                    }
+                    state.set_hotkey_status("macos", &status);
+                },
+                |activation| {
+                    state.trigger_popup_activation(activation);
+                },
+                |delay| {
+                    clipmonger_daemon::capture::sleep_interruptible(
+                        &shutdown,
+                        delay,
+                        std::thread::sleep,
+                    );
+                },
+                Some(&state),
+                |id, chord, pause| state.press_permanent(id, chord, "macos", pause),
+            );
+        });
+    }
+}
+
 /// Start the session backends selected by `want_backends` (X11 and/or
 /// Wayland on Linux; Windows keeps its single-backend path). With neither
 /// display set this is a no-op and the daemon serves history offline.
@@ -788,6 +920,8 @@ fn setup_session_backends(
 ) {
     #[cfg(all(windows, feature = "backend-windows"))]
     setup_windows_backend(profile, state, config, backend_shutdown);
+    #[cfg(macos_backend)]
+    setup_macos_backend(profile, state, config, backend_shutdown);
     #[cfg(linux_x11)]
     {
         let (want_x11, _) = want_backends(
@@ -984,14 +1118,26 @@ fn main() {
         let profile = profile_arg(&args);
         std::process::exit(serve_helper(&profile, false));
     }
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap_or_else(|e| {
-            eprintln!("daemon: runtime build failed: {e}");
-            std::process::exit(1);
+    let run = move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|e| {
+                eprintln!("daemon: runtime build failed: {e}");
+                std::process::exit(1);
+            });
+        rt.block_on(async_main(args));
+    };
+    // macOS: global hotkeys need an NSApplication loop on the main thread;
+    // the daemon itself runs on a worker thread. Headless runs skip it.
+    #[cfg(macos_backend)]
+    if !std::env::args().any(|a| a == "--headless" || a == "--script") {
+        clipmonger_backend_macos::main_loop::run(move || {
+            run();
+            0
         });
-    rt.block_on(async_main(args));
+    }
+    run();
 }
 
 #[allow(clippy::too_many_lines)]

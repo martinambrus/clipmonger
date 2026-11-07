@@ -41,7 +41,10 @@ pub use caps::PasteboardAccess;
 pub use foreground::{pid_of, MacForeground, RunningApp};
 pub use hotkeys::MacHotkeys;
 pub use monitor::{MacMonitor, MonitorOpts};
-pub use paste::{accessibility_trusted, secure_input_enabled, ClipboardWriteHook, MacPaste};
+pub use paste::{
+    accessibility_trusted, secure_input_enabled, wait_modifiers_released, ClipboardWriteHook,
+    MacPaste,
+};
 pub use transfer::MacTransfer;
 
 /// Pasteboard privacy state (macOS 15.4+ `accessBehavior`; older systems

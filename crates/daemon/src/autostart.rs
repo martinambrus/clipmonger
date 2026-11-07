@@ -506,7 +506,11 @@ impl AutostartService {
         if !daemon_exe.is_absolute() {
             return Self::unconfigured();
         }
-        let supported = cfg!(any(all(windows, feature = "backend-windows"), linux_x11));
+        let supported = cfg!(any(
+            all(windows, feature = "backend-windows"),
+            linux_x11,
+            macos_backend
+        ));
         let portable = match selection(&classify_portable(daemon_exe, profile_dir), supported) {
             Selection::Portable => return Self::portable(),
             Selection::Native => false,
@@ -550,7 +554,29 @@ impl AutostartService {
             }
         }
 
-        #[cfg(not(any(all(windows, feature = "backend-windows"), linux_x11)))]
+        #[cfg(macos_backend)]
+        {
+            let Some(agents) = clipmonger_backend_macos::autostart::default_agents_dir() else {
+                return Self::unconfigured();
+            };
+            let ui_exe = sibling_ui_exe(daemon_exe);
+            let Ok(profile_abs) = absolute_path(profile_dir) else {
+                return Self::unconfigured();
+            };
+            match clipmonger_backend_macos::MacAutostart::with_profile(
+                ui_exe,
+                agents,
+                profile_abs,
+                false,
+            ) {
+                Ok(manager) => {
+                    return Self::with_adapter(make_adapter(manager), portable);
+                }
+                Err(_) => return Self::unconfigured(),
+            }
+        }
+
+        #[cfg(not(any(all(windows, feature = "backend-windows"), linux_x11, macos_backend)))]
         {
             let _ = portable;
             return Self::unconfigured();

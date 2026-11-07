@@ -27,7 +27,7 @@ use crate::foreground::RunningApp;
 use crate::mime::{Item, TypeNames, WritePlan};
 use crate::sys;
 
-pub(crate) use crate::sys::{post_key, post_unicode, secure_input_enabled};
+pub(crate) use crate::sys::{held_modifier_flags, post_key, post_unicode, secure_input_enabled};
 
 /// Refusal when there is no per-user pasteboard (system daemon context).
 const NO_SESSION: &str = "no user pasteboard: Clipmonger must run in the logged-in user's \

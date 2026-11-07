@@ -16,11 +16,11 @@ path = "src/main.rs"
 # all three is a no-op on non-matching targets. Use
 # `--no-default-features` (optionally `--features minimal`) for the
 # headless skeleton.
-default = ["backend-windows", "backend-x11", "backend-wayland"]
+default = ["backend-windows", "backend-x11", "backend-wayland", "backend-macos"]
 backend-windows = ["dep:clipmonger-backend-windows"]
 backend-x11 = ["dep:clipmonger-backend-x11"]
 backend-wayland = ["dep:clipmonger-backend-wayland", "dep:ashpd", "dep:futures-util"]
-backend-macos = []
+backend-macos = ["dep:clipmonger-backend-macos"]
 minimal = []
 
 [dependencies]
@@ -37,6 +37,9 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 rusqlite.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+clipmonger-backend-macos = { path = "../backend-macos", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation","Win32_Storage_FileSystem","Win32_UI_WindowsAndMessaging","Win32_UI_Input_KeyboardAndMouse","Win32_System_LibraryLoader","Win32_System_Threading"] }

@@ -668,6 +668,7 @@ name = "clipmonger-daemon"
 version = "0.2.0"
 dependencies = [
  "ashpd",
+ "clipmonger-backend-macos",
  "clipmonger-backend-wayland",
  "clipmonger-backend-windows",
  "clipmonger-backend-x11",

@@ -29,6 +29,7 @@ unsafe extern "C" {
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventKeyboardSetUnicodeString(event: CGEventRef, len: std::ffi::c_ulong, s: *const u16);
     fn CGEventPost(tap: u32, event: CGEventRef);
+    fn CGEventSourceFlagsState(state_id: i32) -> u64;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -107,6 +108,16 @@ pub(crate) fn post_key(code: u16, down: bool, flags: u64) -> Result<()> {
         CGEventPost(HID_EVENT_TAP, event.0);
     }
     Ok(())
+}
+
+/// Modifier flags (Shift, Control, Option, Command) held on the hardware
+/// keyboard right now (`kCGEventSourceStateHIDSystemState`).
+pub(crate) fn held_modifier_flags() -> u64 {
+    const HID_SYSTEM_STATE: i32 = 1;
+    // Shift | Control | Alternate | Command (CGEventFlags masks).
+    const MODIFIERS: u64 = 0x0002_0000 | 0x0004_0000 | 0x0008_0000 | 0x0010_0000;
+    // Safety: pure query without pointers.
+    unsafe { CGEventSourceFlagsState(HID_SYSTEM_STATE) & MODIFIERS }
 }
 
 /// Post a down/up pair carrying `units` as the typed string.

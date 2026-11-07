@@ -899,7 +899,7 @@ fn extension_press_decision(
     (focused_popup_pid == Some(ui_pid)).then_some((None, true))
 }
 
-#[cfg(all(unix, not(target_os = "macos"), any(test, linux_x11)))]
+#[cfg(all(unix, any(test, linux_x11)))]
 fn x11_press_decision(target: Option<u64>, popup: Option<u64>) -> (Option<u64>, bool) {
     if target.is_some() && target == popup {
         (None, true)
@@ -908,7 +908,7 @@ fn x11_press_decision(target: Option<u64>, popup: Option<u64>) -> (Option<u64>, 
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos"), any(test, linux_x11)))]
+#[cfg(all(unix, any(test, linux_x11)))]
 fn x11_press_target_for_ui(
     target: Option<u64>,
     ui: Option<&SubscriberInfo>,
@@ -936,8 +936,22 @@ fn press_target(ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
     x11_press_target_for_ui(target, ui)
 }
 
+/// macOS: the frontmost app (its pid) is the paste target; when that is
+/// the UI itself the popup is in front and the press toggles it.
+#[cfg(macos_backend)]
+fn press_target(ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
+    let Some(pid) = clipmonger_backend_macos::MacForeground::frontmost_pid() else {
+        return (None, false);
+    };
+    let pid = u32::try_from(pid).ok();
+    if pid.is_some() && pid == ui.and_then(|ui| ui.peer_pid) {
+        return (None, true);
+    }
+    (pid.map(u64::from), false)
+}
+
 /// No foreground target on this platform (Wayland, headless).
-#[cfg(not(any(all(windows, feature = "backend-windows"), linux_x11)))]
+#[cfg(not(any(all(windows, feature = "backend-windows"), linux_x11, macos_backend)))]
 fn press_target(_ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
     (None, false)
 }
@@ -1259,6 +1273,7 @@ mod tests {
     }
 
     /// A fake extension: answer every `paste.assist` with `answer(params)`.
+    #[cfg(linux_wayland)]
     fn fake_extension(
         sock: &std::path::Path,
         answer: impl Fn(&serde_json::Value) -> Option<serde_json::Value> + Send + 'static,

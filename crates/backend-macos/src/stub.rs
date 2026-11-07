@@ -62,6 +62,10 @@ pub(crate) fn accessibility_trusted(_prompt: bool) -> bool {
 pub(crate) fn secure_input_enabled() -> bool {
     false
 }
+pub(crate) fn held_modifier_flags() -> u64 {
+    0
+}
+
 pub(crate) fn post_key(_code: u16, _down: bool, _flags: u64) -> Result<()> {
     unavailable()
 }
