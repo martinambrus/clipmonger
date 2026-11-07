@@ -73,7 +73,10 @@ fn permanent_id(id: uuid::Uuid, chord: &str) -> String {
 /// The shortcuts to hold: the popup chord, then each permanent clip with a
 /// chord (`(id, chord, name)`). A permanent chord equal to the popup chord
 /// or to an earlier permanent is left out; the popup wins.
-pub(crate) fn plan_bindings(popup: &str, permanents: &[(uuid::Uuid, String, String)]) -> Vec<Binding> {
+pub(crate) fn plan_bindings(
+    popup: &str,
+    permanents: &[(uuid::Uuid, String, String)],
+) -> Vec<Binding> {
     let norm = |chord: &str| {
         clipmonger_platform::chord::parse(chord)
             .map_or_else(|_| chord.trim().to_ascii_lowercase(), |c| c.to_string())
@@ -178,7 +181,9 @@ async fn run_session(state: Arc<crate::DaemonState>) {
     // Must precede every other portal call on the shared connection. A
     // portal older than 1.19 has no Registry; it then derives the id itself.
     let registered = match ashpd::AppID::try_from(APP_ID) {
-        Ok(app_id) => ashpd::register_host_app(app_id).await.map_err(|e| e.to_string()),
+        Ok(app_id) => ashpd::register_host_app(app_id)
+            .await
+            .map_err(|e| e.to_string()),
         Err(e) => Err(e.to_string()),
     };
     if let Err(e) = &registered {
@@ -291,8 +296,7 @@ fn on_activated(
     pending: &mut Option<(Binding, std::time::Instant)>,
     signal: &crate::portal_raw::ShortcutSignal,
 ) {
-    let Some(binding) = bound.and_then(|set| set.iter().find(|b| b.id == signal.id))
-    else {
+    let Some(binding) = bound.and_then(|set| set.iter().find(|b| b.id == signal.id)) else {
         return;
     };
     match binding.action {
@@ -434,7 +438,10 @@ mod tests {
         let h = set("ctrl+alt+h");
         let j = set("ctrl+alt+j");
         let k = set("ctrl+alt+k");
-        assert_eq!(portal_step(&h, false, None, None), PortalStep::Bind(h.clone()));
+        assert_eq!(
+            portal_step(&h, false, None, None),
+            PortalStep::Bind(h.clone())
+        );
         assert_eq!(
             portal_step(&h, false, Some(&h), None),
             PortalStep::Idle,
@@ -450,7 +457,10 @@ mod tests {
             PortalStep::Idle,
             "a refused set waits for a change: no dialog loop"
         );
-        assert_eq!(portal_step(&k, false, None, Some(&j)), PortalStep::Bind(k.clone()));
+        assert_eq!(
+            portal_step(&k, false, None, Some(&j)),
+            PortalStep::Bind(k.clone())
+        );
         assert_eq!(
             portal_step(&h, true, Some(&h), None),
             PortalStep::Release,
@@ -484,7 +494,9 @@ mod tests {
             "an edited chord is a new shortcut"
         );
         assert_eq!(set[1].label, "Clipmonger: paste Sig");
-        assert!(plan_bindings("", &rows).iter().all(|b| b.action != Action::Popup));
+        assert!(plan_bindings("", &rows)
+            .iter()
+            .all(|b| b.action != Action::Popup));
     }
 
     #[test]

@@ -148,6 +148,16 @@ pub mod popup;
 pub mod portal;
 #[cfg(all(unix, feature = "backend-wayland"))]
 mod portal_raw;
+#[cfg(all(unix, feature = "backend-wayland"))]
+pub mod wlr;
+
+/// Whether `$XDG_CURRENT_DESKTOP` names `desktop` (case ignored), e.g.
+/// `GNOME` or `KDE`.
+#[must_use]
+pub fn current_desktop_is(desktop: &str) -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .is_ok_and(|current| current.split(':').any(|d| d.eq_ignore_ascii_case(desktop)))
+}
 
 /// Daemon crate version reported by `status`.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -735,6 +745,9 @@ pub struct CapsAggregator {
     registered: Mutex<HashMap<String, String>>,
     /// GNOME extension link state.
     extension_connected: Mutex<bool>,
+    /// Whether this is a GNOME session on Linux: only there does a missing
+    /// extension cost paste and capture, and only there is it noted.
+    gnome_session: bool,
     /// Live typed backend snapshots by name (`windows`, `x11`, `wayland`).
     backends: Mutex<HashMap<String, BackendCaps>>,
 }
@@ -761,14 +774,29 @@ fn strategy_str(strategy: PasteStrategy) -> &'static str {
 }
 
 impl CapsAggregator {
-    /// Create an aggregator with no extension connected and no backends.
+    /// Create an aggregator with no extension connected and no backends,
+    /// for the desktop this process runs in.
     #[must_use]
     pub fn new() -> Self {
+        Self::for_desktop(cfg!(target_os = "linux") && current_desktop_is("gnome"))
+    }
+
+    /// Create an aggregator, stating whether this is a GNOME session (where
+    /// a disconnected extension is noted).
+    #[must_use]
+    pub fn for_desktop(gnome_session: bool) -> Self {
         Self {
             registered: Mutex::new(HashMap::new()),
             extension_connected: Mutex::new(false),
+            gnome_session,
             backends: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether this is a GNOME session ([`Self::for_desktop`]).
+    #[must_use]
+    pub fn gnome_session(&self) -> bool {
+        self.gnome_session
     }
 
     /// Register one backend's capability summary under `name`.
@@ -836,16 +864,17 @@ impl CapsAggregator {
     #[must_use]
     pub fn snapshot(&self) -> Value {
         let extension_up = self.extension_connected.lock().map_or(true, |f| *f);
+        let note_extension = !extension_up && self.gnome_session;
         let backends = self
             .backends
             .lock()
             .map(|slot| slot.clone())
             .unwrap_or_default();
         if !backends.is_empty() {
-            return Self::merged_snapshot(&backends, extension_up);
+            return Self::merged_snapshot(&backends, extension_up, note_extension);
         }
         let mut notes = vec![Value::from(SKELETON_NOTE)];
-        if !extension_up && cfg!(target_os = "linux") {
+        if note_extension {
             notes.push(Value::from(
                 "gnome extension disconnected: paste unavailable",
             ));
@@ -863,14 +892,15 @@ impl CapsAggregator {
         })
     }
 
-    /// Render a typed backend snapshot into the status JSON shape.
-    fn typed_snapshot(caps: &BackendCaps, extension_up: bool) -> Value {
+    /// Render a typed backend snapshot into the status JSON shape;
+    /// `note_extension` adds the GNOME extension-disconnected note.
+    fn typed_snapshot(caps: &BackendCaps, extension_up: bool, note_extension: bool) -> Value {
         let mut notes: Vec<Value> = caps
             .notes
             .iter()
             .map(|note| Value::from(note.as_str()))
             .collect();
-        if !extension_up && cfg!(target_os = "linux") {
+        if note_extension {
             notes.push(Value::from(
                 "gnome extension disconnected: paste unavailable",
             ));
@@ -911,7 +941,11 @@ impl CapsAggregator {
     /// Merge per-backend snapshots: top-level keys keep their shape with
     /// best-of levels, notes carry `[name]` prefixes, and the per-backend
     /// breakdown rides in the additive `backends` map.
-    fn merged_snapshot(backends: &HashMap<String, BackendCaps>, extension_up: bool) -> Value {
+    fn merged_snapshot(
+        backends: &HashMap<String, BackendCaps>,
+        extension_up: bool,
+        note_extension: bool,
+    ) -> Value {
         let mut names: Vec<&String> = backends.keys().collect();
         names.sort();
         let pick = |level: fn(&BackendCaps) -> Level| {
@@ -947,12 +981,12 @@ impl CapsAggregator {
             primary_selection: names.iter().any(|name| backends[*name].primary_selection),
             notes: prefixed_notes,
         };
-        let mut snapshot = Self::typed_snapshot(&merged, extension_up);
+        let mut snapshot = Self::typed_snapshot(&merged, extension_up, note_extension);
         let mut breakdown = serde_json::Map::new();
         for name in names {
             breakdown.insert(
                 (*name).clone(),
-                Self::typed_snapshot(&backends[name], extension_up),
+                Self::typed_snapshot(&backends[name], extension_up, note_extension),
             );
         }
         snapshot["backends"] = Value::Object(breakdown);
@@ -1295,9 +1329,10 @@ const KLIPPER_REFILL_MIME: &str = "application/x-kde-onlyReplaceEmpty";
 /// Capturing it would move that item back to the top of the history.
 /// On X11 the marker arrives as an unknown target, `x-os/`-prefixed.
 fn klipper_refill(event: &clipmonger_platform::types::CaptureEvent) -> bool {
-    event.offers.iter().any(|offer| {
-        offer.mime.strip_prefix("x-os/").unwrap_or(&offer.mime) == KLIPPER_REFILL_MIME
-    })
+    event
+        .offers
+        .iter()
+        .any(|offer| offer.mime.strip_prefix("x-os/").unwrap_or(&offer.mime) == KLIPPER_REFILL_MIME)
 }
 
 fn strict_capture_requires_skip(
@@ -1755,6 +1790,13 @@ fn skip_x11_capture(origin: &str, x11_session: bool, wayland_backend: bool) -> b
     origin == "x11" && !x11_session && wayland_backend
 }
 
+/// Pure rule behind `DaemonState::extension_report_redundant`: drop GNOME
+/// extension reports on an X11 session that runs the live X11 backend.
+#[cfg(all(unix, feature = "backend-x11"))]
+fn skip_extension_capture(x11_session: bool, x11_backend: bool) -> bool {
+    x11_session && x11_backend
+}
+
 /// Text payloads without trailing NUL terminators: some X11 apps (GNOME Text
 /// Editor's `text/plain` target) append one. Kept, it is pasted back and
 /// makes the clip differ from the same text captured elsewhere, so copies
@@ -1923,6 +1965,80 @@ fn extension_paste_caps(snapshot: &mut Value) {
     });
     if let Some(wayland) = snapshot.pointer_mut("/backends/wayland") {
         wayland["paste"] = paste.clone();
+        snapshot["paste"] = paste;
+    }
+}
+
+/// The command a desktop shortcut runs to open the popup: the CLI next to
+/// this daemon, for this profile. Paths with spaces or quotes are quoted
+/// for a shell (Sway's `exec`, Hyprland's `exec_cmd` and COSMIC's custom
+/// shortcuts all run the command through `sh -c`).
+#[cfg(all(unix, feature = "backend-wayland"))]
+fn popup_hotkey_command(profile: &Path) -> String {
+    let cli = std::env::current_exe().map_or_else(
+        |_| PathBuf::from("clipmonger-cli"),
+        |exe| exe.with_file_name("clipmonger-cli"),
+    );
+    format!(
+        "{} --profile-dir {} show-popup",
+        shell_quote(&cli.to_string_lossy()),
+        shell_quote(&profile.to_string_lossy())
+    )
+}
+
+/// The command a compositor config runs at login to start Clipmonger in
+/// the tray (Sway and Hyprland ignore XDG autostart entries).
+#[cfg(all(unix, feature = "backend-wayland"))]
+fn autostart_command(profile: &Path) -> String {
+    let ui = std::env::current_exe().map_or_else(
+        |_| PathBuf::from("clipmonger"),
+        |exe| exe.with_file_name("clipmonger"),
+    );
+    format!(
+        "{} --minimized --profile-dir {}",
+        shell_quote(&ui.to_string_lossy()),
+        shell_quote(&profile.to_string_lossy())
+    )
+}
+
+/// `text` as one shell word: unchanged when it holds only safe characters,
+/// else single-quoted.
+#[cfg(all(unix, feature = "backend-wayland"))]
+fn shell_quote(text: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+=:,@%".contains(c);
+    if !text.is_empty() && text.chars().all(safe) {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// On wlroots-family sessions (Sway, Hyprland, COSMIC, ...) apps cannot
+/// set a working global shortcut: Sway has no shortcut portal, Hyprland's
+/// binds nothing until its config names the shortcut. Report the hotkey as
+/// degraded and publish the command to bind in the desktop's own settings
+/// (the UI shows it). The `XWayland` grab is off there (it would only see
+/// keys while an X11 window has focus).
+#[cfg(all(unix, feature = "backend-wayland"))]
+fn manual_hotkey_caps(snapshot: &mut Value, command: &str) {
+    let hotkey = serde_json::json!({
+        "level": "degraded",
+        "reason": "bind a key in the desktop's shortcut settings to run popup_hotkey_command",
+    });
+    if let Some(wayland) = snapshot.pointer_mut("/backends/wayland") {
+        wayland["hotkey"] = hotkey.clone();
+    }
+    if let Some(x11) = snapshot.pointer_mut("/backends/x11") {
+        x11["hotkey"] = serde_json::json!({
+            "level": "unavailable",
+            "reason": "XWayland grabs see keys only while an X11 window has focus",
+        });
+    }
+    snapshot["hotkey"] = hotkey;
+    snapshot["popup_hotkey_command"] = Value::from(command);
+    // Paste follows the Wayland backend: the X11 engine reaches only
+    // `XWayland` windows.
+    if let Some(paste) = snapshot.pointer("/backends/wayland/paste").cloned() {
         snapshot["paste"] = paste;
     }
 }
@@ -2165,9 +2281,10 @@ pub struct DaemonState {
     sensitive_text: Mutex<Option<String>>,
     /// Whether the last capture read its payload ([`klipper_refill`]).
     last_capture_read: std::sync::atomic::AtomicBool,
-    /// Active window as reported by the `KWin` script ([`kwin`]).
+    /// Active window as reported by the `KWin` script ([`kwin`]) or the
+    /// foreign-toplevel tracker ([`wlr`]).
     #[cfg(all(unix, feature = "backend-wayland"))]
-    kwin_focus: Mutex<crate::kwin::Focus>,
+    focus: Mutex<crate::kwin::Focus>,
     thumbnail: crate::thumbnail::ThumbnailService,
     #[cfg(test)]
     thumbnail_snapshot_hook: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
@@ -2439,7 +2556,7 @@ impl DaemonState {
             sensitive_text: Mutex::new(None),
             last_capture_read: std::sync::atomic::AtomicBool::new(true),
             #[cfg(all(unix, feature = "backend-wayland"))]
-            kwin_focus: Mutex::new(crate::kwin::Focus::default()),
+            focus: Mutex::new(crate::kwin::Focus::default()),
             thumbnail: crate::thumbnail::ThumbnailService::new_for_daemon(),
             #[cfg(test)]
             thumbnail_snapshot_hook: Mutex::new(None),
@@ -2769,8 +2886,18 @@ impl DaemonState {
         if self.extension_connected() && !x11_session_or_absent() {
             extension_paste_caps(&mut snapshot);
         }
+        #[cfg(all(unix, feature = "backend-wayland"))]
+        if crate::wlr::is_wlr_wayland() {
+            let profile = self
+                .profile_dir
+                .lock()
+                .map(|dir| dir.clone())
+                .unwrap_or_default();
+            manual_hotkey_caps(&mut snapshot, &popup_hotkey_command(&profile));
+            snapshot["autostart_command"] = Value::from(autostart_command(&profile));
+        }
         #[cfg(all(unix, feature = "backend-x11"))]
-        if self.xwayland_mirror("x11") {
+        if self.caps.gnome_session() && self.xwayland_mirror("x11") {
             let note = if self.extension_connected() {
                 "capture by the GNOME extension (the X11 watcher stays off on Wayland)"
             } else {
@@ -3020,10 +3147,11 @@ impl DaemonState {
         false
     }
 
-    /// One window activation reported by the `KWin` script.
+    /// One window activation reported by the `KWin` script or the
+    /// foreign-toplevel tracker.
     #[cfg(all(unix, feature = "backend-wayland"))]
-    pub(crate) fn kwin_activated(&self, ids: Vec<String>) {
-        if let Ok(mut focus) = self.kwin_focus.lock() {
+    pub(crate) fn window_activated(&self, ids: Vec<String>) {
+        if let Ok(mut focus) = self.focus.lock() {
             focus.activated(ids);
         }
     }
@@ -3152,6 +3280,12 @@ impl DaemonState {
         Ok(false)
     }
 
+    /// Record that the latest capture read nothing (see `last_capture_read`).
+    fn note_capture_unread(&self) {
+        self.last_capture_read
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Actual lazy-read capture adapter shared by Windows, X11 and Wayland.
     /// Sensitive/strict/pause checks precede payload reads and metadata copies;
     /// known oversize hints preflight the whole observation before any read.
@@ -3259,7 +3393,7 @@ impl DaemonState {
         }
         let implausible = nothing_plausible(origin, &mut payloads);
         if implausible || payloads.is_empty() {
-            self.last_capture_read.store(false, std::sync::atomic::Ordering::SeqCst);
+            self.note_capture_unread();
         }
         if implausible || short_windows_capture(origin, cfg.monitor.min_len, &payloads) {
             return Ok(false);
@@ -3828,6 +3962,9 @@ impl DaemonState {
     /// Dispatch GNOME's existing capture.report contract. Decide the entire
     /// capture from bounded metadata before decoding any ordinary payload.
     fn handle_capture(&self, params: &Value) -> Result<Value, IpcError> {
+        if self.extension_report_redundant() {
+            return Ok(serde_json::json!({"accepted": false}));
+        }
         let event = params.get("event").unwrap_or(&Value::Null);
         match event.get("sensitive") {
             Some(Value::Bool(true)) => {
@@ -3878,6 +4015,23 @@ impl DaemonState {
         }
         let accepted = self.ingest_capture_checked("gnome", false, &payloads)?;
         Ok(serde_json::json!({"accepted": accepted}))
+    }
+
+    /// Whether GNOME extension capture reports add nothing: on an X11
+    /// session with the live X11 backend, its watcher sees every clipboard
+    /// change (privacy hints included) and recognises the daemon's own
+    /// writes, while the extension's copy of a paste or permanent-clip
+    /// write would be stored as a new clip (GNOME 46 Xorg).
+    #[allow(clippy::unused_self)]
+    fn extension_report_redundant(&self) -> bool {
+        #[cfg(all(unix, feature = "backend-x11"))]
+        {
+            skip_extension_capture(x11_session(), self.caps.has_backend("x11"))
+        }
+        #[cfg(not(all(unix, feature = "backend-x11")))]
+        {
+            false
+        }
     }
 
     /// Dispatch `blob.put`: assemble chunks keyed by `(clip, mime)`; on
@@ -5077,15 +5231,15 @@ impl DaemonState {
                 IpcError::new("unavailable", format!("paste.execute: {e}"))
             })?;
         let mut result = serde_json::json!({"pasted": true});
-        match crate::kwin::auto_paste(&self.kwin_focus, payloads) {
+        match crate::kwin::auto_paste(&self.focus, payloads) {
             Ok(true) => return Ok(result),
             Ok(false) => {}
             Err(reason) => {
-                eprintln!("daemon: kwin auto-paste skipped: {reason}");
+                eprintln!("daemon: auto-paste skipped: {reason}");
                 daemon_runtime_emit(
                     clipmonger_core::runtime_log::Severity::Warn,
                     "paste.failed",
-                    &[("operation", "paste_kwin_chord"), ("class", "focus")],
+                    &[("operation", "paste_chord"), ("class", "focus")],
                 );
             }
         }
@@ -5650,7 +5804,10 @@ mod tests {
         let (_dir, state) = fresh_state("klipper-refill");
         let payloads = vec![("text/plain".to_string(), b"older item".to_vec())];
         let transfer = FakeTransfer::new(
-            vec!["text/plain".into(), "application/x-kde-onlyReplaceEmpty".into()],
+            vec![
+                "text/plain".into(),
+                "application/x-kde-onlyReplaceEmpty".into(),
+            ],
             payloads.into_iter().collect(),
             None,
         );
@@ -5660,7 +5817,10 @@ mod tests {
         };
         let refill = CaptureEvent {
             native_sequence: None,
-            offers: vec![offer("text/plain"), offer("application/x-kde-onlyReplaceEmpty")],
+            offers: vec![
+                offer("text/plain"),
+                offer("application/x-kde-onlyReplaceEmpty"),
+            ],
             origin: CaptureOrigin::Clipboard,
             sensitive: false,
         };
@@ -5681,7 +5841,10 @@ mod tests {
             ],
             ..copy
         };
-        assert!(super::klipper_refill(&x11_refill), "X11 spelling of the marker");
+        assert!(
+            super::klipper_refill(&x11_refill),
+            "X11 spelling of the marker"
+        );
         // The copy before the refill could not be read (its app quit at
         // once): the refill is then the only copy, and it is stored.
         let unreadable = FakeTransfer::new(
@@ -5699,7 +5862,10 @@ mod tests {
             .capture_event("x11", &lost, &unreadable, |_| {})
             .unwrap());
         let screenshot = FakeTransfer::new(
-            vec!["text/plain".into(), "application/x-kde-onlyReplaceEmpty".into()],
+            vec![
+                "text/plain".into(),
+                "application/x-kde-onlyReplaceEmpty".into(),
+            ],
             vec![("text/plain".to_string(), b"only via klipper".to_vec())]
                 .into_iter()
                 .collect(),
@@ -6959,6 +7125,43 @@ mod tests {
         );
     }
 
+    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[test]
+    fn wlroots_sessions_publish_the_popup_command() {
+        assert_eq!(
+            super::shell_quote("/opt/clipmonger/clipmonger-cli"),
+            "/opt/clipmonger/clipmonger-cli"
+        );
+        assert_eq!(super::shell_quote("/home/a b/it's"), "'/home/a b/it'\\''s'");
+        assert_eq!(super::shell_quote(""), "''");
+        let mut snapshot = serde_json::json!({
+            "hotkey": {"level": "full", "reason": ""},
+            "paste": {"level": "full", "strategy": "clipboard_restore"},
+            "backends": {
+                "wayland": {"hotkey": {"level": "full"}, "paste": {"level": "degraded", "strategy": "write_and_toast"}},
+                "x11": {"hotkey": {"level": "full"}},
+            },
+        });
+        super::manual_hotkey_caps(&mut snapshot, "cli --profile-dir p show-popup");
+        assert_eq!(snapshot["hotkey"]["level"], "degraded");
+        assert_eq!(
+            snapshot["backends"]["wayland"]["hotkey"]["level"],
+            "degraded"
+        );
+        assert_eq!(
+            snapshot["backends"]["x11"]["hotkey"]["level"],
+            "unavailable"
+        );
+        assert_eq!(
+            snapshot["popup_hotkey_command"],
+            "cli --profile-dir p show-popup"
+        );
+        assert_eq!(
+            snapshot["paste"]["strategy"], "write_and_toast",
+            "paste follows Wayland"
+        );
+    }
+
     #[cfg(all(unix, feature = "backend-x11"))]
     #[test]
     fn x11_watcher_stays_off_on_a_wayland_session() {
@@ -6977,6 +7180,18 @@ mod tests {
         );
         assert!(!skip("gnome", false, true), "the extension always captures");
         assert!(!skip("wayland", false, true));
+    }
+
+    #[cfg(all(unix, feature = "backend-x11"))]
+    #[test]
+    fn extension_reports_are_dropped_only_on_a_live_x11_session() {
+        use super::skip_extension_capture as skip;
+        assert!(skip(true, true), "X11 session: the X11 watcher captures");
+        assert!(
+            !skip(false, true),
+            "Wayland session: the extension captures"
+        );
+        assert!(!skip(true, false), "no live X11 backend (tests, headless)");
     }
 
     #[test]
@@ -8308,8 +8523,42 @@ mod tests {
     }
 
     #[test]
+    fn caps_extension_note_only_on_gnome() {
+        use clipmonger_platform::types::{BackendCaps, Level, PasteCaps, PasteStrategy};
+        let caps = CapsAggregator::for_desktop(false);
+        caps.set_extension_connected(false);
+        let gnome_noted = |snapshot: &Value| {
+            snapshot
+                .to_string()
+                .contains("gnome extension disconnected")
+        };
+        assert!(!gnome_noted(&caps.snapshot()), "skeleton snapshot");
+        caps.register_backend(
+            "wayland",
+            BackendCaps {
+                monitor: Level::Full,
+                transfer: Level::Full,
+                hotkey: Level::Full,
+                paste: PasteCaps {
+                    level: Level::Full,
+                    strategy: PasteStrategy::WriteAndToast,
+                    reason: String::new(),
+                },
+                tray: Level::Unavailable,
+                autostart: true,
+                primary_selection: false,
+                notes: Vec::new(),
+            },
+        );
+        assert!(!gnome_noted(&caps.snapshot()), "typed snapshot");
+        let gnome = CapsAggregator::for_desktop(true);
+        gnome.set_extension_connected(false);
+        assert!(gnome_noted(&gnome.snapshot()));
+    }
+
+    #[test]
     fn caps_extension_flip_marks_gnome_unavailable() {
-        let caps = CapsAggregator::new();
+        let caps = CapsAggregator::for_desktop(cfg!(target_os = "linux"));
         assert_eq!(
             caps.snapshot()
                 .get("extension_connected")

@@ -2,9 +2,11 @@
 //!
 //! Pure modules (no compositor connection) work everywhere; session code
 //! (`monitor`, `transfer`, `paste`, `probe_current`, `wlprobe`) needs a
-//! Unix Wayland session. v1 paste is the seg-06 S7 fallback (write + toast)
-//! only. This crate stays `tokio`-free (seg-02 S8); the portal session
-//! lives in the daemon.
+//! Unix Wayland session. Paste writes the clipboard (seg-06 S7); the daemon
+//! then presses the paste chord where the compositor allows it
+//! (`fake_input` on `KWin`, `virtual_keyboard` with `toplevel` focus
+//! tracking on wlroots-family compositors), else shows a toast. This crate
+//! stays `tokio`-free (seg-02 S8); the portal session lives in the daemon.
 
 pub mod caps;
 pub mod merge;
@@ -22,7 +24,11 @@ pub mod paste;
 #[cfg(unix)]
 pub mod probe_current;
 #[cfg(unix)]
+pub mod toplevel;
+#[cfg(unix)]
 pub mod transfer;
+#[cfg(unix)]
+pub mod virtual_keyboard;
 
 #[cfg(unix)]
 pub use monitor::{WlMonitor, WlMonitorOpts};
@@ -44,8 +50,8 @@ pub use transfer::WlTransfer;
 /// `$WAYLAND_DISPLAY` socket to connect to.
 #[cfg(unix)]
 pub fn wait_compositor_closed() -> clipmonger_platform::types::Result<()> {
-    use std::io::Read as _;
     use clipmonger_platform::types::Error;
+    use std::io::Read as _;
     let name = std::env::var_os("WAYLAND_DISPLAY")
         .ok_or_else(|| Error::Unavailable("no WAYLAND_DISPLAY".to_string()))?;
     let name = std::path::PathBuf::from(name);

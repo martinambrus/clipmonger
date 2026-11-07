@@ -32,8 +32,21 @@ pub fn exec_arg(arg: &str) -> String {
         c.is_whitespace()
             || matches!(
                 c,
-                '"' | '\'' | '\\' | '>' | '<' | '~' | '|' | '&' | ';' | '$' | '*' | '?' | '#'
-                    | '(' | ')' | '`'
+                '"' | '\''
+                    | '\\'
+                    | '>'
+                    | '<'
+                    | '~'
+                    | '|'
+                    | '&'
+                    | ';'
+                    | '$'
+                    | '*'
+                    | '?'
+                    | '#'
+                    | '('
+                    | ')'
+                    | '`'
             )
     };
     if !arg.chars().any(reserved) {
@@ -138,8 +151,8 @@ pub fn ensure(ui_exe: &Path, daemon_exe: &Path) {
     };
     for (name, wanted) in entries(ui_exe, daemon_exe) {
         if let Action::Write(path) = plan(&name, &wanted, &user_dir, &system_dirs) {
-            let written = std::fs::create_dir_all(&user_dir)
-                .and_then(|()| std::fs::write(&path, &wanted));
+            let written =
+                std::fs::create_dir_all(&user_dir).and_then(|()| std::fs::write(&path, &wanted));
             if let Err(e) = written {
                 eprintln!("daemon: desktop entry {name} not written: {e}");
             }
@@ -164,7 +177,10 @@ mod tests {
 
     #[test]
     fn exec_quotes_reserved_characters_and_doubles_percent() {
-        assert_eq!(exec_arg("/opt/clipmonger/clipmonger"), "/opt/clipmonger/clipmonger");
+        assert_eq!(
+            exec_arg("/opt/clipmonger/clipmonger"),
+            "/opt/clipmonger/clipmonger"
+        );
         assert_eq!(exec_arg("/opt/My Apps/cm"), "\"/opt/My Apps/cm\"");
         assert_eq!(exec_arg("/a/100%/cm"), "/a/100%%/cm");
         assert_eq!(exec_arg("/a b/$x"), "\"/a b/\\\\$x\"");
@@ -172,12 +188,17 @@ mod tests {
 
     #[test]
     fn entries_name_the_programs_and_declare_fake_input() {
-        let [ui, daemon] = entries(Path::new("/opt/cm/clipmonger"), Path::new("/opt/cm/clipmonger-daemon"));
+        let [ui, daemon] = entries(
+            Path::new("/opt/cm/clipmonger"),
+            Path::new("/opt/cm/clipmonger-daemon"),
+        );
         assert_eq!(ui.0, "com.martinambrus.clipmonger.desktop");
         assert!(ui.1.contains("\nExec=/opt/cm/clipmonger\n"));
         assert_eq!(daemon.0, "com.martinambrus.clipmonger.daemon.desktop");
         assert!(daemon.1.contains("\nExec=/opt/cm/clipmonger-daemon\n"));
-        assert!(daemon.1.contains("X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input"));
+        assert!(daemon
+            .1
+            .contains("X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input"));
         assert!(daemon.1.contains("NoDisplay=true"));
     }
 
@@ -191,13 +212,23 @@ mod tests {
         let wanted = format!("Exec=/new\n{GENERATED_KEY}\n");
         let systems = [system.clone()];
         // Nothing anywhere: write.
-        assert_eq!(plan("a.desktop", &wanted, &user, &systems), Action::Write(user.join("a.desktop")));
+        assert_eq!(
+            plan("a.desktop", &wanted, &user, &systems),
+            Action::Write(user.join("a.desktop"))
+        );
         // A package provides it: keep.
         std::fs::write(system.join("a.desktop"), "x").unwrap();
         assert_eq!(plan("a.desktop", &wanted, &user, &systems), Action::Keep);
         // Our own stale copy: rewrite.
-        std::fs::write(user.join("b.desktop"), format!("Exec=/old\n{GENERATED_KEY}\n")).unwrap();
-        assert_eq!(plan("b.desktop", &wanted, &user, &systems), Action::Write(user.join("b.desktop")));
+        std::fs::write(
+            user.join("b.desktop"),
+            format!("Exec=/old\n{GENERATED_KEY}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            plan("b.desktop", &wanted, &user, &systems),
+            Action::Write(user.join("b.desktop"))
+        );
         // Up to date: keep.
         std::fs::write(user.join("b.desktop"), &wanted).unwrap();
         assert_eq!(plan("b.desktop", &wanted, &user, &systems), Action::Keep);

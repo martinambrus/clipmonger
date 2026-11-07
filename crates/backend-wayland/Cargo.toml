@@ -16,6 +16,8 @@ serde_json.workspace = true
 wl-clipboard-rs.workspace = true
 wayland-client.workspace = true
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [lints]
 workspace = true

@@ -305,6 +305,13 @@ impl PopupApp {
             // Pending placement for closed-to-open transition; not for raise while open.
             self.placement_pending = true;
             self.placement_waiting_for_geometry = false;
+            // A hidden window gets no frames on Wayland, so the periodic
+            // status poll did not run while closed: an early "offline" (the
+            // daemon still starting) would show until the next period.
+            if self.shell.offline() {
+                self.last_poll = Instant::now();
+                self.send(UiCmd::Status);
+            }
         } else if was_open && !is_open {
             self.pending_desktop = None;
             self.popup_frame = None;
@@ -498,6 +505,14 @@ impl PopupApp {
                         .get("autostart_portable")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    config.hotkey_command = body
+                        .pointer("/caps/popup_hotkey_command")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                    config.autostart_command = body
+                        .pointer("/caps/autostart_command")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
                 }
                 self.feed(Event::Bridge(UiEvent::Status(body)));
                 if recovering && self.shell.desired().popup_open {

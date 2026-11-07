@@ -67,6 +67,27 @@ pub fn caps_for(probe: &ProbeState, primary: bool, portal: bool) -> BackendCaps 
     }
 }
 
+/// Paste reason when the daemon presses the chord through a virtual keyboard.
+pub const VIRTUAL_KEYBOARD_PASTE_REASON: &str =
+    "via virtual keyboard: Ctrl+V pressed into the window focused after the popup, else a toast";
+
+/// Report paste as `Full` where the daemon presses the paste chord itself
+/// through a virtual keyboard (wlroots-family compositors), like the GNOME
+/// extension path: the clipboard is written, then `Ctrl+V` (`Ctrl+Shift+V`
+/// in terminals) is pressed; the toast remains the fallback. Without a
+/// write path paste stays unavailable.
+#[must_use]
+pub fn with_virtual_keyboard_paste(mut caps: BackendCaps) -> BackendCaps {
+    if caps.paste.strategy == PasteStrategy::WriteAndToast {
+        caps.paste = PasteCaps {
+            level: Level::Full,
+            strategy: PasteStrategy::WriteAndToast,
+            reason: VIRTUAL_KEYBOARD_PASTE_REASON.to_string(),
+        };
+    }
+    caps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +125,18 @@ mod tests {
         assert_eq!(caps.paste.level, Level::Unavailable);
         assert_eq!(caps.paste.strategy, PasteStrategy::Unavailable);
         assert!(!caps.primary_selection);
+    }
+
+    #[test]
+    fn virtual_keyboard_lifts_paste_only_with_a_write_path() {
+        let caps =
+            with_virtual_keyboard_paste(caps_for(&probed(None, Some(2), false), false, false));
+        assert_eq!(caps.paste.level, Level::Full);
+        assert_eq!(caps.paste.strategy, PasteStrategy::WriteAndToast);
+        assert_eq!(caps.paste.reason, VIRTUAL_KEYBOARD_PASTE_REASON);
+        let caps = with_virtual_keyboard_paste(caps_for(&probed(None, None, false), false, false));
+        assert_eq!(caps.paste.level, Level::Unavailable);
+        assert_eq!(caps.paste.strategy, PasteStrategy::Unavailable);
     }
 
     #[test]

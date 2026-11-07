@@ -249,6 +249,13 @@ pub trait OsWindow {
 
 impl OsWindow for Window {
     fn is_visible(&self) -> Option<bool> {
+        // On X11 ask the server: winit marks a window visible only on a
+        // VisibilityNotify, which a compositing window manager (Cinnamon)
+        // does not send when the popup is mapped again.
+        #[cfg(target_os = "linux")]
+        if let Some(viewable) = x11_window(self).and_then(x11_is_viewable) {
+            return Some(viewable);
+        }
         Window::is_visible(self)
     }
 
@@ -261,6 +268,15 @@ impl OsWindow for Window {
     }
 
     fn has_focus(&self) -> bool {
+        // On X11 ask the server: when the focus falls back to PointerRoot
+        // with the pointer over our window (after an unmap), winit reports
+        // focus the window does not hold.
+        #[cfg(target_os = "linux")]
+        if let Some(window) = x11_window(self) {
+            if let Some(focused) = x11_has_input_focus(window) {
+                return focused;
+            }
+        }
         Window::has_focus(self)
     }
 
@@ -281,6 +297,62 @@ impl OsWindow for Window {
         let _ = time;
         OsWindow::focus_window(self);
     }
+}
+
+/// Whether the X server has `window` mapped and viewable; `None` when it
+/// cannot be asked.
+#[cfg(target_os = "linux")]
+fn x11_is_viewable(window: u64) -> Option<bool> {
+    use x11rb::protocol::xproto::{ConnectionExt as _, MapState};
+    let window = u32::try_from(window).ok()?;
+    let (connection, _) = x11rb::connect(None).ok()?;
+    let attributes = connection
+        .get_window_attributes(window)
+        .ok()?
+        .reply()
+        .ok()?;
+    Some(attributes.map_state == MapState::VIEWABLE)
+}
+
+/// Whether `window` holds the X input focus; `None` when the server cannot
+/// be asked.
+#[cfg(target_os = "linux")]
+fn x11_has_input_focus(window: u64) -> Option<bool> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    let window = u32::try_from(window).ok()?;
+    let (connection, _) = x11rb::connect(None).ok()?;
+    let focus = connection.get_input_focus().ok()?.reply().ok()?.focus;
+    Some(focus == window)
+}
+
+/// Set `_NET_WM_USER_TIME` on `window` (EWMH): the time of the user input
+/// that asked for it, which the window manager compares when the window
+/// maps. Best effort.
+#[cfg(target_os = "linux")]
+pub fn set_x11_user_time(window: u64, time: u32) {
+    use x11rb::{
+        connection::Connection as _,
+        protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode},
+        wrapper::ConnectionExt as _,
+    };
+    let set = || -> Option<()> {
+        let window = u32::try_from(window).ok()?;
+        let (connection, _) = x11rb::connect(None).ok()?;
+        let atom = connection
+            .intern_atom(false, b"_NET_WM_USER_TIME")
+            .ok()?
+            .reply()
+            .ok()?
+            .atom;
+        connection
+            .change_property32(PropMode::REPLACE, window, atom, AtomEnum::CARDINAL, &[time])
+            .ok()?
+            .check()
+            .ok()?;
+        connection.flush().ok()?;
+        Some(())
+    };
+    let _ = set();
 }
 
 #[cfg(target_os = "linux")]
@@ -322,7 +394,12 @@ fn x11_activation_event(
     atom: u32,
     time: u32,
 ) -> x11rb::protocol::xproto::ClientMessageEvent {
-    x11rb::protocol::xproto::ClientMessageEvent::new(32, window, atom, [1, time, 0, 0, 0])
+    // Source indication 2 (pager): the popup is summoned by the user's own
+    // hotkey or tray click. As an application request (1), Cinnamon's
+    // focus-stealing prevention refused it whenever another window (Mint's
+    // Update Manager) held a newer user time, so the popup showed without
+    // the keyboard and Esc, typing and Enter went elsewhere.
+    x11rb::protocol::xproto::ClientMessageEvent::new(32, window, atom, [2, time, 0, 0, 0])
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -331,7 +408,7 @@ mod activation_message_tests {
     fn net_active_window_message_carries_original_input_time() {
         let event = super::x11_activation_event(123, 456, 789);
         assert_eq!((event.window, event.type_), (123, 456));
-        assert_eq!(event.data.as_data32(), [1, 789, 0, 0, 0]);
+        assert_eq!(event.data.as_data32(), [2, 789, 0, 0, 0]);
     }
 }
 
@@ -423,7 +500,18 @@ pub fn try_activate<W: OsWindow>(window: &W, per_show: bool) -> ActivationStatus
 pub struct Activation {
     pending: bool,
     time: Option<u32>,
+    /// Focus requests sent for the current activation.
+    tries: u8,
+    /// The window's focus flag may be stale: set while the popup is closed
+    /// (an X server hands the focus to `PointerRoot` on unmap and winit
+    /// reports that as focus on our hidden window), cleared by a real focus
+    /// event after it opened.
+    stale_focus: bool,
 }
+
+/// Focus requests per activation before giving up: a window manager may
+/// ignore one sent before it has mapped the window (Cinnamon).
+const ACTIVATION_TRIES: u8 = 8;
 
 impl Activation {
     #[must_use]
@@ -431,7 +519,15 @@ impl Activation {
         Self {
             pending: false,
             time: None,
+            tries: 0,
+            stale_focus: false,
         }
+    }
+
+    /// A focus-in event arrived for the open popup: its focus flag is
+    /// current again.
+    pub fn focus_seen(&mut self) {
+        self.stale_focus = false;
     }
 
     #[must_use]
@@ -453,10 +549,12 @@ impl Activation {
         if !desired_open {
             self.pending = false;
             self.time = None;
+            self.stale_focus = true;
             return;
         }
         if request || edge {
             self.time = time;
+            self.tries = 0;
         }
         let mut pending = self.pending || request || edge;
         if pending {
@@ -465,11 +563,23 @@ impl Activation {
                     ActivationStatus::Done
                 } else if window.is_visible() != Some(true) {
                     ActivationStatus::Pending
-                } else if window.is_minimized() == Some(true) || window.has_focus() {
+                } else if window.is_minimized() == Some(true)
+                    || (window.has_focus() && !self.stale_focus)
+                {
                     ActivationStatus::Done
                 } else {
-                    window.focus_with_time(self.time);
-                    ActivationStatus::Done
+                    // Keep asking until the window manager has given the
+                    // focus (checked on the next pass), within a bound.
+                    // Retries use CurrentTime (0): a window manager may
+                    // refuse the press time once another window has a newer
+                    // user time.
+                    window.focus_with_time(if self.tries == 0 { self.time } else { Some(0) });
+                    self.tries = self.tries.saturating_add(1);
+                    if self.tries >= ACTIVATION_TRIES {
+                        ActivationStatus::Done
+                    } else {
+                        ActivationStatus::Pending
+                    }
                 };
                 if status == ActivationStatus::Done {
                     pending = false;

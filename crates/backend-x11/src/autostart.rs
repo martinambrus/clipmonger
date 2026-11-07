@@ -311,7 +311,11 @@ Terminal=false
             "[Desktop Entry]\nType=Application\nName=Clipmonger\nExec=/old/clipmonger --minimized\nHidden=false\nTerminal=false\n",
         )
         .unwrap();
-        let mut m = X11Autostart::new(Path::new("/usr/bin/clipmonger").to_path_buf(), root.clone(), false);
+        let mut m = X11Autostart::new(
+            Path::new("/usr/bin/clipmonger").to_path_buf(),
+            root.clone(),
+            false,
+        );
         assert!(m.is_enabled().unwrap(), "an old entry still means enabled");
         m.enable().unwrap();
         assert!(dir.join(AUTOSTART_FILE).is_file());

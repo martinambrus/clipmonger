@@ -141,7 +141,13 @@ fn keysym_name(key: &str) -> String {
         "backquote" => "grave",
         "comma" | "period" | "slash" | "semicolon" | "backslash" | "minus" | "equal"
         | "bracketleft" | "bracketright" => return lower,
-        _ => return if key.chars().count() == 1 { lower } else { key.to_string() },
+        _ => {
+            return if key.chars().count() == 1 {
+                lower
+            } else {
+                key.to_string()
+            }
+        }
     };
     named.to_string()
 }
@@ -208,7 +214,21 @@ mod tests {
             "Ctrl+ArrowUp".to_string(),
             "Ctrl+Backquote".to_string(),
         ];
-        let triggers: Vec<String> = bind_requested(&chords).into_iter().map(|r| r.trigger).collect();
-        assert_eq!(triggers, ["CTRL+ALT+h", "LOGO+F12", "CTRL+SHIFT+space", "ALT+Page_Down", "CTRL+1", "CTRL+Up", "CTRL+grave"]);
+        let triggers: Vec<String> = bind_requested(&chords)
+            .into_iter()
+            .map(|r| r.trigger)
+            .collect();
+        assert_eq!(
+            triggers,
+            [
+                "CTRL+ALT+h",
+                "LOGO+F12",
+                "CTRL+SHIFT+space",
+                "ALT+Page_Down",
+                "CTRL+1",
+                "CTRL+Up",
+                "CTRL+grave"
+            ]
+        );
     }
 }

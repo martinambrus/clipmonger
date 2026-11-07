@@ -208,7 +208,10 @@ fn cli_permanent_create_then_delete() {
         .as_str()
         .expect("permanent-create must return the new id")
         .to_string();
-    let deleted = stdout_json(&run_cli(&profile, &["permanent-delete", &id]), "permanent-delete");
+    let deleted = stdout_json(
+        &run_cli(&profile, &["permanent-delete", &id]),
+        "permanent-delete",
+    );
     assert_eq!(deleted["deleted"], true, "got: {deleted}");
     let listed = stdout_json(&run_cli(&profile, &["permanent-list"]), "permanent-list");
     let ids: Vec<&str> = listed["permanents"]
@@ -217,9 +220,18 @@ fn cli_permanent_create_then_delete() {
         .iter()
         .filter_map(|p| p["id"].as_str())
         .collect();
-    assert!(!ids.contains(&id.as_str()), "deleted clip still listed: {listed}");
-    let again = stdout_json(&run_cli(&profile, &["permanent-delete", &id]), "permanent-delete");
-    assert_eq!(again["deleted"], false, "a second delete finds nothing: {again}");
+    assert!(
+        !ids.contains(&id.as_str()),
+        "deleted clip still listed: {listed}"
+    );
+    let again = stdout_json(
+        &run_cli(&profile, &["permanent-delete", &id]),
+        "permanent-delete",
+    );
+    assert_eq!(
+        again["deleted"], false,
+        "a second delete finds nothing: {again}"
+    );
 }
 
 /// Daemon up: `stop` exits 0 and the daemon process actually exits.

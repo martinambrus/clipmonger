@@ -425,6 +425,66 @@ name (autostart file renamed); KWin 5 script paths and names; the daemon
 outlived logouts when started from a terminal; stale Xvfb locks made every
 X11 test skip silently.
 
+## Linux acceptance on Ubuntu 24.04, Xfce, Cinnamon, Sway, Hyprland and COSMIC (2026-11-07)
+
+All six desktops were installed in new KVM VMs and driven end to end from the
+host (keys, pointer and screenshots through libvirt, commands over SSH) with
+release binaries from the Debian 12 build container
+(`scripts/build-linux-release.sh`, glibc 2.35 at most). Each run covered
+capture of text and an image, the popup hotkey and pick, paste into a GTK
+editor, a terminal and a root-owned window, the password-manager hint, a
+permanent-clip hotkey, the tray, and Start on login across a reboot (plus
+turning it off on Xfce).
+
+| Desktop | VM | Result |
+| --- | --- | --- |
+| Ubuntu 24.04.5, GNOME 46 Wayland | `cm-ubuntu2404-gnome` | Pass: extension auto-paste, terminal, root, permanent, autostart |
+| Ubuntu 24.04.5, GNOME 46 Xorg | same | Pass after the duplicate-capture fix below; extension reconnects after a Shell restart |
+| Xubuntu 26.10, Xfce 4.20 (X11) | `cm-xubuntu2610-xfce` | Pass, autostart on and off (T-508 Xfce row) |
+| Linux Mint 22.3, Cinnamon 6.6 (X11) | `cm-mint223-cinnamon` | Pass after the focus fix below |
+| Arch, Sway 1.12 (wlroots) | `cm-arch-wlroots` | Pass: auto-paste through the virtual keyboard; hotkey and login start through the Sway config |
+| Arch, Hyprland 0.57 | same | Pass: auto-paste, Lua-config bind, login start in `hyprland.start`, tray |
+| Pop!_OS 24.04, COSMIC 1.0 | `cm-popos2404-cosmic` | Pass: capture, custom-shortcut hotkey, copy plus "press Ctrl+V" notification, XDG autostart |
+
+Found and fixed:
+
+- **wlroots auto-paste.** Sway and Hyprland now get the same auto-paste as
+  KDE: focus tracking over `wlr-foreign-toplevel-management` and the chord
+  through `zwp_virtual_keyboard_v1`. The virtual keyboard uploads the seat's
+  own keymap and taps Shift first, because GTK3 drops the first chord from a
+  keyboard the seat has just switched to. COSMIC offers the virtual keyboard,
+  but its window-activation protocol is GPL-3.0 (cosmic-protocols), so COSMIC
+  keeps the honest copy and notification.
+- **Shortcuts and login start on wlroots-family desktops.** Sway has no
+  shortcut portal, Hyprland binds portal shortcuts only from its config, and
+  neither runs XDG autostart. Caps now report the hotkey as degraded there and
+  publish `popup_hotkey_command` and `autostart_command`; Settings shows them
+  with Copy buttons, plus a per-clip "Copy shortcut command". The XWayland
+  grab is off on these sessions, and the top-level paste caps follow the
+  Wayland backend. README documents the Sway, Hyprland and COSMIC recipes.
+- **GNOME-only notes.** "gnome extension disconnected" and "capture paused"
+  appeared on every Linux session; they now show on GNOME only.
+- **GNOME Xorg duplicates.** The extension's capture reports duplicated the
+  X11 watcher and stored Clipmonger's own paste and permanent-clip writes as
+  new clips; on an X11 session with the live X11 backend they are dropped.
+- **Cinnamon popup focus.** Every second popup opened without the keyboard,
+  so Esc, typing and Enter went to the window behind. After an unmap the X
+  server falls back to PointerRoot, winit reported that as focus on the hidden
+  popup, and the activation was skipped. On X11 the activation now asks the
+  server for the real focus and map state, retries within a short bound,
+  sends a pager activation and sets `_NET_WM_USER_TIME` before mapping. 6 of
+  6 popups took focus afterwards.
+- **Tray at login.** A tray started before the panel or bar never registered;
+  it now waits for a tray host (seen with Hyprland's waybar).
+- **Stale "Connection lost" line.** A popup opened while the UI still held an
+  early transport error showed "Connection lost" until the next status poll;
+  opening the popup now polls at once.
+- **Formatting.** `cargo fmt` had drifted in several Linux files; reformatted.
+
+Harness: the VM tools and guest helpers live in `~/clipmonger-vm-tools/`
+(`vmctl.py`, `build-linux.sh`, `deploy-linux.sh`, `guest/`). Raw-mode terminal
+checks need `timeout --foreground`.
+
 ## Windows acceptance in KVM VMs (2026-11-06)
 
 Automated run on two VMs converted from the user's VMware machines, with real
@@ -470,15 +530,16 @@ outdated since the GNOME extension and the KDE portal support them.
 
 - Linux desktop acceptance: GNOME 46 on Xorg and Wayland passed on 2026-11-05
   (T-508 GNOME rows, T-607 GNOME rows, T-702, T-703, T-705; see
-  [Linux acceptance](#linux-acceptance-on-gnome-46-2026-11-05)). Still open:
-  [T-508](../tests/manual/T-508-x11-real-de.md) on Xfce (KDE X11 passed on
-  Plasma 5.27, see
-  [Plasma 5.27](#linux-acceptance-on-kde-plasma-527-x11-and-wayland-2026-11-06)),
-  [T-606](../tests/manual/T-606-wayland-compositor-matrix.md),
-  [T-607](../tests/manual/T-607-paste-spike-acceptance.md) on wlroots (KDE
-  Plasma 6.8 Wayland passed, see
-  [KDE](#linux-acceptance-on-kde-plasma-68-wayland-2026-11-06)),
-  T-704 for GNOME 47 and 49 (46, 48, 50 and 51 passed, see
+  [Linux acceptance](#linux-acceptance-on-gnome-46-2026-11-05)).
+  [T-508](../tests/manual/T-508-x11-real-de.md) on Xfce and Cinnamon,
+  [T-606](../tests/manual/T-606-wayland-compositor-matrix.md) and
+  [T-607](../tests/manual/T-607-paste-spike-acceptance.md) on Sway, Hyprland
+  and COSMIC passed on 2026-11-07 (see
+  [the 2026-11-07 runs](#linux-acceptance-on-ubuntu-2404-xfce-cinnamon-sway-hyprland-and-cosmic-2026-11-07));
+  KDE X11 and Wayland passed earlier (see
+  [Plasma 5.27](#linux-acceptance-on-kde-plasma-527-x11-and-wayland-2026-11-06)
+  and [KDE](#linux-acceptance-on-kde-plasma-68-wayland-2026-11-06)). Still
+  open: T-704 for GNOME 47 and 49 (46, 48, 50 and 51 passed, see
   [GNOME 48](#linux-acceptance-on-gnome-48-2026-11-06),
   [GNOME 50](#linux-acceptance-on-gnome-50-2026-11-06) and
   [GNOME 51](#linux-acceptance-on-gnome-51-2026-11-06)). The portal rebind

@@ -98,6 +98,19 @@ impl ksni::Tray for KsniTray {
         strings::text("tray.tooltip").to_string()
     }
 
+    /// No tray host yet (or it went away): log it and keep waiting, so
+    /// the icon appears once a panel or bar starts.
+    fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
+        eprintln!("tray: no tray host yet ({reason:?}); waiting for one");
+        let _ = clipmonger_core::runtime_log::global_emit(
+            clipmonger_core::runtime_log::Role::Ui,
+            clipmonger_core::runtime_log::Severity::Warn,
+            "tray.unavailable",
+            &[("class", "tray_waiting"), ("origin", "linux")],
+        );
+        true
+    }
+
     fn status(&self) -> ksni::Status {
         if !self.inputs.attached || self.inputs.degraded {
             ksni::Status::NeedsAttention
@@ -187,7 +200,9 @@ impl LinuxTray {
                 inputs: snapshot,
                 wake,
             };
-            let _ = ready_tx.send(tray.spawn().ok());
+            // A tray host (waybar, a panel) may start after us at login:
+            // keep the item and register once a watcher appears.
+            let _ = ready_tx.send(tray.assume_sni_available(true).spawn().ok());
         });
         Self {
             rx,

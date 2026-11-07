@@ -27,8 +27,14 @@ fn shortcut_list(specs: &[Spec<'_>]) -> Vec<(String, HashMap<String, Value<'stat
         .iter()
         .map(|(id, description, trigger)| {
             let mut info = HashMap::new();
-            info.insert("description".to_string(), Value::from(description.to_string()));
-            info.insert("preferred_trigger".to_string(), Value::from(trigger.to_string()));
+            info.insert(
+                "description".to_string(),
+                Value::from(description.to_string()),
+            );
+            info.insert(
+                "preferred_trigger".to_string(),
+                Value::from(trigger.to_string()),
+            );
             (id.to_string(), info)
         })
         .collect()
@@ -78,7 +84,9 @@ where
     let (code, results): (u32, HashMap<String, OwnedValue>) = message.body().deserialize()?;
     match code {
         0 => Ok(results),
-        1 => Err(zbus::Error::Failure(format!("{method}: cancelled by the user"))),
+        1 => Err(zbus::Error::Failure(format!(
+            "{method}: cancelled by the user"
+        ))),
         _ => Err(zbus::Error::Failure(format!("{method}: failed"))),
     }
 }
@@ -268,8 +276,11 @@ mod tests {
 
     #[test]
     fn only_our_session_or_a_portal_restart_ends_the_binding() {
-        let ours = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/1_2/clipmonger").unwrap();
-        let other = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/1_2/other").unwrap();
+        let ours =
+            OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/1_2/clipmonger")
+                .unwrap();
+        let other =
+            OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/1_2/other").unwrap();
         assert!(Lost::Session(ours.clone()).ends(Some(&ours)));
         assert!(!Lost::Session(other).ends(Some(&ours)));
         assert!(Lost::Portal.ends(Some(&ours)));

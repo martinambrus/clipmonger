@@ -1,9 +1,10 @@
 //! Wayland v1 paste: clipboard-write + toast fallback (seg-06 S7).
 //!
-//! Real injection (virtual-keyboard, `RemoteDesktop`, libei, extension,
-//! helper) is spike-documented and NOT a v1 code path: with a data-control
-//! write path the daemon writes the payload and the UI toasts
-//! `paste.press_ctrl_v`; without one there is no paste path
+//! This engine only writes: with a data-control write path the daemon
+//! writes the payload, then presses the chord itself where it can
+//! ([`crate::fake_input`] on `KWin`, [`crate::virtual_keyboard`] on
+//! wlroots-family compositors) or the UI toasts `paste.press_ctrl_v`;
+//! without a write path there is no paste path
 //! ([`Error::Unavailable`]). The trait `paste_to` stays `Unsupported`,
 //! mirroring the sibling backends (the trait carries only `ClipRef`, never
 //! payload bytes).

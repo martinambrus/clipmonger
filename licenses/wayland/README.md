@@ -34,5 +34,22 @@ binaries from that source with `cargo build --release`, using
 
 Windows builds do not include these bindings.
 
+## Permissively licensed protocol bindings
+
+For auto-paste on wlroots-family compositors (Sway, Hyprland) the daemon
+also compiles bindings for two more protocol descriptions. Both carry
+permissive licenses that need no source offer, only the notice:
+
+    virtual-keyboard-unstable-v1.xml (wayland-protocols-misc 0.3.12, manifest: MIT):
+    Copyright © 2008-2011 Kristian Høgsberg
+    Copyright © 2010-2013 Intel Corporation
+    Copyright © 2012-2013 Collabora, Ltd.
+    Copyright © 2018 Purism SPC
+    License: MIT (the notice is in the protocol file)
+
+    wlr-foreign-toplevel-management-unstable-v1.xml (wayland-protocols-wlr 0.3.12, manifest: MIT):
+    Copyright © 2018 Ilia Bozhinov
+    License: HPND-style permission notice (in the protocol file)
+
 Linux release packages (`.deb`, portable archive) must ship this file and
 `LGPL-2.1.txt`.

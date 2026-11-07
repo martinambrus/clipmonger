@@ -46,12 +46,15 @@ fn flag_value(args: &[String], name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Whether the X11 hotkey thread should run: not on `KWin` Wayland.
+/// Whether the X11 hotkey thread should run: not on `KWin` Wayland (it
+/// triggers an input-control prompt) nor on wlroots-family sessions (an
+/// `XWayland` grab sees keys only while an X11 window has focus; the user
+/// binds the popup command in the compositor instead).
 #[cfg(all(unix, feature = "backend-x11"))]
 fn x11_hotkeys_wanted() -> bool {
     #[cfg(all(unix, feature = "backend-wayland"))]
     {
-        !clipmonger_daemon::kwin::is_kwin_wayland()
+        !clipmonger_daemon::kwin::is_kwin_wayland() && !clipmonger_daemon::wlr::is_wlr_wayland()
     }
     #[cfg(not(all(unix, feature = "backend-wayland")))]
     {
@@ -663,7 +666,11 @@ fn setup_wayland_backend(
 
     let capture_primary = config.monitor.capture_primary;
     let probe = probe_current();
-    let caps = backend_caps::caps_for(&probe, capture_primary, false);
+    let mut caps = backend_caps::caps_for(&probe, capture_primary, false);
+    // wlroots family: the daemon presses the chord through a virtual keyboard.
+    if clipmonger_daemon::wlr::auto_paste_available() {
+        caps = backend_caps::with_virtual_keyboard_paste(caps);
+    }
 
     let transfer = match WlTransfer::connect() {
         Ok(transfer) => Some(Arc::new(transfer)),
@@ -753,8 +760,10 @@ fn setup_wayland_backend(
     // Portal session owns the popup hotkey (first bind may show a system
     // dialog; `status.portal_bind_pending` forewarns the UI per W-F4).
     clipmonger_daemon::portal::spawn_portal_session(Arc::clone(state), capture_primary);
-    // KWin: track the active window for auto-paste (no-op elsewhere).
+    // KWin and wlroots family: track the active window for auto-paste
+    // (no-op elsewhere).
     clipmonger_daemon::kwin::spawn_focus_tracker(Arc::clone(state));
+    clipmonger_daemon::wlr::spawn_focus_tracker(Arc::clone(state));
 }
 
 /// Start the session backends selected by `want_backends` (X11 and/or

@@ -7,6 +7,11 @@
 //! own window), picks Ctrl+Shift+V for terminals, and presses the chord
 //! through `KWin`'s fake-input protocol
 //! ([`clipmonger_backend_wayland::fake_input`]).
+//!
+//! wlroots-family compositors (Sway, Hyprland) feed the same [`Focus`] from
+//! the foreign-toplevel protocol ([`crate::wlr`]), and [`auto_paste`]
+//! presses the chord there through a virtual keyboard
+//! ([`clipmonger_backend_wayland::virtual_keyboard`]).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,14 +36,15 @@ const SETTLE_LARGE: Duration = Duration::from_millis(200);
 /// Text up to this size counts as small.
 const SMALL_TEXT_BYTES: usize = 64 * 1024;
 
-/// Focus as last reported by the `KWin` script.
+/// Focus as last reported by the `KWin` script or the foreign-toplevel
+/// tracker.
 #[derive(Debug, Default, Clone)]
 pub struct Focus {
     /// Identities of the last activated window that was not ours.
     pub target: Option<Vec<String>>,
     /// Whether one of our windows is active right now.
     pub own_active: bool,
-    /// Whether the script has reported at all.
+    /// Whether the tracker has reported at all.
     pub tracking: bool,
 }
 
@@ -46,11 +52,9 @@ impl Focus {
     /// Record one activation.
     pub fn activated(&mut self, ids: Vec<String>) {
         self.tracking = true;
-        let own = ids.iter().any(|id| {
-            OWN_IDS
-                .iter()
-                .any(|own| id.eq_ignore_ascii_case(own))
-        });
+        let own = ids
+            .iter()
+            .any(|id| OWN_IDS.iter().any(|own| id.eq_ignore_ascii_case(own)));
         self.own_active = own;
         if !own && ids.iter().any(|id| !id.is_empty()) {
             self.target = Some(ids);
@@ -61,9 +65,7 @@ impl Focus {
 /// Whether this session runs `KWin` on Wayland.
 #[must_use]
 pub fn is_kwin_wayland() -> bool {
-    std::env::var_os("WAYLAND_DISPLAY").is_some()
-        && std::env::var("XDG_CURRENT_DESKTOP")
-            .is_ok_and(|desktop| desktop.split(':').any(|d| d.eq_ignore_ascii_case("kde")))
+    std::env::var_os("WAYLAND_DISPLAY").is_some() && crate::current_desktop_is("kde")
 }
 
 /// The `KWin` script text, calling back to `bus_name`.
@@ -112,12 +114,20 @@ async fn track(state: &crate::DaemonState) -> zbus::Result<()> {
     let path = dir.join(format!("{SCRIPT_NAME}.js"));
     std::fs::write(&path, script_source(&bus_name))
         .map_err(|e| zbus::Error::Failure(format!("write kwin script: {e}")))?;
-    let scripting = zbus::Proxy::new(&conn, "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting")
-        .await?;
+    let scripting = zbus::Proxy::new(
+        &conn,
+        "org.kde.KWin",
+        "/Scripting",
+        "org.kde.kwin.Scripting",
+    )
+    .await?;
     // A script left by an earlier daemon calls a bus name that is gone.
     let _: zbus::Result<bool> = scripting.call("unloadScript", &(SCRIPT_NAME,)).await;
     let id: i32 = scripting
-        .call("loadScript", &(path.to_string_lossy().as_ref(), SCRIPT_NAME))
+        .call(
+            "loadScript",
+            &(path.to_string_lossy().as_ref(), SCRIPT_NAME),
+        )
         .await?;
     if id < 0 {
         return Err(zbus::Error::Failure("kwin refused the script".to_string()));
@@ -126,8 +136,7 @@ async fn track(state: &crate::DaemonState) -> zbus::Result<()> {
     // at `/<id>`.
     let mut ran = Err(zbus::Error::Failure("no script path".to_string()));
     for path in [format!("/Scripting/Script{id}"), format!("/{id}")] {
-        let script =
-            zbus::Proxy::new(&conn, "org.kde.KWin", path, "org.kde.kwin.Script").await?;
+        let script = zbus::Proxy::new(&conn, "org.kde.KWin", path, "org.kde.kwin.Script").await?;
         ran = script.call::<_, _, ()>("run", &()).await;
         if ran.is_ok() {
             break;
@@ -148,7 +157,7 @@ async fn track(state: &crate::DaemonState) -> zbus::Result<()> {
             .deserialize::<(String, String, String)>()
             .map(|(class, name, desktop)| vec![class, name, desktop])
             .unwrap_or_default();
-        state.kwin_activated(ids);
+        state.window_activated(ids);
         let _ = conn.reply(&header, &()).await;
     }
     Ok(())
@@ -168,22 +177,13 @@ pub fn settle_for(payloads: &[(String, Vec<u8>)]) -> Duration {
     }
 }
 
-/// Wait for focus to leave our popup, then press the paste chord.
-///
-/// Returns `Ok(false)` when this is not `KWin` or `KWin` offers no fake input
-/// (the caller then shows the press-Ctrl+V toast instead).
+/// Wait for focus to leave our popup; return the focus then.
 ///
 /// # Errors
 ///
 /// When focus is still on our own window after [`FOCUS_WAIT`]: pasting
 /// then would type into the popup.
-pub fn auto_paste(
-    focus: &Mutex<Focus>,
-    payloads: &[(String, Vec<u8>)],
-) -> Result<bool, String> {
-    if !is_kwin_wayland() {
-        return Ok(false);
-    }
+fn wait_focus_left(focus: &Mutex<Focus>) -> Result<Focus, String> {
     let deadline = Instant::now() + FOCUS_WAIT;
     let read = || focus.lock().map(|f| f.clone()).unwrap_or_default();
     let mut now = read();
@@ -194,15 +194,59 @@ pub fn auto_paste(
     if now.tracking && now.own_active {
         return Err("focus did not return from the popup".to_string());
     }
-    let shift = now.target.as_ref().is_some_and(|ids| {
+    Ok(now)
+}
+
+/// Whether the paste into the `focus` target needs Ctrl+Shift+V.
+fn needs_shift(focus: &Focus) -> bool {
+    focus.target.as_ref().is_some_and(|ids| {
         let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
         clipmonger_platform::paste_policy::paste_needs_shift(&ids)
-    });
-    std::thread::sleep(settle_for(payloads));
-    let Ok(mut input) = clipmonger_backend_wayland::fake_input::FakeInput::connect() else {
+    })
+}
+
+/// Wait for focus to leave our popup, then press the paste chord: through
+/// `KWin`'s fake input on `KWin`, through a virtual keyboard on wlroots-family
+/// compositors ([`crate::wlr::is_wlr_wayland`]).
+///
+/// Returns `Ok(false)` on other sessions, when `KWin` offers no fake input,
+/// or when the compositor offers no virtual keyboard or has not reported
+/// the active window (the caller then shows the press-Ctrl+V toast
+/// instead).
+///
+/// # Errors
+///
+/// When focus is still on our own window after [`FOCUS_WAIT`]: pasting
+/// then would type into the popup.
+pub fn auto_paste(focus: &Mutex<Focus>, payloads: &[(String, Vec<u8>)]) -> Result<bool, String> {
+    if is_kwin_wayland() {
+        let now = wait_focus_left(focus)?;
+        std::thread::sleep(settle_for(payloads));
+        let Ok(mut input) = clipmonger_backend_wayland::fake_input::FakeInput::connect() else {
+            return Ok(false);
+        };
+        input
+            .paste_chord(needs_shift(&now))
+            .map_err(|e| e.to_string())?;
+        return Ok(true);
+    }
+    if !crate::wlr::is_wlr_wayland() {
+        return Ok(false);
+    }
+    // Without focus reports there is no telling whether the popup still
+    // has the keyboard.
+    if !focus.lock().is_ok_and(|f| f.tracking) {
+        return Ok(false);
+    }
+    let Ok(mut keyboard) = clipmonger_backend_wayland::virtual_keyboard::VirtualKeyboard::connect()
+    else {
         return Ok(false);
     };
-    input.paste_chord(shift).map_err(|e| e.to_string())?;
+    let now = wait_focus_left(focus)?;
+    std::thread::sleep(settle_for(payloads));
+    keyboard
+        .paste_chord(needs_shift(&now))
+        .map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -220,12 +264,18 @@ mod tests {
         focus.activated(ids(&["org.kde.konsole", "konsole", "org.kde.konsole"]));
         focus.activated(ids(&["clipmonger", "clipmonger", ""]));
         assert!(focus.own_active);
-        assert_eq!(focus.target.as_deref().map(|t| t[1].as_str()), Some("konsole"));
+        assert_eq!(
+            focus.target.as_deref().map(|t| t[1].as_str()),
+            Some("konsole")
+        );
         focus.activated(ids(&[crate::portal::APP_ID, "", ""]));
         assert!(focus.own_active);
         focus.activated(ids(&["kwrite", "kwrite", "org.kde.kwrite"]));
         assert!(!focus.own_active);
-        assert_eq!(focus.target.as_deref().map(|t| t[0].as_str()), Some("kwrite"));
+        assert_eq!(
+            focus.target.as_deref().map(|t| t[0].as_str()),
+            Some("kwrite")
+        );
     }
 
     #[test]

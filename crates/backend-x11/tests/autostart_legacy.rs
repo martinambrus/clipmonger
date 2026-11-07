@@ -48,7 +48,10 @@ fn legacy_manager_writes_exact_descriptors_and_roundtrips() {
     for (exe, expected_exec) in cases {
         let mut manager = X11Autostart::new(PathBuf::from(exe), root.0.clone(), false);
         manager.enable().expect("enable legacy entry");
-        let file = root.0.join("autostart").join(clipmonger_backend_x11::autostart::AUTOSTART_FILE);
+        let file = root
+            .0
+            .join("autostart")
+            .join(clipmonger_backend_x11::autostart::AUTOSTART_FILE);
         let text = std::fs::read_to_string(&file).expect("read descriptor");
         let expected = format!("[Desktop Entry]\nType=Application\nName=Clipmonger\nExec={expected_exec}\nHidden=false\nTerminal=false\n");
         assert_eq!(text, expected, "executable {exe:?}");

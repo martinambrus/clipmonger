@@ -57,7 +57,9 @@ fn popup_stays_transient_across_native_style_changes() {
             assert_popup_style(&popup.window);
             let hwnd = HWND(window::hwnd(&popup.window).unwrap() as *mut std::ffi::c_void);
             for _ in 0..3 {
-                self.runner.set_popup_open(event_loop, true, None).unwrap();
+                self.runner
+                    .set_popup_open(event_loop, true, None, None)
+                    .unwrap();
                 let popup = self.runner.popup.host.as_ref().unwrap();
                 assert_eq!(popup.window.id(), popup_id, "popup identity must be stable");
                 assert_popup_style(&popup.window);
@@ -72,7 +74,9 @@ fn popup_stays_transient_across_native_style_changes() {
                 unsafe { SetWindowLongW(hwnd, GWL_EXSTYLE, proposed.cast_signed()) };
                 assert_popup_style(&popup.window);
                 assert_ne!(style(&popup.window) & 0x0040_0000, 0);
-                self.runner.set_popup_open(event_loop, false, None).unwrap();
+                self.runner
+                    .set_popup_open(event_loop, false, None, None)
+                    .unwrap();
                 assert_popup_style(&self.runner.popup.host.as_ref().unwrap().window);
             }
             let settings = self

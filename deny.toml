@@ -45,6 +45,10 @@ allow = ["OFL-1.1", "Ubuntu-font-1.0"]
 # LGPL-2.1-or-later for those bindings only (decision 2026-11-05) and ships the
 # notice in licenses/wayland/. Re-check the generated protocols when winit or
 # the crate updates.
+# The daemon's wlroots auto-paste compiles virtual-keyboard-unstable-v1.xml
+# (wayland-protocols-misc@0.3.12, MIT) and
+# wlr-foreign-toplevel-management-unstable-v1.xml (wayland-protocols-wlr@0.3.12,
+# HPND-style notice); both permissive, noted in licenses/wayland/ as well.
 
 [bans]
 multiple-versions = "warn"

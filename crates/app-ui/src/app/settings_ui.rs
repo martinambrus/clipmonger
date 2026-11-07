@@ -37,6 +37,14 @@ pub struct ConfigWindowState {
     pub perm_confirm_delete: Option<uuid::Uuid>,
     /// The daemon runs portable, where Start on login is unavailable.
     pub autostart_portable: bool,
+    /// Command to bind in the desktop's own shortcut settings when the
+    /// desktop does not let apps register global shortcuts (Sway,
+    /// Hyprland, COSMIC): from the daemon's `caps.popup_hotkey_command`.
+    pub hotkey_command: Option<String>,
+    /// Command to add to the compositor's startup config where XDG
+    /// autostart entries are not run: from the daemon's
+    /// `caps.autostart_command`.
+    pub autostart_command: Option<String>,
     /// Per-setting error text, drawn under the setting's control.
     pub field_errors: std::collections::HashMap<String, String>,
     /// Setting whose text field takes keyboard focus on the next frame.
@@ -81,6 +89,8 @@ impl ConfigWindowState {
             perm_group_new: String::new(),
             perm_confirm_delete: None,
             autostart_portable: false,
+            hotkey_command: None,
+            autostart_command: None,
             field_errors: std::collections::HashMap::new(),
             focus_field: None,
         }
@@ -300,7 +310,11 @@ pub fn render_config_viewport(
                     ui.label(strings::text("config.non_atomic_note"));
                     if config.tab == "PermanentClips" && !filtering {
                         ui.label(strings::text("perm.immediate_note"));
-                        ui.label(strings::text("perm.hotkey_note"));
+                        if config.hotkey_command.is_some() {
+                            ui.label(strings::text("perm.hotkey_manual"));
+                        } else {
+                            ui.label(strings::text("perm.hotkey_note"));
+                        }
                         ui.horizontal(|ui| {
                             ui.add(egui::TextEdit::singleline(&mut config.perm_group_new));
                             if ui.button(strings::text("perm.new_group")).clicked() {
@@ -374,6 +388,11 @@ pub fn render_config_viewport(
                         if let Some(id) = config.perm_vm.activate_selected() {
                             if ui.button(strings::text("perm.delete_clip")).clicked() {
                                 perm_confirm = Some(id);
+                            }
+                            if let Some(command) = config.hotkey_command.as_deref() {
+                                if ui.button(strings::text("perm.copy_command")).clicked() {
+                                    ui.ctx().copy_text(permanent_command(command, id));
+                                }
                             }
                             if config.perm_confirm_delete == Some(id) {
                                 ui.label(strings::text("perm.delete_confirm"));
@@ -479,6 +498,11 @@ pub fn render_config_viewport(
                             if portable {
                                 ui.label(strings::text("config.restore_warning_portable"));
                             }
+                            if key == "autostart.enabled" {
+                                if let Some(command) = config.autostart_command.clone() {
+                                    manual_hotkey_hint(ui, "config.autostart_manual", &command);
+                                }
+                            }
                         } else if *kind == config_model::Kind::Enum {
                             let mut picked = current.clone();
                             egui::ComboBox::from_id_salt(("cfg_enum", key.as_str()))
@@ -521,6 +545,11 @@ pub fn render_config_viewport(
                             && config.hotkey_apply == config_model::HotkeyApply::DesktopConfirms
                         {
                             ui.label(strings::text("config.desktop_confirms_hotkey"));
+                        }
+                        if key == "popup.hotkey" {
+                            if let Some(command) = config.hotkey_command.clone() {
+                                manual_hotkey_hint(ui, "config.hotkey_manual", &command);
+                            }
                         }
                     }
                 });
@@ -661,5 +690,39 @@ pub fn render_config_viewport(
             // popup.keys live-applies in the Config event handler on reload.
             send(ipc_bridge::UiCmd::ConfigGet);
         }
+    }
+}
+
+/// A note that this desktop binds global shortcuts only in its own
+/// settings, with the command to bind (selectable, plus a copy button).
+fn manual_hotkey_hint(ui: &mut egui::Ui, note: &str, command: &str) {
+    ui.label(strings::text(note));
+    ui.horizontal(|ui| {
+        let mut text = command.to_string();
+        ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .code_editor()
+                .desired_width(f32::INFINITY.min(ui.available_width() - 60.0)),
+        );
+        if ui.button(strings::text("config.copy_command")).clicked() {
+            ui.ctx().copy_text(command.to_string());
+        }
+    });
+}
+
+/// The shortcut command for one permanent clip, from the popup command.
+fn permanent_command(popup_command: &str, id: uuid::Uuid) -> String {
+    popup_command.replace(" show-popup", &format!(" exec-permanent {id}"))
+}
+
+#[cfg(test)]
+mod manual_hotkey_tests {
+    #[test]
+    fn permanent_command_swaps_the_subcommand() {
+        let id = uuid::Uuid::nil();
+        assert_eq!(
+            super::permanent_command("/opt/c/clipmonger-cli --profile-dir /p show-popup", id),
+            format!("/opt/c/clipmonger-cli --profile-dir /p exec-permanent {id}")
+        );
     }
 }

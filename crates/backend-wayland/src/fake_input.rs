@@ -143,10 +143,7 @@ mod tests {
 
     #[test]
     fn chord_presses_modifiers_first_and_releases_in_reverse() {
-        assert_eq!(
-            chord_events(false),
-            [(29, 1), (47, 1), (47, 0), (29, 0)]
-        );
+        assert_eq!(chord_events(false), [(29, 1), (47, 1), (47, 0), (29, 0)]);
         assert_eq!(
             chord_events(true),
             [(29, 1), (42, 1), (47, 1), (47, 0), (42, 0), (29, 0)]

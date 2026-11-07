@@ -125,6 +125,28 @@ gnome-extensions enable clipmonger@extensions.clipmonger.dev
 
 On Xorg the extension is optional.
 
+**Sway, Hyprland and COSMIC** don't let apps register global shortcuts or run
+XDG autostart entries, so bind the keys and the login start in the
+compositor's own config. Settings shows the exact commands for your install
+(Popup and Startup tabs; Permanent Clips has **Copy shortcut command** for each
+clip). For Sway, with the default profile:
+
+```
+bindsym Ctrl+Alt+h exec clipmonger-cli --profile-dir ~/.local/share/clipmonger show-popup
+bindsym Ctrl+Alt+k exec clipmonger-cli --profile-dir ~/.local/share/clipmonger exec-permanent <clip id>
+exec clipmonger --minimized --profile-dir ~/.local/share/clipmonger
+```
+
+On Hyprland bind the same commands (`hyprland.conf`: `bind = CTRL ALT, H, exec,
+...` and `exec-once = ...`; Lua config: `hl.bind("CTRL + ALT + H",
+hl.dsp.exec_cmd("..."))`, with the login start inside
+`hl.on("hyprland.start", ...)`). On COSMIC add a custom shortcut in Settings,
+Keyboard; COSMIC runs the regular Start on login entry.
+
+On Sway and Hyprland a picked clip is pasted for you: Clipmonger presses
+Ctrl+V (Ctrl+Shift+V in terminals) through the compositor's virtual keyboard.
+On COSMIC the clip is copied and a notification asks you to press Ctrl+V.
+
 ### Build from source
 
 Clipmonger builds with the Rust toolchain pinned in `rust-toolchain.toml`

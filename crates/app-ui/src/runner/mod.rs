@@ -895,6 +895,7 @@ impl<A: App> Runner<A> {
                 metadata
                     .as_ref()
                     .and_then(|m| m.activation_token.as_deref()),
+                metadata.as_ref().and_then(|m| m.x11_time),
             ) {
                 self.fail(event_loop, e);
                 return;
@@ -930,6 +931,13 @@ impl<A: App> Runner<A> {
                 metadata.as_ref().and_then(|m| m.x11_time),
             );
         }
+        // An activation still waiting (window not mapped yet, or the focus
+        // request not yet honoured) is retried on a short timer.
+        if self.pending_activation.is_pending() {
+            self.popup
+                .deadline
+                .at(now + std::time::Duration::from_millis(40));
+        }
         let context = self
             .app
             .as_ref()
@@ -948,7 +956,10 @@ impl<A: App> Runner<A> {
         event_loop: &ActiveEventLoop,
         open: bool,
         activation_token: Option<&str>,
+        x11_time: Option<u32>,
     ) -> Result<(), RunError> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = x11_time;
         if self.per_show {
             if open {
                 let host =
@@ -961,6 +972,12 @@ impl<A: App> Runner<A> {
             }
         } else if let Some(host) = self.popup.host.as_mut() {
             if open {
+                // The press time as the window's user time: window managers
+                // decide on map whether a new window may take the focus.
+                #[cfg(target_os = "linux")]
+                if let (Some(time), Some(window)) = (x11_time, window::x11_window(&host.window)) {
+                    window::set_x11_user_time(window, time);
+                }
                 host.visibility.show(&*host.window);
             } else {
                 host.visibility.hide(&*host.window);
@@ -1250,6 +1267,12 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
         };
         let now = Instant::now();
         let close = matches!(event, WindowEvent::CloseRequested);
+        if kind == Some(WindowKind::Popup)
+            && self.last.popup_open
+            && matches!(event, WindowEvent::Focused(true))
+        {
+            self.pending_activation.focus_seen();
+        }
         if let Some(kind) = kind {
             self.window_geometry_event(kind, &event);
             let preserve_super = self

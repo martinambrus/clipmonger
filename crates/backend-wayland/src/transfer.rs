@@ -179,7 +179,10 @@ mod twin_tests {
     use super::with_text_twin;
 
     fn p(items: &[(&str, &str)]) -> Vec<(String, Vec<u8>)> {
-        items.iter().map(|(m, b)| ((*m).to_string(), b.as_bytes().to_vec())).collect()
+        items
+            .iter()
+            .map(|(m, b)| ((*m).to_string(), b.as_bytes().to_vec()))
+            .collect()
     }
 
     #[test]
