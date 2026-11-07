@@ -5237,56 +5237,66 @@ mod tests {
         let (profile, sentinel, blocker) = rollback_fixture("open-waits");
         drop(blocker);
         let path = db_path(&profile);
-        let handles = Rc::new(RefCell::new(Vec::new()));
-        let workers = Rc::clone(&handles);
+        // One blocker per stage, connected before the open starts: the open's
+        // budget is wall-clock time, so the boundary hook must only signal a
+        // ready blocker (opening a connection and spawning a thread there
+        // used the 90 ms budget up on slow CI runners).
+        let mut blockers = std::collections::HashMap::new();
+        let mut workers = Vec::new();
+        for stage in [
+            super::OpenStage::Header,
+            super::OpenStage::Wal,
+            super::OpenStage::EnsureSchema,
+        ] {
+            let path = path.clone();
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            workers.push(std::thread::spawn(move || {
+                let blocker = rusqlite::Connection::open(path).unwrap();
+                if go_rx.recv().is_err() {
+                    return;
+                }
+                match stage {
+                    super::OpenStage::Header => {
+                        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+                    }
+                    super::OpenStage::Wal => {
+                        blocker.execute_batch("BEGIN; SELECT * FROM meta").unwrap();
+                    }
+                    _ => blocker.execute_batch("BEGIN IMMEDIATE").unwrap(),
+                }
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(
+                    if stage == super::OpenStage::EnsureSchema {
+                        250
+                    } else {
+                        25
+                    },
+                ));
+                blocker.execute_batch("ROLLBACK").unwrap();
+            }));
+            blockers.insert(format!("{stage:?}"), (go_tx, ready_rx));
+        }
         let seen = Rc::new(RefCell::new(Vec::new()));
         let boundaries = Rc::clone(&seen);
-        let mut stages = HashSet::new();
         let guard = OpenControlGuard::install(super::OpenTestControl {
             budget: Some(Duration::from_millis(90)),
             boundary: Some(Box::new(move |conn, stage| {
-                if !matches!(
-                    stage,
-                    super::OpenStage::Header
-                        | super::OpenStage::Wal
-                        | super::OpenStage::EnsureSchema
-                ) || !stages.insert(format!("{stage:?}"))
-                {
+                // First boundary of each blocked stage only.
+                let Some((go, ready)) = blockers.remove(&format!("{stage:?}")) else {
                     return;
-                }
+                };
                 let timeout: i64 = conn
                     .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
                     .unwrap();
                 boundaries.borrow_mut().push((stage, timeout));
-                let path = path.clone();
-                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-                workers.borrow_mut().push(std::thread::spawn(move || {
-                    let blocker = rusqlite::Connection::open(path).unwrap();
-                    match stage {
-                        super::OpenStage::Header => {
-                            blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
-                        }
-                        super::OpenStage::Wal => {
-                            blocker.execute_batch("BEGIN; SELECT * FROM meta").unwrap();
-                        }
-                        _ => blocker.execute_batch("BEGIN IMMEDIATE").unwrap(),
-                    }
-                    ready_tx.send(()).unwrap();
-                    std::thread::sleep(Duration::from_millis(
-                        if stage == super::OpenStage::EnsureSchema {
-                            250
-                        } else {
-                            25
-                        },
-                    ));
-                    blocker.execute_batch("ROLLBACK").unwrap();
-                }));
-                ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                go.send(()).unwrap();
+                ready.recv_timeout(Duration::from_secs(3)).unwrap();
             })),
             ..Default::default()
         });
         let result = Store::open(&profile);
-        for worker in handles.borrow_mut().drain(..) {
+        for worker in workers {
             worker.join().unwrap();
         }
         assert!(
@@ -5309,12 +5319,14 @@ mod tests {
     /// statements. A slow earlier boundary cannot replenish the next wait.
     ///
     /// The boundary callback drives the clock instead of fixed sleeps against
-    /// a tight budget: earlier stages do real I/O, and under a loaded parallel
-    /// run they used up a 45 ms budget before the schema stage, so every
-    /// schema reading was 0. With 300 ms the schema stage starts at the 50 ms
-    /// slice cap; schema boundaries sleep 25 ms while capped, then half of
-    /// what is left, so the readings fall inside that stage; the first later
-    /// boundary with time left sleeps past the budget, so a 0 follows.
+    /// a tight budget: earlier stages do real I/O, and under a loaded run
+    /// (slow CI runners) they used up a 45 ms and later a 300 ms budget before
+    /// the schema stage, so every schema reading was 0. With 1 s the schema
+    /// stage starts at the 50 ms slice cap; the first capped schema boundary
+    /// sleeps until about 40 ms are left (the test tracks the budget's clock
+    /// itself), later ones half of what is left, so the readings fall inside
+    /// that stage; the first later boundary with time left sleeps past the
+    /// budget, so a 0 follows.
     #[test]
     fn opening_budget_refreshes_across_stages_and_schema_statements() {
         use std::cell::RefCell;
@@ -5325,16 +5337,22 @@ mod tests {
         let readings = Rc::new(RefCell::new(Vec::new()));
         let output = Rc::clone(&readings);
         let slice = i64::try_from(super::OPEN_WAIT_SLICE.as_millis()).unwrap();
+        let budget = Duration::from_millis(1000);
+        // Starts no later than the open's own budget clock, so the estimate
+        // of what is left never exceeds the real remainder.
+        let started = std::time::Instant::now();
         let _guard = OpenControlGuard::install(super::OpenTestControl {
-            budget: Some(Duration::from_millis(300)),
+            budget: Some(budget),
             boundary: Some(Box::new(move |conn, stage| {
                 let timeout: i64 = conn
                     .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
                     .unwrap();
                 output.borrow_mut().push((stage, timeout));
+                let left = i64::try_from(budget.saturating_sub(started.elapsed()).as_millis())
+                    .unwrap_or(i64::MAX);
                 let sleep_ms = match stage {
                     super::OpenStage::Header => 12,
-                    super::OpenStage::EnsureSchema if timeout >= slice => 25,
+                    super::OpenStage::EnsureSchema if timeout >= slice => (left - 40).max(1),
                     super::OpenStage::EnsureSchema => (timeout / 2).max(1),
                     _ if timeout > 0 => timeout + 2,
                     _ => 0,
