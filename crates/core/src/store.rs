@@ -5236,90 +5236,103 @@ mod tests {
         use std::cell::RefCell;
         use std::rc::Rc;
         use std::time::Duration;
-        let (profile, sentinel, blocker) = rollback_fixture("open-waits");
-        drop(blocker);
-        let path = db_path(&profile);
-        // One blocker per stage, connected before the open starts: the open's
-        // budget is wall-clock time, so the boundary hook must only signal a
-        // ready blocker (opening a connection and spawning a thread there
-        // used the 90 ms budget up on slow CI runners).
-        let mut blockers = std::collections::HashMap::new();
-        let mut workers = Vec::new();
-        for stage in [
-            super::OpenStage::Header,
-            super::OpenStage::Wal,
-            super::OpenStage::EnsureSchema,
-        ] {
-            let path = path.clone();
-            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            workers.push(std::thread::spawn(move || {
-                let blocker = rusqlite::Connection::open(path).unwrap();
-                if go_rx.recv().is_err() {
-                    return;
-                }
-                match stage {
-                    super::OpenStage::Header => {
-                        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        for attempt in 0..3 {
+            let (profile, sentinel, blocker) = rollback_fixture(&format!("open-waits-{attempt}"));
+            drop(blocker);
+            let path = db_path(&profile);
+            // One blocker per stage, connected before the open starts: the open's
+            // budget is wall-clock time, so the boundary hook must only signal a
+            // ready blocker (opening a connection and spawning a thread there
+            // used the 90 ms budget up on slow CI runners).
+            let mut blockers = std::collections::HashMap::new();
+            let mut workers = Vec::new();
+            for stage in [
+                super::OpenStage::Header,
+                super::OpenStage::Wal,
+                super::OpenStage::EnsureSchema,
+            ] {
+                let path = path.clone();
+                let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                workers.push(std::thread::spawn(move || {
+                    let blocker = rusqlite::Connection::open(path).unwrap();
+                    if go_rx.recv().is_err() {
+                        return;
                     }
-                    super::OpenStage::Wal => {
-                        blocker.execute_batch("BEGIN; SELECT * FROM meta").unwrap();
+                    match stage {
+                        super::OpenStage::Header => {
+                            blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+                        }
+                        super::OpenStage::Wal => {
+                            blocker.execute_batch("BEGIN; SELECT * FROM meta").unwrap();
+                        }
+                        _ => blocker.execute_batch("BEGIN IMMEDIATE").unwrap(),
                     }
-                    _ => blocker.execute_batch("BEGIN IMMEDIATE").unwrap(),
-                }
-                ready_tx.send(()).unwrap();
-                // Short holds in the first two stages (a slow runner's
-                // scheduling delay must not use up the 50 ms slice there),
-                // one longer than the whole budget in the schema stage.
-                std::thread::sleep(Duration::from_millis(
-                    if stage == super::OpenStage::EnsureSchema {
-                        400
-                    } else {
-                        5
-                    },
-                ));
-                blocker.execute_batch("ROLLBACK").unwrap();
-            }));
-            blockers.insert(format!("{stage:?}"), (go_tx, ready_rx));
+                    ready_tx.send(()).unwrap();
+                    // Short holds in the first two stages (a slow runner's
+                    // scheduling delay must not use up the 50 ms slice there),
+                    // one longer than the whole budget in the schema stage.
+                    std::thread::sleep(Duration::from_millis(
+                        if stage == super::OpenStage::EnsureSchema {
+                            400
+                        } else {
+                            5
+                        },
+                    ));
+                    blocker.execute_batch("ROLLBACK").unwrap();
+                }));
+                blockers.insert(format!("{stage:?}"), (go_tx, ready_rx));
+            }
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let boundaries = Rc::clone(&seen);
+            let guard = OpenControlGuard::install(super::OpenTestControl {
+                budget: Some(Duration::from_millis(60)),
+                boundary: Some(Box::new(move |conn, stage| {
+                    // First boundary of each blocked stage only.
+                    let Some((go, ready)) = blockers.remove(&format!("{stage:?}")) else {
+                        return;
+                    };
+                    let timeout: i64 = conn
+                        .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                        .unwrap();
+                    boundaries.borrow_mut().push((stage, timeout));
+                    go.send(()).unwrap();
+                    ready.recv_timeout(Duration::from_secs(3)).unwrap();
+                })),
+                ..Default::default()
+            });
+            let result = Store::open(&profile);
+            // Release the blockers of stages the open never reached before
+            // joining them (their start signal lives in the hook).
+            drop(guard);
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            // A 5 ms hold can outlast the 50 ms slice of the header or WAL stage
+            // when a loaded runner deschedules the blocker thread; that run says
+            // nothing about the shared budget, so try again (at most 3 runs).
+            if attempt < 2
+                && matches!(&result, Err(crate::CoreError::Backend { message, .. })
+                    if message.starts_with("Header:") || message.starts_with("Wal:"))
+            {
+                eprintln!("attempt {attempt}: early stage outlasted its slice: {result:?}");
+                continue;
+            }
+            assert!(
+                matches!(&result, Err(crate::CoreError::Backend { message, .. }) if message.starts_with("EnsureSchema:")),
+                "{result:?}"
+            );
+            let seen = seen.borrow();
+            eprintln!("actual successive SQL waits: {seen:?}; {result:?}");
+            assert_eq!(seen.len(), 3);
+            assert!(
+                seen[2].1 < seen[0].1,
+                "later SQL reused a stale allowance: {seen:?}"
+            );
+            assert_eq!(history_ids(&Store::open(&profile).unwrap()), vec![sentinel]);
+            assert_no_asides(&profile);
+            return;
         }
-        let seen = Rc::new(RefCell::new(Vec::new()));
-        let boundaries = Rc::clone(&seen);
-        let guard = OpenControlGuard::install(super::OpenTestControl {
-            budget: Some(Duration::from_millis(60)),
-            boundary: Some(Box::new(move |conn, stage| {
-                // First boundary of each blocked stage only.
-                let Some((go, ready)) = blockers.remove(&format!("{stage:?}")) else {
-                    return;
-                };
-                let timeout: i64 = conn
-                    .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
-                    .unwrap();
-                boundaries.borrow_mut().push((stage, timeout));
-                go.send(()).unwrap();
-                ready.recv_timeout(Duration::from_secs(3)).unwrap();
-            })),
-            ..Default::default()
-        });
-        let result = Store::open(&profile);
-        // Release the blockers of stages the open never reached before
-        // joining them (their start signal lives in the hook).
-        drop(guard);
-        for worker in workers {
-            worker.join().unwrap();
-        }
-        assert!(
-            matches!(&result, Err(crate::CoreError::Backend { message, .. }) if message.starts_with("EnsureSchema:")),
-            "{result:?}"
-        );
-        let seen = seen.borrow();
-        eprintln!("actual successive SQL waits: {seen:?}; {result:?}");
-        assert_eq!(seen.len(), 3);
-        assert!(
-            seen[2].1 < seen[0].1,
-            "later SQL reused a stale allowance: {seen:?}"
-        );
-        assert_eq!(history_ids(&Store::open(&profile).unwrap()), vec![sentinel]);
-        assert_no_asides(&profile);
     }
 
     /// Exercise actual public-opening SQL across stages and individual schema
