@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="cosmic_workspace_stub">
+  <copyright>
+    Part of Clipmonger, MIT license (see LICENSE at the repository root).
+  </copyright>
+
+  <!--
+    Stand-in for COSMIC's zcosmic_workspace_handle_v1, which
+    cosmic-toplevel-info-unstable-v1.xml names in its (deprecated)
+    workspace_enter/workspace_leave events. Clipmonger never binds the
+    workspace protocol, so the compositor never sends those events to it;
+    the stand-in only lets the bindings compile.
+  -->
+  <interface name="zcosmic_workspace_handle_v1" version="1">
+  </interface>
+</protocol>

@@ -18,6 +18,8 @@ wayland-client.workspace = true
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-scanner = "0.31"
 
 [lints]
 workspace = true

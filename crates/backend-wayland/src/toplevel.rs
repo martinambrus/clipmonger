@@ -1,11 +1,15 @@
-//! Active-window tracking over `zwlr_foreign_toplevel_manager_v1`.
+//! Active-window tracking over `zwlr_foreign_toplevel_manager_v1`, or on
+//! COSMIC over `ext_foreign_toplevel_list_v1` with `zcosmic_toplevel_info_v1`
+//! ([`crate::cosmic_toplevel`]).
 //!
 //! A Wayland client cannot see which window has focus. wlroots-based
 //! compositors (Sway, Hyprland, and others) offer the foreign-toplevel
 //! protocol to taskbars: it lists every toplevel window with its `app_id`,
-//! title and state, including `activated`. [`track`] follows that state and
-//! reports each change of the active window. Compositors that do not
-//! advertise the global make [`track`] fail with [`Error::Unavailable`].
+//! title and state, including `activated`. COSMIC splits the same data over
+//! the ext list (`app_id`, title) and its own info extension (state).
+//! [`track`] follows that state and reports each change of the active
+//! window. Compositors that offer neither set make [`track`] fail with
+//! [`Error::Unavailable`].
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -24,10 +28,42 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_m
 
 /// Interface name of the manager global.
 const MANAGER_INTERFACE: &str = "zwlr_foreign_toplevel_manager_v1";
+/// Interface name of the ext toplevel list global (COSMIC set).
+pub(crate) const EXT_LIST_INTERFACE: &str = "ext_foreign_toplevel_list_v1";
+/// Interface name of COSMIC's toplevel info global.
+pub(crate) const COSMIC_INFO_INTERFACE: &str = "zcosmic_toplevel_info_v1";
+/// `zcosmic_toplevel_info_v1.get_cosmic_toplevel` exists from version 2.
+pub(crate) const COSMIC_INFO_MIN_VERSION: u32 = 2;
 /// Highest manager version the bundled protocol file describes.
 const MAX_VERSION: u32 = 3;
 /// `zwlr_foreign_toplevel_handle_v1.state` entry: activated.
 const STATE_ACTIVATED: u32 = 2;
+
+/// The toplevel protocol set a compositor offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocols {
+    /// `zwlr_foreign_toplevel_manager_v1` (wlroots family).
+    Wlr,
+    /// `ext_foreign_toplevel_list_v1` with `zcosmic_toplevel_info_v1` v2+.
+    Cosmic,
+}
+
+/// Pick the protocol set from the advertised `(interface, version)`
+/// globals: wlroots first, else the COSMIC pair.
+#[must_use]
+pub fn protocols_for<'a>(globals: impl IntoIterator<Item = (&'a str, u32)>) -> Option<Protocols> {
+    let mut ext_list = false;
+    let mut cosmic_info = false;
+    for (interface, version) in globals {
+        match interface {
+            MANAGER_INTERFACE => return Some(Protocols::Wlr),
+            EXT_LIST_INTERFACE => ext_list = true,
+            COSMIC_INFO_INTERFACE => cosmic_info |= version >= COSMIC_INFO_MIN_VERSION,
+            _ => {}
+        }
+    }
+    (ext_list && cosmic_info).then_some(Protocols::Cosmic)
+}
 
 /// The active window after a change.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -115,6 +151,19 @@ impl<K: Eq + Hash + Clone> Tracker<K> {
             return Some(Activation::default());
         }
         None
+    }
+
+    /// The `done` of several windows at once (COSMIC's info `done`):
+    /// windows that lost activation first, so the result ends on the
+    /// window that gained it.
+    pub fn done_all(&mut self, ids: impl IntoIterator<Item = K>) -> Vec<Activation> {
+        let (gained, lost): (Vec<K>, Vec<K>) = ids
+            .into_iter()
+            .partition(|id| self.toplevels.get(id).is_some_and(|t| t.activated));
+        lost.iter()
+            .chain(gained.iter())
+            .filter_map(|id| self.done(id))
+            .collect()
     }
 
     /// A `closed` event: the window is gone.
@@ -219,20 +268,25 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
     }
 }
 
-/// Whether the session compositor advertises the foreign-toplevel manager.
-/// Only reads the global list.
+/// The toplevel protocol set the session compositor offers. Only reads the
+/// global list.
+#[must_use]
+pub fn offered() -> Option<Protocols> {
+    let conn = Connection::connect_to_env().ok()?;
+    let (globals, _queue) = registry_queue_init::<Probe>(&conn).ok()?;
+    globals.contents().with_list(|list| {
+        protocols_for(
+            list.iter()
+                .map(|global| (global.interface.as_str(), global.version)),
+        )
+    })
+}
+
+/// Whether the session compositor offers a toplevel protocol set [`track`]
+/// can follow.
 #[must_use]
 pub fn available() -> bool {
-    let Ok(conn) = Connection::connect_to_env() else {
-        return false;
-    };
-    let Ok((globals, _queue)) = registry_queue_init::<Probe>(&conn) else {
-        return false;
-    };
-    globals.contents().with_list(|list| {
-        list.iter()
-            .any(|global| global.interface == MANAGER_INTERFACE)
-    })
+    offered().is_some()
 }
 
 /// Follow the active toplevel, calling `on_change` with each new active
@@ -242,9 +296,20 @@ pub fn available() -> bool {
 /// # Errors
 ///
 /// [`Error::Unavailable`] without a Wayland connection, when the compositor
-/// does not offer `zwlr_foreign_toplevel_manager_v1`, or when the
-/// connection fails.
+/// offers neither protocol set ([`Protocols`]), or when the connection
+/// fails.
 pub fn track(on_change: Box<dyn FnMut(&Activation) + Send>) -> Result<()> {
+    match offered() {
+        Some(Protocols::Wlr) => track_wlr(on_change),
+        Some(Protocols::Cosmic) => crate::cosmic_toplevel::track(on_change),
+        None => Err(Error::Unavailable(
+            "no foreign-toplevel protocol offered".to_string(),
+        )),
+    }
+}
+
+/// [`track`] over `zwlr_foreign_toplevel_manager_v1`.
+fn track_wlr(on_change: Box<dyn FnMut(&Activation) + Send>) -> Result<()> {
     let unavailable =
         |e: &dyn std::fmt::Display| Error::Unavailable(format!("foreign toplevel: {e}"));
     let conn = Connection::connect_to_env().map_err(|e| unavailable(&e))?;
@@ -287,6 +352,54 @@ mod tests {
         assert!(!state_is_activated(&entries(&[0, 1, 3])));
         assert!(!state_is_activated(&[]));
         assert!(!state_is_activated(&[2, 0]), "a partial entry is ignored");
+    }
+
+    #[test]
+    fn wlroots_wins_and_cosmic_needs_both_globals() {
+        let wlr = [
+            ("wl_seat", 7),
+            (MANAGER_INTERFACE, 3),
+            (EXT_LIST_INTERFACE, 1),
+        ];
+        assert_eq!(protocols_for(wlr), Some(Protocols::Wlr));
+        let cosmic = [(EXT_LIST_INTERFACE, 1), (COSMIC_INFO_INTERFACE, 3)];
+        assert_eq!(protocols_for(cosmic), Some(Protocols::Cosmic));
+        assert_eq!(
+            protocols_for([(EXT_LIST_INTERFACE, 1), (COSMIC_INFO_INTERFACE, 1)]),
+            None,
+            "info v1 has no get_cosmic_toplevel"
+        );
+        assert_eq!(protocols_for([(COSMIC_INFO_INTERFACE, 3)]), None);
+        assert_eq!(protocols_for([(EXT_LIST_INTERFACE, 1)]), None);
+        assert_eq!(protocols_for([]), None);
+    }
+
+    #[test]
+    fn batched_done_reports_the_gained_window_last() {
+        let mut tracker = Tracker::default();
+        tracker.app_id(&1, "foot".to_string());
+        tracker.state(&1, true);
+        assert_eq!(tracker.done_all([1]), [active("foot", "")]);
+        // One batch: the popup gains focus, the terminal loses it; the
+        // gained window is listed first but reported last.
+        tracker.app_id(&2, "com.martinambrus.clipmonger".to_string());
+        tracker.state(&2, true);
+        tracker.state(&1, false);
+        assert_eq!(
+            tracker.done_all([2, 1]),
+            [
+                Activation::default(),
+                active("com.martinambrus.clipmonger", "")
+            ]
+        );
+        // Back: the popup loses focus, the terminal gains it.
+        tracker.state(&2, false);
+        tracker.state(&1, true);
+        assert_eq!(
+            tracker.done_all([1, 2]),
+            [Activation::default(), active("foot", "")]
+        );
+        assert!(tracker.done_all([1, 2]).is_empty(), "no change, no report");
     }
 
     #[test]

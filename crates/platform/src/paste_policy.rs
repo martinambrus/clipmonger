@@ -359,6 +359,8 @@ const SHIFT_PASTE_APPS: &[&str] = &[
     "tilda",
     "terminology",
     "st",
+    "com.system76.cosmicterm",
+    "cosmic-term",
 ];
 
 /// Whether a paste into a window with these identities needs Ctrl+Shift+V
@@ -381,6 +383,7 @@ mod shift_paste_tests {
         assert!(paste_needs_shift(&["gnome-terminal-server"]));
         assert!(paste_needs_shift(&["org.gnome.Ptyxis.desktop"]));
         assert!(paste_needs_shift(&["Alacritty"]));
+        assert!(paste_needs_shift(&["com.system76.CosmicTerm"]));
         assert!(
             paste_needs_shift(&["firefox", "kitty"]),
             "any identity counts"

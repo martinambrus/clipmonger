@@ -444,7 +444,7 @@ turning it off on Xfce).
 | Linux Mint 22.3, Cinnamon 6.6 (X11) | `cm-mint223-cinnamon` | Pass after the focus fix below |
 | Arch, Sway 1.12 (wlroots) | `cm-arch-wlroots` | Pass: auto-paste through the virtual keyboard; hotkey and login start through the Sway config |
 | Arch, Hyprland 0.57 | same | Pass: auto-paste, Lua-config bind, login start in `hyprland.start`, tray |
-| Pop!_OS 24.04, COSMIC 1.0 | `cm-popos2404-cosmic` | Pass: capture, custom-shortcut hotkey, copy plus "press Ctrl+V" notification, XDG autostart |
+| Pop!_OS 24.04, COSMIC 1.0 | `cm-popos2404-cosmic` | Pass: capture, custom-shortcut hotkey, auto-paste into GTK3, COSMIC Terminal and a root window, XDG autostart |
 
 Found and fixed:
 
@@ -452,9 +452,12 @@ Found and fixed:
   KDE: focus tracking over `wlr-foreign-toplevel-management` and the chord
   through `zwp_virtual_keyboard_v1`. The virtual keyboard uploads the seat's
   own keymap and taps Shift first, because GTK3 drops the first chord from a
-  keyboard the seat has just switched to. COSMIC offers the virtual keyboard,
-  but its window-activation protocol is GPL-3.0 (cosmic-protocols), so COSMIC
-  keeps the honest copy and notification.
+  keyboard the seat has just switched to. COSMIC has no wlroots toplevel
+  manager; there the focus comes from `ext_foreign_toplevel_list_v1` plus
+  `zcosmic_toplevel_info_v1`. Its XML is vendored from pop-os/cosmic-protocols
+  (commit c0cff4d, HPND-style notice) rather than taking the crates.io
+  `cosmic-protocols` package, which is labelled GPL-3.0-only. COSMIC Terminal
+  joined the Ctrl+Shift+V list.
 - **Shortcuts and login start on wlroots-family desktops.** Sway has no
   shortcut portal, Hyprland binds portal shortcuts only from its config, and
   neither runs XDG autostart. Caps now report the hotkey as degraded there and

@@ -5,7 +5,7 @@
 //! Unix Wayland session. Paste writes the clipboard (seg-06 S7); the daemon
 //! then presses the paste chord where the compositor allows it
 //! (`fake_input` on `KWin`, `virtual_keyboard` with `toplevel` focus
-//! tracking on wlroots-family compositors), else shows a toast. This crate
+//! tracking on wlroots-family compositors and COSMIC), else shows a toast. This crate
 //! stays `tokio`-free (seg-02 S8); the portal session lives in the daemon.
 
 pub mod caps;
@@ -15,6 +15,10 @@ pub mod portal;
 pub mod primary;
 pub mod probe;
 
+#[cfg(unix)]
+pub mod cosmic_protocol;
+#[cfg(unix)]
+pub mod cosmic_toplevel;
 #[cfg(unix)]
 pub mod fake_input;
 #[cfg(unix)]

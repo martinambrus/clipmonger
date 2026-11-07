@@ -72,6 +72,7 @@ const SHIFT_PASTE_APPS = new Set([
     'ptyxis', 'org.gnome.ptyxis', 'konsole', 'org.kde.konsole', 'xfce4-terminal', 'tilix',
     'com.gexperts.tilix', 'terminator', 'alacritty', 'kitty', 'foot', 'footclient', 'wezterm',
     'wezterm-gui', 'org.wezfurlong.wezterm', 'guake', 'tilda', 'terminology', 'st',
+    'com.system76.cosmicterm', 'cosmic-term',
 ]);
 /** Whether a paste into a window with these identities needs Ctrl+Shift+V. */
 export function pasteNeedsShift(ids) {

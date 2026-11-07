@@ -1,6 +1,6 @@
-//! Paste chord over `zwp_virtual_keyboard_manager_v1` (wlroots family).
+//! Paste chord over `zwp_virtual_keyboard_manager_v1` (wlroots family, COSMIC).
 //!
-//! Sway, Hyprland and other wlroots-based compositors offer the virtual
+//! Sway, Hyprland, other wlroots-based compositors and COSMIC offer the virtual
 //! keyboard protocol to ordinary clients (`wtype` uses it). A virtual
 //! keyboard brings its own XKB keymap. It uploads the seat's current keymap
 //! (read from a `wl_keyboard`): a different keymap makes the compositor send

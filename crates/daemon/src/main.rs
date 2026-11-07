@@ -667,7 +667,8 @@ fn setup_wayland_backend(
     let capture_primary = config.monitor.capture_primary;
     let probe = probe_current();
     let mut caps = backend_caps::caps_for(&probe, capture_primary, false);
-    // wlroots family: the daemon presses the chord through a virtual keyboard.
+    // wlroots family and COSMIC: the daemon presses the chord through a
+    // virtual keyboard.
     if clipmonger_daemon::wlr::auto_paste_available() {
         caps = backend_caps::with_virtual_keyboard_paste(caps);
     }
@@ -760,7 +761,7 @@ fn setup_wayland_backend(
     // Portal session owns the popup hotkey (first bind may show a system
     // dialog; `status.portal_bind_pending` forewarns the UI per W-F4).
     clipmonger_daemon::portal::spawn_portal_session(Arc::clone(state), capture_primary);
-    // KWin and wlroots family: track the active window for auto-paste
+    // KWin, wlroots family and COSMIC: track the active window for auto-paste
     // (no-op elsewhere).
     clipmonger_daemon::kwin::spawn_focus_tracker(Arc::clone(state));
     clipmonger_daemon::wlr::spawn_focus_tracker(Arc::clone(state));

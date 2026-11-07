@@ -36,8 +36,8 @@ Windows builds do not include these bindings.
 
 ## Permissively licensed protocol bindings
 
-For auto-paste on wlroots-family compositors (Sway, Hyprland) the daemon
-also compiles bindings for two more protocol descriptions. Both carry
+For auto-paste on wlroots-family compositors (Sway, Hyprland) and COSMIC the
+daemon also compiles bindings for more protocol descriptions. All carry
 permissive licenses that need no source offer, only the notice:
 
     virtual-keyboard-unstable-v1.xml (wayland-protocols-misc 0.3.12, manifest: MIT):
@@ -50,6 +50,34 @@ permissive licenses that need no source offer, only the notice:
     wlr-foreign-toplevel-management-unstable-v1.xml (wayland-protocols-wlr 0.3.12, manifest: MIT):
     Copyright © 2018 Ilia Bozhinov
     License: HPND-style permission notice (in the protocol file)
+
+    ext-foreign-toplevel-list-v1.xml (wayland-protocols 0.32.13, staging, manifest: MIT):
+    Copyright © 2018 Ilia Bozhinov
+    Copyright © 2020 Isaac Freund
+    Copyright © 2022 wb9688
+    Copyright © 2023 i509VCB
+    License: HPND-style permission notice (in the protocol file)
+
+    ext-workspace-v1.xml (wayland-protocols 0.32.13, staging, manifest: MIT;
+    referenced by the COSMIC protocol below):
+    Copyright © 2019 Christopher Billington
+    Copyright © 2020 Ilia Bozhinov
+    Copyright © 2022 Victoria Brekenfeld
+    License: HPND-style permission notice (in the protocol file)
+
+    cosmic-toplevel-info-unstable-v1.xml (vendored in
+    crates/backend-wayland/protocols/ from pop-os/cosmic-protocols, commit
+    c0cff4db14c37ed954983158e4055aa94c7741d9, unmodified):
+    Copyright © 2018 Ilia Bozhinov
+    Copyright © 2020 Isaac Freund
+    Copyright © 2024 Victoria Brekenfeld
+    License: HPND-style permission notice (in the protocol file)
+
+The `cosmic-protocols` crate itself is not used (its crates.io release is
+labelled GPL-3.0-only); Clipmonger generates the bindings from the vendored
+file with `wayland-scanner`. `protocols/cosmic-workspace-stub.xml` next to it
+is Clipmonger's own (MIT): an empty stand-in for the
+`zcosmic_workspace_handle_v1` interface the COSMIC file names.
 
 Linux release packages (`.deb`, portable archive) must ship this file and
 `LGPL-2.1.txt`.

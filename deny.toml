@@ -49,6 +49,11 @@ allow = ["OFL-1.1", "Ubuntu-font-1.0"]
 # (wayland-protocols-misc@0.3.12, MIT) and
 # wlr-foreign-toplevel-management-unstable-v1.xml (wayland-protocols-wlr@0.3.12,
 # HPND-style notice); both permissive, noted in licenses/wayland/ as well.
+# COSMIC auto-paste adds ext-foreign-toplevel-list-v1.xml and ext-workspace-v1.xml
+# (wayland-protocols@0.32, staging, HPND-style) and cosmic-toplevel-info-unstable-v1.xml
+# vendored in crates/backend-wayland/protocols/ from pop-os/cosmic-protocols commit
+# c0cff4db14c37ed954983158e4055aa94c7741d9 (HPND-style). The cosmic-protocols crate
+# (crates.io label GPL-3.0-only) is deliberately not a dependency.
 
 [bans]
 multiple-versions = "warn"

@@ -143,9 +143,9 @@ hl.dsp.exec_cmd("..."))`, with the login start inside
 `hl.on("hyprland.start", ...)`). On COSMIC add a custom shortcut in Settings,
 Keyboard; COSMIC runs the regular Start on login entry.
 
-On Sway and Hyprland a picked clip is pasted for you: Clipmonger presses
-Ctrl+V (Ctrl+Shift+V in terminals) through the compositor's virtual keyboard.
-On COSMIC the clip is copied and a notification asks you to press Ctrl+V.
+On Sway, Hyprland and COSMIC a picked clip is pasted for you: Clipmonger
+presses Ctrl+V (Ctrl+Shift+V in terminals) through the compositor's virtual
+keyboard.
 
 ### Build from source
 

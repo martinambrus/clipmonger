@@ -8,8 +8,8 @@
 //! through `KWin`'s fake-input protocol
 //! ([`clipmonger_backend_wayland::fake_input`]).
 //!
-//! wlroots-family compositors (Sway, Hyprland) feed the same [`Focus`] from
-//! the foreign-toplevel protocol ([`crate::wlr`]), and [`auto_paste`]
+//! wlroots-family compositors (Sway, Hyprland) and COSMIC feed the same
+//! [`Focus`] from their toplevel protocols ([`crate::wlr`]), and [`auto_paste`]
 //! presses the chord there through a virtual keyboard
 //! ([`clipmonger_backend_wayland::virtual_keyboard`]).
 
