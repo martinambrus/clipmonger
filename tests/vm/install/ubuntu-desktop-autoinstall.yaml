@@ -1,0 +1,23 @@
+#cloud-config
+autoinstall:
+  version: 1
+  interactive-sections: []
+  locale: en_US.UTF-8
+  keyboard: {layout: us}
+  timezone: Europe/Bratislava
+  identity:
+    hostname: @VM_HOSTNAME@
+    realname: @VM_USER@
+    username: @VM_USER@
+    password: '@VM_PASS_HASH@'
+  ssh:
+    install-server: true
+    allow-pw: true
+    authorized-keys:
+      - '@VM_SSH_KEY@'
+  storage:
+    layout: {name: direct}
+  late-commands:
+    - echo 'root:@VM_ROOT_PASS@' | chroot /target chpasswd
+    - printf '[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=@VM_USER@\n' > /target/etc/gdm3/custom.conf
+    - echo '@VM_USER@ ALL=(ALL) NOPASSWD:ALL' > /target/etc/sudoers.d/90-@VM_USER@ && chmod 440 /target/etc/sudoers.d/90-@VM_USER@

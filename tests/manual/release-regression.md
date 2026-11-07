@@ -28,10 +28,9 @@ test and name it in the log row.
 4. Deploy the binaries, the GNOME extension `dist/` and the guest helpers to
    each VM, start from a fresh profile, and record the build's commit.
 
-The maintainer's VM harness (libvirt VMs, key/pointer/screenshot driver,
-clipboard and editor helpers, GNOME suite script) is described in
-`docs/v1-continuation.md` under the dated acceptance sections; the helper
-names below refer to it.
+The VM harness (installing the test desktops, the key, pointer and screenshot
+driver, clipboard and editor helpers, the GNOME suite script) is in
+[tests/vm](../vm/README.md); the helper names below refer to it.
 
 ## 2. Desktop matrix
 

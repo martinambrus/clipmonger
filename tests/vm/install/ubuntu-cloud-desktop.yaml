@@ -1,0 +1,33 @@
+#cloud-config
+hostname: @VM_HOSTNAME@
+users:
+  - name: @VM_USER@
+    gecos: @VM_USER@
+    groups: [sudo, adm]
+    shell: /bin/bash
+    lock_passwd: false
+    passwd: '@VM_PASS_HASH@'
+    sudo: 'ALL=(ALL) NOPASSWD:ALL'
+    ssh_authorized_keys: ['@VM_SSH_KEY@']
+chpasswd:
+  expire: false
+  users:
+    - {name: root, password: '@VM_ROOT_HASH@'}
+ssh_pwauth: true
+apt:
+  primary:
+    - arches: [default]
+      uri: http://@APT_MIRROR@/ubuntu
+  security:
+    - arches: [default]
+      uri: http://@APT_SECURITY@/ubuntu
+package_update: true
+packages: []
+runcmd:
+  - [sh, -c, 'DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ubuntu-desktop-minimal gdm3 gnome-shell gnome-terminal gnome-shell-extension-appindicator nautilus python3-gi gir1.2-gtk-3.0 wl-clipboard xclip xserver-xorg xwayland fonts-dejavu-core > /var/log/desktop-install.log 2>&1']
+  - [sh, -c, 'printf "[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=@VM_USER@\n" > /etc/gdm3/custom.conf']
+  - [systemctl, set-default, graphical.target]
+  - [sh, -c, 'echo DESKTOP-DONE > /var/log/desktop-done']
+power_state:
+  mode: reboot
+  condition: true
