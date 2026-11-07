@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 use clipmonger_ipc::proto::methods::PASTE_ASSIST_TOPIC;
 use clipmonger_ipc::proto::methods::{
     ShowPopupEvent, CAPS_CHANGED_TOPIC, CONFIG_CHANGED_TOPIC, HISTORY_CHANGED_TOPIC,
@@ -39,17 +39,17 @@ const PRESS_DEBOUNCE: Duration = Duration::from_millis(300);
 /// While no UI subscribes, the daemon starts at most one per this window.
 const SPAWN_INTERVAL: Duration = Duration::from_secs(10);
 /// How long a paste waits for the GNOME extension's answer.
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 const ASSIST_WAIT: Duration = Duration::from_secs(3);
 /// Largest clip sent inline in the `paste.assist` push (base64 must fit
 /// one IPC frame); larger ones are pulled with `paste.assist_chunk`.
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 const ASSIST_INLINE_BYTES: usize = 512 * 1024;
 /// Raw bytes per `paste.assist_chunk` reply (base64 fits one frame).
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 pub(crate) const ASSIST_CHUNK_BYTES: usize = 256 * 1024;
 /// Toast id telling the user to press Ctrl+V (the paste was not injected).
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 pub(crate) const PRESS_CTRL_V_TOAST: &str = "paste.press_ctrl_v";
 
 /// Trigger-path state kept by the daemon.
@@ -63,12 +63,12 @@ pub(crate) struct PopupTrigger {
     assists: std::collections::HashMap<u64, std::sync::mpsc::Sender<serde_json::Value>>,
     /// Content hash, as the extension reports it, of the last clip it
     /// pasted, and when: its capture of that write is not a new copy.
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     last_assist: Option<(String, Instant)>,
     /// Bytes of a chunked extension paste, served by `paste.assist_chunk`.
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     assist_data: std::collections::HashMap<u64, std::sync::Arc<Vec<u8>>>,
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     next_assist: u64,
 }
 
@@ -109,7 +109,7 @@ impl DaemonState {
     /// extension listens (the caller uses its own path). The extension
     /// writes the clip to the clipboard and presses Ctrl+V when the window
     /// focused at the popup press is in front again, else it toasts.
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     pub(crate) fn paste_via_extension(
         &self,
         payloads: &[(String, Vec<u8>)],
@@ -189,7 +189,7 @@ impl DaemonState {
 
     /// The extension's `paste.assist_chunk {id, seq}`: chunk `seq` of a
     /// chunked paste still in flight, as `{data_b64}`.
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     pub(crate) fn assist_chunk(
         &self,
         params: &serde_json::Value,
@@ -217,7 +217,7 @@ impl DaemonState {
 
     /// Whether an extension report of `payloads` is the extension reading
     /// back the clip it just pasted (one-shot, [`ASSIST_ECHO_WINDOW`]).
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     pub(crate) fn assist_echo(&self, payloads: &[(String, Vec<u8>)]) -> bool {
         let Ok(mut trigger) = self.popup.lock() else {
             return false;
@@ -899,7 +899,7 @@ fn extension_press_decision(
     (focused_popup_pid == Some(ui_pid)).then_some((None, true))
 }
 
-#[cfg(all(unix, any(test, feature = "backend-x11")))]
+#[cfg(all(unix, not(target_os = "macos"), any(test, linux_x11)))]
 fn x11_press_decision(target: Option<u64>, popup: Option<u64>) -> (Option<u64>, bool) {
     if target.is_some() && target == popup {
         (None, true)
@@ -908,7 +908,7 @@ fn x11_press_decision(target: Option<u64>, popup: Option<u64>) -> (Option<u64>, 
     }
 }
 
-#[cfg(all(unix, any(test, feature = "backend-x11")))]
+#[cfg(all(unix, not(target_os = "macos"), any(test, linux_x11)))]
 fn x11_press_target_for_ui(
     target: Option<u64>,
     ui: Option<&SubscriberInfo>,
@@ -920,7 +920,7 @@ fn x11_press_target_for_ui(
 }
 
 /// Paste target of a press, unless the registered X11 popup is foreground.
-#[cfg(all(unix, feature = "backend-x11"))]
+#[cfg(linux_x11)]
 fn press_target(ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
     use clipmonger_platform::types::PlatformHandle;
     if std::env::var_os("DISPLAY").is_none() {
@@ -937,10 +937,7 @@ fn press_target(ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
 }
 
 /// No foreground target on this platform (Wayland, headless).
-#[cfg(not(any(
-    all(windows, feature = "backend-windows"),
-    all(unix, feature = "backend-x11")
-)))]
+#[cfg(not(any(all(windows, feature = "backend-windows"), linux_x11)))]
 fn press_target(_ui: Option<&SubscriberInfo>) -> (Option<u64>, bool) {
     (None, false)
 }
@@ -1009,12 +1006,12 @@ mod activation_report_tests {
 }
 
 /// How long after an extension paste its read-back counts as the paste.
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 const ASSIST_ECHO_WINDOW: Duration = Duration::from_secs(10);
 
 /// The content hash of a pasted clip in the form the extension reports
 /// it: text as `text/plain`, anything else under its own type.
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 fn assist_report_hash(mime: &str, bytes: &[u8]) -> String {
     let reported = if mime.split(';').next().map(str::trim) == Some("text/plain") {
         "text/plain"
@@ -1026,14 +1023,14 @@ fn assist_report_hash(mime: &str, bytes: &[u8]) -> String {
 
 /// How long a paste waits for the extension: the base wait plus a second
 /// per started MiB it has to pull, at most 20 s.
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 fn assist_wait(len: usize) -> Duration {
     let mib = u64::try_from(len.div_ceil(1024 * 1024)).unwrap_or(u64::MAX);
     (ASSIST_WAIT + Duration::from_secs(mib)).min(Duration::from_secs(20))
 }
 
 /// Chunk `seq` of `data`, `None` past the end.
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 fn assist_chunk_slice(data: &[u8], seq: usize) -> Option<&[u8]> {
     data.chunks(ASSIST_CHUNK_BYTES).nth(seq)
 }
@@ -1043,7 +1040,7 @@ fn assist_chunk_slice(data: &[u8], seq: usize) -> Option<&[u8]> {
 /// else the first format. A browser image copy carries `text/html` (the
 /// `<img>` tag) first; pasting that gave image editors no image. `None` for
 /// an empty clip.
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 fn assist_payload(payloads: &[(String, Vec<u8>)]) -> Option<(&str, &[u8])> {
     let base = |mime: &str| {
         mime.split(';')
@@ -1283,7 +1280,7 @@ mod tests {
         seen_rx
     }
 
-    #[cfg(feature = "backend-wayland")]
+    #[cfg(linux_wayland)]
     #[tokio::test(flavor = "multi_thread")]
     async fn extension_paste_round_trips_and_reports_injection() {
         let (state, sock, _) = served("assist").await;
@@ -1353,7 +1350,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "backend-wayland")]
+    #[cfg(linux_wayland)]
     #[test]
     fn the_extension_reading_back_its_paste_is_not_a_new_copy() {
         let dir = std::env::temp_dir().join(format!("cm-assist-echo-{}", std::process::id()));
@@ -1383,7 +1380,7 @@ mod tests {
         assert!(!state.assist_echo(std::slice::from_ref(&png)), "too late");
     }
 
-    #[cfg(feature = "backend-wayland")]
+    #[cfg(linux_wayland)]
     #[test]
     fn large_extension_pastes_are_served_in_chunks_while_in_flight() {
         use super::{assist_chunk_slice, assist_wait, ASSIST_CHUNK_BYTES, ASSIST_WAIT};
@@ -1428,7 +1425,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "backend-wayland")]
+    #[cfg(linux_wayland)]
     #[test]
     fn extension_pastes_text_then_image_then_files_then_the_first_format() {
         let clip = |mimes: &[&str]| -> Vec<(String, Vec<u8>)> {
@@ -1456,7 +1453,7 @@ mod tests {
         assert_eq!(pick(&[]), None);
     }
 
-    #[cfg(feature = "backend-wayland")]
+    #[cfg(linux_wayland)]
     #[tokio::test(flavor = "multi_thread")]
     async fn extension_paste_toasts_when_not_injected_and_times_out_without_answer() {
         let (state, sock, _) = served("assist-toast").await;

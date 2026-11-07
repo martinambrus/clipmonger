@@ -3,6 +3,7 @@
 pub mod chord;
 pub mod fakes;
 pub mod paste_policy;
+pub mod process;
 pub mod traits;
 pub mod types;
 

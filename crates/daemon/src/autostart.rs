@@ -506,10 +506,7 @@ impl AutostartService {
         if !daemon_exe.is_absolute() {
             return Self::unconfigured();
         }
-        let supported = cfg!(any(
-            all(windows, feature = "backend-windows"),
-            all(unix, feature = "backend-x11")
-        ));
+        let supported = cfg!(any(all(windows, feature = "backend-windows"), linux_x11));
         let portable = match selection(&classify_portable(daemon_exe, profile_dir), supported) {
             Selection::Portable => return Self::portable(),
             Selection::Native => false,
@@ -531,7 +528,7 @@ impl AutostartService {
             }
         }
 
-        #[cfg(all(unix, feature = "backend-x11"))]
+        #[cfg(linux_x11)]
         {
             let Ok(root) = xdg_autostart_root() else {
                 return Self::unconfigured();
@@ -553,10 +550,7 @@ impl AutostartService {
             }
         }
 
-        #[cfg(not(any(
-            all(windows, feature = "backend-windows"),
-            all(unix, feature = "backend-x11")
-        )))]
+        #[cfg(not(any(all(windows, feature = "backend-windows"), linux_x11)))]
         {
             let _ = portable;
             return Self::unconfigured();

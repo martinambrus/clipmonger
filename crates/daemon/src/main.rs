@@ -50,13 +50,13 @@ fn flag_value(args: &[String], name: &str) -> Option<PathBuf> {
 /// triggers an input-control prompt) nor on wlroots-family sessions (an
 /// `XWayland` grab sees keys only while an X11 window has focus; the user
 /// binds the popup command in the compositor instead).
-#[cfg(all(unix, feature = "backend-x11"))]
+#[cfg(linux_x11)]
 fn x11_hotkeys_wanted() -> bool {
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     {
         !clipmonger_daemon::kwin::is_kwin_wayland() && !clipmonger_daemon::wlr::is_wlr_wayland()
     }
-    #[cfg(not(all(unix, feature = "backend-wayland")))]
+    #[cfg(not(linux_wayland))]
     {
         true
     }
@@ -78,11 +78,11 @@ fn watch_session_end(
     std::thread::spawn(move || {
         #[allow(unused_mut)]
         let mut closed: Option<bool> = None;
-        #[cfg(feature = "backend-wayland")]
+        #[cfg(linux_wayland)]
         if wayland {
             closed = Some(clipmonger_backend_wayland::wait_compositor_closed().is_ok());
         }
-        #[cfg(feature = "backend-x11")]
+        #[cfg(linux_x11)]
         if closed.is_none() && x11 {
             closed = Some(clipmonger_backend_x11::wait_display_closed(None).is_ok());
         }
@@ -110,9 +110,15 @@ fn process_runs(pid: u32, exe: &Path) -> bool {
         clipmonger_backend_windows::process_image_path(pid)
             .is_some_and(|path| path.eq_ignore_ascii_case(&exe.to_string_lossy()))
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|path| path == exe)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        clipmonger_platform::process::image_path(pid).is_some_and(|path| {
+            path == exe || fs::canonicalize(&path).ok() == fs::canonicalize(exe).ok()
+        })
     }
     #[cfg(not(any(all(windows, feature = "backend-windows"), unix)))]
     {
@@ -198,6 +204,13 @@ fn ui_launcher(profile: PathBuf) -> clipmonger_daemon::popup::UiLauncher {
 
 /// Generate a single-line token for `<profile>/token`.
 fn generate_token() -> String {
+    // 128 bits from the operating system (getrandom: every supported OS).
+    if let (Ok(high), Ok(low)) = (
+        clipmonger_core::entropy::random_u64(),
+        clipmonger_core::entropy::random_u64(),
+    ) {
+        return format!("{high:016x}{low:016x}");
+    }
     if let Ok(raw) = fs::read_to_string("/proc/sys/kernel/random/uuid") {
         let compact: String = raw.trim().chars().filter(|c| *c != '-').collect();
         if !compact.is_empty() {
@@ -483,7 +496,7 @@ fn admin_consent_loop(
 /// Construct the live X11 backend: typed caps, monitor thread (real
 /// payloads via transfer honoring the denylist + privacy counter), and
 /// the popup-hotkey listener (presses trigger the popup, like Windows).
-#[cfg(all(unix, feature = "backend-x11"))]
+#[cfg(linux_x11)]
 #[allow(clippy::too_many_lines)]
 fn setup_x11_backend(
     _profile: &Path,
@@ -638,10 +651,7 @@ fn setup_x11_backend(
 /// Which session backends to start: X11 when `DISPLAY` is set, Wayland
 /// when `WAYLAND_DISPLAY` is set (seg-06 S8 coexistence: both at once).
 /// Neither set means offline mode still serves history.
-#[cfg(any(
-    all(unix, feature = "backend-x11"),
-    all(unix, feature = "backend-wayland")
-))]
+#[cfg(any(linux_x11, linux_wayland))]
 fn want_backends(display: Option<&str>, wayland_display: Option<&str>) -> (bool, bool) {
     let want_x11 = display.is_some_and(|d| !d.is_empty());
     let want_wayland = wayland_display.is_some_and(|d| !d.is_empty());
@@ -653,7 +663,7 @@ fn want_backends(display: Option<&str>, wayland_display: Option<&str>) -> (bool,
 /// `GlobalShortcuts` portal session for the popup hotkey (presses trigger
 /// the popup, like X11/Windows). A missing compositor only degrades caps; the daemon
 /// keeps running (offline rule, seg-02 S7).
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 #[allow(clippy::too_many_lines)]
 fn setup_wayland_backend(
     state: &Arc<DaemonState>,
@@ -778,7 +788,7 @@ fn setup_session_backends(
 ) {
     #[cfg(all(windows, feature = "backend-windows"))]
     setup_windows_backend(profile, state, config, backend_shutdown);
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     {
         let (want_x11, _) = want_backends(
             std::env::var("DISPLAY").ok().as_deref(),
@@ -788,7 +798,7 @@ fn setup_session_backends(
             setup_x11_backend(profile, state, config, backend_shutdown);
         }
     }
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     {
         let (_, want_wayland) = want_backends(
             std::env::var("DISPLAY").ok().as_deref(),

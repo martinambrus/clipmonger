@@ -490,9 +490,9 @@ fn ordinary_capture_and_existing_dedupe_or_merge_remain_unchanged() {
     let observation = event(&[("text/plain", None)], false);
     assert!(capture(&fixture, &observation, &transfer));
     let second = capture(&fixture, &observation, &transfer);
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     assert!(!second, "existing 2-second merger suppresses duplicate");
-    #[cfg(not(all(unix, feature = "backend-wayland")))]
+    #[cfg(not(linux_wayland))]
     assert!(second, "existing Store moves dedupe hit to top");
     assert_eq!(fixture.history().len(), 1);
     assert_eq!(fixture.history()[0]["preview"], "ok");

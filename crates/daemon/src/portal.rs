@@ -20,7 +20,7 @@ use std::sync::Arc;
 /// (GNOME 48+ offers both). Success and failure update only the portal
 /// hotkey capability and its owned notes. `Activated` fires trigger the
 /// popup like the X11/Windows hotkey threads.
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 pub fn spawn_portal_session(state: Arc<crate::DaemonState>, _capture_primary: bool) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -173,7 +173,7 @@ fn extension_holds(
 
 // One event loop: binding, activation, release and session-loss handling.
 #[allow(clippy::too_many_lines)]
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 async fn run_session(state: Arc<crate::DaemonState>) {
     use ashpd::desktop::global_shortcuts::GlobalShortcuts;
     use std::time::Instant;
@@ -289,7 +289,7 @@ async fn run_session(state: Arc<crate::DaemonState>) {
 
 /// A shortcut fired: open the popup now, or hold a permanent paste until
 /// its key is released.
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 fn on_activated(
     state: &crate::DaemonState,
     bound: Option<&[Binding]>,
@@ -322,7 +322,7 @@ const PENDING_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 const PERMANENT_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Paste a permanent clip on a worker thread (delivery may sleep).
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 fn fire_permanent(state: &Arc<crate::DaemonState>, binding: &Binding) {
     let Action::Permanent(id) = binding.action else {
         return;
@@ -336,7 +336,7 @@ fn fire_permanent(state: &Arc<crate::DaemonState>, binding: &Binding) {
 /// Publishes the portal hotkey result; `None` when the session or the bind
 /// failed (the session is closed again). The shortcuts go in both
 /// `CreateSession` and `BindShortcuts` ([`crate::portal_raw`]).
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 async fn bind_set(
     shortcuts: &ashpd::desktop::global_shortcuts::GlobalShortcuts,
     state: &crate::DaemonState,
@@ -376,7 +376,7 @@ async fn bind_set(
     Some(session)
 }
 
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 fn shortcut_activation_token(
     options: &std::collections::HashMap<String, ashpd::zvariant::OwnedValue>,
 ) -> Option<String> {
@@ -529,7 +529,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     #[test]
     fn activated_signal_options_preserve_only_valid_tokens() {
         use ashpd::zvariant::{OwnedValue, Str};

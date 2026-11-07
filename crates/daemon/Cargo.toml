@@ -41,7 +41,7 @@ rusqlite.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation","Win32_Storage_FileSystem","Win32_UI_WindowsAndMessaging","Win32_UI_Input_KeyboardAndMouse","Win32_System_LibraryLoader","Win32_System_Threading"] }
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 clipmonger-backend-x11 = { path = "../backend-x11", optional = true }
 clipmonger-backend-wayland = { path = "../backend-wayland", optional = true }
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "global_shortcuts"], optional = true }

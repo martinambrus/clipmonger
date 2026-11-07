@@ -139,16 +139,16 @@ fn runtime_origin(origin: &str) -> &'static str {
 
 /// Protocol tag written to the rendezvous file.
 pub const PROTOCOL: &str = "ipc/v1";
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 pub mod kwin;
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 mod notify;
 pub mod popup;
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 pub mod portal;
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 mod portal_raw;
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 pub mod wlr;
 
 /// Whether `$XDG_CURRENT_DESKTOP` names `desktop` (case ignored), e.g.
@@ -302,18 +302,12 @@ const HELPER_LOST: &str = "helper connection lost";
 #[cfg(all(windows, feature = "backend-windows"))]
 const HELPER_TIMED_OUT: &str = "helper result timed out";
 /// Refusal for a paste whose deadline passed before it could run.
-#[cfg(any(
-    all(windows, feature = "backend-windows"),
-    all(unix, feature = "backend-x11")
-))]
+#[cfg(any(all(windows, feature = "backend-windows"), linux_x11))]
 const PASTE_EXPIRED: &str = "unavailable: paste request expired";
 /// Paste deadline: a clip picked in the popup (or a paste request without a
 /// pick time) must be delivered within this many ms, else it is refused;
 /// the helper enforces the same absolute deadline before injecting.
-#[cfg(any(
-    all(windows, feature = "backend-windows"),
-    all(unix, feature = "backend-x11")
-))]
+#[cfg(any(all(windows, feature = "backend-windows"), linux_x11))]
 const PASTE_DEADLINE_MS: i64 = 2_000;
 
 /// Elevated-helper supervisor: an always-listening pipe server for the
@@ -1785,14 +1779,14 @@ fn popup_hotkey_conflict(snapshot: &Value, extension_note: Option<&str>) -> Opti
 
 /// Pure rule behind `DaemonState::xwayland_mirror`: drop X11-watcher
 /// captures on a Wayland session that runs the live Wayland backend.
-#[cfg(all(unix, feature = "backend-x11"))]
+#[cfg(linux_x11)]
 fn skip_x11_capture(origin: &str, x11_session: bool, wayland_backend: bool) -> bool {
     origin == "x11" && !x11_session && wayland_backend
 }
 
 /// Pure rule behind `DaemonState::extension_report_redundant`: drop GNOME
 /// extension reports on an X11 session that runs the live X11 backend.
-#[cfg(all(unix, feature = "backend-x11"))]
+#[cfg(linux_x11)]
 fn skip_extension_capture(x11_session: bool, x11_backend: bool) -> bool {
     x11_session && x11_backend
 }
@@ -1928,12 +1922,12 @@ fn retention_limits(config: &clipmonger_core::Config) -> clipmonger_core::policy
 
 /// How long an X11 popup paste waits for its target to be in front again
 /// after the popup hides.
-#[cfg(all(unix, feature = "backend-x11"))]
+#[cfg(linux_x11)]
 const X11_TARGET_SETTLE: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Whether this is an X11 session (no Wayland compositor): popup paste then
 /// goes through the X11 engine. Under Wayland, `DISPLAY` names `XWayland`.
-#[cfg(all(unix, feature = "backend-x11"))]
+#[cfg(linux_x11)]
 fn x11_session() -> bool {
     let set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
     set("DISPLAY") && !set("WAYLAND_DISPLAY")
@@ -1941,13 +1935,13 @@ fn x11_session() -> bool {
 
 /// Whether popup paste skips the extension: an X11 session (the X11 engine
 /// pastes) or a build without the X11 backend's session check.
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 fn x11_session_or_absent() -> bool {
-    #[cfg(feature = "backend-x11")]
+    #[cfg(linux_x11)]
     {
         x11_session()
     }
-    #[cfg(not(feature = "backend-x11"))]
+    #[cfg(not(linux_x11))]
     {
         false
     }
@@ -1956,7 +1950,7 @@ fn x11_session_or_absent() -> bool {
 /// On GNOME Wayland with the extension connected, popup paste goes through
 /// the extension (`paste.assist`): report that as the Wayland and top-level
 /// paste instead of "no extension write path" or `XWayland`'s X11 engine.
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 fn extension_paste_caps(snapshot: &mut Value) {
     let paste = serde_json::json!({
         "level": "full",
@@ -1973,7 +1967,7 @@ fn extension_paste_caps(snapshot: &mut Value) {
 /// this daemon, for this profile. Paths with spaces or quotes are quoted
 /// for a shell (Sway's `exec`, Hyprland's `exec_cmd` and COSMIC's custom
 /// shortcuts all run the command through `sh -c`).
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 fn popup_hotkey_command(profile: &Path) -> String {
     let cli = std::env::current_exe().map_or_else(
         |_| PathBuf::from("clipmonger-cli"),
@@ -1988,7 +1982,7 @@ fn popup_hotkey_command(profile: &Path) -> String {
 
 /// The command a compositor config runs at login to start Clipmonger in
 /// the tray (Sway and Hyprland ignore XDG autostart entries).
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 fn autostart_command(profile: &Path) -> String {
     let ui = std::env::current_exe().map_or_else(
         |_| PathBuf::from("clipmonger"),
@@ -2003,7 +1997,7 @@ fn autostart_command(profile: &Path) -> String {
 
 /// `text` as one shell word: unchanged when it holds only safe characters,
 /// else single-quoted.
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 fn shell_quote(text: &str) -> String {
     let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+=:,@%".contains(c);
     if !text.is_empty() && text.chars().all(safe) {
@@ -2019,7 +2013,7 @@ fn shell_quote(text: &str) -> String {
 /// degraded and publish the command to bind in the desktop's own settings
 /// (the UI shows it). The `XWayland` grab is off there (it would only see
 /// keys while an X11 window has focus).
-#[cfg(all(unix, feature = "backend-wayland"))]
+#[cfg(linux_wayland)]
 fn manual_hotkey_caps(snapshot: &mut Value, command: &str) {
     let hotkey = serde_json::json!({
         "level": "degraded",
@@ -2048,10 +2042,7 @@ fn manual_hotkey_caps(snapshot: &mut Value, command: &str) {
 /// value, or the two disagreeing, is refused instead of silently falling
 /// back to whatever window is in front.
 #[cfg_attr(
-    not(any(
-        all(windows, feature = "backend-windows"),
-        all(unix, feature = "backend-x11")
-    )),
+    not(any(all(windows, feature = "backend-windows"), linux_x11)),
     allow(dead_code)
 )]
 fn requested_target(params: &Value) -> Result<Option<u64>, IpcError> {
@@ -2157,7 +2148,7 @@ pub fn replay_script(store: &Store, lines: impl Iterator<Item = String>) -> Vec<
 #[cfg(test)]
 type RestoreHook = Box<dyn FnOnce(&clipmonger_core::store::PreparedRestore) + Send>;
 
-#[cfg(all(unix, feature = "backend-x11"))]
+#[cfg(linux_x11)]
 trait PermanentX11Engine: Send {
     fn serving_health(&self) -> clipmonger_platform::types::Result<bool> {
         Err(clipmonger_platform::types::Error::Unavailable(
@@ -2189,12 +2180,12 @@ trait PermanentX11Engine: Send {
     }
 }
 
-#[cfg(all(unix, feature = "backend-x11"))]
+#[cfg(linux_x11)]
 struct PermanentX11Cache {
     engine: Option<Box<dyn PermanentX11Engine>>,
 }
 
-#[cfg(all(unix, feature = "backend-x11"))]
+#[cfg(linux_x11)]
 impl PermanentX11Engine for clipmonger_backend_x11::X11Paste {
     fn serving_health(&self) -> clipmonger_platform::types::Result<bool> {
         clipmonger_backend_x11::X11Paste::serving_health(self)
@@ -2270,10 +2261,10 @@ pub struct DaemonState {
     /// Popup trigger path: event hub, UI launcher, debounce state.
     popup: Mutex<popup::PopupTrigger>,
     /// Keep the X11 clipboard owner alive across hotkey-manager replacements.
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     permanent_x11_engine: Mutex<PermanentX11Cache>,
     /// Dual-backend merge window state (seg-06 S8, W-F5: 2000 ms).
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     merger: Mutex<clipmonger_backend_wayland::merge::Merger>,
     /// Origin, formats and time of the last stored stub ([`repeat_stub`]).
     last_stub: Mutex<Option<StubSeen>>,
@@ -2283,7 +2274,7 @@ pub struct DaemonState {
     last_capture_read: std::sync::atomic::AtomicBool,
     /// Active window as reported by the `KWin` script ([`kwin`]) or the
     /// foreign-toplevel tracker ([`wlr`]).
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     focus: Mutex<crate::kwin::Focus>,
     thumbnail: crate::thumbnail::ThumbnailService,
     #[cfg(test)]
@@ -2406,7 +2397,7 @@ impl Drop for CompactMaintenance {
 }
 
 impl DaemonState {
-    #[cfg(all(unix, any(feature = "backend-wayland", feature = "backend-x11")))]
+    #[cfg(any(linux_wayland, linux_x11))]
     fn self_write_with<T, E>(
         &self,
         payloads: &[(String, Vec<u8>)],
@@ -2453,22 +2444,22 @@ impl DaemonState {
         result
     }
 
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     fn wayland_self_write<T, E>(
         &self,
         payloads: &[(String, Vec<u8>)],
         write: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
-        #[cfg(feature = "backend-x11")]
+        #[cfg(linux_x11)]
         let alternate = Self::x11_projection(payloads);
-        #[cfg(feature = "backend-x11")]
+        #[cfg(linux_x11)]
         let alternate = Some(alternate.as_slice());
-        #[cfg(not(feature = "backend-x11"))]
+        #[cfg(not(linux_x11))]
         let alternate = None;
         self.self_write_with(payloads, alternate, "wayland", write)
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     fn x11_projection(payloads: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
         use clipmonger_backend_x11::mime::{
             canonical_to_x11, served_target, targets_for, x11_to_canonical,
@@ -2497,7 +2488,7 @@ impl DaemonState {
         projected
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     fn x11_self_write<T, E>(
         &self,
         payloads: &[(String, Vec<u8>)],
@@ -2548,14 +2539,14 @@ impl DaemonState {
             hotkey_conflict_note: Mutex::new(None),
             autostart: Mutex::new(None),
             popup: Mutex::new(popup::PopupTrigger::default()),
-            #[cfg(all(unix, feature = "backend-x11"))]
+            #[cfg(linux_x11)]
             permanent_x11_engine: Mutex::new(PermanentX11Cache { engine: None }),
-            #[cfg(all(unix, feature = "backend-wayland"))]
+            #[cfg(linux_wayland)]
             merger: Mutex::new(clipmonger_backend_wayland::merge::Merger::new(2000)),
             last_stub: Mutex::new(None),
             sensitive_text: Mutex::new(None),
             last_capture_read: std::sync::atomic::AtomicBool::new(true),
-            #[cfg(all(unix, feature = "backend-wayland"))]
+            #[cfg(linux_wayland)]
             focus: Mutex::new(crate::kwin::Focus::default()),
             thumbnail: crate::thumbnail::ThumbnailService::new_for_daemon(),
             #[cfg(test)]
@@ -2882,11 +2873,11 @@ impl DaemonState {
         snapshot["popup_hotkey_conflict"] =
             popup_hotkey_conflict(&snapshot, extension_note.as_deref())
                 .map_or(Value::Null, Value::from);
-        #[cfg(all(unix, feature = "backend-wayland"))]
+        #[cfg(linux_wayland)]
         if self.extension_connected() && !x11_session_or_absent() {
             extension_paste_caps(&mut snapshot);
         }
-        #[cfg(all(unix, feature = "backend-wayland"))]
+        #[cfg(linux_wayland)]
         if crate::wlr::is_wlr_wayland() {
             let profile = self
                 .profile_dir
@@ -2896,7 +2887,7 @@ impl DaemonState {
             manual_hotkey_caps(&mut snapshot, &popup_hotkey_command(&profile));
             snapshot["autostart_command"] = Value::from(autostart_command(&profile));
         }
-        #[cfg(all(unix, feature = "backend-x11"))]
+        #[cfg(linux_x11)]
         if self.caps.gnome_session() && self.xwayland_mirror("x11") {
             let note = if self.extension_connected() {
                 "capture by the GNOME extension (the X11 watcher stays off on Wayland)"
@@ -3034,10 +3025,7 @@ impl DaemonState {
     /// Snapshot all settings used by one paste. Restore publishes this tuple
     /// in one assignment, so a delivery cannot combine two configurations.
     #[cfg_attr(
-        not(any(
-            all(windows, feature = "backend-windows"),
-            all(unix, feature = "backend-x11")
-        )),
+        not(any(all(windows, feature = "backend-windows"), linux_x11)),
         allow(dead_code)
     )]
     fn paste_budget(&self) -> (u64, u64, clipmonger_core::PasteDelivery, bool) {
@@ -3095,13 +3083,13 @@ impl DaemonState {
     /// clipboard: on a Wayland session (the live Wayland backend
     /// registered) the X11 watcher cannot tell which app copied, so the
     /// denylist could not apply; only the GNOME extension captures there.
-    #[cfg_attr(not(all(unix, feature = "backend-x11")), allow(clippy::unused_self))]
+    #[cfg_attr(not(linux_x11), allow(clippy::unused_self))]
     fn xwayland_mirror(&self, origin: &str) -> bool {
-        #[cfg(all(unix, feature = "backend-x11"))]
+        #[cfg(linux_x11)]
         {
             skip_x11_capture(origin, x11_session(), self.caps.has_backend("wayland"))
         }
-        #[cfg(not(all(unix, feature = "backend-x11")))]
+        #[cfg(not(linux_x11))]
         {
             let _ = origin;
             false
@@ -3149,7 +3137,7 @@ impl DaemonState {
 
     /// One window activation reported by the `KWin` script or the
     /// foreign-toplevel tracker.
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     pub(crate) fn window_activated(&self, ids: Vec<String>) {
         if let Ok(mut focus) = self.focus.lock() {
             focus.activated(ids);
@@ -3196,7 +3184,7 @@ impl DaemonState {
             .as_ref()
             .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?;
         drop(gate);
-        #[cfg(all(unix, feature = "backend-wayland"))]
+        #[cfg(linux_wayland)]
         {
             if !sensitive && !payloads.is_empty() {
                 let key = clipmonger_backend_wayland::merge::MergeKey::of(payloads);
@@ -4024,11 +4012,11 @@ impl DaemonState {
     /// write would be stored as a new clip (GNOME 46 Xorg).
     #[allow(clippy::unused_self)]
     fn extension_report_redundant(&self) -> bool {
-        #[cfg(all(unix, feature = "backend-x11"))]
+        #[cfg(linux_x11)]
         {
             skip_extension_capture(x11_session(), self.caps.has_backend("x11"))
         }
-        #[cfg(not(all(unix, feature = "backend-x11")))]
+        #[cfg(not(linux_x11))]
         {
             false
         }
@@ -4041,11 +4029,11 @@ impl DaemonState {
     /// paste (GNOME Wayland); other builds have no extension paste.
     #[allow(clippy::unused_self)]
     fn report_is_paste_echo(&self, payloads: &[(String, Vec<u8>)]) -> bool {
-        #[cfg(all(unix, feature = "backend-wayland"))]
+        #[cfg(linux_wayland)]
         {
             self.assist_echo(payloads)
         }
-        #[cfg(not(all(unix, feature = "backend-wayland")))]
+        #[cfg(not(linux_wayland))]
         {
             let _ = payloads;
             false
@@ -4675,7 +4663,7 @@ impl DaemonState {
 
     /// Permanent clips with a chord, with their names, for the portal
     /// session (`(id, chord, name)`); empty when the store is unavailable.
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     pub(crate) fn portal_permanents(&self) -> Vec<(uuid::Uuid, String, String)> {
         let Ok(rows) = self.permanent_hotkeys() else {
             return Vec::new();
@@ -4705,9 +4693,9 @@ impl DaemonState {
     /// default, so `XWayland` reports them: wait until they are released,
     /// and skip the paste if they stay held. Without `XWayland` a short
     /// fixed pause stands in.
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     pub(crate) fn press_permanent_portal(&self, id: uuid::Uuid, chord: &str) {
-        #[cfg(feature = "backend-x11")]
+        #[cfg(linux_x11)]
         {
             use clipmonger_platform::types::Error;
             match clipmonger_backend_x11::paste::wait_modifiers_released(
@@ -4722,7 +4710,7 @@ impl DaemonState {
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(300)),
             }
         }
-        #[cfg(not(feature = "backend-x11"))]
+        #[cfg(not(linux_x11))]
         std::thread::sleep(std::time::Duration::from_millis(300));
         let params = serde_json::json!({"picked_ms": now_ms()});
         let result = self.execute_permanent_with(id, Some(chord), |payloads| {
@@ -4780,7 +4768,7 @@ impl DaemonState {
                 }
             },
             || {
-                #[cfg(all(unix, feature = "backend-x11"))]
+                #[cfg(linux_x11)]
                 self.press_x11_with(
                     id,
                     chord,
@@ -4814,7 +4802,7 @@ impl DaemonState {
         let _ = id;
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     fn deliver_x11_with_factory(
         &self,
         id: uuid::Uuid,
@@ -4858,7 +4846,7 @@ impl DaemonState {
         }
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     #[expect(
         clippy::too_many_arguments,
         reason = "capture, pause, wait and delivery are distinct injected boundaries"
@@ -4902,10 +4890,7 @@ impl DaemonState {
     /// with `unavailable` when no live backend is compiled in.
     #[allow(clippy::unused_self)] // self used only in backend cfg branches
     fn handle_paste_execute(&self, params: &Value) -> Result<Value, IpcError> {
-        #[cfg(any(
-            all(windows, feature = "backend-windows"),
-            all(unix, feature = "backend-wayland")
-        ))]
+        #[cfg(any(all(windows, feature = "backend-windows"), linux_wayland))]
         {
             let found = self.requested_clip(params)?.ok_or_else(|| {
                 IpcError::new("backend", "paste.execute: unknown clip".to_string())
@@ -4924,10 +4909,7 @@ impl DaemonState {
                 params,
             )
         }
-        #[cfg(not(any(
-            all(windows, feature = "backend-windows"),
-            all(unix, feature = "backend-wayland")
-        )))]
+        #[cfg(not(any(all(windows, feature = "backend-windows"), linux_wayland)))]
         {
             let _ = params;
             Err(IpcError::new(
@@ -5089,11 +5071,11 @@ impl DaemonState {
         }
         // Only a daemon running the live X11 backend pastes through it: a
         // state without it (tests, headless) must never type into a desktop.
-        #[cfg(all(unix, feature = "backend-x11"))]
+        #[cfg(linux_x11)]
         if x11_session() && self.caps.has_backend("x11") {
             return self.paste_x11_popup(clip, payloads, params);
         }
-        #[cfg(all(unix, feature = "backend-wayland"))]
+        #[cfg(linux_wayland)]
         {
             if let Some(result) = self.paste_via_extension(payloads) {
                 if result.is_ok() {
@@ -5114,10 +5096,7 @@ impl DaemonState {
             }
             result
         }
-        #[cfg(not(any(
-            all(windows, feature = "backend-windows"),
-            all(unix, feature = "backend-wayland")
-        )))]
+        #[cfg(not(any(all(windows, feature = "backend-windows"), linux_wayland)))]
         {
             let _ = (self, clip, payloads, params);
             daemon_runtime_emit(
@@ -5140,7 +5119,7 @@ impl DaemonState {
     /// foreground for a targetless paste (CLI), refused once the pick is
     /// older than the paste deadline. A target that cannot be brought back in
     /// front is refused (`denied`), never pasted elsewhere.
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     fn paste_x11_popup(
         &self,
         clip: clipmonger_platform::types::ClipRef,
@@ -5208,7 +5187,7 @@ impl DaemonState {
     }
 
     /// Deliver payloads through the Wayland backend and report its toast.
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     fn paste_wayland_payloads(&self, payloads: &[(String, Vec<u8>)]) -> Result<Value, IpcError> {
         use clipmonger_backend_wayland::{probe_current, WlPaste};
         let has_data =
@@ -5439,7 +5418,7 @@ impl DaemonState {
                 Ok(serde_json::json!({"ok": true}))
             }
             "paste.assist_done" => Ok(self.assist_done(params)),
-            #[cfg(all(unix, feature = "backend-wayland"))]
+            #[cfg(linux_wayland)]
             "paste.assist_chunk" => self.assist_chunk(params),
             "popup.open" => {
                 // Only the CLI asks for the target: a second launch would
@@ -5876,7 +5855,7 @@ mod tests {
             .unwrap());
     }
 
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     #[test]
     fn wayland_write_registers_before_reentrant_capture() {
         use clipmonger_platform::fakes::FakeTransfer;
@@ -5907,7 +5886,7 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     #[test]
     fn failed_wayland_write_does_not_suppress_later_copy() {
         use clipmonger_platform::fakes::FakeTransfer;
@@ -5936,7 +5915,7 @@ mod tests {
         assert_eq!(state.self_writes.lock().unwrap().suppressed_count(), 0);
     }
 
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     #[test]
     fn bridged_write_is_dropped_in_either_monitor_order() {
         use clipmonger_platform::fakes::FakeTransfer;
@@ -5979,7 +5958,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     #[test]
     fn x11_write_projection_handles_text_aliases_during_write() {
         use clipmonger_platform::fakes::FakeTransfer;
@@ -6016,7 +5995,7 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     #[test]
     fn x11_utf8_only_write_matches_both_capture_aliases() {
         use clipmonger_backend_x11::mime::{
@@ -6064,7 +6043,7 @@ mod tests {
         assert_eq!(state.self_writes.lock().unwrap().suppressed_count(), 1);
     }
 
-    #[cfg(all(unix, feature = "backend-x11", feature = "backend-wayland"))]
+    #[cfg(all(linux_x11, linux_wayland))]
     #[test]
     fn bridge_matches_distinct_whole_capture_projections_in_both_orders() {
         use clipmonger_platform::fakes::FakeTransfer;
@@ -6123,7 +6102,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(unix, feature = "backend-x11", feature = "backend-wayland"))]
+    #[cfg(all(linux_x11, linux_wayland))]
     #[test]
     fn bridge_swapped_backend_representation_is_a_user_capture() {
         use clipmonger_platform::fakes::FakeTransfer;
@@ -6164,7 +6143,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(unix, feature = "backend-x11", feature = "backend-wayland"))]
+    #[cfg(all(linux_x11, linux_wayland))]
     #[test]
     fn bridge_wayland_rejects_x11_representation_before_and_after_companion() {
         use clipmonger_platform::fakes::FakeTransfer;
@@ -7018,7 +6997,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     #[test]
     fn extension_paste_caps_report_the_extension_path_on_wayland() {
         let mut snapshot = serde_json::json!({
@@ -7058,7 +7037,7 @@ mod tests {
         assert!(state.ingest_capture("x11", false, &x11));
         let stored = history_texts(&state).len();
         let merged = !state.ingest_capture("gnome", false, &gnome);
-        #[cfg(all(unix, feature = "backend-wayland"))]
+        #[cfg(linux_wayland)]
         assert!(merged, "the extension copy merges into the X11 row");
         let _ = merged;
         assert_eq!(history_texts(&state).len(), stored, "one row for one copy");
@@ -7125,7 +7104,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, feature = "backend-wayland"))]
+    #[cfg(linux_wayland)]
     #[test]
     fn wlroots_sessions_publish_the_popup_command() {
         assert_eq!(
@@ -7162,7 +7141,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     #[test]
     fn x11_watcher_stays_off_on_a_wayland_session() {
         use super::skip_x11_capture as skip;
@@ -7182,7 +7161,7 @@ mod tests {
         assert!(!skip("wayland", false, true));
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     #[test]
     fn extension_reports_are_dropped_only_on_a_live_x11_session() {
         use super::skip_extension_capture as skip;
@@ -7520,7 +7499,7 @@ mod tests {
         assert_eq!(fired, [(id, "ctrl+alt+k".to_string())]);
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     #[test]
     #[expect(
         clippy::too_many_lines,
@@ -7642,7 +7621,7 @@ mod tests {
         assert_eq!(*deliveries.lock().unwrap(), [1, 1, 1]);
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     #[test]
     fn x11_engine_delivery_follows_popup_restore_clipboard() {
         use clipmonger_platform::types::{AppId, PasteTarget, PlatformHandle, Result};
@@ -7703,7 +7682,7 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), [false, true]);
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     #[test]
     fn permanent_x11_engine_retries_factory_after_failure_and_retains_on_delivery_error() {
         use clipmonger_platform::types::{AppId, Error, PasteTarget, PlatformHandle, Result};
@@ -7758,7 +7737,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     #[test]
     fn permanent_x11_engine_reconnects_once_after_io_failure() {
         use clipmonger_platform::types::{AppId, Error, PasteTarget, PlatformHandle, Result};
@@ -7835,7 +7814,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     #[test]
     fn permanent_x11_cache_recovers_after_multiple_dead_generations() {
         use clipmonger_platform::types::{AppId, Error, PasteTarget, PlatformHandle, Result};
@@ -7919,7 +7898,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     #[test]
     fn permanent_x11_cache_retains_healthy_owner_across_input_errors() {
         use clipmonger_platform::types::{AppId, Error, PasteTarget, PlatformHandle, Result};
@@ -7989,7 +7968,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     #[test]
     fn permanent_x11_unknown_health_retains_owner_and_skips_delivery() {
         use clipmonger_platform::types::{AppId, Error, PasteTarget, PlatformHandle, Result};
@@ -8390,7 +8369,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, feature = "backend-x11"))]
+    #[cfg(linux_x11)]
     #[test]
     #[expect(
         clippy::too_many_lines,
