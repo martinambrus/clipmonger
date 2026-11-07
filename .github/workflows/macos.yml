@@ -56,7 +56,6 @@ jobs:
   build:
     name: build (oldest supported macOS)
     runs-on: macos-15
-    needs: check
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain (rust-toolchain.toml)
