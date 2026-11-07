@@ -19,3 +19,14 @@ text from the Apache Software Foundation, pinned by SHA-256 in
 stops if a NOTICE or COPYRIGHT file needs additional review. See the [Cargo
 license-field reference](https://doc.rust-lang.org/cargo/reference/manifest.html#the-license-and-license-file-fields)
 and [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0.txt).
+
+The macOS `objc2` family (`objc2`, `objc-sys`, `objc2-encode`, `block2`,
+`dispatch2`, `objc2-foundation`, `objc2-app-kit` and the other `objc2-*`
+frameworks) packages no license file. Up to January 2025 the repository's
+`LICENSE.txt` held the MIT text (Copyright (c) Steven Sheldon); commit
+`cfb199226661` replaced it with `LICENSE.md`, which states the licences
+(MIT, or Zlib, Apache-2.0 or MIT) without the text. Each record keeps the
+crate's packaged commit (checked against `.cargo_vcs_info.json`) and uses
+that MIT text, fetched from a commit that still had it. `dispatch` 0.2.0
+(rust-dispatch, MIT in its manifest, no license file in the repository) uses
+the identical MIT text of the same author's `rust-objc`.

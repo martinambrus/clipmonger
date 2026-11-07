@@ -216,5 +216,117 @@
     "binding": "whole-published-payload-match",
     "matching_payload_files": 1418,
     "manifest_difference": "published version 0.4.0 versus source 0.3.2; other original manifest bytes match"
+  },
+  {
+    "repo": "madsmtm/objc2",
+    "commit": "4fc083f1c6d6784577e38b0ee8dbd344481e2fd2",
+    "license": "MIT",
+    "crates": [
+      "block2@0.5.1",
+      "objc-sys@0.3.5"
+    ],
+    "url": "https://raw.githubusercontent.com/madsmtm/objc2/4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt",
+    "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+    "file": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5.txt"
+  },
+  {
+    "repo": "madsmtm/objc2",
+    "commit": "5237cbf081d04ef75a1f6a207b4018e7c1ae7438",
+    "license": "MIT",
+    "crates": [
+      "objc2@0.5.3"
+    ],
+    "url": "https://raw.githubusercontent.com/madsmtm/objc2/5237cbf081d04ef75a1f6a207b4018e7c1ae7438/LICENSE.txt",
+    "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+    "file": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5.txt"
+  },
+  {
+    "repo": "madsmtm/objc2",
+    "commit": "e282618be4c3a3b9542957e0c8540e9588472ce8",
+    "license": "MIT",
+    "crates": [
+      "objc2-app-kit@0.2.2",
+      "objc2-foundation@0.2.2"
+    ],
+    "url": "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt",
+    "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+    "file": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5.txt"
+  },
+  {
+    "repo": "madsmtm/objc2",
+    "commit": "b4167b582b2f75f9a1be75495c41b765344fd03c",
+    "license": "MIT",
+    "crates": [
+      "block2@0.6.2"
+    ],
+    "url": "https://raw.githubusercontent.com/madsmtm/objc2/4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt",
+    "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+    "file": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5.txt",
+    "note": "LICENSE.md at this commit states that these crates are MIT licensed (or Zlib, Apache-2.0 or MIT) without the text; the text is the project MIT LICENSE.txt, removed in commit cfb199226661 (Clarify the licensing)."
+  },
+  {
+    "repo": "madsmtm/objc2",
+    "commit": "d7d2fa23ceaa5e6096c923b081040e5d81b3b9df",
+    "license": "MIT",
+    "crates": [
+      "objc2@0.6.5"
+    ],
+    "url": "https://raw.githubusercontent.com/madsmtm/objc2/4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt",
+    "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+    "file": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5.txt",
+    "note": "LICENSE.md at this commit states that these crates are MIT licensed (or Zlib, Apache-2.0 or MIT) without the text; the text is the project MIT LICENSE.txt, removed in commit cfb199226661 (Clarify the licensing)."
+  },
+  {
+    "repo": "madsmtm/objc2",
+    "commit": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+    "license": "MIT",
+    "crates": [
+      "objc2-app-kit@0.3.2",
+      "objc2-core-foundation@0.3.2",
+      "objc2-core-graphics@0.3.2",
+      "objc2-core-text@0.3.2",
+      "objc2-foundation@0.3.2",
+      "objc2-quartz-core@0.3.2"
+    ],
+    "url": "https://raw.githubusercontent.com/madsmtm/objc2/4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt",
+    "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+    "file": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5.txt",
+    "note": "LICENSE.md at this commit states that these crates are MIT licensed (or Zlib, Apache-2.0 or MIT) without the text; the text is the project MIT LICENSE.txt, removed in commit cfb199226661 (Clarify the licensing)."
+  },
+  {
+    "repo": "madsmtm/objc2",
+    "commit": "8d214f5477365ffcbcbb7de058c86ed9a518efb7",
+    "license": "MIT",
+    "crates": [
+      "objc2-encode@4.1.0"
+    ],
+    "url": "https://raw.githubusercontent.com/madsmtm/objc2/4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt",
+    "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+    "file": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5.txt",
+    "note": "LICENSE.md at this commit states that these crates are MIT licensed (or Zlib, Apache-2.0 or MIT) without the text; the text is the project MIT LICENSE.txt, removed in commit cfb199226661 (Clarify the licensing)."
+  },
+  {
+    "repo": "madsmtm/objc2",
+    "commit": "8852b424193ca41602281b3d7540d7c8ed51e49a",
+    "license": "MIT",
+    "crates": [
+      "dispatch2@0.3.1"
+    ],
+    "url": "https://raw.githubusercontent.com/madsmtm/objc2/4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt",
+    "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+    "file": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5.txt",
+    "note": "LICENSE.md at this commit states that these crates are MIT licensed (or Zlib, Apache-2.0 or MIT) without the text; the text is the project MIT LICENSE.txt, removed in commit cfb199226661 (Clarify the licensing)."
+  },
+  {
+    "repo": "SSheldon/rust-dispatch",
+    "commit": "82d6c7a5b75dc0c71c3f46f87bb6c16a476f7748",
+    "license": "MIT",
+    "crates": [
+      "dispatch@0.2.0"
+    ],
+    "url": "https://raw.githubusercontent.com/SSheldon/rust-objc/9961247c1a82027d6edbe6c516011b1363b9354c/LICENSE.txt",
+    "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+    "file": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5.txt",
+    "note": "rust-dispatch has no license file; its manifest declares MIT. The text is the MIT LICENSE.txt of the same author's rust-objc (Copyright (c) Steven Sheldon)."
   }
 ]

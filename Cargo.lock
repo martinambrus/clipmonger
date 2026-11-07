@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "clipmonger-app-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "clipmonger-core",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "clipmonger-app-ui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "clipmonger-backend-macos",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "clipmonger-backend-macos"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clipmonger-core",
  "clipmonger-platform",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "clipmonger-backend-wayland"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clipmonger-core",
  "clipmonger-platform",
@@ -621,7 +621,7 @@ dependencies = [
 
 [[package]]
 name = "clipmonger-backend-windows"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clipboard-win",
  "clipmonger-core",
@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "clipmonger-backend-x11"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clipmonger-core",
  "clipmonger-platform",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "clipmonger-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "directories",
  "getrandom 0.4.3",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "clipmonger-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ashpd",
  "clipmonger-backend-macos",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "clipmonger-ipc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clipmonger-core",
  "clipmonger-platform",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "clipmonger-platform"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clipmonger-core",
  "serde",

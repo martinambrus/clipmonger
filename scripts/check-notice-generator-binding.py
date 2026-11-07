@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix='notice-binding-') as tmp:
     def run(argv):
         return subprocess.run(argv, env=env, capture_output=True)
     assert run(args).returncode == 0
-    assert json.loads(spy.read_text()) == [str(tool), 'about', 'generate', '--frozen', '--workspace', '--all-features', '--target', 'x86_64-pc-windows-gnu', '--target', 'x86_64-unknown-linux-gnu', '--fail', '--format', 'json', '--config', str(config), '--output-file', str(root / 'out')]
+    assert json.loads(spy.read_text()) == [str(tool), 'about', 'generate', '--frozen', '--workspace', '--all-features', '--target', 'x86_64-pc-windows-gnu', '--target', 'x86_64-unknown-linux-gnu', '--target', 'x86_64-apple-darwin', '--target', 'aarch64-apple-darwin', '--fail', '--format', 'json', '--config', str(config), '--output-file', str(root / 'out')]
     other = root / 'other'
     other.write_text('wrong')
     assert run(args[:3] + [str(other)] + args[4:]).returncode != 0
@@ -38,7 +38,7 @@ with tempfile.TemporaryDirectory(prefix='notice-binding-') as tmp:
     renamed.write_text(source)
     renamed.chmod(0o755)
     assert run([str(renamed), 'clipmonger-notice-scan-wrong', *args[2:]]).returncode != 0
-    receipt = {'status': 'PASS', 'direct_exit': 0, 'effective_gate_exit': 0, 'source_changed': False, 'cleanup_verified': True, 'evidence_complete': True, 'resource_violation': False, 'next_calls_must_hold': False, 'before': {}, 'after': {}, 'command': ['cargo', 'about', 'generate', '--frozen', '--workspace', '--all-features', '--target', 'x86_64-pc-windows-gnu', '--target', 'x86_64-unknown-linux-gnu', '--fail', '--format', 'json', '--config', str(config), '--output-file', str(root / 'out')]}
+    receipt = {'status': 'PASS', 'direct_exit': 0, 'effective_gate_exit': 0, 'source_changed': False, 'cleanup_verified': True, 'evidence_complete': True, 'resource_violation': False, 'next_calls_must_hold': False, 'before': {}, 'after': {}, 'command': ['cargo', 'about', 'generate', '--frozen', '--workspace', '--all-features', '--target', 'x86_64-pc-windows-gnu', '--target', 'x86_64-unknown-linux-gnu', '--target', 'x86_64-apple-darwin', '--target', 'aarch64-apple-darwin', '--fail', '--format', 'json', '--config', str(config), '--output-file', str(root / 'out')]}
     try:
         p.validate_receipt(receipt, root / 'out')
     except ValueError:
