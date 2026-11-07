@@ -249,11 +249,15 @@ Section "Uninstall"
   Delete "$INSTDIR\licenses\rust-upstream\c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566.txt"
   Delete "$INSTDIR\licenses\rust-upstream\eb227437252b2a7a9c1fc342c93ade1f3d7ce38cc6dd754f613db07d53ceff0b.txt"
   Delete "$INSTDIR\licenses\rust-upstream\sources.json"
+  Delete "$INSTDIR\licenses\wayland\LGPL-2.1.txt"
+  Delete "$INSTDIR\licenses\wayland\README.md"
   Delete "$INSTDIR\licenses\RUST-NOTICES.txt"
   IfFileExists "$INSTDIR\licenses\rust-upstream\*.*" 0 +2
   RMDir "$INSTDIR\licenses\rust-upstream"
   IfFileExists "$INSTDIR\licenses\fonts\*.*" 0 +2
   RMDir "$INSTDIR\licenses\fonts"
+  IfFileExists "$INSTDIR\licenses\wayland\*.*" 0 +2
+  RMDir "$INSTDIR\licenses\wayland"
   IfFileExists "$INSTDIR\licenses\*.*" 0 +2
   RMDir "$INSTDIR\licenses"
   Delete "$SMPROGRAMS\Clipmonger\Clipmonger.lnk"

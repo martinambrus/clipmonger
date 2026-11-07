@@ -25,6 +25,7 @@ export class PopupPlacer {
     watch(win) {
         let pointer = null;
         let settle = null;
+        let activated = false;
         const ids = [];
         let actor = null;
         // Once the window is unmanaged its actor is already disposed: touching
@@ -52,6 +53,17 @@ export class PopupPlacer {
                 return;
             }
             pointer ??= globalThis.global.get_pointer().slice(0, 2);
+            // Mutter's focus-stealing prevention (GNOME 48+) can map the popup
+            // behind the focused window's input: it shows, but typing goes to
+            // the window below. The popup opens on the user's own hotkey, so
+            // give it the focus once it is on screen.
+            if (!activated && win.showing_on_its_workspace?.() !== false && win.get_compositor_private?.()) {
+                activated = true;
+                try {
+                    win.activate(globalThis.global.get_current_time());
+                }
+                catch { /* best effort */ }
+            }
             if (this.place(win, pointer) && settle === null) {
                 settle = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SETTLE_MS, () => { settle = null; done(); return GLib.SOURCE_REMOVE; });
             }

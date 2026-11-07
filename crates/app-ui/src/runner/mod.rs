@@ -233,6 +233,28 @@ struct Host {
     present_error_logged: bool,
     info: ViewportInfo,
     visibility: Visibility,
+    /// Wayland: present only after the compositor's frame callback.
+    frame_throttle: bool,
+    /// A frame went out and its frame callback has not arrived yet. A
+    /// compositor may hold the buffers of a covered window (`KWin` does), and
+    /// softbuffer then blocks the whole UI thread waiting for one; so passes
+    /// run the UI logic but do not paint until `RedrawRequested`.
+    awaiting_frame: bool,
+    /// Keyboard focus as last reported. A covered Wayland window still gets
+    /// frame callbacks from `KWin` but not its buffers back, so a window that
+    /// lost focus paints once more and then waits for focus.
+    focus: Focus,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    /// Not focused yet (a window paints freely until it first gets focus).
+    Never,
+    Focused,
+    /// Lost focus; frames presented since.
+    Lost {
+        paints: u8,
+    },
 }
 
 impl Host {
@@ -246,10 +268,22 @@ impl Host {
         clear: Color32,
         primitives: &[ClippedPrimitive],
     ) {
-        if let Err(error) =
-            self.presenter
-                .present(rasterizer, size, pixels_per_point, clear, primitives)
-        {
+        if self.frame_throttle {
+            self.window.pre_present_notify();
+        }
+        let result = self
+            .presenter
+            .present(rasterizer, size, pixels_per_point, clear, primitives);
+        if self.frame_throttle && matches!(result, Ok(true)) {
+            // winit answers with `RedrawRequested` once the frame callback
+            // arrives.
+            self.awaiting_frame = true;
+            self.window.request_redraw();
+            if let Focus::Lost { paints } = &mut self.focus {
+                *paints = paints.saturating_add(1);
+            }
+        }
+        if let Err(error) = result {
             if !self.present_error_logged {
                 self.present_error_logged = true;
                 let _ = clipmonger_core::runtime_log::global_emit(
@@ -420,6 +454,12 @@ impl Slot {
     /// `window.is_minimized() != Some(true)`, and `window.inner_size()` has width and height > 0.
     fn paintable(&self) -> bool {
         if let Some(host) = &self.host {
+            if host.awaiting_frame {
+                return false;
+            }
+            if host.frame_throttle && matches!(host.focus, Focus::Lost { paints } if paints >= 1) {
+                return false;
+            }
             if host.window.is_visible() == Some(false) {
                 return false;
             }
@@ -583,7 +623,7 @@ impl<A: App> Runner<A> {
     }
 
     /// Create the OS window for a slot.
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn create_host(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -591,6 +631,7 @@ impl<A: App> Runner<A> {
         visible: bool,
         activation_token: Option<&str>,
     ) -> Result<Host, RunError> {
+        let frame_throttle = window::is_wayland(event_loop);
         let builder = match kind {
             WindowKind::Popup => window::popup_builder(
                 &self.config.popup_title,
@@ -683,6 +724,9 @@ impl<A: App> Runner<A> {
                 present_error_logged: false,
                 info,
                 visibility,
+                frame_throttle,
+                awaiting_frame: false,
+                focus: Focus::Never,
             })
         })();
         match host_res {
@@ -897,6 +941,24 @@ impl<A: App> Runner<A> {
                     .and_then(|m| m.activation_token.as_deref()),
                 metadata.as_ref().and_then(|m| m.x11_time),
             ) {
+                self.fail(event_loop, e);
+                return;
+            }
+            self.popup.deadline.at(now);
+        } else if self.per_show && request && desired.popup_open {
+            // Wayland: a client cannot raise or focus its own mapped window
+            // without a fresh activation token, and a popup that never had
+            // the focus (opened behind another window) would stay there. A
+            // hotkey raise shows it again as a new window, which gets the
+            // press's token (and, on GNOME, the extension's placement and
+            // activation).
+            let token = metadata
+                .as_ref()
+                .and_then(|m| m.activation_token.as_deref());
+            let reopened = self
+                .set_popup_open(event_loop, false, None, None)
+                .and_then(|()| self.set_popup_open(event_loop, true, token, None));
+            if let Err(e) = reopened {
                 self.fail(event_loop, e);
                 return;
             }
@@ -1288,6 +1350,18 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
                 if let Some(host) = slot.host.as_mut() {
                     if close {
                         host.info.events.push(ViewportEvent::Close);
+                    }
+                    if matches!(event, WindowEvent::RedrawRequested) && host.awaiting_frame {
+                        host.awaiting_frame = false;
+                        slot.deadline.at(now);
+                    }
+                    if let WindowEvent::Focused(focused) = event {
+                        if focused {
+                            host.focus = Focus::Focused;
+                            slot.deadline.at(now);
+                        } else if host.focus == Focus::Focused {
+                            host.focus = Focus::Lost { paints: 0 };
+                        }
                     }
                     let start = host.state.egui_input_mut().events.len();
                     if preserve_super {

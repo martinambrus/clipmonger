@@ -51,9 +51,14 @@ export class Relay {
     this.failureLimit = opts.failureLimit ?? 3;
   }
   private emit(i: RelayIntent): void { if (!this.disabled) this.onIntent?.(i); }
-  /** Backoff 1s,2s,4s,8s,16s capped 30s, +/-20% jitter. rng()=0.5 gives the exact sequence. */
+  /**
+   * Backoff 1s,2s,4s capped at 4s, +/-20% jitter. rng()=0.5 gives the exact sequence.
+   * The cap keeps a just-started daemon within ~5s of the extension: on GNOME 48+
+   * the daemon falls back to the GlobalShortcuts portal (and its dialog) after 10s.
+   * An attempt with no daemon only reads the rendezvous file.
+   */
   backoffDelayMs(attempt = this.attempt): number {
-    const base = Math.min(30000, 1000 * 2 ** attempt);
+    const base = Math.min(4000, 1000 * 2 ** attempt);
     return Math.round(base * (1 + (this.rng() * 0.4 - 0.2)));
   }
   start(): void {

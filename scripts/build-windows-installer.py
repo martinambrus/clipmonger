@@ -52,6 +52,17 @@ try:
             actual.add(path.relative_to(source / 'licenses').as_posix())
     if actual != expected:
         raise ValueError(f'license payload members differ: missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)}')
+    # The uninstaller removes license files by name: every payload file and
+    # folder must be listed, or its folder (and the uninstaller) stays behind.
+    script = (ROOT / 'packaging/windows/installer.nsi').read_text(encoding='utf-8')
+    for name in sorted(expected):
+        line = 'Delete "$INSTDIR\\licenses\\' + name.replace('/', '\\') + '"'
+        if line not in script:
+            raise ValueError(f'installer.nsi does not uninstall licenses/{name}')
+    for folder in sorted({name.rsplit('/', 1)[0] for name in expected if '/' in name}):
+        line = 'RMDir "$INSTDIR\\licenses\\' + folder.replace('/', '\\') + '"'
+        if line not in script:
+            raise ValueError(f'installer.nsi does not remove the licenses/{folder} folder')
     # No caller-controlled shell: NSIS receives separate arguments and a local tool directory.
     env = os.environ | {'NSISDIR': str(nsisdir)}
     result = subprocess.run([str(compiler), '-WX', f'-DINPUT_DIR={source}', f'-DOUTPUT_FILE={output}',

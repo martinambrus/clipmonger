@@ -29,9 +29,9 @@ test('config.changed push re-reads config only while ready', () => {
   assert.deepEqual(kinds(intents), ['send:config.get']);
 });
 
-test('backoff sequence 1,2,4,8,16,30 cap and reset on welcome', () => {
+test('backoff sequence 1,2,4 cap and reset on welcome', () => {
   const { relay } = harness();
-  assert.deepEqual([0, 1, 2, 3, 4, 5, 6].map((a) => relay.backoffDelayMs(a)), [1000, 2000, 4000, 8000, 16000, 30000, 30000]);
+  assert.deepEqual([0, 1, 2, 3, 4, 5, 6].map((a) => relay.backoffDelayMs(a)), [1000, 2000, 4000, 4000, 4000, 4000, 4000]);
   relay.start(); relay.handleConnected(); relay.handleHelloOk();
   assert.equal(relay.backoffDelayMs(), 1000);
 });
