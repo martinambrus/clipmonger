@@ -957,6 +957,8 @@ mod tests {
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // macOS: an accepted socket inherits the listener's O_NONBLOCK.
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_secs(4)))
                             .unwrap();

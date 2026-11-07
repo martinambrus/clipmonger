@@ -372,7 +372,11 @@ mod tests {
             let end = Instant::now() + Duration::from_secs(3);
             let mut stream = loop {
                 match listener.accept() {
-                    Ok((s, _)) => break s,
+                    Ok((s, _)) => {
+                        // macOS: an accepted socket inherits the listener's O_NONBLOCK.
+                        s.set_nonblocking(false).unwrap();
+                        break s;
+                    }
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < end =>
                     {
@@ -411,7 +415,11 @@ mod tests {
             let end = Instant::now() + Duration::from_secs(3);
             let mut stream = loop {
                 match listener.accept() {
-                    Ok((s, _)) => break s,
+                    Ok((s, _)) => {
+                        // macOS: an accepted socket inherits the listener's O_NONBLOCK.
+                        s.set_nonblocking(false).unwrap();
+                        break s;
+                    }
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < end =>
                     {
@@ -558,7 +566,11 @@ mod tests {
                 let end = Instant::now() + Duration::from_secs(3);
                 loop {
                     match listener.accept() {
-                        Ok((s, _)) => break s,
+                        Ok((s, _)) => {
+                            // macOS: an accepted socket inherits the listener's O_NONBLOCK.
+                            s.set_nonblocking(false).unwrap();
+                            break s;
+                        }
                         Err(e)
                             if e.kind() == std::io::ErrorKind::WouldBlock
                                 && Instant::now() < end =>
@@ -853,6 +865,8 @@ mod tests {
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // macOS: an accepted socket inherits the listener's O_NONBLOCK.
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .unwrap();

@@ -7153,6 +7153,7 @@ mod tests {
         );
     }
 
+    #[cfg(linux_x11)]
     #[test]
     fn nul_terminated_x11_text_merges_with_the_extension_copy() {
         // Live gap (GNOME 46 Xorg): GNOME Text Editor's X11 text/plain
