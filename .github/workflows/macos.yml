@@ -28,6 +28,7 @@ jobs:
       matrix:
         runner: [macos-15-intel, macos-15, macos-26]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain (rust-toolchain.toml)

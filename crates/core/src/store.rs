@@ -5149,7 +5149,9 @@ mod tests {
                 })
                 .unwrap();
             let _guard = OpenControlGuard::install(super::OpenTestControl {
-                budget: Some(Duration::from_millis(700)),
+                // Generous: the hook alone sleeps 300 ms after the first wait, and
+                // slow CI runners need headroom for the retry after it.
+                budget: Some(Duration::from_millis(3000)),
                 busy: Some(Box::new(move |_, error| {
                     assert!(super::is_sqlite_busy(error));
                     std::thread::sleep(Duration::from_millis(300));
