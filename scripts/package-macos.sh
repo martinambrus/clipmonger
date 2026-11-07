@@ -78,5 +78,12 @@ STAGE=$WORK/dmg
 mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
-hdiutil create -quiet -volname "Clipmonger $VERSION" -srcfolder "$STAGE" -format UDZO -ov "$DMG"
+# hdiutil fails now and then on CI machines ("Resource busy"): retry.
+for attempt in 1 2 3; do
+    if hdiutil create -volname "Clipmonger $VERSION" -srcfolder "$STAGE" -format UDZO -ov "$DMG"; then
+        break
+    fi
+    [ "$attempt" = 3 ] && { echo "hdiutil create failed" >&2; exit 1; }
+    sleep 5
+done
 (cd "$OUT" && shasum -a 256 "$(basename "$ZIP")" "$(basename "$DMG")")
