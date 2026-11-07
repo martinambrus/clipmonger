@@ -12,7 +12,8 @@ Everything here is for test machines only.
 | `host/vmctl.py DOM key\|type\|click\|move\|shot\|size` | Keys (US layout, paced typing), absolute pointer clicks, PNG screenshots of a libvirt domain. Needs the `libvirt` and `PIL` Python modules. |
 | `host/build-linux.sh REPO` | Release build in the Debian 12 container, behind a host-wide lock (`CLIPMONGER_BUILD_LOCK`, default `~/.cache/clipmonger-build.lock`) so only one heavy build runs at a time. |
 | `host/deploy-linux.sh SSH_ALIAS REPO` | Copies the three binaries, the GNOME extension `dist/` and `guest/linux/` to `~/clipmonger-test` on the VM. |
-| `host/gnome-suite.sh SSH_ALIAS DOMAIN` | The GNOME Wayland journey (capture, popup text and image paste, permanent hotkey, terminal, password hint, root window); prints one line per check. |
+| `host/linux-suite.sh SSH_ALIAS DOMAIN` | Core checks R-02 to R-09 on any desktop (capture, popup text and image paste, permanent hotkey, terminal, password hint, root window); prints one line per check. `SUITE_TERM` picks the terminal, `SUITE_COPY=wl` copies through `wl-copy` (Sway, Hyprland, COSMIC). |
+| `host/prep-package-test.sh SSH_ALIAS` | Makes a VM look like it never had Clipmonger (stops it, removes the dev deployment, per-user install, menu and autostart entries and user extension, moves the profile aside) before a package install test. |
 | `host/deploy-win.sh`, `host/win-*.sh` | Windows: serve the build over HTTP to the VM, run programs in the logged-in desktop session, put files, copy and read the clipboard. |
 | `guest/linux/` | `cmcopy.py` (text, image, noise, file copies), `secret.py` (password-hinted copy), `readclip.py`, `editor.py` (GTK3 paste target that saves to a file), `mkpng.py`, `cmls.sh` (compact history), `mkenv.sh PROCESS` (writes `env.sh` with the session's display variables). |
 | `guest/windows/` | PowerShell equivalents (`cmcopy.ps1`, `editor.ps1`, `readclip.ps1`, ...). |
@@ -71,3 +72,18 @@ no screen lock.
   keeps the session open.
 - GRUB drops characters when typed too fast; `vmctl.py type` paces at 80 ms
   (`PACE` overrides).
+- `mkenv.sh PROCESS` matches with `pgrep -x`, which sees at most 15
+  characters: use `cinnamon`, not `cinnamon-session`.
+- Ubuntu opens its welcome window after each login and it takes clicks and
+  pastes; close it (`pkill -f gnome-initial-setup`) before the suite.
+- The suite's permanent-clip checks need Ctrl+Alt+K bound to
+  `exec-permanent <id>` on Sway, Hyprland and COSMIC (Settings, Permanent
+  Clips, Copy shortcut command).
+- A newly installed GNOME extension appears only after logging out and in.
+- Windows: run installers and uninstallers in the desktop session
+  (`win-run.sh`, `RUNLEVEL=Highest`). Over SSH they run in session 0, where
+  a message box waits invisibly (even with `/S`). `win-put.sh` uploads;
+  check `Get-MpThreatDetection` afterwards, as Defender removes quarantined
+  files silently.
+- After `virsh shutdown`, wait until `virsh list` is empty before a heavy
+  build; some guests ignore the ACPI request (`virsh destroy` then).

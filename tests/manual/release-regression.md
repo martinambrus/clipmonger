@@ -19,13 +19,21 @@ test and name it in the log row.
    binaries (glibc floor 2.36, `scripts/check-glibc-floor.py`). A host
    `cargo build --release` is not a release build: it needs the host glibc.
 2. Windows: `cargo build --release --target x86_64-pc-windows-gnu -p
-   clipmonger-daemon -p clipmonger-app-ui -p clipmonger-app-cli`, or the
-   installer from `scripts/build-windows-installer.py`.
-3. Before any VM run: `cargo fmt --all --check`, workspace clippy for Linux
+   clipmonger-daemon -p clipmonger-app-ui -p clipmonger-app-cli`, then the
+   installer from `scripts/build-windows-installer.py` and the portable ZIP
+   from `scripts/package-portable.py build --platform windows`. Compile the
+   installer with NSIS 3.09 or newer (Ubuntu 24.04's `nsis`, also in a
+   container): Defender quarantined a 3.08 build as
+   `Trojan:Win32/Bearfoos.A!ml`. Compare both with
+   `scripts/check-windows-installer.py` (needs `7z`).
+3. Linux packages: `scripts/package-linux.sh RUST-NOTICES.txt OUTDIR` makes
+   the `.deb`, `.rpm`, tarball, `install.sh` and `SHA256SUMS`
+   (notices: [scripts/NOTICE-SCAN.md](../../scripts/NOTICE-SCAN.md)).
+4. Before any VM run: `cargo fmt --all --check`, workspace clippy for Linux
    and `--target x86_64-pc-windows-gnu`, and the crate tests
    (`scripts/release-gate.sh` runs them all). On the 16 GB build host, run
    heavy cargo steps one at a time and not while two VMs are up.
-4. Deploy the binaries, the GNOME extension `dist/` and the guest helpers to
+5. Install the packages (section 4, R-60) or deploy the binaries, the GNOME extension `dist/` and the guest helpers to
    each VM, start from a fresh profile, and record the build's commit.
 
 The VM harness (installing the test desktops, the key, pointer and screenshot
@@ -77,7 +85,10 @@ Expected: not stored, also not when GNOME's clipboard manager re-offers it.
 row with the hotkey and Esc, with another app focused in between.
 Expected: every popup takes the keyboard (Esc closes it, typing filters).
 Watch for: every second popup opening without focus (Cinnamon); a stale
-"Connection lost" line right after the daemon started.
+"Connection lost" line right after the daemon started; on GNOME 48+, the
+first popup after login without focus or a GNOME "Set shortcut" dialog for
+the popup hotkey (run this right after a fresh login too); a popup left
+behind another window that the hotkey does not bring forward (Wayland).
 
 **R-05 Popup paste into a GTK editor.** Pick a text row, then an image row.
 Expected: the text and the image land in the editor; history gains no row.
@@ -117,6 +128,9 @@ before waybar at login).
 change.
 Expected: applies; on Sway, Hyprland and COSMIC the Popup, Startup and
 Permanent Clips tabs show the commands with working Copy buttons.
+Watch for: Settings ignoring clicks and the popup hotkey stopping after
+Settings was opened from the popup (KDE Wayland); open the popup over
+Settings, close it, and click another tab.
 
 **R-12 Start on login.** Turn it on in Settings, reboot (or log out and in).
 Expected: Clipmonger runs, history intact, hotkey and (GNOME) extension work.
@@ -163,8 +177,27 @@ Expected: the old daemon has exited; one daemon with the new session's caps.
 - R-50 UAC matrix ([T-409](T-409-uac-matrix.md)): popup and permanent-clip
   paste into elevated windows, with modifiers still held.
 - R-51 Autostart across reboot ([T-410](T-410-autostart-reboot.md)).
-- R-52 Installer upgrade over an existing install; uninstall leaves no
-  leftovers.
+- R-52 Install, then uninstall from the desktop session (with Clipmonger
+  running): no `Program Files\Clipmonger`, uninstall registry key, Start
+  menu folder or process is left; the profile stays unless its box was
+  ticked. Watch for: "Some installed files or shortcuts could not be
+  removed" (a licence file missing from the uninstall list). Upgrading over
+  an existing install is refused by design: uninstall first.
+- R-53 Defender: copy the installer and the ZIP onto the VM, wait a minute,
+  check `Get-MpThreatDetection`; neither may be quarantined.
+
+**Packages (Linux).**
+- R-60 Install each package on a machine that never had Clipmonger
+  (`tests/vm/host/prep-package-test.sh`): `.deb` (apt), `.rpm` (dnf) and
+  the per-user installer with both `curl ... | sh` and `wget -qO- ... | sh`
+  (Debian has no curl by default). Then run section 3 on the installed
+  build. On GNOME log out and in, then enable the extension.
+- R-61 Remove each again (quit first; `apt remove`, `dnf remove`,
+  `install.sh --uninstall`): no files in `/opt/clipmonger`, `/usr/bin`,
+  `~/.local/opt`, `~/.local/bin`, menu entries, autostart entry or user
+  extension; history stays.
+- R-62 `SHA256SUMS` verifies (`sha256sum -c`) and `install.sh` finds the
+  tarball line in it.
 
 ## 5. Recording results
 
@@ -204,3 +237,10 @@ for every new one.
 | 2026-11-07 | all | Stale "Connection lost" after daemon start | 606a288 | R-04 |
 | 2026-11-07 | COSMIC | No auto-paste; COSMIC Terminal got Ctrl+V | 245e837 | R-06, R-41 |
 | 2026-11-07 | GNOME 47 to 51 | Extension installer refused every version but the first | 972cc6c | R-20 |
+| 2026-11-07 | all Linux | Per-user installer read the tarball name with a leading space from SHA256SUMS | 0.2.0 | R-60, R-62 |
+| 2026-11-07 | KDE Wayland | Settings froze after opening it from the popup (covered popup kept painting) | 0.2.0 | R-11 |
+| 2026-11-07 | GNOME 48 | Extension reconnected too late: GNOME "Set shortcut" dialog, first capture lost | 0.2.0 | R-02, R-04 |
+| 2026-11-07 | GNOME 48 | Popup opened without keyboard focus | 0.2.0 | R-04 |
+| 2026-11-07 | Wayland | Hotkey did not bring an open popup forward | 0.2.0 | R-04 |
+| 2026-11-07 | Windows | Uninstaller left `licenses` (new licence folder not listed) | 0.2.0 | R-52 |
+| 2026-11-07 | Windows | Defender quarantined an NSIS 3.08 build | 0.2.0 | section 1, R-53 |

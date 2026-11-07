@@ -1,7 +1,8 @@
 #!/bin/sh
 # Compact view of the newest N clips (default 6): id, formats, size, preview.
 . ~/clipmonger-test/env.sh 2>/dev/null
-~/clipmonger-test/bin/clipmonger-cli --profile-dir ~/.local/share/clipmonger list | python3 -c '
+PATH=$HOME/.local/bin:$HOME/clipmonger-test/bin:$PATH
+clipmonger-cli --profile-dir ~/.local/share/clipmonger list | python3 -c '
 import json,sys
 n=int(sys.argv[1]) if len(sys.argv)>1 else 6
 for c in json.load(sys.stdin)["clips"][:n]:
