@@ -50,6 +50,7 @@ fn insert_clip_with_payloads(store: &Store, clip: &Clip, payloads: &[(String, Ve
 }
 
 const EXTERNAL_READ_SUPPORTED: bool = cfg!(any(
+    target_os = "macos",
     windows,
     all(
         target_os = "linux",

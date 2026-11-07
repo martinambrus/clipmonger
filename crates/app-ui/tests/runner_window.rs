@@ -173,7 +173,10 @@ impl OsWindow for ActivateFake {
     }
 
     fn focus_window(&self) {
+        // Like a window manager that grants the request: the next pass sees
+        // the focus (activation keeps retrying until it does).
         self.focus_calls.set(self.focus_calls.get() + 1);
+        self.focused.set(true);
     }
 }
 
@@ -903,6 +906,8 @@ fn activation_helper_notready_then_ready_no_app_pass() {
     // visibility notification makes ready, next reconcile with no app pass
     fake.visible.set(Some(true));
     helper.reconcile(false, true, true, Some(&fake), ActivationPolicy::Supported);
+    // The next pass sees the granted focus and completes the activation.
+    helper.reconcile(false, true, true, Some(&fake), ActivationPolicy::Supported);
     assert!(!helper.is_pending());
     assert_eq!(fake.focus_calls.get(), 1);
     assert_eq!(fake.visible_calls.get(), 0);
@@ -915,6 +920,8 @@ fn activation_helper_startopen() {
     let mut helper = Activation::new();
     // startopen: previous false, desired true, edge triggers even without request
     helper.reconcile(false, false, true, Some(&fake), ActivationPolicy::Supported);
+    // The next pass sees the granted focus and completes the activation.
+    helper.reconcile(false, true, true, Some(&fake), ActivationPolicy::Supported);
     assert!(!helper.is_pending());
     assert_eq!(fake.focus_calls.get(), 1);
     assert_eq!(fake.visible_calls.get(), 0);
@@ -926,6 +933,8 @@ fn activation_helper_alreadyopen_raise_no_visibility() {
     let fake = ActivateFake::visible_unfocused(ActivationPolicy::Supported);
     let mut helper = Activation::new();
     helper.reconcile(true, true, true, Some(&fake), ActivationPolicy::Supported);
+    // The next pass sees the granted focus and completes the activation.
+    helper.reconcile(false, true, true, Some(&fake), ActivationPolicy::Supported);
     assert!(!helper.is_pending());
     assert_eq!(fake.focus_calls.get(), 1);
     assert_eq!(
@@ -942,6 +951,9 @@ fn activation_helper_idle_after_delivery_no_repeat() {
     let mut helper = Activation::new();
     helper.reconcile(true, true, true, Some(&fake), ActivationPolicy::Supported);
     assert_eq!(fake.focus_calls.get(), 1);
+    // The next pass sees the granted focus and completes the activation.
+    helper.reconcile(false, true, true, Some(&fake), ActivationPolicy::Supported);
+    assert!(!helper.is_pending());
     // focus lost again but idle should not refocus
     fake.focused.set(false);
     fake.visible.set(Some(true));
@@ -1016,6 +1028,14 @@ fn activation_helper_coalescing() {
     // now ready, only one focus
     let fake_ready = ActivateFake::visible_unfocused(ActivationPolicy::Supported);
     // transfer pending to new fake by reusing helper pending true
+    helper.reconcile(
+        false,
+        true,
+        true,
+        Some(&fake_ready),
+        ActivationPolicy::Supported,
+    );
+    // The next pass sees the granted focus and completes the activation.
     helper.reconcile(
         false,
         true,
@@ -1292,7 +1312,9 @@ fn activation_keeps_each_shows_timestamp_until_visible_and_clears_on_hide() {
         ActivationPolicy::Supported,
         Some(456),
     );
-    assert_eq!(*host.times.borrow(), vec![Some(123), Some(456)]);
+    // The press time goes with the first request; the retry (focus not yet
+    // seen) uses CurrentTime (0); a new show brings its own press time.
+    assert_eq!(*host.times.borrow(), vec![Some(123), Some(0), Some(456)]);
 }
 
 #[cfg(target_os = "linux")]

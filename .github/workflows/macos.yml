@@ -44,6 +44,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
+        # Short temp paths: test profiles under /var/folders/.../T/ make
+        # socket paths longer than sun_path (real profiles are short).
+        env:
+          TMPDIR: /tmp
         run: cargo test --workspace --locked --no-fail-fast
       - name: macOS details
         if: always()
