@@ -3,6 +3,60 @@
 All notable changes to Clipmonger. Semver per seg-12 §6; `1.0.0` is
 reserved for the release that passes all seg-11 §5 gates.
 
+## [0.2.0] — 2026-11-07
+
+Linux release: packages for every major distro and fixes from acceptance
+runs on GNOME 46 to 51, KDE Plasma 5.27 and 6, Xfce, Cinnamon, Sway,
+Hyprland and COSMIC.
+
+### Added
+
+- Linux packages: `.deb` and `.rpm` (programs in `/opt/clipmonger`, menu
+  entries, the GNOME Shell extension system-wide) and a per-user installer
+  for any distro (`install.sh`, curl or wget one-liner, checks
+  `SHA256SUMS`, installs into `~/.local`, `--uninstall`).
+- Release binaries are built in a Debian 12 container: they run on glibc
+  2.35 and newer instead of needing the build host's glibc.
+- KDE Plasma Wayland: auto-paste through KWin fake input, popup and
+  permanent-clip hotkeys through the GlobalShortcuts portal (also on
+  Plasma 5.27).
+- Sway and Hyprland: auto-paste through the virtual keyboard; Settings
+  shows the commands to bind the popup, each permanent clip and the login
+  start.
+- COSMIC: auto-paste with toplevel focus tracking (COSMIC Terminal gets
+  Ctrl+Shift+V).
+- `clipmonger-cli permanent-delete`.
+- Release regression runbook (`tests/manual/release-regression.md`) and the
+  VM harness that drives it (`tests/vm`).
+
+### Fixed
+
+- Terminals now get Ctrl+Shift+V (they ignored Ctrl+V), including GNOME
+  Terminal on GNOME 46 Xorg.
+- GNOME Wayland: permanent hotkeys, duplicate image and file rows, Shell
+  freeze on large images, large-clip paste and format choice, popup
+  placement on GNOME 50, a UI crash on GNOME 50, auto-paste on GNOME 51
+  (removed Clutter API), and the extension being refused on GNOME 47 to 51.
+- GNOME 48+: the popup now opens with keyboard focus, and the extension
+  reconnects within seconds of a daemon start, so GNOME no longer shows
+  its own "Set shortcut" dialog for the popup hotkey.
+- KDE Plasma Wayland: the Settings window froze (and the hotkey stopped
+  working) when opened from the popup.
+- Wayland: a hotkey press brings an open popup to the front with focus.
+- X11: INCR transfers truncating or stalling, Qt images not captured,
+  Klipper refills stored as new rows, charset-twin duplicates.
+- GNOME Xorg: Clipmonger's own paste and permanent-clip writes were stored
+  as new rows; tray paused state; denylist.
+- Cinnamon: every second popup opened without keyboard focus.
+- Tray icon missing when the panel or bar starts after Clipmonger.
+- A stale "Connection lost" line right after the daemon started.
+- Password-manager text re-offered without its hint is no longer stored.
+- Windows: per-clip hotkey paste into an elevated window with modifiers
+  held.
+- Windows: the uninstaller left the `licenses` folder (and itself) behind
+  and reported an error; the installer build now checks that every
+  licence file is uninstalled.
+
 ## [0.1.0] — 2026-11-04
 
 First public pre-release, for Windows and Ubuntu (`.deb`).

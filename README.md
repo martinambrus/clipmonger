@@ -10,9 +10,10 @@ Clipmonger is MIT-licensed. It is a modern, open successor to the classic
 Windows clipboard manager ArsClip, rebuilt from scratch (no ArsClip code is
 used).
 
-> **Status: 0.1.0 pre-release.** Core capture, popup, paste and Settings are
-> verified by hand on Windows 10 and Windows 11. Linux packages are available,
-> but full acceptance across Linux desktops is still in progress. See
+> **Status: 0.2.0 pre-release.** Capture, popup, paste, permanent clips,
+> Settings and start-on-login are checked before each release on Windows 10
+> and 11 and on every Linux desktop in the table below
+> ([release regression run](tests/manual/release-regression.md)). See
 > [Known limitations](#known-limitations).
 
 ## Features
@@ -79,10 +80,12 @@ used).
 
 | Platform | Status |
 |---|---|
-| Windows 10 / 11 (64-bit) | Supported, installer available |
-| Linux X11 | Supported, `.deb` package available |
-| Linux Wayland (wlroots and other compositors with data-control) | Supported, `.deb` package available |
-| GNOME Wayland (GNOME 46 to 51) | Supported via the bundled GNOME Shell extension |
+| Windows 10 / 11 (64-bit) | Supported, installer and portable ZIP |
+| Linux x86_64, glibc 2.35+ (Ubuntu 22.04+, Debian 12+, Fedora, Arch, Mint, Pop!_OS, ...) | Supported: `.deb`, `.rpm`, or the per-user installer for any distro |
+| GNOME 46 to 51 (Wayland and Xorg) | Supported via the bundled GNOME Shell extension |
+| KDE Plasma 6 and 5.27 (Wayland and X11) | Supported |
+| Xfce, Cinnamon and other X11 desktops | Supported |
+| Sway, Hyprland, COSMIC | Supported; bind the hotkeys in the compositor (Settings shows the commands) |
 | macOS | Planned |
 
 ## Installation
@@ -90,40 +93,81 @@ used).
 Download the files from the
 [latest release](https://github.com/martinambrus/clipmonger/releases/latest).
 
+Every release has a `SHA256SUMS` file; check your download against it
+(`sha256sum -c SHA256SUMS --ignore-missing` on Linux).
+
 ### Windows
 
-1. Download `clipmonger-0.1.0-windows-x86_64-setup.exe`.
+1. Download `clipmonger-0.2.0-windows-x86_64-setup.exe` (or the portable
+   `clipmonger-0.2.0-windows-x86_64.zip`, which keeps its data next to the
+   programs).
 2. Run it. The binaries are not code-signed yet, so Windows SmartScreen shows
    **Windows protected your PC**: click **More info**, then **Run anyway**.
 3. Approve the User Account Control prompt and finish the installer.
 4. Start Clipmonger from the Start menu and press **Ctrl+Alt+H**.
 
+**Upgrading from 0.1.0:** quit Clipmonger (tray icon, Exit), uninstall it in
+Settings, Apps (leave "Delete my default Clipmonger profile" unticked to keep
+your history), then run the new installer. The installer does not install
+over an existing copy.
+
 The full walk-through, including browser download warnings, checksum
 verification and Windows 11 Smart App Control, is in
 [Installing on Windows](docs/install-windows.md).
 
-### Linux (Ubuntu / Debian)
+### Linux
 
-1. Download `clipmonger_0.1.0_amd64.deb`.
-2. Install it:
+Pick one of the three. All of them need an x86_64 system with glibc 2.35 or
+newer, and all keep your history in `~/.local/share/clipmonger`.
 
-   ```sh
-   sudo apt install ./clipmonger_0.1.0_amd64.deb
-   ```
+**Ubuntu, Debian, Mint, Pop!_OS (`.deb`):**
 
-3. Start **Clipmonger** from the applications menu, or run `clipmonger`. The
-   UI starts its background daemon automatically. History is stored in
-   `~/.local/share/clipmonger`.
-4. Press **Ctrl+Alt+H** to open the popup.
+```sh
+sudo apt install ./clipmonger_0.2.0-1_amd64.deb
+```
 
-**GNOME on Wayland** needs the bundled GNOME Shell extension for capture, the
-hotkey and paste. Enable it once, then log out and back in:
+**Fedora, openSUSE and other RPM distros (`.rpm`):**
+
+```sh
+sudo dnf install ./clipmonger-0.2.0-1.x86_64.rpm
+```
+
+The packages are not signed yet, so the package manager may warn about a
+missing signature; check the file against `SHA256SUMS` first.
+
+**Any distro, no root (per-user install into `~/.local`):**
+
+```sh
+curl -fsSL https://github.com/martinambrus/clipmonger/releases/latest/download/install.sh | sh
+```
+
+Without curl (Debian ships without it): `wget -qO-
+https://github.com/martinambrus/clipmonger/releases/latest/download/install.sh | sh`.
+The script downloads the release tarball, checks it against `SHA256SUMS`, and
+installs the programs to `~/.local/opt/clipmonger`, the commands to
+`~/.local/bin`, the menu entry and, on GNOME, the Shell extension. You can
+also download `clipmonger-0.2.0-linux-x86_64.tar.gz`, extract it and run
+`sh install.sh`. Set `CLIPMONGER_VERSION=0.2.0` to install a specific
+release.
+
+Then start **Clipmonger** from the applications menu, or run `clipmonger`.
+The UI starts its background daemon. Press **Ctrl+Alt+H** to open the popup.
+On KDE Plasma, approve the shortcut in the dialog Plasma shows the first
+time.
+
+**GNOME:** the bundled GNOME Shell extension handles capture, the hotkey and
+paste on Wayland (on Xorg it is optional). After installing, log out and back
+in once, then enable it:
 
 ```sh
 gnome-extensions enable clipmonger@extensions.clipmonger.dev
 ```
 
-On Xorg the extension is optional.
+**Removing it:** quit Clipmonger first (tray icon, Exit), then
+`sudo apt remove clipmonger`, `sudo dnf remove clipmonger`, or
+`sh ~/.local/opt/clipmonger/install.sh --uninstall` for the per-user install.
+Your history stays in `~/.local/share/clipmonger`; delete that folder to
+remove it too.
 
 **Sway, Hyprland and COSMIC** don't let apps register global shortcuts or run
 XDG autostart entries, so bind the keys and the login start in the
@@ -181,9 +225,14 @@ The popup hotkey and every other option can be changed in Settings.
 - A paste into an administrator window needs the popup to be opened with the
   hotkey; from a tray- or CLI-opened popup it is refused with a visible
   reason.
+- The Linux packages are unsigned and there is no package repository yet;
+  download new releases by hand (or run the per-user installer again).
+- On Windows the installer does not upgrade in place: uninstall the old
+  version first (your history is kept).
 - No automatic update check yet.
 
-Release notes: [CHANGELOG.md](CHANGELOG.md) and
+Release notes: [CHANGELOG.md](CHANGELOG.md),
+[docs/release-notes-0.2.0.md](docs/release-notes-0.2.0.md) and
 [docs/release-notes-0.1.0.md](docs/release-notes-0.1.0.md). The full design
 and specification live in [docs/](docs/README.md).
 

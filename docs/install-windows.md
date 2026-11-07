@@ -4,16 +4,20 @@
 > ([T-1204](../tests/manual/T-1204-bypass-docs-accuracy.md)). If a screen does
 > not match, please report it.
 
-Clipmonger 0.1.0 runs on 64-bit Windows 10 and Windows 11. The release has two
+Clipmonger 0.2.0 runs on 64-bit Windows 10 and Windows 11. The release has two
 Windows downloads:
 
-- `clipmonger-0.1.0-windows-x86_64-setup.exe`: installer for Program Files with
+- `clipmonger-0.2.0-windows-x86_64-setup.exe`: installer for Program Files with
   a Start menu entry. Needed for pasting into windows that run as administrator
   without asking at every start.
-- `clipmonger-0.1.0-windows-x86_64.zip`: portable copy. Nothing is installed;
+- `clipmonger-0.2.0-windows-x86_64.zip`: portable copy. Nothing is installed;
   data is stored beside the program files.
 
 Download `SHA256SUMS` from the same release as well.
+
+**Upgrading from 0.1.0:** quit Clipmonger (tray icon, Exit) and uninstall it
+in Settings, Apps first. Leave "Delete my default Clipmonger profile" unticked
+to keep your history. The installer does not install over an existing copy.
 
 ## Why Windows warns you
 
@@ -50,7 +54,7 @@ Some browsers block unsigned downloads that few people have downloaded.
 
 ## 3a. Installer
 
-1. Run `clipmonger-0.1.0-windows-x86_64-setup.exe`.
+1. Run `clipmonger-0.2.0-windows-x86_64-setup.exe`.
 2. If a blue **Windows protected your PC** window appears, click **More info**.
    It shows **Unknown publisher**. Click **Run anyway**.
 3. Approve the User Account Control prompt. It also shows an unknown publisher.
