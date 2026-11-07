@@ -108,14 +108,25 @@ pub fn pipe_name_for(profile_dir: &Path) -> String {
     format!(r"\\.\pipe\clipmonger-{}", profile_hash(profile_dir))
 }
 
-/// Socket path for a profile; long profile paths fall back under `runtime_dir`.
+/// Longest Unix socket path `bind` accepts (`sun_path` size minus the NUL).
+const SOCKET_PATH_MAX: usize = if cfg!(any(target_os = "macos", target_os = "ios")) {
+    103
+} else {
+    107
+};
+
+/// Socket path for a profile. Long profile paths (over 100 bytes, or whose
+/// socket path would not fit `sun_path`) fall back under `runtime_dir`.
 #[must_use]
 pub fn socket_path_for(profile_dir: &Path, runtime_dir: &Path) -> PathBuf {
-    if profile_dir.as_os_str().as_encoded_bytes().len() > 100 {
+    let in_profile = profile_dir.join("clipmonger.sock");
+    if profile_dir.as_os_str().as_encoded_bytes().len() > 100
+        || in_profile.as_os_str().as_encoded_bytes().len() > SOCKET_PATH_MAX
+    {
         let hash = profile_hash(profile_dir);
         runtime_dir.join(format!("clipmonger-{hash}.sock"))
     } else {
-        profile_dir.join("clipmonger.sock")
+        in_profile
     }
 }
 

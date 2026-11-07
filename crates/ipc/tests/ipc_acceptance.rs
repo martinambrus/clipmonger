@@ -857,6 +857,18 @@ fn t210_socket_fallback_over_100() {
         Some(short),
         "short profile path must stay under the profile dir"
     );
+    // A profile under 100 bytes whose socket path would still exceed
+    // `sun_path` (104 bytes on macOS, 108 on Linux) falls back too: macOS
+    // temp folders are long (/var/folders/xx/.../T/).
+    let near: String = std::iter::repeat_n('n', 95 - "/tmp/".len()).collect();
+    let near = PathBuf::from(format!("/tmp/{near}"));
+    assert_eq!(near.to_string_lossy().len(), 95);
+    let got_near = framing::socket_path_for(&near, runtime);
+    assert_eq!(
+        got_near,
+        runtime.join(format!("clipmonger-{}.sock", framing::profile_hash(&near))),
+        "a socket path longer than sun_path must fall back to the runtime dir"
+    );
 }
 
 // ---------------------------------------------------------------------------
