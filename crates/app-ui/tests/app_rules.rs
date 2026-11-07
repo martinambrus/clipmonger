@@ -4209,7 +4209,10 @@ fn r1_visible_rows_still_partition_the_legacy_config_key() {
         tabs.iter()
             .map(|tab| config_model::visible_rows(*tab).len())
             .sum::<usize>(),
-        config_model::ROWS.len()
+        config_model::ROWS
+            .iter()
+            .filter(|row| config_model::applies_here(row.key))
+            .count()
     );
     let keys = |tab| {
         config_model::visible_rows(tab)

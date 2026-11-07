@@ -515,5 +515,13 @@ fn u10_config_tab_excludes_legacy_groups_row() {
     ] {
         total += config_model::visible_rows(tab).len();
     }
-    assert_eq!(total, 30, "visible_rows partitions the 30-row matrix");
+    let applicable = config_model::ROWS
+        .iter()
+        .filter(|row| config_model::applies_here(row.key))
+        .count();
+    assert_eq!(config_model::ROWS.len(), 30, "the 30-row matrix");
+    assert_eq!(
+        total, applicable,
+        "visible_rows partitions the rows for this platform"
+    );
 }

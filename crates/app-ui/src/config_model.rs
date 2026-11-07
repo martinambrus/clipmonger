@@ -253,6 +253,7 @@ pub const ROWS: &[Row] = &[
 pub fn visible_rows(tab: Tab) -> Vec<usize> {
     ROWS.iter()
         .enumerate()
+        .filter(|(_, row)| applies_here(row.key))
         .filter(|(_, row)| {
             if tab == Tab::PermanentClips && row.key == "permanents.groups" {
                 return false;
@@ -264,6 +265,17 @@ pub fn visible_rows(tab: Tab) -> Vec<usize> {
         })
         .map(|(index, _)| index)
         .collect()
+}
+
+/// Whether the setting `key` means anything on this platform: Scroll Lock
+/// and the primary selection do not exist on macOS (hidden there only).
+#[must_use]
+pub fn applies_here(key: &str) -> bool {
+    !(cfg!(target_os = "macos")
+        && matches!(
+            key,
+            "monitor.scroll_lock_toggle" | "monitor.capture_primary"
+        ))
 }
 
 fn row_for(key: &str) -> Option<&'static Row> {
