@@ -171,9 +171,8 @@ impl SuppressionRegistry {
             e.ready
                 && (if e.bridge {
                     match (origin, e.primary_origin.as_deref()) {
-                        (Some(actual @ ("x11" | "wayland")), Some(primary))
-                            if actual == primary =>
-                        {
+                        // The origin that wrote it (any backend, e.g. macos).
+                        (Some(actual), Some(primary)) if actual == primary => {
                             e.hash == content_hash
                         }
                         (Some("x11" | "wayland"), Some(_)) => {
@@ -397,5 +396,15 @@ mod shift_paste_tests {
             "xterm pastes with Shift+Insert, not Ctrl+Shift+V"
         );
         assert!(!paste_needs_shift(&[]));
+    }
+
+    #[test]
+    fn bridged_write_is_suppressed_for_its_own_non_linux_origin() {
+        // macOS registers its paste writes like the Unix backends; the
+        // capture from the same origin must be suppressed once.
+        let mut registry = super::SuppressionRegistry::default();
+        registry.register_bridged_for("macos", "h".into(), None, 0);
+        assert!(registry.should_suppress_from("h", Some("7"), 10, Some("macos")));
+        assert!(!registry.should_suppress_from("h", Some("8"), 20, Some("macos")));
     }
 }

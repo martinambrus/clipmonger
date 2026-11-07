@@ -27,8 +27,11 @@ function run(argv) {
     pb.setDataForType(rep.representationUsingTypeProperties($.NSPNGFileType, $({})), $.NSPasteboardTypePNG);
     pb.setDataForType(rep.TIFFRepresentation, $.NSPasteboardTypeTIFF);
   } else if (kind === 'file') {
-    var urls = rest.map(function (p) { return $.NSURL.fileURLWithPath($(p)); });
-    pb.writeObjects($(urls));
+    // Build the NSArray explicitly: $() of a JS array of ObjC objects
+    // bridged only the first URL.
+    var urls = $.NSMutableArray.array;
+    rest.forEach(function (p) { urls.addObject($.NSURL.fileURLWithPath($(p))); });
+    pb.writeObjects(urls);
   } else {
     throw new Error('usage: cmcopy.js text|big|image|file|secret|transient ...');
   }
