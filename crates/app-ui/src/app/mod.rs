@@ -357,6 +357,13 @@ impl PopupApp {
     /// (a bad override is ignored).
     #[allow(clippy::cast_possible_truncation)]
     fn apply_effects(&mut self, effects: Vec<Effect>) {
+        // macOS: the paste target (a process id) of this batch, activated by
+        // the UI itself while it is still the active app.
+        #[cfg(target_os = "macos")]
+        let paste_target = effects.iter().find_map(|effect| match effect {
+            Effect::Send(UiCmd::PasteClipTo(_, target, _, _)) => *target,
+            _ => None,
+        });
         for effect in effects {
             match effect {
                 Effect::Send(cmd) => {
@@ -378,7 +385,13 @@ impl PopupApp {
                         self.send(cmd);
                     }
                 }
-                Effect::AllowForeground => (self.allow_foreground)(),
+                Effect::AllowForeground => {
+                    (self.allow_foreground)();
+                    #[cfg(target_os = "macos")]
+                    if let Some(pid) = paste_target {
+                        clipmonger_backend_macos::ui::activate_pid(pid);
+                    }
+                }
                 Effect::Hide => self.pending_activation = false,
                 Effect::Raise => self.pending_activation = true,
                 Effect::ClearSearch => {

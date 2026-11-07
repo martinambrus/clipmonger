@@ -169,6 +169,15 @@ pub fn cursor() -> Option<(i32, i32)> {
     }
 }
 
+/// Activate the app with process id `pid` (the paste target). Called by
+/// the UI while it is the active app: macOS 14+ lets the active app pass
+/// activation on, but refuses a background process (the daemon).
+pub fn activate_pid(pid: u64) {
+    if let (Ok(pid), Ok(foreground)) = (i32::try_from(pid), crate::MacForeground::new()) {
+        let _ = foreground.activate(pid);
+    }
+}
+
 /// Hide this app so macOS gives the focus back to the app used before it
 /// (the paste target). Works where a background process may no longer
 /// activate another app (macOS 14+).

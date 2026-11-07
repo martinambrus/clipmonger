@@ -806,6 +806,33 @@ fn setup_macos_backend(
             clipmonger_backend_macos::pasteboard_access(),
         ),
     );
+    // The user grants Accessibility (or clipboard access) while we run:
+    // re-probe so status and Settings stop reporting the paste as degraded.
+    {
+        let state = Arc::clone(state);
+        let shutdown = Arc::clone(shutdown);
+        std::thread::spawn(move || {
+            let mut last = (trusted, clipmonger_backend_macos::pasteboard_access());
+            while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                clipmonger_daemon::capture::sleep_interruptible(
+                    &shutdown,
+                    std::time::Duration::from_secs(3),
+                    std::thread::sleep,
+                );
+                let now = (
+                    clipmonger_backend_macos::accessibility_trusted(false),
+                    clipmonger_backend_macos::pasteboard_access(),
+                );
+                if now != last {
+                    state.refresh_paste_caps(
+                        "macos",
+                        &clipmonger_backend_macos::caps::caps_for(now.0, now.1),
+                    );
+                    last = now;
+                }
+            }
+        });
+    }
     let transfer = match MacTransfer::new() {
         Ok(transfer) => Some(Arc::new(transfer)),
         Err(e) => {
