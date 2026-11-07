@@ -78,8 +78,10 @@ jobs:
             lipo -info "out/$b"
             otool -l "target/x86_64-apple-darwin/release/$b" | grep -A3 -E 'LC_VERSION_MIN_MACOSX|LC_BUILD_VERSION' | head -4
           done
+      - name: App bundle (.app, .zip, .dmg)
+        run: scripts/package-macos.sh out dist
       - uses: actions/upload-artifact@v4
         with:
           name: clipmonger-macos-universal-${{ github.sha }}
-          path: out/
+          path: dist/
           retention-days: 14
