@@ -17,6 +17,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSArray",
     "NSData",
     "NSDictionary",
+    "NSGeometry",
     "NSEnumerator",
     "NSObject",
     "NSString",
@@ -33,6 +34,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSPasteboard",
     "NSPasteboardItem",
     "NSResponder",
+    "NSScreen",
     "NSRunningApplication",
     "NSWorkspace",
 ] }

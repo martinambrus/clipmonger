@@ -216,9 +216,16 @@ pub fn run<A: App + 'static>(
     config: Config,
     make_app: impl FnOnce(Startup) -> A + 'static,
 ) -> Result<(), RunError> {
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .build()
-        .map_err(RunError::EventLoop)?;
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    // macOS: a menu-bar app (no Dock icon, no app menu).
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS as _};
+        builder
+            .with_activation_policy(ActivationPolicy::Accessory)
+            .with_default_menu(false);
+    }
+    let event_loop = builder.build().map_err(RunError::EventLoop)?;
     let proxy = event_loop.create_proxy();
     let mut runner = Runner::new(config, proxy, Box::new(make_app));
     let loop_result = event_loop.run_app(&mut runner).map_err(RunError::EventLoop);
@@ -1043,6 +1050,13 @@ impl<A: App> Runner<A> {
                 host.visibility.show(&*host.window);
             } else {
                 host.visibility.hide(&*host.window);
+                // macOS: hiding the app gives the focus back to the app used
+                // before the popup (the paste target); a background process
+                // may not activate it on macOS 14+.
+                #[cfg(target_os = "macos")]
+                if !self.last.settings_open {
+                    clipmonger_backend_macos::ui::hide_app();
+                }
             }
         }
         Ok(())
@@ -1225,7 +1239,8 @@ fn monitor_rect(monitor: &winit::monitor::MonitorHandle) -> crate::placement::Re
 }
 
 /// Usable area of a monitor for the popup: the work area without the taskbar
-/// on Windows, the whole monitor elsewhere.
+/// on Windows, without the menu bar and Dock on macOS, the whole monitor
+/// elsewhere.
 fn work_rect(monitor: &winit::monitor::MonitorHandle) -> crate::placement::Rect {
     #[cfg(target_os = "windows")]
     {
@@ -1249,6 +1264,18 @@ fn work_rect(monitor: &winit::monitor::MonitorHandle) -> crate::placement::Rect 
             };
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        let position = monitor.position();
+        if let Some(area) = clipmonger_backend_macos::ui::work_area(position.x, position.y) {
+            return crate::placement::Rect {
+                x: area.x,
+                y: area.y,
+                w: area.w,
+                h: area.h,
+            };
+        }
+    }
     monitor_rect(monitor)
 }
 
@@ -1265,6 +1292,10 @@ fn query_cursor(event_loop: &ActiveEventLoop) -> Option<(i32, i32)> {
         if unsafe { GetCursorPos(&raw mut point) }.is_ok() {
             return Some((point.x, point.y));
         }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(position) = clipmonger_backend_macos::ui::cursor() {
+        return Some(position);
     }
     #[cfg(target_os = "linux")]
     {

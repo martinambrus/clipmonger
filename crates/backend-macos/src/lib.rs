@@ -23,6 +23,7 @@ pub mod paste;
 pub mod plist;
 pub mod text;
 pub mod transfer;
+pub mod ui;
 pub mod uri;
 
 #[cfg(target_os = "macos")]
