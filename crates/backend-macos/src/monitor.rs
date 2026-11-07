@@ -23,6 +23,8 @@ use crate::transfer::sequence_of;
 pub const DEFAULT_POLL_MS: u64 = 500;
 /// How often the privacy state is re-read.
 const ACCESS_REFRESH: Duration = Duration::from_secs(5);
+/// How long an empty pasteboard after a change is re-read for its data.
+const EMPTY_SETTLE: Duration = Duration::from_secs(2);
 
 /// Monitor options.
 #[derive(Debug, Clone)]
@@ -135,6 +137,11 @@ fn run_worker(
     let mut last = start;
     let mut access = os::access();
     let mut access_at = Instant::now();
+    // A writer clears the pasteboard (changeCount + 1) and then sets its
+    // data, which does not move the count again: a poll in between sees an
+    // empty pasteboard. Such a change stays pending and its types are read
+    // again until data appears or EMPTY_SETTLE passes.
+    let mut empty_since: Option<Instant> = None;
     while !stop.load(Ordering::Relaxed) {
         sleep_unless_stopped(poll, stop);
         let Ok(count) = os::change_count() else {
@@ -142,9 +149,17 @@ fn run_worker(
             return;
         };
         if count == last {
-            continue;
+            match empty_since {
+                Some(since) if since.elapsed() < EMPTY_SETTLE => {}
+                _ => {
+                    empty_since = None;
+                    continue;
+                }
+            }
+        } else {
+            last = count;
+            empty_since = None;
         }
-        last = count;
         if access_at.elapsed() >= ACCESS_REFRESH {
             access = os::access();
             access_at = Instant::now();
@@ -152,8 +167,14 @@ fn run_worker(
         let types = os::types().unwrap_or_default();
         let front = os::frontmost();
         let Some(event) = observe(count, access, &types, front.as_ref(), opts, names) else {
+            if types.is_empty() && access != PasteboardAccess::Denied {
+                empty_since.get_or_insert_with(Instant::now);
+            } else {
+                empty_since = None;
+            }
             continue;
         };
+        empty_since = None;
         let mut guard = match shared.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
