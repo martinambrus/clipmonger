@@ -5266,11 +5266,14 @@ mod tests {
                     _ => blocker.execute_batch("BEGIN IMMEDIATE").unwrap(),
                 }
                 ready_tx.send(()).unwrap();
+                // Short holds in the first two stages (a slow runner's
+                // scheduling delay must not use up the 50 ms slice there),
+                // one longer than the whole budget in the schema stage.
                 std::thread::sleep(Duration::from_millis(
                     if stage == super::OpenStage::EnsureSchema {
-                        250
+                        400
                     } else {
-                        25
+                        5
                     },
                 ));
                 blocker.execute_batch("ROLLBACK").unwrap();
@@ -5280,7 +5283,7 @@ mod tests {
         let seen = Rc::new(RefCell::new(Vec::new()));
         let boundaries = Rc::clone(&seen);
         let guard = OpenControlGuard::install(super::OpenTestControl {
-            budget: Some(Duration::from_millis(90)),
+            budget: Some(Duration::from_millis(60)),
             boundary: Some(Box::new(move |conn, stage| {
                 // First boundary of each blocked stage only.
                 let Some((go, ready)) = blockers.remove(&format!("{stage:?}")) else {
@@ -5296,6 +5299,9 @@ mod tests {
             ..Default::default()
         });
         let result = Store::open(&profile);
+        // Release the blockers of stages the open never reached before
+        // joining them (their start signal lives in the hook).
+        drop(guard);
         for worker in workers {
             worker.join().unwrap();
         }
@@ -5310,7 +5316,6 @@ mod tests {
             seen[2].1 < seen[0].1,
             "later SQL reused a stale allowance: {seen:?}"
         );
-        drop(guard);
         assert_eq!(history_ids(&Store::open(&profile).unwrap()), vec![sentinel]);
         assert_no_asides(&profile);
     }
