@@ -554,6 +554,11 @@ outdated since the GNOME extension and the KDE portal support them.
 
 ## Other release gates: do not silently waive
 
+Every release repeats the walk-through in
+[the release regression run](../tests/manual/release-regression.md) on each
+supported desktop; bugs found there get a row in its regression log and a
+check, so later runs cover them.
+
 - Linux desktop acceptance: GNOME 46 on Xorg and Wayland passed on 2026-11-05
   (T-508 GNOME rows, T-607 GNOME rows, T-702, T-703, T-705; see
   [Linux acceptance](#linux-acceptance-on-gnome-46-2026-11-05)).
