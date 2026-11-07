@@ -3,8 +3,9 @@
 use clipmonger_platform::types::{BackendCaps, Level, PasteCaps, PasteStrategy};
 
 /// Paste degradation reason without Accessibility.
-pub const NEEDS_ACCESSIBILITY: &str =
-    "needs Accessibility permission: System Settings > Privacy & Security > Accessibility";
+pub const NEEDS_ACCESSIBILITY: &str = "needs Accessibility permission: turn Clipmonger on in \
+     System Settings > Privacy & Security > Accessibility (macOS 12 and older: System Preferences > \
+     Security & Privacy > Privacy > Accessibility)";
 /// Guidance when pasteboard privacy (macOS 15.4+) is not "Always allow".
 pub const PASTEBOARD_GUIDANCE: &str =
     "set Clipmonger to \"Always allow\" in System Settings > Privacy & Security > Paste from Other Apps";

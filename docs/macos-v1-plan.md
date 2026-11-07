@@ -5,15 +5,32 @@ Goal: a macOS build at feature parity with the Windows and Linux v1
 
 Decisions (2026-11-07):
 
-- Floors: Intel 10.12 Sierra if the dependencies allow it (otherwise the
+- Floors (initial): Intel 10.12 Sierra if the dependencies allow it (otherwise the
   lowest version that works, with the reason recorded here); Apple Silicon
   11.0. One universal `.app` (x86_64 + arm64).
+- 2026-11-07, 10.12 dropped (user decision): on the Sierra VM the UI loads
+  (after weak-linking AppKit) and capture works, but the daemon-UI socket
+  loses about half of the replies: the tokio/mio server's write gets EPIPE
+  while the client waits; a plain std-thread server on the same machine
+  never does, and macOS 26 is fine. The Intel floor becomes the oldest
+  version that passes on a VM, starting with Catalina 10.15.
+- 2026-11-07, Intel floor is macOS 10.15 Catalina: the full check list
+  passes on a 10.15.7 VM (capture of text, images and files; concealed and
+  transient markers; popup hotkey and paste of text and images; permanent
+  hotkey; CLI; Settings; start on login across a reboot; uninstall). One
+  fix came out of it: `NSWorkspace.frontmostApplication` lags behind
+  activations in the background daemon on 10.15, so the paste wait and the
+  hotkey-time target now ask Accessibility (`AXFocusedApplication`) for the
+  focused app. `LSMinimumSystemVersion` and the Intel
+  `MACOSX_DEPLOYMENT_TARGET` are 10.15; the 10.12 weak-linking of the UI
+  binary was removed.
 - Signing: ad-hoc for now; the pipeline keeps a slot for Developer ID and
   notarization.
 - Apple Silicon testing: GitHub-hosted macOS arm64 runners (public repo)
   until a physical ARM Mac is available.
-- Intel test VMs: Sierra 10.12 (existing), Ventura 13, Sequoia 15,
-  Tahoe 26 (development VM). One Mac VM runs at a time.
+- Intel test VMs: Catalina 10.15 (floor), Ventura 13, Sequoia 15,
+  Tahoe 26 (development VM); the Sierra 10.12 VM was deleted with the 10.12
+  floor. One Mac VM runs at a time.
 - Work happens on the `macos` branch; main, tags and releases only with the
   user's OK.
 
@@ -28,7 +45,7 @@ Decisions (2026-11-07):
 2. UI on macOS (rows U-*).
 3. Packaging (rows P-*).
 4. macOS section in `tests/manual/release-regression.md`; full run on all
-   four Intel VMs plus scripted smoke on arm64 runners (macOS 15 and 26);
+   four Intel VMs (10.15, 13, 15, 26) plus scripted smoke on arm64 runners (macOS 15 and 26);
    release 0.3.0 after the user's OK.
 
 ## Parity checklist
@@ -100,7 +117,8 @@ Every v1 feature, how macOS provides it, and the check that proves it.
 
 ## Risks
 
-- 10.12 support depends on winit, softbuffer, tray-icon and objc2 floors.
+- 10.12 support depended on winit, softbuffer, tray-icon and objc2 floors
+  (resolved: the floor is 10.15, see Decisions).
 - Pasteboard privacy behaviour on 26/27 (prompts for background readers).
 - No GPU acceleration in the Intel VMs (slow UI; functional only).
 - Ad-hoc signatures change per build, so Accessibility and clipboard

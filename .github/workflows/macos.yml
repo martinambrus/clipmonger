@@ -1,7 +1,7 @@
 name: macOS
 
 # Builds, lints and tests Clipmonger on Intel and Apple Silicon macOS, and
-# uploads the binaries built for the oldest supported macOS (Intel 10.12,
+# uploads the binaries built for the oldest supported macOS (Intel 10.15,
 # Apple Silicon 11.0) for testing on the VMs (docs/macos-v1-plan.md).
 on:
   push:
@@ -61,9 +61,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - name: Build Intel (macOS 10.12+)
+      - name: Build Intel (macOS 10.15+)
         env:
-          MACOSX_DEPLOYMENT_TARGET: "10.12"
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
         run: cargo build --release --locked --target x86_64-apple-darwin -p clipmonger-daemon -p clipmonger-app-ui -p clipmonger-app-cli
       - name: Build Apple Silicon (macOS 11+)
         env:

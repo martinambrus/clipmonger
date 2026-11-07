@@ -52,7 +52,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$VERSION</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
-    <key>LSMinimumSystemVersion</key><string>10.12</string>
+    <key>LSMinimumSystemVersion</key><string>10.15</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSHumanReadableCopyright</key><string>MIT License. Copyright (c) Martin Ambrus.</string>
