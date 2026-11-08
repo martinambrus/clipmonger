@@ -3,18 +3,31 @@
 Clipmonger is a cross-platform clipboard history manager written in Rust. It
 remembers everything you copy (text, images and file lists), opens a popup on
 a global hotkey and pastes the clip you pick straight into the window you came
-from. It runs on Windows 10/11 and on Linux under X11 and Wayland, including
-GNOME Wayland through a bundled GNOME Shell extension.
+from. It runs on Windows 10/11, on macOS 10.15 and newer (Intel and Apple
+Silicon), and on Linux under X11 and Wayland, including GNOME Wayland through a
+bundled GNOME Shell extension.
 
 Clipmonger is MIT-licensed. It is a modern, open successor to the classic
 Windows clipboard manager ArsClip, rebuilt from scratch (no ArsClip code is
 used).
 
-> **Status: 0.2.0 pre-release.** Capture, popup, paste, permanent clips,
+> **Status: 0.3.0 pre-release.** Capture, popup, paste, permanent clips,
 > Settings and start-on-login are checked before each release on Windows 10
-> and 11 and on every Linux desktop in the table below
+> and 11, on macOS VMs from 10.15 to 26 and on the Linux desktops in the table
+> below
 > ([release regression run](tests/manual/release-regression.md)). See
 > [Known limitations](#known-limitations).
+
+<p align="center">
+  <a href="docs/media/clipmonger-demo.mp4"><img src="docs/media/clipmonger-demo-poster.webp" alt="Clipmonger demo video: press the hotkey, filter, paste; on macOS, Windows and Linux" width="720"></a>
+  <br><sub>Demo video (40 s): <a href="docs/media/clipmonger-demo.mp4">docs/media/clipmonger-demo.mp4</a></sub>
+</p>
+
+| macOS (Ventura) | Windows 11 | Ubuntu GNOME |
+| --- | --- | --- |
+| ![Clipmonger popup on macOS](docs/screenshots/macos-popup.webp) | ![Clipmonger popup on Windows 11](docs/screenshots/windows11-popup.webp) | ![Clipmonger popup on GNOME](docs/screenshots/gnome-popup.webp) |
+| **Fedora KDE Plasma** | **Xubuntu Xfce** | **Settings** |
+| ![Clipmonger popup on KDE Plasma](docs/screenshots/kde-popup.webp) | ![Clipmonger popup on Xfce](docs/screenshots/xfce-popup.webp) | ![Clipmonger Settings window](docs/screenshots/macos-settings.webp) |
 
 ## Features
 
@@ -86,7 +99,7 @@ used).
 | KDE Plasma 6 and 5.27 (Wayland and X11) | Supported |
 | Xfce, Cinnamon and other X11 desktops | Supported |
 | Sway, Hyprland, COSMIC | Supported; bind the hotkeys in the compositor (Settings shows the commands) |
-| macOS | Planned |
+| macOS 10.15 Catalina and newer (Intel and Apple Silicon) | Supported: one universal `.dmg` or `.zip` |
 
 ## Installation
 
@@ -98,15 +111,15 @@ Every release has a `SHA256SUMS` file; check your download against it
 
 ### Windows
 
-1. Download `clipmonger-0.2.0-windows-x86_64-setup.exe` (or the portable
-   `clipmonger-0.2.0-windows-x86_64.zip`, which keeps its data next to the
+1. Download `clipmonger-0.3.0-windows-x86_64-setup.exe` (or the portable
+   `clipmonger-0.3.0-windows-x86_64.zip`, which keeps its data next to the
    programs).
 2. Run it. The binaries are not code-signed yet, so Windows SmartScreen shows
    **Windows protected your PC**: click **More info**, then **Run anyway**.
 3. Approve the User Account Control prompt and finish the installer.
 4. Start Clipmonger from the Start menu and press **Ctrl+Alt+H**.
 
-**Upgrading from 0.1.0:** quit Clipmonger (tray icon, Exit), uninstall it in
+**Upgrading from an older version:** quit Clipmonger (tray icon, Exit), uninstall it in
 Settings, Apps (leave "Delete my default Clipmonger profile" unticked to keep
 your history), then run the new installer. The installer does not install
 over an existing copy.
@@ -123,13 +136,13 @@ newer, and all keep your history in `~/.local/share/clipmonger`.
 **Ubuntu, Debian, Mint, Pop!_OS (`.deb`):**
 
 ```sh
-sudo apt install ./clipmonger_0.2.0-1_amd64.deb
+sudo apt install ./clipmonger_0.3.0-1_amd64.deb
 ```
 
 **Fedora, openSUSE and other RPM distros (`.rpm`):**
 
 ```sh
-sudo dnf install ./clipmonger-0.2.0-1.x86_64.rpm
+sudo dnf install ./clipmonger-0.3.0-1.x86_64.rpm
 ```
 
 The packages are not signed yet, so the package manager may warn about a
@@ -146,8 +159,8 @@ https://github.com/martinambrus/clipmonger/releases/latest/download/install.sh |
 The script downloads the release tarball, checks it against `SHA256SUMS`, and
 installs the programs to `~/.local/opt/clipmonger`, the commands to
 `~/.local/bin`, the menu entry and, on GNOME, the Shell extension. You can
-also download `clipmonger-0.2.0-linux-x86_64.tar.gz`, extract it and run
-`sh install.sh`. Set `CLIPMONGER_VERSION=0.2.0` to install a specific
+also download `clipmonger-0.3.0-linux-x86_64.tar.gz`, extract it and run
+`sh install.sh`. Set `CLIPMONGER_VERSION=0.3.0` to install a specific
 release.
 
 Then start **Clipmonger** from the applications menu, or run `clipmonger`.
@@ -191,6 +204,41 @@ On Sway, Hyprland and COSMIC a picked clip is pasted for you: Clipmonger
 presses Ctrl+V (Ctrl+Shift+V in terminals) through the compositor's virtual
 keyboard.
 
+### macOS
+
+Clipmonger for macOS is one universal app for Intel and Apple Silicon Macs
+and needs macOS 10.15 Catalina or newer.
+
+1. Download `clipmonger-0.3.0-macos-universal.dmg` (or the `.zip`), open it
+   and drag **Clipmonger** to **Applications**.
+2. The app is not notarized yet, so the first start is blocked. Open
+   **Applications**, Control-click **Clipmonger**, choose **Open**, then
+   **Open** again. On macOS 15 and newer, start it once, then go to System
+   Settings, Privacy & Security, and click **Open Anyway** next to the
+   Clipmonger message.
+3. Clipmonger appears in the menu bar. To paste a picked clip for you it
+   needs **Accessibility** access: allow it when macOS asks, or turn
+   Clipmonger on in System Settings (System Preferences on 12 and older),
+   Privacy & Security, Accessibility. Without it Clipmonger copies the clip
+   and tells you to press Cmd+V.
+4. Press **Ctrl+Option+H** to open the popup.
+
+Your history lives in `~/Library/Application Support/clipmonger`. The command
+line tool is inside the app; to use it from a terminal:
+
+```sh
+sudo ln -s /Applications/Clipmonger.app/Contents/MacOS/clipmonger-cli /usr/local/bin/clipmonger-cli
+```
+
+**Updating:** quit Clipmonger (menu bar icon, Exit) and replace the app. The
+app is signed ad hoc, so macOS treats each version as a new app: turn
+Clipmonger off and on again in Accessibility (or remove it with **-** and
+let it ask again) after updating.
+
+**Removing it:** run `/Applications/Clipmonger.app/Contents/MacOS/clipmonger-cli uninstall`
+(add `--delete-history` to delete your history too). It stops Clipmonger and
+removes its login item; then drag the app to the Trash.
+
 ### Build from source
 
 Clipmonger builds with the Rust toolchain pinned in `rust-toolchain.toml`
@@ -229,9 +277,14 @@ The popup hotkey and every other option can be changed in Settings.
   download new releases by hand (or run the per-user installer again).
 - On Windows the installer does not upgrade in place: uninstall the old
   version first (your history is kept).
+- The macOS app is signed ad hoc and not notarized: the first start needs
+  **Open** from the context menu (or **Open Anyway**), and Accessibility
+  access must be granted again after each update.
+- macOS 10.14 and older are not supported.
 - No automatic update check yet.
 
 Release notes: [CHANGELOG.md](CHANGELOG.md),
+[docs/release-notes-0.3.0.md](docs/release-notes-0.3.0.md),
 [docs/release-notes-0.2.0.md](docs/release-notes-0.2.0.md) and
 [docs/release-notes-0.1.0.md](docs/release-notes-0.1.0.md). The full design
 and specification live in [docs/](docs/README.md).

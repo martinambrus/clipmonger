@@ -1,5 +1,13 @@
 # Docs status
 
+## 0.3.0 (2026-11-08)
+
+macOS release: one universal app (Intel and Apple Silicon), floor macOS 10.15
+Catalina, at parity with the Windows and Linux v1 ([macOS plan](macos-v1-plan.md),
+[release notes](release-notes-0.3.0.md)). Tested on Intel VMs 10.15, 13, 15 and 26
+and on GitHub Apple Silicon runners; Linux and Windows packages re-tested. The
+history below is kept for reference.
+
 ## Current implementation (2026-11-04)
 
 Start at [v1 continuation](v1-continuation.md) for exact candidate identity,

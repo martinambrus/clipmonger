@@ -54,6 +54,7 @@ Run sections 3 and 4 on every row. "Paste" is what a popup pick does.
 | Sway, Hyprland | Wayland | compositor binding (Settings shows the command) | virtual keyboard | compositor config (Settings shows the command) |
 | COSMIC | Wayland | custom shortcut (Settings shows the command) | virtual keyboard | XDG autostart |
 | Windows 10 and 11 | | RegisterHotKey | SendInput, elevated helper for admin windows | Run key |
+| macOS 10.15 to 26 (Intel VMs; Apple Silicon on CI) | | Carbon hotkeys | Cmd+V via CGEvent (needs Accessibility) | LaunchAgent |
 
 Oldest distro in the matrix: Debian 12 (glibc 2.36). Each release should run
 at least one distro per row; when a desktop ships a new major version, add it.
@@ -199,6 +200,27 @@ Expected: the old daemon has exited; one daemon with the new session's caps.
 - R-62 `SHA256SUMS` verifies (`sha256sum -c`) and `install.sh` finds the
   tarball line in it.
 
+**macOS.** Build the universal app on GitHub Actions (`.github/workflows/macos.yml`,
+artifact `clipmonger-macos-universal-<sha>`); never ship a VM build. Use one
+Mac VM at a time (guest helpers in `tests/vm/guest/macos`: `cmcopy.js`,
+`readclip.js`; TextEdit is the paste target).
+- R-70 Install from the `.dmg` (copy to `/Applications`), first start shows
+  the Accessibility prompt; grant it in System Settings (System Preferences on
+  12 and older) and `clipmonger-cli status` reports paste, hotkey, monitor and
+  tray `full` without a restart.
+- R-71 Capture text, an image (`cmcopy.js image 64x48`) and a file
+  (`cmcopy.js file PATH`); `cmcopy.js secret` and `transient` leave no row.
+- R-72 Ctrl+Option+H opens the popup at the pointer over TextEdit; Enter
+  pastes text (several times in a row) and the image; a permanent clip's
+  hotkey pastes without an extra history row.
+- R-73 CLI: 50 `list` calls in a row all succeed (IPC reliability; 10.12
+  failed this), `paste ID` pastes into the frontmost app.
+- R-74 Settings opens, Start on login writes
+  `~/Library/LaunchAgents/com.martinambrus.clipmonger.plist`; after a reboot
+  and login the UI and daemon run.
+- R-75 `clipmonger-cli uninstall` stops both processes and removes the
+  LaunchAgent; history stays (`--delete-history` removes it).
+
 ## 5. Recording results
 
 Add a dated section to `docs/v1-continuation.md` (or the release notes) with
@@ -213,6 +235,8 @@ for every new one.
 | Date | Desktop | Bug | Fix | Check |
 | --- | --- | --- | --- | --- |
 | 2026-11-04 | GNOME Xorg | Popup did not show or flashed away | 5badd58 | R-04 |
+| 2026-11-07 | macOS 10.15 | Popup paste refused with "target changed": NSWorkspace frontmost app stale in the daemon | df47348 | R-72 |
+| 2026-11-07 | macOS 10.12 | Daemon replies lost over the socket (EPIPE); floor raised to 10.15 | 386d29c | R-73 |
 | 2026-11-05 | GNOME Wayland | Permanent hotkeys did nothing | eabadf8 | R-08 |
 | 2026-11-05 | GNOME Wayland | Duplicate image and file rows | 0452f30 | R-02, R-09 |
 | 2026-11-05 | GNOME Xorg | Duplicate copies, tray paused state, denylist | 2a7a2e2 | R-02, R-10 |

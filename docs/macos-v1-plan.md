@@ -1,5 +1,7 @@
 # macOS v1 plan (Clipmonger 0.3.0)
 
+Status: released in 0.3.0 (2026-11-08); results in [release notes](release-notes-0.3.0.md).
+
 Goal: a macOS build at feature parity with the Windows and Linux v1
 (0.2.0) builds, per [seg-08](seg-08-macos-backend.md). Accepted 2026-11-07.
 

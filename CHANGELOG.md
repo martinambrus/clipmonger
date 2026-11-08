@@ -3,6 +3,39 @@
 All notable changes to Clipmonger. Semver per seg-12 §6; `1.0.0` is
 reserved for the release that passes all seg-11 §5 gates.
 
+## [0.3.0] — 2026-11-08
+
+macOS release: one universal app for Intel and Apple Silicon Macs on macOS
+10.15 Catalina and newer, at feature parity with Windows and Linux.
+
+### Added
+
+- macOS backend: capture of text, HTML, RTF, images and file lists (with
+  the nspasteboard.org concealed and transient markers honoured), global
+  popup and permanent-clip hotkeys, paste into the app you were in (Cmd+V
+  with guarded restore, or typed text), menu-bar icon, start on login
+  (LaunchAgent), popup at the pointer within the screen's visible area.
+- macOS packages: `Clipmonger.app` as a `.dmg` and a `.zip` (universal,
+  signed ad hoc), with the licence texts and `RUST-NOTICES.txt`.
+- `clipmonger-cli uninstall [--delete-history]` on macOS: stops Clipmonger,
+  removes its login item and optionally the history.
+- Accessibility status on macOS: without the permission, paste reports
+  "Degraded" with the System Settings path, and Clipmonger notices a grant
+  without a restart.
+- GitHub Actions builds and tests on Intel and Apple Silicon (macOS 15 and
+  26) and builds the universal app.
+
+### Fixed
+
+- Unix socket paths that would exceed the system limit fall back to a short
+  path (long profile folders, macOS temporary folders).
+- Store tests: a deadlock and timing flakes under load.
+
+### Changed
+
+- Settings on macOS hide the Scroll Lock and primary selection options,
+  which do not exist there.
+
 ## [0.2.0] — 2026-11-07
 
 Linux release: packages for every major distro and fixes from acceptance
