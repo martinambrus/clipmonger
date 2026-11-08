@@ -5,7 +5,7 @@ name: macOS
 # Apple Silicon 11.0) for testing on the VMs (docs/macos-v1-plan.md).
 on:
   push:
-    branches: [macos, main]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
