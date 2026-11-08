@@ -14,7 +14,8 @@ fn main() {
     let token = std::fs::read_to_string(profile.join("token")).unwrap();
     let socket = rendezvous["socket"].as_str().unwrap();
     let client =
-        clipmonger_ipc::client::Client::connect(std::path::Path::new(socket), token.trim()).unwrap();
+        clipmonger_ipc::client::Client::connect(std::path::Path::new(socket), token.trim())
+            .unwrap();
     let started = std::time::Instant::now();
     let result = client.call(method, serde_json::from_str(params).unwrap());
     println!("{:?} after {:?}", result, started.elapsed());
