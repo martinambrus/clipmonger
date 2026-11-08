@@ -148,7 +148,12 @@ async fn listener_delivers_pushes_and_yields_to_another_instance() {
         matches!(&event, UiEvent::ShowPopup(show) if show.source == "request"),
         "{event:?}"
     );
-    assert!(wakes.load(Ordering::SeqCst) >= 1, "the shell is woken");
+    // The listener wakes the shell right after sending, so allow it a moment.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while wakes.load(Ordering::SeqCst) == 0 {
+        assert!(std::time::Instant::now() < deadline, "the shell is woken");
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     // A second UI's listener finds the popup taken and reports it.
     let (tx2, rx2) = mpsc::channel();
