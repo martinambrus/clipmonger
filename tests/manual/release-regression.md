@@ -123,7 +123,8 @@ Expected: unchanged except for clips moved to the top.
 **R-10 Tray.** Check the icon, click it, use its menu.
 Expected: icon visible, the click opens the popup.
 Watch for: no icon when the panel or bar starts after Clipmonger (start it
-before waybar at login).
+before waybar at login); a panel that keeps the normal icon while the daemon
+is unreachable (stop the daemon: the icon must turn orange).
 
 **R-11 Settings.** Open Settings from the popup, visit every tab, apply one
 change.
@@ -268,3 +269,4 @@ for every new one.
 | 2026-11-07 | Wayland | Hotkey did not bring an open popup forward | 0.2.0 | R-04 |
 | 2026-11-07 | Windows | Uninstaller left `licenses` (new licence folder not listed) | 0.2.0 | R-52 |
 | 2026-11-07 | Windows | Defender quarantined an NSIS 3.08 build | 0.2.0 | section 1, R-53 |
+| 2026-11-09 | Ubuntu GNOME | Degraded tray icon stayed normal: `NeedsAttention` without an attention image | 0.4.0 | R-10 |

@@ -1,5 +1,12 @@
 # Docs status
 
+## 0.4.0 (2026-11-09)
+
+Own icons on every platform, tray state on Windows and macOS, popup search over
+the whole history ([release notes](release-notes-0.4.0.md)). The published
+installers were tested on 12 Linux desktops, Windows 10 and 11 and macOS 10.15
+to 26 before release.
+
 ## 0.3.0 (2026-11-08)
 
 macOS release: one universal app (Intel and Apple Silicon), floor macOS 10.15

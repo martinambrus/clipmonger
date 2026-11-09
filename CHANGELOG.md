@@ -3,7 +3,7 @@
 All notable changes to Clipmonger. Semver per seg-12 §6; `1.0.0` is
 reserved for the release that passes all seg-11 §5 gates.
 
-## [Unreleased]
+## [0.4.0] — 2026-11-09
 
 ### Added
 

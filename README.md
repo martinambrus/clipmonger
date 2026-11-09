@@ -11,7 +11,7 @@ Clipmonger is MIT-licensed. It is a modern, open successor to the classic
 Windows clipboard manager ArsClip, rebuilt from scratch (no ArsClip code is
 used).
 
-> **Status: 0.3.0 pre-release.** Capture, popup, paste, permanent clips,
+> **Status: 0.4.0 pre-release.** Capture, popup, paste, permanent clips,
 > Settings and start-on-login are checked before each release on Windows 10
 > and 11, on macOS VMs from 10.15 to 26 and on the Linux desktops in the table
 > below
@@ -111,8 +111,8 @@ Every release has a `SHA256SUMS` file; check your download against it
 
 ### Windows
 
-1. Download `clipmonger-0.3.0-windows-x86_64-setup.exe` (or the portable
-   `clipmonger-0.3.0-windows-x86_64.zip`, which keeps its data next to the
+1. Download `clipmonger-0.4.0-windows-x86_64-setup.exe` (or the portable
+   `clipmonger-0.4.0-windows-x86_64.zip`, which keeps its data next to the
    programs).
 2. Run it. The binaries are not code-signed yet, so Windows SmartScreen shows
    **Windows protected your PC**: click **More info**, then **Run anyway**.
@@ -136,13 +136,13 @@ newer, and all keep your history in `~/.local/share/clipmonger`.
 **Ubuntu, Debian, Mint, Pop!_OS (`.deb`):**
 
 ```sh
-sudo apt install ./clipmonger_0.3.0-1_amd64.deb
+sudo apt install ./clipmonger_0.4.0-1_amd64.deb
 ```
 
 **Fedora, openSUSE and other RPM distros (`.rpm`):**
 
 ```sh
-sudo dnf install ./clipmonger-0.3.0-1.x86_64.rpm
+sudo dnf install ./clipmonger-0.4.0-1.x86_64.rpm
 ```
 
 The packages are not signed yet, so the package manager may warn about a
@@ -159,8 +159,8 @@ https://github.com/martinambrus/clipmonger/releases/latest/download/install.sh |
 The script downloads the release tarball, checks it against `SHA256SUMS`, and
 installs the programs to `~/.local/opt/clipmonger`, the commands to
 `~/.local/bin`, the menu entry and, on GNOME, the Shell extension. You can
-also download `clipmonger-0.3.0-linux-x86_64.tar.gz`, extract it and run
-`sh install.sh`. Set `CLIPMONGER_VERSION=0.3.0` to install a specific
+also download `clipmonger-0.4.0-linux-x86_64.tar.gz`, extract it and run
+`sh install.sh`. Set `CLIPMONGER_VERSION=0.4.0` to install a specific
 release.
 
 Then start **Clipmonger** from the applications menu, or run `clipmonger`.
@@ -209,7 +209,7 @@ keyboard.
 Clipmonger for macOS is one universal app for Intel and Apple Silicon Macs
 and needs macOS 10.15 Catalina or newer.
 
-1. Download `clipmonger-0.3.0-macos-universal.dmg` (or the `.zip`), open it
+1. Download `clipmonger-0.4.0-macos-universal.dmg` (or the `.zip`), open it
    and drag **Clipmonger** to **Applications**.
 2. The app is not notarized yet, so the first start is blocked. Open
    **Applications**, Control-click **Clipmonger**, choose **Open**, then
@@ -285,6 +285,7 @@ The popup hotkey and every other option can be changed in Settings.
 - No automatic update check yet.
 
 Release notes: [CHANGELOG.md](CHANGELOG.md),
+[docs/release-notes-0.4.0.md](docs/release-notes-0.4.0.md),
 [docs/release-notes-0.3.0.md](docs/release-notes-0.3.0.md),
 [docs/release-notes-0.2.0.md](docs/release-notes-0.2.0.md) and
 [docs/release-notes-0.1.0.md](docs/release-notes-0.1.0.md). The full design
