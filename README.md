@@ -258,8 +258,9 @@ placed in `target/release/`. The GNOME extension is built separately, see
 
 1. Copy things as usual; Clipmonger records them in the background.
 2. Press **Ctrl+Alt+H** in any application.
-3. Type to filter, pick a clip with the arrow keys or the mouse, press
-   **Enter**. The clip is pasted into the application you were in.
+3. Type to search your whole history and permanent clips, pick a clip with
+   the arrow keys or the mouse, press **Enter**. The clip is pasted into the
+   application you were in.
 4. Right-click the tray icon for Settings, pausing monitoring or exiting.
 
 The popup hotkey and every other option can be changed in Settings.

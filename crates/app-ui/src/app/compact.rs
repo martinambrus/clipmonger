@@ -5,6 +5,9 @@ use clipmonger_ipc::proto::methods::{
     HistoryCompactCancelParams, HistoryCompactParams, HistoryCompactResult,
 };
 
+/// Rows on one page of search results, the same as a page of history.
+const RESULT_PAGE_ROWS: usize = 32;
+
 // These flags represent independent request and coverage properties.
 #[allow(clippy::struct_excessive_bools)]
 pub(super) struct Compact {
@@ -17,6 +20,8 @@ pub(super) struct Compact {
     cursor: Option<String>,
     pending: Option<CompactRequest>,
     wanted: bool,
+    /// Every match of the current search; `page` indexes pages of it.
+    results: Vec<CompactRow>,
     pub loading: bool,
     pub done: bool,
     pub error: bool,
@@ -35,6 +40,7 @@ impl Compact {
             cursor: None,
             pending: None,
             wanted: false,
+            results: Vec::new(),
             loading: false,
             done: false,
             error: false,
@@ -66,6 +72,7 @@ impl Compact {
         }
         self.query = query;
         self.page = 0;
+        self.results.clear();
         self.done = false;
         self.error = next.is_none() || restore_next.is_none() || self.owner.is_none();
         self.error_code = None;
@@ -90,6 +97,60 @@ impl Compact {
     }
     pub fn on_first_page(&self) -> bool {
         self.page == 0
+    }
+    /// Whether this is a search: every match is collected before the first
+    /// page shows, unlike history, which is browsed one scan step at a time.
+    pub fn searching(&self) -> bool {
+        !self.query.is_empty()
+    }
+    /// Put rows found outside the history (permanents) before its matches.
+    pub fn seed_results(&mut self, rows: Vec<CompactRow>) {
+        self.results = rows;
+    }
+    /// The number of matches, once the search has finished.
+    pub fn results_total(&self) -> Option<usize> {
+        (self.searching() && self.done).then_some(self.results.len())
+    }
+    /// One-based result page and the number of result pages.
+    pub fn result_page(&self) -> (u64, u64) {
+        (
+            self.page.saturating_add(1),
+            (self.results.len().div_ceil(RESULT_PAGE_ROWS).max(1)) as u64,
+        )
+    }
+    fn results_page(&self) -> Vec<CompactRow> {
+        usize::try_from(self.page)
+            .ok()
+            .and_then(|page| page.checked_mul(RESULT_PAGE_ROWS))
+            .map_or_else(Vec::new, |start| {
+                self.results
+                    .iter()
+                    .skip(start)
+                    .take(RESULT_PAGE_ROWS)
+                    .cloned()
+                    .collect()
+            })
+    }
+    /// Move to result page `page` (zero-based) of a finished search and
+    /// return its rows; `None` when there is no such page.
+    pub fn turn_results(&mut self, page: u64) -> Option<Vec<CompactRow>> {
+        if !self.searching() || !self.done || page >= self.result_page().1 {
+            return None;
+        }
+        self.page = page;
+        Some(self.results_page())
+    }
+    /// Zero-based index of the current result page.
+    pub fn page_index(&self) -> u64 {
+        self.page
+    }
+    pub fn forget_result(&mut self, id: uuid::Uuid) {
+        self.results.retain(|row| row.id != id);
+    }
+    pub fn pin_result(&mut self, id: uuid::Uuid, pinned: bool) {
+        if let Some(row) = self.results.iter_mut().find(|row| row.id == id) {
+            row.pinned = pinned;
+        }
     }
     pub fn next_page(&mut self) {
         if !self.loading && !self.done && self.cursor.is_some() {
@@ -205,6 +266,12 @@ impl Compact {
         self.cursor = parsed.cursor;
         self.uri_search_incomplete = parsed.uri_search_incomplete;
         self.done = parsed.done;
+        if self.searching() {
+            self.results.extend(rows);
+            self.loading = !self.done;
+            self.wanted = self.loading;
+            return (self.done.then(|| self.results_page()), None);
+        }
         self.loading = rows.is_empty() && !self.done;
         self.wanted = self.loading;
         if self.loading {
@@ -259,7 +326,7 @@ mod tests {
     #[test]
     fn sparse_progress_pages_and_restore_drop_old_errors() {
         let mut state = Compact::new();
-        state.reset("needle".into(), true, false);
+        state.reset(String::new(), true, false);
         let first = command(&mut state);
         assert!(state
             .result(first.clone(), Ok(reply(&first, Some("cursor"), vec![])))
@@ -277,7 +344,7 @@ mod tests {
         let page = command(&mut state);
         assert_eq!(page.page, 1);
         assert!(matches!(
-            state.reset("needle".into(), true, true),
+            state.reset(String::new(), true, true),
             Some(UiCmd::CancelCompactHistory(_))
         ));
         let error = clipmonger_ipc::proto::IpcError::new("unavailable", "late".into());
@@ -287,6 +354,45 @@ mod tests {
         assert_eq!(fresh.page, 0);
         assert_eq!(fresh.params.cursor, None);
         assert_ne!(fresh.restore_epoch, progress.restore_epoch);
+    }
+    fn numbered(n: u128) -> serde_json::Value {
+        json!({"id":uuid::Uuid::from_u128(n),"pinned":false,"last_used_ms":1,"preview":format!("hit {n}"),"preview_truncated":false,"kind":"text","thumbnail_hash":null})
+    }
+    fn permanent() -> CompactRow {
+        CompactRow {
+            id: uuid::Uuid::from_u128(1000),
+            pinned: false,
+            preview: "Permanent hit".into(),
+            kind: clipmonger_core::store::CompactKind::Text,
+            thumbnail_hash: None,
+            group: Some("Group".into()),
+        }
+    }
+    #[test]
+    fn search_collects_every_scan_step_and_pages_the_matches() {
+        let mut state = Compact::new();
+        state.reset("logo".into(), true, false);
+        state.seed_results(vec![permanent()]);
+        // Sparse steps show nothing until the scan is complete.
+        for range in [1..=1, 2..=2, 3..=40] {
+            let tag = command(&mut state);
+            let rows = range.clone().map(numbered).collect();
+            let (shown, _) = state.result(tag.clone(), Ok(reply(&tag, Some("cursor"), rows)));
+            assert!(shown.is_none());
+            assert!(state.loading);
+        }
+        let tag = command(&mut state);
+        let (shown, _) = state.result(tag.clone(), Ok(reply(&tag, None, vec![numbered(41)])));
+        let shown = shown.expect("first page");
+        assert_eq!(shown.len(), RESULT_PAGE_ROWS);
+        assert_eq!(shown[0].preview, "Permanent hit");
+        assert_eq!(state.results_total(), Some(42));
+        assert_eq!(state.result_page(), (1, 2));
+        let second = state.turn_results(1).expect("second page");
+        assert_eq!(second.len(), 10);
+        assert_eq!(second[9].preview, "hit 41");
+        assert!(state.turn_results(2).is_none());
+        assert_eq!(state.turn_results(0).expect("back")[1].preview, "hit 1");
     }
 }
 

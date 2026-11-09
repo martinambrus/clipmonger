@@ -469,6 +469,7 @@ mod tests {
                 preview: red.preview.clone(),
                 kind: clipmonger_core::store::CompactKind::Image,
                 thumbnail_hash: Some(red.content_hash.clone()),
+                group: None,
             },
             crate::popup::CompactRow {
                 id: text.id,
@@ -476,6 +477,7 @@ mod tests {
                 preview: text.preview.clone(),
                 kind: clipmonger_core::store::CompactKind::Text,
                 thumbnail_hash: None,
+                group: None,
             },
         ]);
         app.vm_mut().set_current(Some(red.clone()));
@@ -635,6 +637,7 @@ mod tests {
                 preview: original.preview.clone(),
                 kind: clipmonger_core::store::CompactKind::Image,
                 thumbnail_hash: Some(original.content_hash.clone()),
+                group: None,
             }]);
         app.vm_mut().set_current(Some(original.clone()));
         let ctx = egui::Context::default();

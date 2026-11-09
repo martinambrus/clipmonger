@@ -78,6 +78,39 @@ struct PopupFrame {
     /// Top-left, unknown where the compositor places the popup (Wayland).
     pos: Option<(i32, i32)>,
     size: (i32, i32),
+    /// Top edge the height is measured from, for popups that open at the cursor.
+    top: Option<i32>,
+    /// Wayland: size before the last grow. Changing the size hints makes
+    /// Mutter answer that grow with a configure of the old size, which winit
+    /// applies; any other height is the Shell extension's trim, which stands.
+    grown_from: Option<(i32, i32)>,
+    /// Wayland: how many undone grows may be requested again.
+    regrows_left: u8,
+}
+
+/// Undone grows requested again per show.
+const REGROW_LIMIT: u8 = 3;
+
+impl PopupFrame {
+    /// Physical size of the popup for a wanted size in points.
+    fn size_for(
+        work: placement::Rect,
+        scale: f32,
+        top: Option<i32>,
+        fit: (f32, f32),
+    ) -> (i32, i32) {
+        top.map_or_else(
+            || placement::popup_size(fit, scale, work),
+            |top| placement::popup_size_from_top(fit, scale, work, top),
+        )
+    }
+}
+
+/// Whether the compositor trims a popup taller than the room below the
+/// pointer: the GNOME Shell extension does, and it alone knows the pointer on
+/// Wayland.
+fn shell_trims_height() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktop| desktop.contains("GNOME"))
 }
 
 /// The application behind the runner's windows.
@@ -445,6 +478,7 @@ impl PopupApp {
             thumbs.revoke_visibility();
         }
         self.vm.set_compact_rows(Vec::new());
+        self.vm.set_result_total(None);
         if let Some(cancel) = self.compact.reset(
             self.vm.query.clone(),
             self.shell.desired().popup_open,
@@ -452,9 +486,39 @@ impl PopupApp {
         ) {
             self.send(cancel);
         }
+        if !self.vm.query.is_empty() {
+            let rows = self.config.lock().map_or_else(
+                |_| Vec::new(),
+                |config| {
+                    config
+                        .perm_vm
+                        .search(&self.vm.query)
+                        .into_iter()
+                        .map(popup::CompactRow::from_permanent)
+                        .collect()
+                },
+            );
+            self.compact.seed_results(rows);
+        }
         if let Some(cmd) = self.compact.command() {
             self.send(cmd);
         }
+    }
+
+    /// Search again after the permanents changed under an open results view.
+    fn refresh_search(&mut self) {
+        if !self.vm.query.is_empty()
+            && self.shell.desired().popup_open
+            && !self.shell.desired().settings_open
+        {
+            self.reset_compact(false);
+        }
+    }
+
+    /// Whether the popup shows a permanents tab: a search shows its results
+    /// over whichever tab is active.
+    fn permanent_view(&self) -> bool {
+        self.vm.query.is_empty() && self.config.lock().is_ok_and(|c| c.perm_source.is_some())
     }
 
     fn restore_error_message(&self, message: &str) -> String {
@@ -552,6 +616,7 @@ impl PopupApp {
                         thumbs.revoke_visibility();
                     }
                     self.vm.set_compact_rows(rows);
+                    self.vm.set_result_total(self.compact.results_total());
                 }
             }
             UiEvent::CompactCurrent(tag, outcome) => {
@@ -597,11 +662,18 @@ impl PopupApp {
                     thumbs.reset();
                 }
                 self.vm.remove_clip(id);
+                self.compact.forget_result(id);
+                if self.compact.searching() {
+                    self.vm.set_result_total(self.compact.results_total());
+                }
                 if self.vm.current().is_some_and(|clip| clip.id == id) {
                     self.vm.set_current(None);
                 }
             }
-            UiEvent::Pinned(id, pinned) => self.vm.apply_pin(id, pinned),
+            UiEvent::Pinned(id, pinned) => {
+                self.vm.apply_pin(id, pinned);
+                self.compact.pin_result(id, pinned);
+            }
             UiEvent::CompactCancelled | UiEvent::PasteDone(_) | UiEvent::Purged(_) => {}
             UiEvent::HistoryClip(body) => {
                 let clip = body.get("clip").and_then(|value| {
@@ -628,6 +700,7 @@ impl PopupApp {
                         config.perm_source = Some(config.perm_vm.active_group);
                     }
                 }
+                self.refresh_search();
             }
             UiEvent::PermGroups(body) => {
                 if let Ok(mut config) = self.config.lock() {
@@ -640,6 +713,7 @@ impl PopupApp {
                         config.perm_source = Some(config.perm_vm.active_group);
                     }
                 }
+                self.refresh_search();
             }
             UiEvent::PermanentSaved => {
                 if let Ok(mut config) = self.config.lock() {
@@ -1050,8 +1124,22 @@ impl PopupApp {
             desktop.primary_monitor,
         );
         let scale = ctx.zoom_factor() * desktop.destination_scale as f32;
-        if let (Some(fit), Some(work)) = (self.popup_fit, work) {
-            desktop.popup_physical_size = placement::popup_size(fit, scale, work);
+        let top = (self.placement == placement::Placement::Cursor)
+            .then(|| {
+                desktop.cursor.map(|cursor| cursor.1).or_else(|| {
+                    (!desktop.supports_global_position && shell_trims_height())
+                        .then(|| work.map(|work| work.y))
+                        .flatten()
+                })
+            })
+            .flatten();
+        // A Wayland window is new at every show, and winit drops a size
+        // requested before its first configure: `grow_popup` sizes it once
+        // it paints.
+        if let (Some(fit), Some(work), true) =
+            (self.popup_fit, work, desktop.supports_global_position)
+        {
+            desktop.popup_physical_size = PopupFrame::size_for(work, scale, top, fit);
             let (w, h) = desktop.popup_physical_size;
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                 w as f32 / scale,
@@ -1068,12 +1156,15 @@ impl PopupApp {
             scale,
             pos,
             size: desktop.popup_physical_size,
+            top,
+            grown_from: None,
+            regrows_left: REGROW_LIMIT,
         });
     }
 
-    /// Grow the open popup when its unfiltered clips need more height than it
+    /// Grow the open popup when its unfiltered clips need more room than it
     /// has, up to the work-area cap; it shrinks only at the next show.
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn grow_popup(&mut self, ctx: &egui::Context) {
         if self.placement_pending || self.pending_desktop.is_some() {
             return;
@@ -1081,11 +1172,26 @@ impl PopupApp {
         let (Some(fit), Some(frame)) = (self.popup_fit, self.popup_frame.as_mut()) else {
             return;
         };
-        let height = placement::popup_size(fit, frame.scale, frame.work).1;
-        if height <= frame.size.1.saturating_add(2) {
+        let viewport = ctx.viewport_rect().size() * frame.scale;
+        let actual = (viewport.x.round() as i32, viewport.y.round() as i32);
+        let near = |a: (i32, i32), b: (i32, i32)| (a.0 - b.0).abs() <= 1 && (a.1 - b.1).abs() <= 1;
+        let undone =
+            frame.grown_from.is_some_and(|from| near(actual, from)) && frame.regrows_left > 0;
+        if undone {
+            frame.regrows_left -= 1;
+        }
+        let (width, height) = PopupFrame::size_for(frame.work, frame.scale, frame.top, fit);
+        let grows =
+            width > frame.size.0.saturating_add(2) || height > frame.size.1.saturating_add(2);
+        if !grows && !undone {
             return;
         }
-        frame.size.1 = height;
+        if grows {
+            if frame.pos.is_none() {
+                frame.grown_from = Some(actual);
+            }
+            frame.size = (frame.size.0.max(width), frame.size.1.max(height));
+        }
         let (w, h) = frame.size;
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
             w as f32 / frame.scale,
@@ -1106,7 +1212,7 @@ impl PopupApp {
 impl PopupApp {
     fn compute_reveal_key(&self) -> Option<(Option<String>, usize, uuid::Uuid)> {
         let config = self.config.lock().ok()?;
-        if config.perm_source.is_some() {
+        if config.perm_source.is_some() && self.vm.query.is_empty() {
             let group = config
                 .perm_vm
                 .group_names()

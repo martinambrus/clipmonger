@@ -1,9 +1,15 @@
 //! Frozen v1 string catalog with a locale fallback rule.
 
 const ENTRIES: &[(&str, &str)] = &[
-    ("popup.search_hint", "Type to filter"),
+    ("popup.search_hint", "Search history and permanents"),
     ("popup.empty", "Nothing here yet"),
     ("popup.loading", "Loading history…"),
+    ("popup.searching", "Searching…"),
+    ("popup.no_results", "No matches"),
+    ("popup.results", "{count} results"),
+    ("popup.result_page", "Page {page} of {pages}"),
+    ("popup.results_end", "End of results"),
+    ("popup.previous_page", "Previous page"),
     ("popup.history_error", "History is unavailable. Refresh to try again."),
     ("popup.history_preparing", "History is getting ready. Refresh to try again."),
     ("popup.file_search_incomplete", "File search may be incomplete; some files may need repair."),
@@ -172,6 +178,12 @@ const ENTRIES: &[(&str, &str)] = &[
 /// Every view string id shipped in v1.
 pub const IDS: &[&str] = &[
     "popup.search_hint",
+    "popup.searching",
+    "popup.no_results",
+    "popup.results",
+    "popup.result_page",
+    "popup.results_end",
+    "popup.previous_page",
     "popup.empty",
     "popup.loading",
     "popup.history_error",

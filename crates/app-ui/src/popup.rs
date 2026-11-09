@@ -162,6 +162,23 @@ pub struct CompactRow {
     pub preview: String,
     pub kind: CompactKind,
     pub thumbnail_hash: Option<String>,
+    /// Permanent group of a search result that is a permanent clip.
+    pub group: Option<String>,
+}
+
+impl CompactRow {
+    /// A search-result row for a permanent clip, shown by its name.
+    #[must_use]
+    pub fn from_permanent(clip: &clipmonger_core::model::PermanentClip) -> Self {
+        Self {
+            id: clip.id,
+            pinned: false,
+            preview: clip.name.clone(),
+            kind: CompactKind::Text,
+            thumbnail_hash: None,
+            group: Some(clip.group.clone()),
+        }
+    }
 }
 
 impl TryFrom<CompactHit> for CompactRow {
@@ -180,6 +197,7 @@ impl TryFrom<CompactHit> for CompactRow {
             preview: hit.preview,
             kind: hit.kind,
             thumbnail_hash: hit.thumbnail_hash,
+            group: None,
         })
     }
 }
@@ -196,6 +214,8 @@ pub struct PopupVm {
     pub selected: usize,
     clips: Vec<Clip>,
     compact_rows: Option<Vec<CompactRow>>,
+    /// Matches of a finished search across all its pages.
+    result_total: Option<usize>,
     current: Option<Clip>,
     offline: bool,
     target_valid: bool,
@@ -222,6 +242,7 @@ impl PopupVm {
             selected: 0,
             clips: Vec::new(),
             compact_rows: None,
+            result_total: None,
             current: Option::None,
             offline: false,
             target_valid: true,
@@ -248,6 +269,11 @@ impl PopupVm {
         self.selected = 0;
     }
 
+    /// Set the number of search matches shown on the status line.
+    pub fn set_result_total(&mut self, total: Option<usize>) {
+        self.result_total = total;
+    }
+
     /// The current compact page, if compact history is active.
     #[must_use]
     pub fn compact_rows(&self) -> Option<&[CompactRow]> {
@@ -260,6 +286,15 @@ impl PopupVm {
         } else {
             self.clip_at(self.selected).map(|clip| clip.id)
         }
+    }
+
+    /// Id of the selected row when it is a permanent clip in search results.
+    fn selected_permanent(&self) -> Option<Uuid> {
+        self.compact_rows
+            .as_ref()?
+            .get(self.selected)
+            .filter(|row| row.group.is_some())
+            .map(|row| row.id)
     }
 
     /// Set the current-clipboard slot shown above the list.
@@ -432,6 +467,8 @@ impl PopupVm {
     pub fn status_line(&self) -> String {
         if self.paused {
             strings::text("popup.paused").to_string()
+        } else if let Some(total) = self.result_total {
+            strings::text("popup.results").replace("{count}", &total.to_string())
         } else {
             strings::text("popup.count").replace(
                 "{count}",
@@ -517,17 +554,27 @@ impl PopupVm {
                 VmEffect::None
             }
             keymap::Action::Paste | keymap::Action::PasteInto => {
+                if let Some(id) = self.selected_permanent() {
+                    return VmEffect::ExecPermanent(id);
+                }
                 if !self.target_valid {
                     return VmEffect::None;
                 }
                 self.selected_id().map_or(VmEffect::None, VmEffect::Paste)
             }
             keymap::Action::Dismiss => VmEffect::Dismiss,
-            keymap::Action::Remove => self.selected_id().map_or(VmEffect::None, VmEffect::Remove),
-            keymap::Action::Pin => self.selected_id().map_or(VmEffect::None, VmEffect::Pin),
+            keymap::Action::Remove if self.selected_permanent().is_none() => {
+                self.selected_id().map_or(VmEffect::None, VmEffect::Remove)
+            }
+            keymap::Action::Pin if self.selected_permanent().is_none() => {
+                self.selected_id().map_or(VmEffect::None, VmEffect::Pin)
+            }
             keymap::Action::Refresh => VmEffect::Refresh,
             keymap::Action::GroupTab(n) => VmEffect::GroupTab(n),
-            keymap::Action::Edit | keymap::Action::None => VmEffect::None,
+            keymap::Action::Remove
+            | keymap::Action::Pin
+            | keymap::Action::Edit
+            | keymap::Action::None => VmEffect::None,
         }
     }
 }
@@ -546,6 +593,7 @@ mod compact_row_tests {
             preview: "short".into(),
             kind: CompactKind::Text,
             thumbnail_hash: None,
+            group: None,
         }]);
         assert_eq!(vm.visible(), vec![0]);
         assert_eq!(vm.on_action(keymap::Action::Paste), VmEffect::Paste(id));
@@ -554,6 +602,27 @@ mod compact_row_tests {
         assert!(vm.is_pinned(id));
         vm.remove_clip(id);
         assert_eq!(vm.visible(), [] as [usize; 0]);
+    }
+
+    #[test]
+    fn permanent_results_execute_and_cannot_be_pinned_or_deleted() {
+        let id = Uuid::from_u128(7);
+        let mut vm = PopupVm::new();
+        vm.query = "logo".into();
+        vm.set_compact_rows(vec![CompactRow {
+            id,
+            pinned: false,
+            preview: "Company logo".into(),
+            kind: CompactKind::Text,
+            thumbnail_hash: None,
+            group: Some("Brand".into()),
+        }]);
+        assert_eq!(
+            vm.on_action(keymap::Action::Paste),
+            VmEffect::ExecPermanent(id)
+        );
+        assert_eq!(vm.on_action(keymap::Action::Pin), VmEffect::None);
+        assert_eq!(vm.on_action(keymap::Action::Remove), VmEffect::None);
     }
 }
 

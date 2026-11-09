@@ -1,7 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { placePopup } from '../src/placement.js';
+import { placePopup, popupHeight } from '../src/placement.js';
 const area = { x: 0, y: 27, width: 1920, height: 1053 };
+test('cursor popup stops at the bottom of the work area', () => {
+    assert.equal(popupHeight('cursor', [400, 300], area, 1053), 780);
+    assert.equal(popupHeight('cursor', [400, 300], area, 200), 200);
+    assert.equal(popupHeight('center', [400, 300], area, 1000), 1000);
+});
+test('cursor popup near the bottom keeps a usable height', () => {
+    assert.equal(popupHeight('cursor', [400, 1000], area, 1053), 422);
+});
 test('cursor placement opens at the pointer', () => {
     assert.deepEqual(placePopup('cursor', [400, 300], area, [480, 360]), [400, 300]);
 });

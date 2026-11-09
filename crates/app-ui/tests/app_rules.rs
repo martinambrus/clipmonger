@@ -3478,9 +3478,10 @@ fn rule_open_popup_grows_when_clips_arrive_and_stays_in_the_work_area() {
     rig.push(history(&clips));
     rig.tick();
     let grown = rig.show();
-    assert_eq!(grown.sizes(), vec![egui::vec2(width, 972.0)]);
-    // The bottom edge stays at the work area's bottom (-200 + 1080).
-    assert_eq!(grown.positions(), vec![egui::pos2(-1700.0, -92.0)]);
+    // The top stays at the cursor; the bottom edge reaches the work area's
+    // bottom (-200 + 1080).
+    assert_eq!(grown.sizes(), vec![egui::vec2(width, 780.0)]);
+    assert_eq!(grown.positions(), vec![egui::pos2(-1700.0, 100.0)]);
     assert_none(&rig.show().commands, "idle commands");
 }
 
@@ -5248,19 +5249,21 @@ fn active_list_permanent_navigation_and_history_actions_are_isolated() {
 
 fn filtered_permanent_pick(mouse: bool) {
     let mut rig = active_list_rig(true, 2);
-    rig.app.vm_mut().query = "row 2".into();
-    rig.app.vm_mut().selected = 1;
+    rig.input(egui::Event::Text("row 2".into()));
+    rig.show();
+    let commands = rig.cmds();
+    rig.answer_compact(&commands, &[]);
     rig.show();
     rig.show();
+    assert_eq!(rig.app.vm().selected, 0);
     if mouse {
-        click_popup_widget(&mut rig, "Permanent row 2");
+        click_popup_widget(&mut rig, "[Work] Permanent row 2");
     } else {
         rig.key(egui::Key::Enter);
         rig.show();
     }
     finish_popup_pick(&mut rig);
     assert_eq!(rig.cmds(), vec![UiCmd::ExecPermanent(id(1002))]);
-    assert_eq!(rig.app.vm().selected, 1);
 }
 
 #[test]
@@ -5430,10 +5433,15 @@ fn active_list_search_editing_and_focused_widget_activation_stay_separate() {
     assert_eq!(rig.app.vm().query, "row 2");
     assert_eq!(
         rig.app.vm().selected,
-        2,
-        "searching permanents leaves hidden history alone"
+        0,
+        "a search starts at its first result"
     );
-    assert_eq!(rig.app.config().lock().expect("config").perm_vm.selected, 0);
+    assert_eq!(
+        rig.app.config().lock().expect("config").perm_vm.selected,
+        2,
+        "a search leaves the hidden tab's selection alone"
+    );
+    let _ = rig.cmds();
     rig.key(egui::Key::Delete);
     rig.show();
     assert!(
@@ -5495,11 +5503,20 @@ fn active_list_source_switch_and_replaced_pending_rows_settle() {
 #[test]
 fn active_list_return_to_history_clamps_only_when_displayed() {
     let mut rig = active_list_rig(true, 3);
-    rig.app.vm_mut().selected = 2;
-    rig.input(egui::Event::Text("row 1".into()));
+    rig.input(egui::Event::Text("1".into()));
+    rig.show();
+    let commands = rig.cmds();
+    rig.answer_compact(&commands, &[]);
+    rig.show();
+    popup_widget(&mut rig, "[Work] Permanent row 1");
+    assert!(
+        !rig.show().painted(strings::text("perm.tab_history")),
+        "the results view replaces the tabs"
+    );
+    rig.key(egui::Key::Backspace);
     rig.show();
     rig.show();
-    assert_eq!(rig.app.vm().selected, 2);
+    popup_widget(&mut rig, "Permanent row 2");
     click_popup_widget(&mut rig, strings::text("perm.tab_history"));
     let commands = rig.cmds();
     rig.answer_compact(&commands, &[clip(1, "History row 1")]);
@@ -5523,35 +5540,25 @@ fn active_list_return_to_history_clamps_only_when_displayed() {
 
 fn query_edit_then_navigation_pick(permanent: bool) {
     let mut rig = active_list_rig(permanent, 3);
-    if permanent {
-        rig.app.vm_mut().selected = 2;
-    }
-    rig.input(egui::Event::Text("row".into()));
-    if permanent {
-        rig.key(egui::Key::ArrowDown);
-    }
+    let query = if permanent { "permanent" } else { "history" };
+    rig.input(egui::Event::Text(query.into()));
     rig.show();
-    if !permanent {
-        let commands = rig.cmds();
-        rig.answer_compact(
-            &commands,
-            &[
-                clip(1, "History row 1"),
-                clip(2, "History row 2"),
-                clip(3, "History row 3"),
-            ],
-        );
-        rig.show();
-        rig.key(egui::Key::ArrowDown);
-        rig.show();
-    }
-    assert_eq!(rig.app.vm().query, "row");
-    if permanent {
-        assert_eq!(rig.app.config().lock().expect("config").perm_vm.selected, 1);
-        assert_eq!(rig.app.vm().selected, 2);
+    let commands = rig.cmds();
+    let history = if permanent {
+        Vec::new()
     } else {
-        assert_eq!(rig.app.vm().selected, 1);
-    }
+        vec![
+            clip(1, "History row 1"),
+            clip(2, "History row 2"),
+            clip(3, "History row 3"),
+        ]
+    };
+    rig.answer_compact(&commands, &history);
+    rig.show();
+    rig.key(egui::Key::ArrowDown);
+    rig.show();
+    assert_eq!(rig.app.vm().query, query);
+    assert_eq!(rig.app.vm().selected, 1);
     // Enter is in the following frame, after the query was already reconciled.
     rig.key(egui::Key::Enter);
     rig.show();

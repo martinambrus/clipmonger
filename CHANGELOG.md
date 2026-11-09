@@ -3,6 +3,19 @@
 All notable changes to Clipmonger. Semver per seg-12 §6; `1.0.0` is
 reserved for the release that passes all seg-11 §5 gates.
 
+## [Unreleased]
+
+### Changed
+
+- Popup search now searches the whole history and every permanent clip and
+  shows its own paginated results view, with the total match count.
+
+### Fixed
+
+- Wayland: the popup grows to fit its clips reliably. At the pointer it
+  reaches the bottom of the screen; the GNOME extension must be reloaded
+  (log out and back in) for this.
+
 ## [0.3.0] — 2026-11-08
 
 macOS release: one universal app for Intel and Apple Silicon Macs on macOS

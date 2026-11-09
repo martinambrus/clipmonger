@@ -4,7 +4,7 @@
 import GLib from 'gi://GLib?version=2.0';
 import Meta from 'gi://Meta';
 import { POPUP_TITLE } from './config.js';
-import { placePopup } from './placement.js';
+import { placePopup, popupHeight } from './placement.js';
 import { isWaylandSession } from './session.js';
 /** How long after the first placement Mutter's own moves are undone. */
 const SETTLE_MS = 1500;
@@ -20,12 +20,14 @@ export class PopupPlacer {
     /** Mutter places a new window after it is shown and the UI then sizes
      * the popup to its clips, so the position is re-applied whenever the
      * window moves or resizes during SETTLE_MS; afterwards the user may drag
-     * it. The pointer is read once, at the first attempt. Other windows stop
+     * it, and growth for a taller page only stops at the bottom of the work
+     * area. The pointer is read once, at the first attempt. Other windows stop
      * being watched as soon as their title is known. */
     watch(win) {
         let pointer = null;
         let settle = null;
         let activated = false;
+        let settled = false;
         const ids = [];
         let actor = null;
         // Once the window is unmanaged its actor is already disposed: touching
@@ -64,8 +66,10 @@ export class PopupPlacer {
                 }
                 catch { /* best effort */ }
             }
+            if (settled)
+                return;
             if (this.place(win, pointer) && settle === null) {
-                settle = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SETTLE_MS, () => { settle = null; done(); return GLib.SOURCE_REMOVE; });
+                settle = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SETTLE_MS, () => { settle = null; settled = true; return GLib.SOURCE_REMOVE; });
             }
         };
         actor = win?.get_compositor_private?.() ?? null;
@@ -79,10 +83,27 @@ export class PopupPlacer {
             }
         }
         try {
+            ids.push([win, win.connect('size-changed', () => { if (settled)
+                    this.trim(win); })]);
+        }
+        catch { /* signal absent */ }
+        try {
             ids.push([win, win.connect('unmanaged', () => done(true))]);
         }
         catch { /* signal absent */ }
         attempt();
+    }
+    /** Keep a settled popup that grew from running past the work area. */
+    trim(win) {
+        try {
+            const frame = win.get_frame_rect();
+            const area = win.get_work_area_for_monitor(globalThis.global.display.get_current_monitor());
+            const bounds = { x: area.x, y: area.y, width: area.width, height: area.height };
+            const height = popupHeight('cursor', [frame.x, frame.y], bounds, frame.height);
+            if (height !== frame.height)
+                win.move_resize_frame(false, frame.x, frame.y, frame.width, height);
+        }
+        catch { /* best effort */ }
     }
     /** Move the popup into place; false until its size is known. */
     place(win, pointer) {
@@ -91,8 +112,12 @@ export class PopupPlacer {
             if (!(frame.width > 0 && frame.height > 0))
                 return false;
             const area = win.get_work_area_for_monitor(globalThis.global.display.get_current_monitor());
-            const [x, y] = placePopup(this.placement, pointer, { x: area.x, y: area.y, width: area.width, height: area.height }, [frame.width, frame.height]);
-            if (frame.x !== x || frame.y !== y)
+            const bounds = { x: area.x, y: area.y, width: area.width, height: area.height };
+            const height = popupHeight(this.placement, pointer, bounds, frame.height);
+            const [x, y] = placePopup(this.placement, pointer, bounds, [frame.width, height]);
+            if (height !== frame.height)
+                win.move_resize_frame(false, x, y, frame.width, height);
+            else if (frame.x !== x || frame.y !== y)
                 win.move_frame(true, x, y);
             return true;
         }

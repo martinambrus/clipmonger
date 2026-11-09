@@ -219,10 +219,10 @@ impl PopupApp {
                 shift,
                 super_key,
             };
-            let permanent = self.config.lock().is_ok_and(|c| c.perm_source.is_some());
+            let permanent = self.permanent_view();
             if name == "Backspace" && !ctrl && !alt && !super_key {
                 self.vm.query.pop();
-                self.reconcile_query(permanent);
+                self.reconcile_query();
                 self.request_reveal(ctx);
                 continue;
             }
@@ -247,7 +247,7 @@ impl PopupApp {
             };
             self.apply_effect(effect);
             if query_changed {
-                self.reconcile_query(permanent);
+                self.reconcile_query();
             }
             if navigation || query_changed || matches!(action, keymap::Action::GroupTab(_)) {
                 self.request_reveal(ctx);
@@ -255,8 +255,8 @@ impl PopupApp {
         }
     }
 
-    fn reconcile_query(&mut self, permanent: bool) {
-        if permanent {
+    fn reconcile_query(&mut self) {
+        if self.permanent_view() {
             if let Ok(mut config) = self.config.lock() {
                 config.perm_vm.selected = 0;
             }
@@ -354,6 +354,7 @@ impl PopupApp {
         let mut delete_row: Option<usize> = Option::None;
         let mut search_focused = false;
         let mut first_page = false;
+        let mut previous_page = false;
         let mut next_page = false;
         let mut thumbnail_demand = Vec::new();
         // List content height minus the height the list may use.
@@ -362,8 +363,9 @@ impl PopupApp {
             thumbs.begin_frame();
         }
         if let Ok(mut config) = self.config.lock() {
+            let permanent_view = config.perm_source.is_some() && query.is_empty();
             if config.perm_source.is_some() {
-                if !self.shell.desired().settings_open {
+                if permanent_view && !self.shell.desired().settings_open {
                     if query != self.last_query {
                         config.perm_vm.selected = 0;
                     }
@@ -371,7 +373,8 @@ impl PopupApp {
                 }
                 config.perm_source = (!config.perm_vm.group_names().is_empty())
                     .then_some(config.perm_vm.active_group);
-            } else {
+            }
+            if !permanent_view {
                 self.vm.clamp_selection();
             }
         }
@@ -425,7 +428,8 @@ impl PopupApp {
                 .map(|config| config.perm_vm.group_names())
                 .unwrap_or_default();
             let perm_source = self.config.lock().map_or(None, |config| config.perm_source);
-            if !group_names.is_empty() {
+            // A search shows its own results view over every source.
+            if !group_names.is_empty() && query.is_empty() {
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .selectable_label(perm_source.is_none(), strings::text("perm.tab_history"))
@@ -443,7 +447,7 @@ impl PopupApp {
                     }
                 });
             }
-            if perm_source.is_some() && !group_names.is_empty() {
+            if perm_source.is_some() && !group_names.is_empty() && query.is_empty() {
                 let rows: Vec<(usize, String, bool, uuid::Uuid)> = self
                     .config
                     .lock()
@@ -497,11 +501,17 @@ impl PopupApp {
                 list_overflow = Some(permanents_area.content_size.y - list_height);
             } else {
                 let count = self.vm.visible().len();
+                let searching = self.compact.searching();
+                let (result_page, result_pages) = self.compact.result_page();
                 if self.compact.uri_search_incomplete {
                     ui.label(strings::text("popup.file_search_incomplete"));
                 }
                 if self.compact.loading {
-                    ui.label(strings::text("popup.loading"));
+                    ui.label(strings::text(if searching {
+                        "popup.searching"
+                    } else {
+                        "popup.loading"
+                    }));
                 } else if self.compact.error {
                     let message = match self.compact.error_code.as_deref() {
                         Some("not_ready") => "popup.history_preparing",
@@ -510,22 +520,50 @@ impl PopupApp {
                     };
                     ui.label(strings::text(message));
                 } else if count == 0 {
-                    ui.label(strings::text("popup.empty"));
+                    ui.label(strings::text(if searching {
+                        "popup.no_results"
+                    } else {
+                        "popup.empty"
+                    }));
                 }
-                let history_end = self.compact.done && count > 0;
+                let last_result_page = result_page >= result_pages;
+                let history_end =
+                    self.compact.done && count > 0 && (!searching || last_result_page);
                 ui.horizontal(|ui| {
-                    first_page = ui
-                        .add_enabled(
-                            !self.compact.on_first_page(),
-                            egui::Button::new(strings::text("popup.first_page")),
-                        )
-                        .clicked();
-                    next_page = ui
-                        .add_enabled(
-                            !self.compact.loading && !self.compact.done && !self.compact.error,
-                            egui::Button::new(strings::text("popup.next_page")),
-                        )
-                        .clicked();
+                    if searching {
+                        previous_page = ui
+                            .add_enabled(
+                                result_page > 1,
+                                egui::Button::new(strings::text("popup.previous_page")),
+                            )
+                            .clicked();
+                        next_page = ui
+                            .add_enabled(
+                                self.compact.done && !last_result_page,
+                                egui::Button::new(strings::text("popup.next_page")),
+                            )
+                            .clicked();
+                        if self.compact.done && count > 0 {
+                            ui.label(
+                                strings::text("popup.result_page")
+                                    .replace("{page}", &result_page.to_string())
+                                    .replace("{pages}", &result_pages.to_string()),
+                            );
+                        }
+                    } else {
+                        first_page = ui
+                            .add_enabled(
+                                !self.compact.on_first_page(),
+                                egui::Button::new(strings::text("popup.first_page")),
+                            )
+                            .clicked();
+                        next_page = ui
+                            .add_enabled(
+                                !self.compact.loading && !self.compact.done && !self.compact.error,
+                                egui::Button::new(strings::text("popup.next_page")),
+                            )
+                            .clicked();
+                    }
                 });
                 #[cfg(test)]
                 let mut history_clip = None;
@@ -547,9 +585,17 @@ impl PopupApp {
                                 .and_then(|rows| rows.get(row))
                                 .cloned();
                             let legacy = self.vm.clip_at(row).cloned();
+                            let permanent_result =
+                                compact.as_ref().is_some_and(|r| r.group.is_some());
                             let Some((clip_id, pinned, preview)) = compact
                                 .as_ref()
-                                .map(|row| (row.id, row.pinned, row.preview.clone()))
+                                .map(|row| {
+                                    let preview = row.group.as_ref().map_or_else(
+                                        || row.preview.clone(),
+                                        |group| format!("[{group}] {}", row.preview),
+                                    );
+                                    (row.id, row.pinned, preview)
+                                })
                                 .or_else(|| {
                                     legacy
                                         .as_ref()
@@ -598,6 +644,9 @@ impl PopupApp {
                             if response.clicked() {
                                 clicked_row = Some(row);
                             }
+                            if permanent_result {
+                                continue;
+                            }
                             response.container_context_menu(|ui| {
                                 let pin_label = if pinned {
                                     strings::text("popup.unpin")
@@ -616,7 +665,11 @@ impl PopupApp {
                             });
                         }
                         if history_end {
-                            ui.weak(strings::text("popup.history_end"));
+                            ui.weak(strings::text(if searching {
+                                "popup.results_end"
+                            } else {
+                                "popup.history_end"
+                            }));
                         }
                     });
                 list_overflow = Some(history_area.content_size.y - list_height);
@@ -642,8 +695,11 @@ impl PopupApp {
         if let Some(thumbs) = &mut self.thumbnails {
             thumbs.update(ui.ctx(), thumbnail_demand);
         }
-        // A filtered list says nothing about the size the clips need.
-        if let (Some(overflow), true) = (list_overflow, query.is_empty()) {
+        // Search results and a list still loading say nothing about the size
+        // the clips need.
+        if let (Some(overflow), true, false) =
+            (list_overflow, query.is_empty(), self.compact.loading)
+        {
             let font = egui::TextStyle::Body.resolve(ui.style());
             let glyph = ui.fonts_mut(|fonts| fonts.glyph_width(&font, 'n'));
             #[allow(clippy::cast_precision_loss)]
@@ -655,7 +711,23 @@ impl PopupApp {
         if first_page {
             self.reset_compact(false);
         }
-        if next_page {
+        if self.compact.searching() {
+            let page = self.compact.page_index();
+            let target = if next_page {
+                page.checked_add(1)
+            } else if previous_page {
+                page.checked_sub(1)
+            } else {
+                None
+            };
+            if let Some(rows) = target.and_then(|page| self.compact.turn_results(page)) {
+                if let Some(thumbs) = &mut self.thumbnails {
+                    thumbs.revoke_visibility();
+                }
+                self.vm.set_compact_rows(rows);
+                self.request_reveal(ui.ctx());
+            }
+        } else if next_page {
             self.compact.next_page();
             if let Some(thumbs) = &mut self.thumbnails {
                 thumbs.revoke_visibility();
@@ -670,8 +742,7 @@ impl PopupApp {
         }
         if query != self.vm.query {
             self.vm.query.clone_from(&query);
-            let permanent = self.config.lock().is_ok_and(|c| c.perm_source.is_some());
-            self.reconcile_query(permanent);
+            self.reconcile_query();
             self.request_reveal(ui.ctx());
         }
         if let Some(tab) = perm_tab_click {

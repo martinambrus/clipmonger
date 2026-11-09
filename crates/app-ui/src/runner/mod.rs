@@ -880,6 +880,7 @@ impl<A: App> Runner<A> {
                 .collect();
             if !allowed.is_empty() {
                 if let Some(host) = slot.host.as_mut() {
+                    release_size_hints(host, &allowed);
                     egui_winit::process_viewport_commands(
                         &ctx,
                         &mut host.info,
@@ -1144,6 +1145,25 @@ impl<A: App> Runner<A> {
             event_loop.primary_monitor().as_ref().map(work_rect),
             !self.per_show,
         ))
+    }
+}
+
+/// A non-resizable Wayland window carries equal minimum and maximum size
+/// hints, which keep the compositor from following a resize; winit's
+/// `set_resizable` restores those same values, so they are cleared by hand.
+/// Tiling compositors have already floated the window when it was mapped as
+/// fixed-size.
+fn release_size_hints(host: &Host, commands: &[egui::ViewportCommand]) {
+    if host.frame_throttle
+        && commands
+            .iter()
+            .any(|command| matches!(command, egui::ViewportCommand::InnerSize(_)))
+    {
+        host.window.set_resizable(true);
+        host.window
+            .set_min_inner_size(None::<winit::dpi::PhysicalSize<u32>>);
+        host.window
+            .set_max_inner_size(None::<winit::dpi::PhysicalSize<u32>>);
     }
 }
 

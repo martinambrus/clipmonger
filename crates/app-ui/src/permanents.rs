@@ -124,6 +124,28 @@ impl PermanentsVm {
             .collect()
     }
 
+    /// Permanents of every user-visible group matching `query` over name and
+    /// body (case-insensitive), in store order. System rows stay hidden.
+    #[must_use]
+    pub fn search(&self, query: &str) -> Vec<&PermanentClip> {
+        let q = query.to_lowercase();
+        let hidden: Vec<&str> = self
+            .groups
+            .iter()
+            .filter(|g| g.system)
+            .map(|g| g.name.as_str())
+            .collect();
+        self.permanents
+            .iter()
+            .filter(|clip| {
+                clip.kind != PermanentKind::System
+                    && !hidden.contains(&clip.group.as_str())
+                    && (clip.name.to_lowercase().contains(&q)
+                        || clip.body.to_lowercase().contains(&q))
+            })
+            .collect()
+    }
+
     /// Switch the active group, clamping and resetting selection.
     pub fn select_group(&mut self, n: usize) {
         let len = self.visible_groups().len();

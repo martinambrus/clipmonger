@@ -225,6 +225,29 @@ pub fn popup_size(wanted: (f32, f32), scale: f32, work: Rect) -> (i32, i32) {
     (w.round() as i32, h.round() as i32)
 }
 
+/// Height share of the work area a popup opened near the bottom edge keeps;
+/// it moves up to fit instead of shrinking to a sliver.
+const CURSOR_MIN_HEIGHT_SHARE: f32 = 0.4;
+
+/// [`popup_size`] for a popup whose top edge sits at `top`: it may reach the
+/// work area's bottom edge, and no further unless that leaves less than
+/// [`CURSOR_MIN_HEIGHT_SHARE`] of the work area.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "physical popup dimensions are small and rounded to whole pixels"
+)]
+#[must_use]
+pub fn popup_size_from_top(wanted: (f32, f32), scale: f32, work: Rect, top: i32) -> (i32, i32) {
+    let (width, _) = popup_size(wanted, scale, work);
+    let room = work.y.saturating_add(work.h).saturating_sub(top) as f32;
+    let height = (wanted.1 * scale)
+        .min(room.max(work.h as f32 * CURSOR_MIN_HEIGHT_SHARE))
+        .min(work.h as f32)
+        .max(POPUP_MIN.1 * scale);
+    (width, height.round() as i32)
+}
+
 /// Compute placement from full desktop context, honoring cursor/center rules and fallbacks.
 #[must_use]
 pub fn place_with_context(mode: Placement, ctx: &DesktopContext) -> Option<(i32, i32)> {
@@ -394,6 +417,22 @@ mod placement_context_tests {
         assert_eq!(popup_size((500.0, 300.0), 1.0, work), (500, 300));
         assert_eq!(popup_size((900.0, 2000.0), 1.0, work), (576, 936));
         assert_eq!(popup_size((500.0, 300.0), 1.5, work), (576, 450));
+    }
+    #[test]
+    fn popup_size_from_top_reaches_the_bottom_edge() {
+        let work = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1040,
+        };
+        let wanted = (500.0, 2000.0);
+        assert_eq!(popup_size_from_top(wanted, 1.0, work, 0).1, 1040);
+        assert_eq!(popup_size_from_top(wanted, 1.0, work, 300).1, 740);
+        // Short content keeps its own height.
+        assert_eq!(popup_size_from_top((500.0, 200.0), 1.0, work, 300).1, 200);
+        // Near the bottom edge the popup keeps a usable height.
+        assert_eq!(popup_size_from_top(wanted, 1.0, work, 1000).1, 416);
     }
     #[test]
     fn popup_size_keeps_minimum_on_small_work_area() {
