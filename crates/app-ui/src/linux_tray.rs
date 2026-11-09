@@ -3,10 +3,7 @@
 #[cfg(target_os = "linux")]
 use super::push::Wake;
 use super::strings;
-use super::tray_logic::{menu_entries, MenuEntry, TrayAction, TrayInputs};
-
-/// Icon edge in pixels.
-const ICON_EDGE: i32 = 16;
+use super::tray_logic::{icon_sizes, icon_state, menu_entries, MenuEntry, TrayAction, TrayInputs};
 
 /// One clickable Linux tray menu item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,27 +54,22 @@ pub fn action_for_id(id: &str) -> TrayAction {
     }
 }
 
-/// Tint for the 16x16 tray icon for the current inputs.
+/// The tray icon for `inputs` at every size, as `(edge, ARGB32 bytes)`, so the
+/// panel can pick the one that fits.
 #[must_use]
-pub fn state_tint(inputs: &TrayInputs) -> (u8, u8, u8) {
-    if !inputs.attached || inputs.degraded {
-        (0xcc, 0x66, 0x22)
-    } else if inputs.paused {
-        (0x99, 0x99, 0x99)
-    } else {
-        (0x33, 0x99, 0xcc)
-    }
-}
-
-/// ARGB32 pixmap bytes for the 16x16 tray icon tinted by inputs state.
-#[must_use]
-pub fn icon_argb(inputs: &TrayInputs) -> Vec<u8> {
-    let (red, green, blue) = state_tint(inputs);
-    let mut out = Vec::with_capacity(ICON_EDGE as usize * ICON_EDGE as usize * 4);
-    for _ in 0..ICON_EDGE * ICON_EDGE {
-        out.extend_from_slice(&[0xff, red, green, blue]);
-    }
-    out
+pub fn icon_pixmaps(inputs: &TrayInputs) -> Vec<(i32, Vec<u8>)> {
+    icon_sizes(icon_state(inputs))
+        .iter()
+        .map(|(edge, rgba)| {
+            let argb = rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|[red, green, blue, alpha]| [*alpha, *red, *green, *blue])
+                .collect();
+            (i32::try_from(*edge).unwrap_or(i32::MAX), argb)
+        })
+        .collect()
 }
 
 /// ksni tray carrying a snapshot of the inputs at creation.
@@ -120,11 +112,19 @@ impl ksni::Tray for KsniTray {
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        vec![ksni::Icon {
-            width: ICON_EDGE,
-            height: ICON_EDGE,
-            data: icon_argb(&self.inputs),
-        }]
+        icon_pixmaps(&self.inputs)
+            .into_iter()
+            .map(|(edge, data)| ksni::Icon {
+                width: edge,
+                height: edge,
+                data,
+            })
+            .collect()
+    }
+
+    /// Panels that honour `NeedsAttention` draw this one instead.
+    fn attention_icon_pixmap(&self) -> Vec<ksni::Icon> {
+        self.icon_pixmap()
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {

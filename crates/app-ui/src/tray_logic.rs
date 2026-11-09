@@ -17,6 +17,68 @@ pub enum TrayUiState {
     Attention,
 }
 
+/// The icon of one state at every generated size, as `(edge, straight RGBA)`
+/// (`scripts/make-icons.py`), smallest first.
+macro_rules! tray_icon_sizes {
+    ($state:literal) => {
+        [
+            tray_icon_sizes!(@one $state, 16, "16"),
+            tray_icon_sizes!(@one $state, 20, "20"),
+            tray_icon_sizes!(@one $state, 22, "22"),
+            tray_icon_sizes!(@one $state, 24, "24"),
+            tray_icon_sizes!(@one $state, 32, "32"),
+            tray_icon_sizes!(@one $state, 48, "48"),
+        ]
+    };
+    (@one $state:literal, $edge:literal, $name:literal) => {
+        (
+            $edge,
+            include_bytes!(concat!("../../../assets/icons/tray/", $state, "-", $name, ".rgba")).as_slice(),
+        )
+    };
+}
+
+/// Square RGBA tray images of one state as `(edge, bytes)`.
+pub type TrayIconSizes = [(u32, &'static [u8]); 6];
+
+const NORMAL_ICONS: TrayIconSizes = tray_icon_sizes!("normal");
+const PAUSED_ICONS: TrayIconSizes = tray_icon_sizes!("paused");
+const DEGRADED_ICONS: TrayIconSizes = tray_icon_sizes!("degraded");
+
+/// The state the tray icon shows for `inputs`: a problem wins over paused.
+#[must_use]
+pub fn icon_state(inputs: &TrayInputs) -> TrayUiState {
+    if !inputs.attached || inputs.degraded {
+        TrayUiState::Attention
+    } else if inputs.paused {
+        TrayUiState::Paused
+    } else {
+        TrayUiState::Normal
+    }
+}
+
+/// Every generated size of the tray icon for `state`.
+#[must_use]
+pub fn icon_sizes(state: TrayUiState) -> &'static TrayIconSizes {
+    match state {
+        TrayUiState::Normal => &NORMAL_ICONS,
+        TrayUiState::Paused => &PAUSED_ICONS,
+        TrayUiState::Attention => &DEGRADED_ICONS,
+    }
+}
+
+/// The smallest tray image of `state` at least `wanted` pixels wide, or the
+/// largest one, as `(edge, straight RGBA)`.
+#[must_use]
+pub fn icon_rgba(state: TrayUiState, wanted: u32) -> (u32, &'static [u8]) {
+    let sizes = icon_sizes(state);
+    sizes
+        .iter()
+        .find(|(edge, _)| *edge >= wanted)
+        .copied()
+        .unwrap_or(sizes[sizes.len() - 1])
+}
+
 /// Action the shell must run for one tray event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayAction {

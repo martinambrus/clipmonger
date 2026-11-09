@@ -10,6 +10,16 @@ pub const POPUP_CLASS: &str = "ClipmongerPopup";
 /// Windows class name of the settings window.
 pub const SETTINGS_CLASS: &str = "ClipmongerSettings";
 
+/// The window icon X11 window managers show (`scripts/make-icons.py`). Windows
+/// loads the `.exe` icon in [`attributes`]; Wayland and macOS go by the app.
+fn window_icon() -> std::sync::Arc<egui::IconData> {
+    std::sync::Arc::new(egui::IconData {
+        rgba: include_bytes!("../../../../assets/icons/window-64.rgba").to_vec(),
+        width: 64,
+        height: 64,
+    })
+}
+
 /// Viewport builder of the popup, sizes in points. Undecorated, always on top,
 /// without taskbar entry, not resizable, active, created hidden, X11 window
 /// type normal (Mutter refuses focus to a parentless utility window), app id
@@ -19,6 +29,7 @@ pub fn popup_builder(title: &str, size: [f32; 2], position: Option<[f32; 2]>) ->
     let mut builder = ViewportBuilder::default()
         .with_title(title)
         .with_app_id(clipmonger_core::DESKTOP_APP_ID)
+        .with_icon(window_icon())
         .with_inner_size(size)
         .with_decorations(false)
         .with_window_level(egui::WindowLevel::AlwaysOnTop)
@@ -40,6 +51,7 @@ pub fn settings_builder(title: &str, size: [f32; 2]) -> ViewportBuilder {
     ViewportBuilder::default()
         .with_title(title)
         .with_app_id(clipmonger_core::DESKTOP_APP_ID)
+        .with_icon(window_icon())
         .with_inner_size(size)
         .with_decorations(true)
         .with_resizable(true)
@@ -50,15 +62,30 @@ pub fn settings_builder(title: &str, size: [f32; 2]) -> ViewportBuilder {
 
 /// Winit window attributes for `builder`, made by
 /// `egui_winit::create_winit_window_attributes(ctx, builder)`; on Windows the
-/// window class is then set to `class` (`WindowAttributesExtWindows::with_class_name`).
-/// `class` is unused on other platforms. Nothing else is changed.
+/// window class is then set to `class` (`WindowAttributesExtWindows::with_class_name`)
+/// and the title bar and taskbar icons come from the `.exe` at the sizes Windows
+/// asks for. `class` is unused on other platforms. Nothing else is changed.
 #[must_use]
 pub fn attributes(ctx: &Context, builder: ViewportBuilder, class: &str) -> WindowAttributes {
     let attrs = egui_winit::create_winit_window_attributes(ctx, builder);
     #[cfg(target_os = "windows")]
     {
-        use winit::platform::windows::WindowAttributesExtWindows as _;
-        attrs.with_class_name(class)
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXICON, SM_CXSMICON, SYSTEM_METRICS_INDEX,
+        };
+        use winit::dpi::PhysicalSize;
+        use winit::platform::windows::{IconExtWindows as _, WindowAttributesExtWindows as _};
+        use winit::window::Icon;
+        let exe_icon = |metric: SYSTEM_METRICS_INDEX| {
+            // SAFETY: GetSystemMetrics only reads a system value.
+            #[allow(unsafe_code)]
+            let edge = u32::try_from(unsafe { GetSystemMetrics(metric) }).ok()?;
+            Icon::from_resource(1, Some(PhysicalSize::new(edge, edge))).ok()
+        };
+        attrs
+            .with_class_name(class)
+            .with_window_icon(exe_icon(SM_CXSMICON))
+            .with_taskbar_icon(exe_icon(SM_CXICON))
     }
     #[cfg(not(target_os = "windows"))]
     {

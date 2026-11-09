@@ -19,6 +19,7 @@ PREFIX=${CLIPMONGER_PREFIX:-$HOME/.local}
 APP_DIR=$PREFIX/opt/clipmonger
 BIN_DIR=$PREFIX/bin
 APPS_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/applications
+ICONS_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor
 EXT_UUID=clipmonger@extensions.clipmonger.dev
 EXT_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$EXT_UUID
 APP_ID=com.martinambrus.clipmonger
@@ -43,6 +44,7 @@ uninstall() {
     rm -f "$BIN_DIR/clipmonger" "$BIN_DIR/clipmonger-cli"
     rm -f "$APPS_DIR/$APP_ID.desktop" "$APPS_DIR/$APP_ID.daemon.desktop"
     rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$APP_ID.desktop"
+    find "$ICONS_DIR" -type f -name "$APP_ID.png" -delete 2>/dev/null || true
     say "Clipmonger removed. Your history is still in ~/.local/share/clipmonger (delete it to remove everything)."
 }
 
@@ -100,6 +102,8 @@ install_files() {
     cp "$SRC/install.sh" "$APP_DIR/install.sh" 2>/dev/null || true
     ln -sf "$APP_DIR/clipmonger" "$BIN_DIR/clipmonger"
     ln -sf "$APP_DIR/clipmonger-cli" "$BIN_DIR/clipmonger-cli"
+    mkdir -p "$ICONS_DIR"
+    cp -R "$SRC/icons/hicolor/." "$ICONS_DIR/"
     # The same entries the daemon writes itself (marked as generated, so it
     # keeps them pointing at this folder).
     cat > "$APPS_DIR/$APP_ID.desktop" <<EOF
@@ -108,7 +112,7 @@ Type=Application
 Name=Clipmonger
 Comment=Clipboard history
 Exec=$APP_DIR/clipmonger
-Icon=edit-paste
+Icon=$APP_ID
 Terminal=false
 Categories=Utility;
 StartupWMClass=$APP_ID

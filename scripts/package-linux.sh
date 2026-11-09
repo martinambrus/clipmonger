@@ -42,6 +42,8 @@ mkdir -p "$STAGE/opt/clipmonger" "$STAGE/usr/share/applications" \
 install -m 755 "$BINS/clipmonger" "$BINS/clipmonger-daemon" "$BINS/clipmonger-cli" "$STAGE/opt/clipmonger/"
 install -m 644 "$ROOT/packaging/linux/com.martinambrus.clipmonger.desktop" \
     "$ROOT/packaging/linux/com.martinambrus.clipmonger.daemon.desktop" "$STAGE/usr/share/applications/"
+mkdir -p "$STAGE/usr/share/icons"
+cp -R "$ROOT/packaging/linux/icons/hicolor" "$STAGE/usr/share/icons/"
 cp -R "$WORK/ext/." "$STAGE/usr/share/gnome-shell/extensions/$EXT_UUID/"
 cp -R "$WORK/licenses/." "$STAGE/usr/share/doc/clipmonger/"
 cat > "$STAGE/usr/share/doc/clipmonger/README" <<EOF
@@ -80,6 +82,9 @@ contents:
     type: tree
   - src: /stage/usr/share/applications
     dst: /usr/share/applications
+    type: tree
+  - src: /stage/usr/share/icons/hicolor
+    dst: /usr/share/icons/hicolor
     type: tree
   - src: /stage/usr/share/gnome-shell/extensions/$EXT_UUID
     dst: /usr/share/gnome-shell/extensions/$EXT_UUID
@@ -126,6 +131,7 @@ mkdir -p "$TAR_DIR"
 install -m 755 "$BINS/clipmonger" "$BINS/clipmonger-daemon" "$BINS/clipmonger-cli" "$ROOT/packaging/linux/install.sh" "$TAR_DIR/"
 cp -R "$WORK/licenses" "$TAR_DIR/licenses"
 cp -R "$WORK/ext" "$TAR_DIR/gnome-extension"
+cp -R "$ROOT/packaging/linux/icons" "$TAR_DIR/icons"
 cat > "$TAR_DIR/README.txt" <<EOF
 Clipmonger $VERSION for x86_64 Linux (glibc 2.35 or newer).
 

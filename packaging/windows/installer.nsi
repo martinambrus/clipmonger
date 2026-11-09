@@ -20,6 +20,8 @@ InstallDir "$PROGRAMFILES64\Clipmonger"
 RequestExecutionLevel admin
 ShowInstDetails show
 ShowUninstDetails show
+!define MUI_ICON "clipmonger.ico"
+!define MUI_UNICON "clipmonger.ico"
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_INSTFILES
@@ -183,12 +185,16 @@ Section "Install"
   !insertmacro CheckInstall
   CreateDirectory "$SMPROGRAMS\Clipmonger"
   !insertmacro CheckInstall
-  CreateShortcut "$SMPROGRAMS\Clipmonger\Clipmonger.lnk" "$INSTDIR\clipmonger.exe"
+  CreateShortcut "$SMPROGRAMS\Clipmonger\Clipmonger.lnk" "$INSTDIR\clipmonger.exe" "" "$INSTDIR\clipmonger.exe" 0
   !insertmacro CheckInstall
   CreateShortcut "$SMPROGRAMS\Clipmonger\Uninstall.lnk" "$INSTDIR\uninstall.exe"
   !insertmacro CheckInstall
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Clipmonger" "DisplayName" "Clipmonger"
   !insertmacro CheckInstall
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Clipmonger" "DisplayIcon" '"$INSTDIR\clipmonger.exe",0'
+  !insertmacro CheckInstall
+  # SHCNE_ASSOCCHANGED: an upgrade would otherwise keep the shell's cached icon.
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Clipmonger" "UninstallString" '"$INSTDIR\uninstall.exe"'
   !insertmacro CheckInstall
 SectionEnd

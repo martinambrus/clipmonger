@@ -14,6 +14,7 @@
 //! `$XDG_DATA_HOME/applications` at start. Copies it wrote carry
 //! [`GENERATED_KEY`] and follow the programs when they move; a file
 //! without that key belongs to the user or a package and is never touched.
+//! Those builds also get the launcher icon the entry names.
 
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,11 @@ use clipmonger_core::{DESKTOP_APP_ID, DESKTOP_DAEMON_ID};
 
 /// Marks an entry the daemon wrote (and may rewrite).
 pub const GENERATED_KEY: &str = "X-Clipmonger-Generated=true";
+
+/// The launcher icon for builds no package installed.
+const APP_ICON_PNG: &[u8] = include_bytes!(
+    "../../../packaging/linux/icons/hicolor/256x256/apps/com.martinambrus.clipmonger.png"
+);
 
 /// Quote one argument for an `Exec=` line (desktop entry spec): reserved
 /// characters force double quotes, inside which `"`, `` ` ``, `$` and `\`
@@ -79,7 +85,7 @@ pub fn entries(ui_exe: &Path, daemon_exe: &Path) -> [(String, String); 2] {
                  Name=Clipmonger\n\
                  Comment=Clipboard history\n\
                  Exec={ui}\n\
-                 Icon=edit-paste\n\
+                 Icon={DESKTOP_APP_ID}\n\
                  Terminal=false\n\
                  Categories=Utility;\n\
                  StartupWMClass={DESKTOP_APP_ID}\n\
@@ -158,6 +164,25 @@ pub fn ensure(ui_exe: &Path, daemon_exe: &Path) {
             }
         }
     }
+    let ui_entry = format!("{DESKTOP_APP_ID}.desktop");
+    if !system_dirs.iter().any(|dir| dir.join(&ui_entry).is_file()) {
+        if let Some(data_home) = user_dir.parent() {
+            if let Err(e) = write_icon(data_home) {
+                eprintln!("daemon: launcher icon not written: {e}");
+            }
+        }
+    }
+}
+
+/// Put the launcher icon in the user's `hicolor` theme unless it is there.
+fn write_icon(data_home: &Path) -> std::io::Result<()> {
+    let dir = data_home.join("icons/hicolor/256x256/apps");
+    let path = dir.join(format!("{DESKTOP_APP_ID}.png"));
+    if std::fs::read(&path).is_ok_and(|current| current == APP_ICON_PNG) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(&path, APP_ICON_PNG)
 }
 
 #[cfg(test)]
@@ -194,12 +219,25 @@ mod tests {
         );
         assert_eq!(ui.0, "com.martinambrus.clipmonger.desktop");
         assert!(ui.1.contains("\nExec=/opt/cm/clipmonger\n"));
+        assert!(ui.1.contains("\nIcon=com.martinambrus.clipmonger\n"));
         assert_eq!(daemon.0, "com.martinambrus.clipmonger.daemon.desktop");
         assert!(daemon.1.contains("\nExec=/opt/cm/clipmonger-daemon\n"));
         assert!(daemon
             .1
             .contains("X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input"));
         assert!(daemon.1.contains("NoDisplay=true"));
+    }
+
+    #[test]
+    fn icon_is_written_once_and_a_stale_one_replaced() {
+        let root = temp("icon");
+        let path = root.join("icons/hicolor/256x256/apps/com.martinambrus.clipmonger.png");
+        write_icon(&root).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), APP_ICON_PNG);
+        std::fs::write(&path, "old").unwrap();
+        write_icon(&root).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), APP_ICON_PNG);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

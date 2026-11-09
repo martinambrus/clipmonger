@@ -282,8 +282,7 @@ fn create_tray(wake: push::Wake, online: bool) -> TrayParts {
             wake();
         }
     }));
-    let icon = tray_icon::Icon::from_rgba([0x33_u8, 0x99, 0xcc, 0xff].repeat(16 * 16), 16, 16);
-    let built = icon.ok().and_then(|icon| {
+    let built = native_tray_icon(tray_logic::icon_state(&inputs)).and_then(|icon| {
         tray_icon::TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
@@ -294,7 +293,7 @@ fn create_tray(wake: push::Wake, online: bool) -> TrayParts {
     });
     if let Some(tray) = built {
         TrayParts {
-            poll: windows_tray_poll(inputs, pause_item, rx),
+            poll: windows_tray_poll(inputs, pause_item, tray.clone(), rx),
             hold: Some(Box::new(tray)),
         }
     } else {
@@ -312,15 +311,41 @@ fn create_tray(wake: push::Wake, online: bool) -> TrayParts {
     }
 }
 
-/// Tray poll for the tray-icon menu: relabel the pause item when the
-/// paused state changes, then drain the clicked actions.
+/// The tray-icon image for `state`: the notification area's size on Windows;
+/// on macOS a size that stays sharp when `AppKit` draws it 18 points tall.
+#[cfg(any(windows, target_os = "macos"))]
+fn native_tray_icon(state: tray_logic::TrayUiState) -> Option<tray_icon::Icon> {
+    #[cfg(windows)]
+    let wanted = {
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+        // SAFETY: GetSystemMetrics only reads a system value.
+        #[allow(unsafe_code)]
+        let edge = unsafe { GetSystemMetrics(SM_CXSMICON) };
+        u32::try_from(edge).unwrap_or(16)
+    };
+    #[cfg(target_os = "macos")]
+    let wanted = 48;
+    let (edge, rgba) = tray_logic::icon_rgba(state, wanted);
+    tray_icon::Icon::from_rgba(rgba.to_vec(), edge, edge).ok()
+}
+
+/// Tray poll for the tray-icon menu: relabel the pause item when the paused
+/// state changes, swap the icon when its state changes, then drain the
+/// clicked actions.
 #[cfg(any(windows, target_os = "macos"))]
 fn windows_tray_poll(
     mut shown: tray_logic::TrayInputs,
     pause_item: Option<tray_icon::menu::MenuItem>,
+    tray: tray_icon::TrayIcon,
     rx: mpsc::Receiver<TrayAction>,
 ) -> Box<dyn FnMut(tray_logic::TrayInputs) -> Vec<TrayAction>> {
     Box::new(move |now| {
+        let state = tray_logic::icon_state(&now);
+        if state != tray_logic::icon_state(&shown) {
+            if let Some(icon) = native_tray_icon(state) {
+                let _ = tray.set_icon(Some(icon));
+            }
+        }
         if now.paused != shown.paused {
             if let Some(item) = &pause_item {
                 item.set_text(strings::text(if now.paused {

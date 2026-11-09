@@ -110,25 +110,45 @@ fn linux_action_for_id_matches_shell_dispatch() {
 }
 
 #[test]
-fn linux_icon_argb_is_16x16_opaque_and_state_tinted() {
-    let normal = linux_tray::icon_argb(&inputs_for(false));
-    assert_eq!(normal.len(), 16 * 16 * 4);
-    for pixel in normal.as_chunks::<4>().0 {
-        assert_eq!(pixel, &[0xff, 0x33, 0x99, 0xcc]);
+fn linux_icon_pixmaps_are_square_argb_and_differ_by_state() {
+    let normal = linux_tray::icon_pixmaps(&inputs_for(false));
+    assert_eq!(
+        normal.iter().map(|(edge, _)| *edge).collect::<Vec<_>>(),
+        [16, 20, 22, 24, 32, 48]
+    );
+    for (edge, data) in &normal {
+        let edge = usize::try_from(*edge).unwrap();
+        assert_eq!(data.len(), edge * edge * 4);
     }
-    let paused = linux_tray::icon_argb(&inputs_for(true));
+    let (edge, data) = &normal[0];
+    let edge = usize::try_from(*edge).unwrap();
+    let corner = &data[..4];
+    let centre = &data[(edge * edge / 2 + edge / 2) * 4..][..4];
+    assert!(corner[0] < 64, "see-through corner, alpha comes first");
+    assert_eq!(centre[0], 0xff, "opaque middle");
+    let paused = linux_tray::icon_pixmaps(&inputs_for(true));
     assert_eq!(paused.len(), normal.len());
     assert_ne!(paused, normal);
-    let degraded = linux_tray::icon_argb(&tray_logic::TrayInputs {
+    let degraded = linux_tray::icon_pixmaps(&tray_logic::TrayInputs {
         paused: false,
         degraded: true,
         attached: true,
     });
     assert_ne!(degraded, normal);
-    let detached = linux_tray::icon_argb(&tray_logic::TrayInputs {
+    assert_ne!(degraded, paused);
+    let detached = linux_tray::icon_pixmaps(&tray_logic::TrayInputs {
         paused: false,
         degraded: false,
         attached: false,
     });
     assert_eq!(detached, degraded);
+}
+
+#[test]
+fn tray_icon_picks_the_smallest_size_that_fits() {
+    let state = tray_logic::TrayUiState::Normal;
+    assert_eq!(tray_logic::icon_rgba(state, 16).0, 16);
+    assert_eq!(tray_logic::icon_rgba(state, 18).0, 20);
+    assert_eq!(tray_logic::icon_rgba(state, 25).0, 32);
+    assert_eq!(tray_logic::icon_rgba(state, 96).0, 48);
 }

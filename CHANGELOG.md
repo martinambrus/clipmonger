@@ -5,6 +5,12 @@ reserved for the release that passes all seg-11 §5 gates.
 
 ## [Unreleased]
 
+### Added
+
+- Clipmonger has its own icon on Linux, Windows and macOS: launcher, programs,
+  installer, windows, notifications, and a tray icon with normal, paused and
+  degraded variants. Windows and macOS now show the state in the tray too.
+
 ### Changed
 
 - Popup search now searches the whole history and every permanent clip and

@@ -1,6 +1,9 @@
 //! `linux_x11` / `linux_wayland`: the X11 and Wayland backends are built only
 //! on Unix desktops other than macOS; `macos_backend`: the macOS backend.
+include!("../../packaging/windows/embed_icon.rs");
+
 fn main() {
+    embed_windows_icon();
     println!("cargo::rustc-check-cfg=cfg(linux_x11)");
     println!("cargo::rustc-check-cfg=cfg(linux_wayland)");
     println!("cargo::rustc-check-cfg=cfg(macos_backend)");

@@ -28,6 +28,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/licenses"
 for b in clipmonger clipmonger-daemon clipmonger-cli; do
     install -m 755 "$BINS/$b" "$APP/Contents/MacOS/$b"
 done
+cp "$ROOT/packaging/macos/Clipmonger.icns" "$APP/Contents/Resources/Clipmonger.icns"
 cp -R "$ROOT/licenses/." "$APP/Contents/Resources/licenses/"
 cp "$ROOT/LICENSE" "$APP/Contents/Resources/licenses/LICENSE"
 if [ -n "$NOTICES" ]; then
@@ -45,6 +46,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleDevelopmentRegion</key><string>en</string>
     <key>CFBundleDisplayName</key><string>Clipmonger</string>
     <key>CFBundleExecutable</key><string>clipmonger</string>
+    <key>CFBundleIconFile</key><string>Clipmonger</string>
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleName</key><string>Clipmonger</string>

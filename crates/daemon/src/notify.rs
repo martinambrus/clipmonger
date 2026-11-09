@@ -36,7 +36,7 @@ fn notify_args(body: &str, replaces: u32) -> NotifyArgs<'_> {
     (
         "Clipmonger",
         replaces,
-        "edit-paste",
+        clipmonger_core::DESKTOP_APP_ID,
         "Clipmonger",
         body,
         Vec::new(),
@@ -85,7 +85,7 @@ mod tests {
             notify_args(PRESS_CTRL_V_TEXT, 7);
         assert_eq!(
             (app, icon, summary),
-            ("Clipmonger", "edit-paste", "Clipmonger")
+            ("Clipmonger", "com.martinambrus.clipmonger", "Clipmonger")
         );
         assert_eq!(replaces, 7);
         assert_eq!(body, "Copied to clipboard. Press Ctrl+V to paste.");
