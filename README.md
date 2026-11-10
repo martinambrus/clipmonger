@@ -79,10 +79,10 @@ used).
 
 ### Settings and tooling
 
-- A Settings window with every option on tabs (General, Popup, Privacy,
-  Permanent Clips, Advanced), a search filter across all tabs and inline
-  validation.
-- Tray icon on Windows and Linux.
+- A Settings window with every option on tabs (History, Popup, Tray,
+  Startup, Privacy, Advanced, Permanent Clips, General, Databases, About and
+  Help), a search filter across all tabs and inline validation.
+- Tray icon on Windows and Linux, menu bar icon on macOS.
 - Optional start on login.
 - Portable mode on Windows: the profile is stored next to the program.
 - `clipmonger-cli` for scripting: status, list and get clips, paste a clip,
@@ -106,6 +106,10 @@ used).
 Download the files from the
 [latest release](https://github.com/martinambrus/clipmonger/releases/latest).
 
+Step-by-step guides: [Windows](docs/user/getting-started-windows.md),
+[macOS](docs/user/getting-started-macos.md),
+[Linux](docs/user/getting-started-linux.md).
+
 Every release has a `SHA256SUMS` file; check your download against it
 (`sha256sum -c SHA256SUMS --ignore-missing` on Linux).
 
@@ -119,7 +123,7 @@ Every release has a `SHA256SUMS` file; check your download against it
 3. Approve the User Account Control prompt and finish the installer.
 4. Start Clipmonger from the Start menu and press **Ctrl+Alt+H**.
 
-**Upgrading from an older version:** quit Clipmonger (tray icon, Exit), uninstall it in
+**Upgrading from an older version:** quit Clipmonger (tray icon, Quit), uninstall it in
 Settings, Apps (leave "Delete my default Clipmonger profile" unticked to keep
 your history), then run the new installer. The installer does not install
 over an existing copy.
@@ -176,7 +180,7 @@ in once, then enable it:
 gnome-extensions enable clipmonger@extensions.clipmonger.dev
 ```
 
-**Removing it:** quit Clipmonger first (tray icon, Exit), then
+**Removing it:** quit Clipmonger first (tray icon, Quit), then
 `sudo apt remove clipmonger`, `sudo dnf remove clipmonger`, or
 `sh ~/.local/opt/clipmonger/install.sh --uninstall` for the per-user install.
 Your history stays in `~/.local/share/clipmonger`; delete that folder to
@@ -230,12 +234,13 @@ line tool is inside the app; to use it from a terminal:
 sudo ln -s /Applications/Clipmonger.app/Contents/MacOS/clipmonger-cli /usr/local/bin/clipmonger-cli
 ```
 
-**Updating:** quit Clipmonger (menu bar icon, Exit) and replace the app. The
+**Updating:** quit Clipmonger (menu bar icon, Quit) and replace the app. The
 app is signed ad hoc, so macOS treats each version as a new app: turn
 Clipmonger off and on again in Accessibility (or remove it with **-** and
 let it ask again) after updating.
 
-**Removing it:** run `/Applications/Clipmonger.app/Contents/MacOS/clipmonger-cli uninstall`
+**Removing it:** run
+`/Applications/Clipmonger.app/Contents/MacOS/clipmonger-cli --profile-dir "$HOME/Library/Application Support/clipmonger" uninstall`
 (add `--delete-history` to delete your history too). It stops Clipmonger and
 removes its login item; then drag the app to the Trash.
 
@@ -264,6 +269,10 @@ placed in `target/release/`. The GNOME extension is built separately, see
 4. Right-click the tray icon for Settings, pausing monitoring or exiting.
 
 The popup hotkey and every other option can be changed in Settings.
+
+The [user guide](docs/user/README.md) covers setup on each system, the popup
+and its shortcuts, permanent clips, paste modes, privacy, every setting, the
+command line, backups and troubleshooting.
 
 ## Known limitations
 
