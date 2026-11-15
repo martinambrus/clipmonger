@@ -8,6 +8,16 @@ import sys
 from notice_provenance import verified_notices
 
 ROOT = Path(__file__).resolve().parent.parent
+def app_version():
+    """The release version: the UI crate's version (all workspace crates share it)."""
+    import re
+    text = (ROOT / 'crates/app-ui/Cargo.toml').read_text()
+    match = re.search(r'^version = "([0-9]+\.[0-9]+\.[0-9]+)"$', text, re.M)
+    if not match:
+        raise ValueError('no version in crates/app-ui/Cargo.toml')
+    return match.group(1)
+
+
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--input', type=Path, required=True, help='prepared Windows binaries and licenses/')
 parser.add_argument('--output', type=Path, required=True, help='new installer path')
@@ -65,7 +75,9 @@ try:
             raise ValueError(f'installer.nsi does not remove the licenses/{folder} folder')
     # No caller-controlled shell: NSIS receives separate arguments and a local tool directory.
     env = os.environ | {'NSISDIR': str(nsisdir)}
+    version = app_version()
     result = subprocess.run([str(compiler), '-WX', f'-DINPUT_DIR={source}', f'-DOUTPUT_FILE={output}',
+                             f'-DAPP_VERSION={version}',
                              str(ROOT / 'packaging/windows/installer.nsi')], env=env)
     if result.returncode or not output.is_file():
         raise ValueError(f'makensis failed: {result.returncode}')

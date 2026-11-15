@@ -20,6 +20,9 @@ InstallDir "$PROGRAMFILES64\Clipmonger"
 RequestExecutionLevel admin
 ShowInstDetails show
 ShowUninstDetails show
+!ifndef APP_VERSION
+  !error "APP_VERSION is required (scripts/build-windows-installer.py passes it)"
+!endif
 !define MUI_ICON "clipmonger.ico"
 !define MUI_UNICON "clipmonger.ico"
 
@@ -196,6 +199,13 @@ Section "Install"
   # SHCNE_ASSOCCHANGED: an upgrade would otherwise keep the shell's cached icon.
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Clipmonger" "UninstallString" '"$INSTDIR\uninstall.exe"'
+  !insertmacro CheckInstall
+  # Shown in Settings > Apps and Programs and Features.
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Clipmonger" "DisplayVersion" "${APP_VERSION}"
+  !insertmacro CheckInstall
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Clipmonger" "Publisher" "Martin Ambrus"
+  !insertmacro CheckInstall
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Clipmonger" "URLInfoAbout" "https://github.com/martinambrus/clipmonger"
   !insertmacro CheckInstall
 SectionEnd
 
