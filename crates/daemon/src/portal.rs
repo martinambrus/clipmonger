@@ -351,6 +351,10 @@ async fn bind_set(
         .zip(&triggers)
         .map(|(b, trigger)| (b.id.as_str(), b.label.as_str(), trigger.as_str()))
         .collect();
+    // Before binding: a key still held by a dropped shortcut would leave the
+    // new one without a key, and KDE keeps that for good.
+    let keep: Vec<&str> = set.iter().map(|b| b.id.as_str()).collect();
+    crate::portal_raw::kde_release_stale(conn, APP_ID, &keep).await;
     let session = match crate::portal_raw::create_session(conn, &specs).await {
         Ok(session) => session,
         Err(e) => {
@@ -373,8 +377,6 @@ async fn bind_set(
         return None;
     }
     note_bound(state);
-    let keep: Vec<&str> = set.iter().map(|b| b.id.as_str()).collect();
-    crate::portal_raw::kde_release_stale(conn, APP_ID, &keep).await;
     Some(session)
 }
 

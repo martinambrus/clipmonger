@@ -158,6 +158,8 @@ pub(crate) async fn close_session(conn: &zbus::Connection, session: &OwnedObject
 }
 
 /// KDE only: remove this app's shortcuts that are no longer in `keep`.
+/// Called before each bind, so a key a dropped shortcut held is free when
+/// the new set registers.
 ///
 /// The portal has no call to drop a shortcut, and KDE keeps every one a
 /// session ever bound, with its key. A deleted permanent clip, or a changed
