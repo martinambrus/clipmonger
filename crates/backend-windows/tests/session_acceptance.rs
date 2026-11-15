@@ -686,51 +686,85 @@ fn t411_swap_restores_formats() {
 /// ADR-004 popup show: `show_owned_window` restores a minimized window of
 /// this process (still visible, or hidden like a popup dismissed with Esc),
 /// shows it and brings it to the front. Own windows only.
+///
+/// As in the app, the window lives on its own message-pumping thread (the
+/// UI thread) and the show request comes from another one:
+/// `show_owned_window` posts the restore to the window's queue, which a
+/// thread blocked in the call itself would never process.
 #[test]
 #[allow(unsafe_code)] // Direct Win32 FFI for the test-owned window.
 fn t_show_owned_window_restores_minimized() {
     use clipmonger_backend_windows::show_owned_window;
     use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, GetForegroundWindow, IsIconic, IsWindowVisible, ShowWindow,
-        SW_HIDE, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, WS_OVERLAPPEDWINDOW,
+        CreateWindowExW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW,
+        IsIconic, IsWindowVisible, PostThreadMessageW, ShowWindow, TranslateMessage, MSG, SW_HIDE,
+        SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, WM_QUIT, WS_OVERLAPPEDWINDOW,
     };
     const T: &str = "t_show_owned_window_restores_minimized";
 
-    /// Destroys the window on drop, also when an assertion fails.
-    struct OwnWindow(HWND);
-    impl Drop for OwnWindow {
+    /// Ends the UI thread's loop (and so the window), also on a failure.
+    struct Quit(u32, Option<std::thread::JoinHandle<()>>);
+    impl Drop for Quit {
         fn drop(&mut self) {
-            // Safety: the window was created by this thread and is destroyed once.
+            // Safety: posts a message to a thread id; no pointers.
             unsafe {
-                DestroyWindow(self.0);
+                PostThreadMessageW(self.0, WM_QUIT, 0, 0);
+            }
+            if let Some(ui) = self.1.take() {
+                let _ = ui.join();
             }
         }
     }
 
-    // Safety: plain window-manager calls on a window this test creates.
-    unsafe {
-        if GetForegroundWindow().is_null() {
-            println!("SKIP {T}: session has no foreground window");
-            return;
+    // Safety: reads the foreground window handle only.
+    if unsafe { GetForegroundWindow() }.is_null() {
+        println!("SKIP {T}: session has no foreground window");
+        return;
+    }
+
+    // The UI thread: create the window, report it, pump until WM_QUIT.
+    let (tx, rx) = std::sync::mpsc::channel::<(isize, u32)>();
+    let ui = std::thread::spawn(move || {
+        // Safety: the window is created, used and destroyed on this thread;
+        // the message loop only dispatches to it.
+        unsafe {
+            let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                std::ptr::null(),
+                WS_OVERLAPPEDWINDOW,
+                100,
+                100,
+                200,
+                100,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            let _ = tx.send((hwnd as isize, GetCurrentThreadId()));
+            if hwnd.is_null() {
+                return;
+            }
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                TranslateMessage(&raw const msg);
+                DispatchMessageW(&raw const msg);
+            }
+            DestroyWindow(hwnd);
         }
-        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
-        let hwnd = CreateWindowExW(
-            0,
-            class.as_ptr(),
-            std::ptr::null(),
-            WS_OVERLAPPEDWINDOW,
-            100,
-            100,
-            200,
-            100,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-        );
-        assert!(!hwnd.is_null(), "{T}: cannot create the test window");
-        let _window = OwnWindow(hwnd);
+    });
+    let (raw, ui_thread) = rx.recv().expect("UI thread reports its window");
+    let _quit = Quit(ui_thread, Some(ui));
+    let hwnd = raw as HWND;
+    assert!(!hwnd.is_null(), "{T}: cannot create the test window");
+
+    // Safety: window-manager calls on the test's own window; cross-thread
+    // ShowWindow is delivered to the pumping UI thread.
+    unsafe {
         // The launcher's startup info may override the first ShowWindow of a
         // process; spend that call on the hidden window.
         ShowWindow(hwnd, SW_HIDE);
