@@ -138,6 +138,10 @@ fn runtime_origin(origin: &str) -> &'static str {
     }
 }
 
+/// Largest `history.list` reply body: under the 1 MiB IPC frame with room
+/// for the envelope.
+const HISTORY_LIST_BUDGET: usize = 768 * 1024;
+
 /// Protocol tag written to the rendezvous file.
 pub const PROTOCOL: &str = "ipc/v1";
 #[cfg(linux_wayland)]
@@ -243,7 +247,7 @@ pub fn read_rendezvous(profile_dir: &Path) -> Result<(PathBuf, String), CoreErro
 
 /// Gesture-token TTL in ms (matches the backend helper contract; kept as a
 /// literal here so the daemon builds without the backend on non-Windows).
-pub const GESTURE_TTL_MS: i64 = 30_000;
+pub const GESTURE_TTL_MS: i64 = 300_000;
 
 #[derive(Debug)]
 pub enum GestureError {
@@ -431,13 +435,24 @@ async fn supervise_helper(
     let mut last_error = String::new();
     let mut mismatch_logged = false;
     loop {
-        let server = match ServerOptions::new()
-            .first_pipe_instance(true)
-            .max_instances(1)
-            .reject_remote_clients(true)
-            .pipe_mode(PipeMode::Byte)
-            .create(&pipe_name)
-        {
+        // Only this user (the elevated helper runs as the same user) and
+        // SYSTEM may open the pipe; the peer binary is checked after connect.
+        let created =
+            clipmonger_backend_windows::sys::OwnerOnlySecurity::new().and_then(|mut security| {
+                let mut options = ServerOptions::new();
+                options
+                    .first_pipe_instance(true)
+                    .max_instances(1)
+                    .reject_remote_clients(true)
+                    .pipe_mode(PipeMode::Byte);
+                // Safety: the attributes and their descriptor outlive the call.
+                #[allow(unsafe_code)]
+                unsafe {
+                    options.create_with_security_attributes_raw(&pipe_name, security.as_ptr())
+                }
+                .map_err(|e| e.to_string())
+            });
+        let server = match created {
             Ok(server) => server,
             Err(e) => {
                 // The previous instance may still be closing, or another
@@ -3249,6 +3264,48 @@ impl DaemonState {
         Ok(stored)
     }
 
+    /// Enforce the retention caps without a new capture (seg-03: on insert
+    /// and hourly), so `max_age_days` also expires clips while nothing is
+    /// copied. Returns how many clips were purged.
+    ///
+    /// # Errors
+    /// Returns an error when the store is unavailable or the purge fails.
+    pub fn enforce_retention_now(&self) -> Result<u64, IpcError> {
+        let _gate = self
+            .profile_op
+            .lock()
+            .map_err(|_| IpcError::new("internal", "profile op poisoned".to_string()))?;
+        let limits = self
+            .config
+            .lock()
+            .map_err(|_| IpcError::new("internal", "config state poisoned".to_string()))
+            .map(|cfg| retention_limits(&cfg))?;
+        let purged = self.with_store(|store| {
+            store.enforce_retention(&limits).map_err(|e| {
+                daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "retention.failed",
+                    &[
+                        ("operation", "retention_scheduled"),
+                        ("class", clipmonger_core::runtime_log::core_class(&e)),
+                        ("code", &clipmonger_core::runtime_log::core_code(&e)),
+                    ],
+                );
+                IpcError::new(e.code(), e.to_string())
+            })
+        })?;
+        if purged > 0 {
+            daemon_runtime_emit(
+                clipmonger_core::runtime_log::Severity::Info,
+                "retention.purged",
+                &[("count", &purged.to_string()), ("origin", "scheduled")],
+            );
+            eprintln!("daemon: scheduled retention purged {purged} clips");
+            self.notify_history_changed();
+        }
+        Ok(purged)
+    }
+
     /// Store a bounded wanted oversize observation, obeying current capture policy.
     pub fn ingest_oversize(&self, origin: &str, entries: &[OversizeEntry]) -> bool {
         match self.ingest_oversize_checked(origin, entries) {
@@ -3711,7 +3768,23 @@ impl DaemonState {
                     .ok_or_else(|| IpcError::new("unavailable", "store unavailable".to_string()))?
                     .list_history(limit, offset, include_removed)
                     .map_err(|e| IpcError::new("backend", e.to_string()))?;
-                Ok(serde_json::json!({"clips": clips}))
+                // Whole clips up to a byte budget: a page of large texts (each
+                // carries its search text) must not exceed the IPC frame limit.
+                let mut page = Vec::with_capacity(clips.len());
+                let mut bytes = 0_usize;
+                let mut truncated = false;
+                for clip in clips {
+                    let value = serde_json::to_value(&clip)
+                        .map_err(|e| IpcError::new("internal", e.to_string()))?;
+                    let size = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
+                    if bytes.saturating_add(size) > HISTORY_LIST_BUDGET {
+                        truncated = true;
+                        break;
+                    }
+                    bytes += size;
+                    page.push(value);
+                }
+                Ok(serde_json::json!({"clips": page, "truncated": truncated}))
             }
             "history.get" => match self.requested_clip(params)? {
                 Some(found) => match self
@@ -4289,6 +4362,62 @@ impl DaemonState {
         }
         self.publish_config(candidate);
         Ok(serde_json::json!({"ok": true}))
+    }
+
+    /// Dispatch `db.info`: the Databases tab diagnostics. With
+    /// `{"check": true}` it also runs the full integrity check and reports
+    /// `health` as `"ok"` or `"corrupt"` (with `health_detail`).
+    fn handle_db_info(&self, params: &Value) -> Result<Value, IpcError> {
+        let check = params.get("check").and_then(Value::as_bool) == Some(true);
+        self.with_store(|store| {
+            let info = store
+                .diagnostics()
+                .map_err(|e| IpcError::new(e.code(), e.to_string()))?;
+            let mut body =
+                serde_json::to_value(info).map_err(|e| IpcError::new("internal", e.to_string()))?;
+            if check {
+                let (health, detail) = match store.integrity_full() {
+                    Ok(()) => ("ok", String::new()),
+                    Err(e) => {
+                        daemon_runtime_emit(
+                            clipmonger_core::runtime_log::Severity::Error,
+                            "db.integrity_failed",
+                            &[
+                                ("class", clipmonger_core::runtime_log::core_class(&e)),
+                                ("code", &clipmonger_core::runtime_log::core_code(&e)),
+                            ],
+                        );
+                        ("corrupt", e.to_string())
+                    }
+                };
+                body["health"] = Value::from(health);
+                body["health_detail"] = Value::from(detail);
+            }
+            Ok(body)
+        })
+    }
+
+    /// Dispatch `db.compact`: vacuum the database in place and report the
+    /// size before and after.
+    fn handle_db_compact(&self) -> Result<Value, IpcError> {
+        let _op = self
+            .profile_op
+            .lock()
+            .map_err(|_| IpcError::new("internal", "profile op poisoned".to_string()))?;
+        let (before, after) = self.with_store(|store| {
+            store
+                .compact()
+                .map_err(|e| IpcError::new(e.code(), e.to_string()))
+        })?;
+        daemon_runtime_emit(
+            clipmonger_core::runtime_log::Severity::Info,
+            "db.compacted",
+            &[
+                ("before", &before.to_string()),
+                ("after", &after.to_string()),
+            ],
+        );
+        Ok(serde_json::json!({"before": before, "after": after}))
     }
 
     /// Dispatch `backup.create`: snapshot the live store into a ZIP at `dest`.
@@ -5527,6 +5656,8 @@ impl DaemonState {
                 result
             }
             "monitor.set" => self.handle_monitor(params),
+            "db.info" => self.handle_db_info(params),
+            "db.compact" => self.handle_db_compact(),
             "capture.report" => self.handle_capture(params),
             "blob.put" => self.handle_blob_put(params),
             "hotkey.fired" => {
@@ -8767,6 +8898,82 @@ mod tests {
         let mut texts = history_texts(&state);
         texts.sort();
         assert_eq!(texts, vec!["second".to_string(), "third".to_string()]);
+    }
+
+    #[test]
+    fn scheduled_retention_expires_old_clips_without_a_capture() {
+        let dir =
+            std::env::temp_dir().join(format!("cm-retention-scheduled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = clipmonger_core::Store::open(&dir).expect("store");
+        let mut config = clipmonger_core::Config::default();
+        config.history.max_age_days = 1;
+        let state = DaemonState::with_config(store, config);
+        for text in ["old", "new"] {
+            assert!(state.ingest_capture(
+                "windows",
+                false,
+                &[("text/plain".to_string(), text.as_bytes().to_vec())]
+            ));
+        }
+        // Age one clip past the cap behind the daemon's back.
+        let db = rusqlite::Connection::open(dir.join("clipstore.sqlite3")).expect("db");
+        let three_days = 3 * 86_400_000_i64;
+        // Age counts from the last use; the first capture is the oldest.
+        db.execute(
+            "UPDATE clips SET last_used_ms = last_used_ms - ?1 WHERE id = \
+             (SELECT id FROM clips ORDER BY created_ms ASC LIMIT 1)",
+            rusqlite::params![three_days],
+        )
+        .expect("backdate");
+        drop(db);
+        assert_eq!(state.enforce_retention_now().expect("retention"), 1);
+        assert_eq!(history_texts(&state), vec!["new".to_string()]);
+        assert_eq!(state.enforce_retention_now().expect("retention"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn db_info_and_compact_over_ipc() {
+        let (dir, state) = fresh_state("db-info");
+        assert!(state.ingest_capture(
+            "windows",
+            false,
+            &[("text/plain".to_string(), b"hello".to_vec())]
+        ));
+        let info = state.handle("db.info", &serde_json::json!({})).unwrap();
+        assert_eq!(info["clips"], 1);
+        assert!(info["schema"].as_u64().unwrap() >= 1);
+        assert!(info.get("health").is_none(), "no check unless asked");
+        let checked = state
+            .handle("db.info", &serde_json::json!({"check": true}))
+            .unwrap();
+        assert_eq!(checked["health"], "ok");
+        let compacted = state.handle("db.compact", &serde_json::json!({})).unwrap();
+        assert!(compacted["after"].as_u64().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_list_stays_under_the_frame_limit_with_large_texts() {
+        let (dir, state) = fresh_state("list-budget");
+        for n in 0..40 {
+            let text = format!("{n} {}", "x".repeat(60 * 1024));
+            assert!(state.ingest_capture(
+                "windows",
+                false,
+                &[("text/plain".to_string(), text.into_bytes())]
+            ));
+        }
+        let reply = state
+            .handle("history.list", &serde_json::json!({}))
+            .expect("list");
+        let size = serde_json::to_vec(&reply).unwrap().len();
+        assert!(size <= super::HISTORY_LIST_BUDGET + 64, "{size} bytes");
+        assert_eq!(reply["truncated"], true);
+        let clips = reply["clips"].as_array().unwrap();
+        assert!(!clips.is_empty() && clips.len() < 40, "{}", clips.len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

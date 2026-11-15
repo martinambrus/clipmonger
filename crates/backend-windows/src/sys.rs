@@ -80,6 +80,134 @@ pub(crate) fn last_error() -> String {
     format!("win32 error {code}")
 }
 
+/// Security attributes that let only SYSTEM and this process's user open a
+/// named pipe (protected DACL, no inherited or default entries). The elevated
+/// helper runs as the same user, so it still connects; another account, even
+/// an administrator, does not.
+#[cfg(windows)]
+pub struct OwnerOnlySecurity {
+    descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    attributes: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+}
+
+#[cfg(windows)]
+impl OwnerOnlySecurity {
+    /// Build the descriptor for the current process token's user.
+    ///
+    /// # Errors
+    /// Returns the Win32 error of the token query or SDDL conversion.
+    pub fn new() -> Result<Self, String> {
+        let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{})", current_user_sid()?);
+        let wide = to_wide(&sddl);
+        let mut descriptor = std::ptr::null_mut();
+        // Safety: NUL-terminated SDDL; the returned descriptor is LocalFree'd on drop.
+        let ok = unsafe {
+            windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                1, // SDDL_REVISION_1
+                &raw mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || descriptor.is_null() {
+            return Err(last_error());
+        }
+        Ok(Self {
+            descriptor,
+            attributes: windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+                nLength: u32::try_from(std::mem::size_of::<
+                    windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+                >())
+                .unwrap_or(0),
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
+            },
+        })
+    }
+
+    /// Pointer for `CreateNamedPipeW` (tokio's
+    /// `create_with_security_attributes_raw`); valid while `self` lives.
+    #[must_use]
+    pub fn as_ptr(&mut self) -> *mut c_void {
+        (&raw mut self.attributes).cast()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnerOnlySecurity {
+    fn drop(&mut self) {
+        // Safety: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
+        unsafe {
+            windows_sys::Win32::Foundation::LocalFree(self.descriptor.cast());
+        }
+    }
+}
+
+/// The current process token's user SID as `S-1-5-...`.
+#[cfg(windows)]
+fn current_user_sid() -> Result<String, String> {
+    use windows_sys::Win32::Security::{TokenUser, SID_AND_ATTRIBUTES};
+    let mut token: HANDLE = std::ptr::null_mut();
+    // Safety: pseudo-handle of this process; the token is closed below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(last_error());
+    }
+    let result = (|| {
+        let mut length = 0;
+        // Safety: size query with a null buffer.
+        unsafe {
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut length);
+        }
+        if length == 0 {
+            return Err(last_error());
+        }
+        let mut buffer = vec![0usize; (length as usize).div_ceil(std::mem::size_of::<usize>())];
+        // Safety: aligned buffer of at least `length` bytes.
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                length,
+                &raw mut length,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        // Safety: TOKEN_USER starts with SID_AND_ATTRIBUTES; the SID lives in `buffer`.
+        let sid = unsafe { (*(buffer.as_ptr().cast::<SID_AND_ATTRIBUTES>())).Sid };
+        let mut text = std::ptr::null_mut();
+        // Safety: valid SID; the string is LocalFree'd below.
+        if unsafe {
+            windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW(sid, &raw mut text)
+        } == 0
+        {
+            return Err(last_error());
+        }
+        let mut len = 0;
+        // Safety: NUL-terminated UTF-16 from the conversion.
+        unsafe {
+            while *text.add(len) != 0 {
+                len += 1;
+            }
+        }
+        // Safety: `len` bounded by the terminator found above.
+        let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(text, len) })
+            .map_err(|_| "non-Unicode SID".to_string());
+        // Safety: allocated by ConvertSidToStringSidW.
+        unsafe {
+            windows_sys::Win32::Foundation::LocalFree(text.cast());
+        }
+        sid
+    })();
+    // Safety: token from OpenProcessToken above.
+    unsafe {
+        CloseHandle(token);
+    }
+    result
+}
+
 /// Encode as nul-terminated UTF-16 for Win32 `*W` calls.
 #[cfg(windows)]
 fn to_wide(value: &str) -> Vec<u16> {
@@ -2404,6 +2532,11 @@ pub(crate) mod task {
         let sddl = format!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;{requester_sid})");
         with_folder(|folder| {
             requester.alive()?;
+            // Replace, never update: an update keeps the old task's security
+            // descriptor (an inherited or forged one fails the readback
+            // below and leaves consent failing at every start).
+            // Safety: fixed local task name; a missing task is not an error here.
+            let _ = unsafe { folder.DeleteTask(&BSTR::from(NAME), 0) };
             let empty = VARIANT::default();
             // Safety: fixed XML built after elevation, verified token SID, empty password and SDDL in the actual final SDDL parameter.
             let task = native(unsafe {

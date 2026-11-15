@@ -58,7 +58,7 @@ What is captured and how much history is kept.
 | **Capture primary selection** | Also records the Linux primary selection (text you select, pasted with the middle mouse button). | Off | On or off | Linux only. Hidden on macOS. |
 | **History maximum items** | How many history entries are kept. When a new entry would exceed it, the oldest unpinned entries are removed. | `750` | 1 or more | Pinned entries and permanent clips are never removed by this limit. |
 | **History maximum store bytes** | Total size of stored history. The oldest unpinned entries are removed when it is exceeded. | `536870912` (512 MiB) | 1 or more, in bytes | |
-| **History retention days** | Entries older than this many days are removed. `0` turns the age limit off. | `0` | 0 or more | |
+| **History retention days** | Entries not used for this many days are removed, checked at every copy and once an hour. `0` turns the age limit off. | `0` | 0 or more | |
 | **History dedupe window** | Intended number of recent entries checked for a duplicate copy. | `100` | 0 or more | In 0.4.0 the value is saved but not used: Clipmonger always checks the last 100 entries and moves a repeated copy to the top instead of adding a new row. |
 
 **Privacy strict mode** (Privacy tab) halves the three history limits while
@@ -177,15 +177,21 @@ Full instructions: [Permanent clips](permanent-clips.md).
 | Label | What it does | Default | Valid values | Platform notes |
 |---|---|---|---|---|
 | **Permanent clip groups** | Older group list kept for compatibility. | Not set | Comma-separated names | Not used in 0.4.0. Manage groups on the **Permanent Clips** tab. |
-| **Check for updates** | Intended automatic update check. | Not set (shown unticked) | On or off | In 0.4.0 the value is saved but not used; there is no update check yet. |
+| **Check for updates** | Once a day, asks GitHub whether a newer Clipmonger exists and says so at the bottom of the popup, with a **Download** button that opens the release page. Nothing is downloaded or installed. | On | On or off | The first check waits until the popup has shown its notice once. Uses the system `curl` or `wget`; without both, or offline, the check is skipped silently. |
 
 ## Databases
 
-Profile and backup actions. These act at once; **Apply** is not used.
+Profile, database and backup actions. These act at once; **Apply** is not used.
 
 | Control | What it does |
 |---|---|
 | **Profile path** | Shows the folder that holds your history and settings. |
+| **Database** | The database file size (with its write log and the folder of large items), the free space inside it, the schema version, and how many clips it holds (and how many removed clips wait for a purge). |
+| **Health** | "not checked yet" until you press **Check integrity**, then "OK" or "damaged" with the reason. A damaged database: restore a backup. |
+| **Refresh** | Reads the numbers again. |
+| **Check integrity** | Runs SQLite's full integrity and foreign-key checks. Can take a few seconds on a large history. |
+| **Compact** | Rewrites the database without its free space and shows the size before and after. If the popup is busy reading the history it may report that the database is busy; try again. |
+| **Open profile folder** | Opens the profile folder in your file manager. |
 | **Purge removed clips** | Permanently deletes the entries you deleted in the popup and frees their space. |
 | **Backup file path** | Path of the backup file to create or restore. Default: `backup.zip` in the profile folder. |
 | **Create backup** | Writes a backup of history, permanent clips and settings to **Backup file path**. On success: "Backup saved:" and the path. |

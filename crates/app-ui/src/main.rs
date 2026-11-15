@@ -420,6 +420,7 @@ fn build_app(
     if let Some(worker) = worker {
         app.attach_thumbnails(worker);
     }
+    app.enable_update_check(clipmonger_app_ui::update_check::feed());
     app
 }
 

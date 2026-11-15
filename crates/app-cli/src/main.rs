@@ -72,6 +72,17 @@ enum Cmd {
     /// Purge soft-deleted clips.
     #[command(name = "purge-removed")]
     PurgeRemoved,
+    /// Database size, schema version and clip counts as JSON; with --check
+    /// also the full integrity check (`health`).
+    #[command(name = "db-info")]
+    DbInfo {
+        /// Run the full integrity check too.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Compact the database; prints the size before and after.
+    #[command(name = "db-compact")]
+    DbCompact,
     /// Stop the serving daemon.
     Stop,
     /// macOS: stop Clipmonger, remove its start-on-login agent and, with
@@ -196,6 +207,8 @@ fn main() -> ExitCode {
         ),
         Cmd::PermanentDelete { id } => ("permanent.delete", serde_json::json!({"id": id}), false),
         Cmd::PurgeRemoved => ("history.purge_removed", serde_json::json!({}), false),
+        Cmd::DbInfo { check } => ("db.info", serde_json::json!({"check": check}), false),
+        Cmd::DbCompact => ("db.compact", serde_json::json!({}), false),
         Cmd::Stop => ("daemon.stop", serde_json::json!({}), true),
         Cmd::Uninstall { .. } => unreachable!("handled before connecting"),
     };

@@ -310,10 +310,26 @@ fn serve_loop(
                 }
             }
             Some(_) => {}
-            None => std::thread::sleep(Duration::from_millis(10)),
+            // Wait on the socket without the lock. Requests made meanwhile on
+            // this connection can buffer an event the socket no longer shows,
+            // so the wait is bounded.
+            None => {
+                let fd = serving.conn.lock().ok().map(|conn| {
+                    use std::os::fd::AsRawFd as _;
+                    conn.stream().as_raw_fd()
+                });
+                match fd {
+                    Some(fd) => session::wait_fd(fd, SERVE_WAIT),
+                    None => std::thread::sleep(SERVE_WAIT),
+                }
+            }
         }
     }
 }
+
+/// Longest wait of the serving loop between checks of its buffer and the
+/// stop flag.
+const SERVE_WAIT: Duration = Duration::from_millis(50);
 
 impl ClipboardTransfer for X11Transfer {
     const AFFINITY: Affinity = Affinity::Worker;

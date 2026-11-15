@@ -2635,7 +2635,9 @@ fn bridge_status_and_history_failures() {
     let other_codes = [
         "denied", "internal", "timeout", "io_error", "closed", "backend",
     ];
-    for cmd in [UiCmd::Status, UiCmd::ListHistory] {
+    // ConfigGet too: the request at start fails while the daemon is still
+    // starting, and status replies ask again until a config arrives.
+    for cmd in [UiCmd::Status, UiCmd::ListHistory, UiCmd::ConfigGet] {
         for code in transport_codes {
             assert_eq!(
                 bridge_event(cmd.clone(), failure(code, "daemon down")),
@@ -2661,7 +2663,7 @@ fn bridge_status_and_history_failures() {
         bridge_event(UiCmd::ListHistory, Ok(history.clone())),
         UiEvent::History(history)
     );
-    for cmd in [UiCmd::ConfigGet, UiCmd::ListPermanents, UiCmd::PermGroups] {
+    for cmd in [UiCmd::ListPermanents, UiCmd::PermGroups] {
         for code in transport_codes {
             assert_eq!(
                 bridge_event(cmd.clone(), failure(code, "daemon down")),

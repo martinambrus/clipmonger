@@ -3,6 +3,45 @@
 All notable changes to Clipmonger. Semver per seg-12 §6; `1.0.0` is
 reserved for the release that passes all seg-11 §5 gates.
 
+## [Unreleased]
+
+### Added
+
+- Hovering an image in the popup shows it enlarged in a tooltip.
+- Settings, **Databases**: database size, write log and large-item sizes,
+  free space, schema version, clip counts, **Check integrity**, **Compact**
+  and **Open profile folder**. The same as `clipmonger-cli db-info [--check]`
+  and `clipmonger-cli db-compact`.
+- Update check: once a day Clipmonger asks GitHub for the latest release and
+  says so at the bottom of the popup, with a **Download** button that opens
+  the release page. Nothing is downloaded or installed. A notice explains it
+  once, with **Turn off**; it uses the system `curl` or `wget` and stays
+  silent offline.
+
+### Changed
+
+- One click on a popup row pastes it (it used to select it first).
+- Windows: a paste into an administrator window may now come up to 5 minutes
+  after the popup hotkey press (was 30 seconds), so browsing the popup first
+  no longer makes it fail.
+- The light popup has the Windows menu colour (#F0F0F0, as in ArsClip), so it
+  stands apart from white windows; rows have space on both sides inside their highlight.
+- History retention also runs every hour, so **History retention days**
+  removes old entries while nothing new is copied.
+- The Windows admin helper's pipe accepts only the signed-in user and SYSTEM.
+
+### Fixed
+
+- The popup could start in the dark theme (and default keys) when the
+  daemon was still starting; it now loads the settings once the daemon is up.
+- Linux X11: an idle daemon used about 1.6 % CPU (polling loops); it now
+  waits for X events and idles at about 0.15 %.
+- `clipmonger-cli list` failed ("response exceeds frame limit") once history
+  held many large texts; the reply is now cut to fit (`"truncated": true`).
+- Windows: when a task named `ClipmongerHelper` with another definition
+  existed, enabling the admin helper failed at every start; the registrar
+  now replaces it.
+
 ## [0.4.0] — 2026-11-09
 
 ### Added

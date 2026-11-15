@@ -50,5 +50,11 @@ clipmonger-backend-wayland = { path = "../backend-wayland", optional = true }
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "global_shortcuts"], optional = true }
 futures-util = { version = "0.3", optional = true }
 
+# T-605 dual-backend test: an in-process X11 selection owner and Wayland
+# copy peer (both crates are already in the lockfile via the backends).
+[target.'cfg(all(unix, not(target_os = "macos")))'.dev-dependencies]
+x11rb = "0.14"
+wl-clipboard-rs.workspace = true
+
 [lints]
 workspace = true

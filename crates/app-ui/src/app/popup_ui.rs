@@ -6,8 +6,11 @@ use crate::{ipc_bridge, keymap, popup, strings};
 use super::{now_ms, PopupApp};
 
 /// Width in points around a preview line: panel margins, scroll bar and the
-/// image thumbnail slot.
-const FIT_MARGIN: f32 = 72.0;
+/// image thumbnail slot and the row padding.
+const FIT_MARGIN: f32 = 72.0 + 2.0 * ROW_PAD;
+
+/// Space between a row's rounded highlight and its contents, on each side.
+const ROW_PAD: f32 = 6.0;
 
 /// One full-width popup list row. The whole row senses clicks and, like a
 /// selectable label, paints its hover or selection background across the
@@ -34,12 +37,24 @@ fn list_row(
             let response = ui.response();
             let visuals = ui.style().interact_selectable(&response, selected);
             let background = ui.painter().add(egui::Shape::Noop);
-            contents(ui, visuals.text_color());
+            ui.add_space(ROW_PAD);
+            ui.scope(|ui| {
+                // Long text stops short of the highlight's right edge.
+                // Clip only the sides: image rows grow taller than `row_rect`.
+                let mut clip = ui.clip_rect();
+                clip.min.x = clip.min.x.max(row_rect.min.x + ROW_PAD);
+                clip.max.x = clip.max.x.min(row_rect.max.x - ROW_PAD);
+                ui.set_clip_rect(clip);
+                contents(ui, visuals.text_color());
+            });
+            ui.add_space(ROW_PAD);
             if selected || response.hovered() || response.has_focus() {
                 ui.painter().set(
                     background,
                     egui::epaint::RectShape::new(
-                        ui.min_rect(),
+                        // The list's width even when a long preview is wider:
+                        // its text is clipped inside the padding instead.
+                        egui::Rect::from_x_y_ranges(row_rect.x_range(), ui.min_rect().y_range()),
                         visuals.corner_radius,
                         visuals.weak_bg_fill,
                         visuals.bg_stroke,
@@ -50,6 +65,21 @@ fn list_row(
         },
     )
     .response
+}
+
+/// What the popup footer's buttons asked for in one pass.
+#[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // One flag per footer button.
+struct Footer {
+    /// "Open settings window".
+    settings: bool,
+    /// The first-run update notice was on screen.
+    notice_shown: bool,
+    /// Its "OK" and "Turn off" buttons.
+    notice_ok: bool,
+    notice_off: bool,
+    /// "Download": the release page to open.
+    download: Option<String>,
 }
 
 /// The non-interactive text of a list row, so clicks reach the row.
@@ -296,7 +326,26 @@ impl PopupApp {
     }
 
     /// Paint the footer and report whether Settings was activated.
-    fn render_footer(&self, ui: &mut egui::Ui) -> bool {
+    fn render_footer(&self, ui: &mut egui::Ui) -> Footer {
+        let mut footer = Footer::default();
+        if let Some((enabled, acknowledged)) = self.update_settings() {
+            if enabled && !acknowledged {
+                footer.notice_shown = true;
+                ui.label(strings::text("update.notice"));
+                ui.horizontal(|ui| {
+                    footer.notice_ok = ui.button(strings::text("update.notice_ok")).clicked();
+                    footer.notice_off = ui.button(strings::text("update.notice_off")).clicked();
+                });
+            }
+        }
+        if let Some(release) = &self.update {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(strings::text("update.available").replace("{version}", &release.version));
+                if ui.button(strings::text("update.download")).clicked() {
+                    footer.download = Some(release.url.clone());
+                }
+            });
+        }
         if let Some(error) = self.shell.error() {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
@@ -306,7 +355,8 @@ impl PopupApp {
             ui.label(self.vm.banner());
         }
         ui.label(self.vm.status_line());
-        ui.button(strings::text("config.open_config")).clicked()
+        footer.settings = ui.button(strings::text("config.open_config")).clicked();
+        footer
     }
 
     fn thumbnail_slot(
@@ -386,7 +436,7 @@ impl PopupApp {
         self.last_reveal = current;
         let pending = self.pending_reveal.take();
 
-        let mut open_settings = false;
+        let mut footer_actions = Footer::default();
         egui::CentralPanel::default().show(ui, |ui| {
             let full_rect = ui.max_rect();
             let footer_height = {
@@ -625,10 +675,55 @@ impl PopupApp {
                                     row_text(ui, &truncated, color);
                                 }
                             });
-                            let response = if cut {
-                                response.on_hover_text(&preview)
-                            } else {
-                                response
+                            let image_hash = match (&compact, &legacy) {
+                                (Some(row), _)
+                                    if row.kind == clipmonger_core::store::CompactKind::Image =>
+                                {
+                                    Some(row.thumbnail_hash.clone())
+                                }
+                                (None, Some(clip))
+                                    if popup::preview_kind(clip) == "popup.kind_image" =>
+                                {
+                                    Some(
+                                        clip.formats
+                                            .iter()
+                                            .any(|mime| mime == "image/png")
+                                            .then(|| clip.content_hash.clone()),
+                                    )
+                                }
+                                _ => None,
+                            };
+                            let response = match (image_hash, &mut self.thumbnails) {
+                                // An image row shows the image enlarged, and
+                                // its full text when the row cuts it.
+                                (Some(Some(hash)), Some(thumbs)) => {
+                                    // The tooltip opens above or below the row,
+                                    // inside the popup window: fit the larger side.
+                                    let window = ui.ctx().content_rect();
+                                    let row = response.rect;
+                                    let text = if cut { 40.0 } else { 0.0 };
+                                    let room = egui::vec2(
+                                        window.width() - 24.0,
+                                        (row.top() - window.top())
+                                            .max(window.bottom() - row.bottom())
+                                            - 24.0
+                                            - text,
+                                    );
+                                    response.on_hover_ui(|ui| {
+                                        thumbs.preview(
+                                            ui,
+                                            clip_id,
+                                            Some(&hash),
+                                            room,
+                                            &mut thumbnail_demand,
+                                        );
+                                        if cut {
+                                            ui.label(&preview);
+                                        }
+                                    })
+                                }
+                                _ if cut => response.on_hover_text(&preview),
+                                _ => response,
                             };
                             if selected
                                 && pending.as_ref().is_some_and(
@@ -689,7 +784,7 @@ impl PopupApp {
                     full_rect.max,
                 ),
             ));
-            open_settings = self.render_footer(&mut footer);
+            footer_actions = self.render_footer(&mut footer);
             ui.expand_to_include_rect(footer.min_rect());
         });
         if let Some(thumbs) = &mut self.thumbnails {
@@ -737,7 +832,16 @@ impl PopupApp {
                 self.send(cmd);
             }
         }
-        if open_settings {
+        if footer_actions.notice_shown {
+            self.update_notice_seen = true;
+        }
+        if footer_actions.notice_ok || footer_actions.notice_off {
+            self.acknowledge_update_notice(footer_actions.notice_off);
+        }
+        if let Some(url) = footer_actions.download {
+            let _ = crate::opener::open(&url);
+        }
+        if footer_actions.settings {
             self.open_settings(None);
         }
         if query != self.vm.query {
@@ -770,12 +874,8 @@ impl PopupApp {
         if let Some(row) = clicked_perm_row {
             let q = self.vm.query.clone();
             let activate = self.config.lock().map_or(None, |mut config| {
-                if row == config.perm_vm.selected {
-                    config.perm_vm.selected_id(&q)
-                } else {
-                    config.perm_vm.selected = row;
-                    None
-                }
+                config.perm_vm.selected = row;
+                config.perm_vm.selected_id(&q)
             });
             if let Some(id) = activate {
                 self.apply_effect(popup::VmEffect::ExecPermanent(id));
@@ -806,20 +906,17 @@ impl PopupApp {
                 self.send(ipc_bridge::UiCmd::DeleteClip(id));
             }
         }
+        // One click pastes the row, like Enter on it.
         if let Some(row) = clicked_row {
-            if row == self.vm.selected {
-                let effect = self.vm.on_key(keymap::KeyEvent {
-                    key: "Enter".to_string(),
-                    ctrl: false,
-                    alt: false,
-                    shift: false,
-                    super_key: false,
-                });
-                self.apply_effect(effect);
-            } else {
-                self.vm.selected = row;
-                self.request_reveal(ui.ctx());
-            }
+            self.vm.selected = row;
+            let effect = self.vm.on_key(keymap::KeyEvent {
+                key: "Enter".to_string(),
+                ctrl: false,
+                alt: false,
+                shift: false,
+                super_key: false,
+            });
+            self.apply_effect(effect);
         }
         self.handle_keys(ui.ctx(), search_focused, &events);
         self.last_query.clone_from(&self.vm.query);

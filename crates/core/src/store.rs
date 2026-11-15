@@ -271,6 +271,27 @@ macro_rules! restore_point {
     }};
 }
 
+/// What [`Store::diagnostics`] reports.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DbInfo {
+    /// Size of the database file.
+    pub db_bytes: u64,
+    /// Size of its write-ahead log.
+    pub wal_bytes: u64,
+    /// Total size of the external blob files.
+    pub blob_bytes: u64,
+    /// Free pages inside the database file, which compacting returns.
+    pub free_bytes: u64,
+    /// Schema version (`PRAGMA user_version`).
+    pub schema: u64,
+    /// Live clips.
+    pub clips: u64,
+    /// Removed clips waiting for a purge.
+    pub removed: u64,
+    /// The store is a read-only recovery handle.
+    pub read_only: bool,
+}
+
 /// SQLite-backed clip store.
 #[derive(Debug)]
 pub struct Store {
@@ -3333,6 +3354,79 @@ impl Store {
         Ok(())
     }
 
+    /// Local diagnostics for the Settings Databases tab: file sizes, schema
+    /// version and clip counts. Cheap: no integrity check.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error when a query fails.
+    pub fn diagnostics(&self) -> Result<DbInfo, CoreError> {
+        let file_len = |path: &Path| fs::metadata(path).map_or(0, |m| m.len());
+        let wal = self.db_path.with_extension("sqlite3-wal");
+        let conn = self.lock();
+        let query = |sql: &str| -> Result<i64, CoreError> {
+            conn.query_row(sql, [], |r| r.get(0))
+                .map_err(|e| db_err(&e))
+        };
+        let schema = query("PRAGMA user_version")?;
+        let page_size = query("PRAGMA page_size")?;
+        let free_pages = query("PRAGMA freelist_count")?;
+        let clips = query("SELECT COUNT(*) FROM clips WHERE removed=0")?;
+        let removed = query("SELECT COUNT(*) FROM clips WHERE removed=1")?;
+        drop(conn);
+        let blob_bytes = fs::read_dir(&self.blobs).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.metadata().ok())
+                .filter(fs::Metadata::is_file)
+                .map(|m| m.len())
+                .sum()
+        });
+        let count = |n: i64| u64::try_from(n).unwrap_or(0);
+        Ok(DbInfo {
+            db_bytes: file_len(&self.db_path),
+            wal_bytes: file_len(&wal),
+            blob_bytes,
+            free_bytes: count(free_pages).saturating_mul(count(page_size)),
+            schema: count(schema),
+            clips: count(clips),
+            removed: count(removed),
+            read_only: self.read_only,
+        })
+    }
+
+    /// Compact the database in place: checkpoint the WAL, `VACUUM` to drop
+    /// free pages, then truncate the WAL. Returns the database file size
+    /// before and after, WAL included.
+    ///
+    /// `VACUUM INTO` (seg-03) would write a copy that then has to replace the
+    /// open file; the daemon is the single writer, so an in-place `VACUUM`
+    /// gives the same result without a swap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Unsupported`] on a recovery handle, or a backend
+    /// error when the database is busy (for example while the popup holds a
+    /// read snapshot) or the vacuum fails.
+    pub fn compact(&self) -> Result<(u64, u64), CoreError> {
+        if self.read_only {
+            return Err(readonly_err());
+        }
+        let wal = self.db_path.with_extension("sqlite3-wal");
+        let size = || {
+            fs::metadata(&self.db_path).map_or(0, |m| m.len())
+                + fs::metadata(&wal).map_or(0, |m| m.len())
+        };
+        let before = size();
+        let conn = self.lock();
+        conn.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .map_err(|e| db_err(&e))?;
+        drop(conn);
+        Ok((before, size()))
+    }
+
     /// Count one OS-privacy skip; creates no clip row.
     ///
     /// # Errors
@@ -5000,6 +5094,37 @@ mod tests {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     /// Unique scratch dir under the OS temp dir.
+    #[test]
+    fn diagnostics_report_counts_and_compact_returns_free_pages() {
+        let dir = unique_dir("diagnostics");
+        let store = Store::open(&dir).unwrap();
+        let mut ids = Vec::new();
+        for n in 0..20 {
+            let big = format!("{n}-{}", "x".repeat(200 * 1024));
+            let id = Uuid::now_v7();
+            let clip = sample_clip(id, &format!("clip {n}"), &big, 1_000 + n);
+            store.insert_clip(&clip, &text_payloads(&big)).unwrap();
+            ids.push(id);
+        }
+        store.soft_delete(ids[0]).unwrap();
+        let info = store.diagnostics().unwrap();
+        assert_eq!((info.clips, info.removed), (19, 1));
+        assert!(info.schema >= 1, "{info:?}");
+        assert!(info.db_bytes + info.wal_bytes > 0, "{info:?}");
+        assert!(!info.read_only);
+        for id in &ids[1..] {
+            store.soft_delete(*id).unwrap();
+        }
+        assert_eq!(store.purge_removed(), 20);
+        let (before, after) = store.compact().unwrap();
+        assert!(after < before, "compact shrank {before} -> {after}");
+        let info = store.diagnostics().unwrap();
+        assert_eq!((info.clips, info.removed, info.free_bytes), (0, 0, 0));
+        assert_eq!(info.wal_bytes, 0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn unique_dir(tag: &str) -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("cm-self-{tag}-{}-{n}", std::process::id()));

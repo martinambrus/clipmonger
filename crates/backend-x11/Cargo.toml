@@ -14,6 +14,7 @@ serde_json.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 x11rb14 = { package = "x11rb", version = "0.14", features = ["xfixes", "xtest", "xinput"] }
+libc = "0.2"
 
 [dev-dependencies]
 x11rb = { version = "0.13", features = ["xtest"] }

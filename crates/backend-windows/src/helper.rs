@@ -15,8 +15,10 @@ use crate::foreground::Integrity;
 
 /// Byte budget for [`Job::payload`]: 64 KiB (matches `popup.unicode_limit`).
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
-/// Gesture-token time to live: 30 000 ms after minting.
-pub const GESTURE_TTL_MS: i64 = 30_000;
+/// Gesture-token time to live: 5 minutes after minting, so a user who
+/// browses the popup (previews, search) can still paste into an admin window.
+/// The token stays single-use and bound to the press's target window.
+pub const GESTURE_TTL_MS: i64 = 300_000;
 
 #[derive(Debug)]
 pub enum GestureError {

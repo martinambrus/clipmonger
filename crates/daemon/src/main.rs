@@ -1113,6 +1113,9 @@ fn run_helper_job(job: &clipmonger_backend_windows::helper::Job) -> Result<(), S
     )
 }
 
+/// How often the daemon enforces retention without a new capture.
+const RETENTION_PERIOD: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 fn main() {
     #[cfg(feature = "backend-windows")]
     if let Some(request) = clipmonger_backend_windows::elevated_task::parse_registrar_invocation(
@@ -1331,6 +1334,18 @@ async fn async_main(args: Vec<String>) {
     // portal and environment, and the next UI would attach to it.
     #[cfg(unix)]
     watch_session_end(Arc::clone(&stop), Arc::clone(&backend_shutdown));
+    // Retention also runs hourly (and once now), so age caps expire clips
+    // while nothing new is copied.
+    let retention_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut hourly = tokio::time::interval(RETENTION_PERIOD);
+        hourly.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            hourly.tick().await;
+            let state = Arc::clone(&retention_state);
+            let _ = tokio::task::spawn_blocking(move || state.enforce_retention_now()).await;
+        }
+    });
     let handler_state = Arc::clone(&state);
     let handler: clipmonger_ipc::server::Handler = Arc::new(move |method, params| {
         if method == "daemon.stop" {

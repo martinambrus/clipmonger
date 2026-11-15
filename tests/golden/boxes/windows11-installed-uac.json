@@ -1,0 +1,61 @@
+{
+  "autostart": true,
+  "backends": {
+    "windows": {
+      "autostart": true,
+      "extension_connected": false,
+      "hotkey": {
+        "level": "full",
+        "reason": ""
+      },
+      "monitor": {
+        "level": "full",
+        "reason": ""
+      },
+      "notes": [
+        "image/png: PNG format or CF_DIBV5/CF_DIB decoded; writes PNG + CF_DIB"
+      ],
+      "paste": {
+        "level": "full",
+        "reason": "",
+        "strategy": "clipboard_restore"
+      },
+      "primary_selection": false,
+      "transfer": {
+        "level": "full",
+        "reason": ""
+      },
+      "tray": {
+        "level": "full",
+        "reason": ""
+      }
+    }
+  },
+  "extension_connected": false,
+  "hotkey": {
+    "level": "full",
+    "reason": ""
+  },
+  "monitor": {
+    "level": "full",
+    "reason": ""
+  },
+  "notes": [
+    "[windows] image/png: PNG format or CF_DIBV5/CF_DIB decoded; writes PNG + CF_DIB"
+  ],
+  "paste": {
+    "level": "full",
+    "reason": "",
+    "strategy": "clipboard_restore"
+  },
+  "popup_hotkey_conflict": null,
+  "primary_selection": false,
+  "transfer": {
+    "level": "full",
+    "reason": ""
+  },
+  "tray": {
+    "level": "full",
+    "reason": ""
+  }
+}

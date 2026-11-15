@@ -1,0 +1,54 @@
+name: Windows
+
+# Lints, tests and builds Clipmonger natively on Windows (seg-12 §2: native
+# runners per OS). The installer and portable ZIP are still made by the
+# release flow (scripts/build-windows-installer.py, package-portable.py).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: check (windows-2022)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain; if ($LASTEXITCODE -ne 0) { rustup toolchain install }
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked --no-fail-fast
+      - name: Release build
+        run: cargo build --release --locked -p clipmonger-daemon -p clipmonger-app-ui -p clipmonger-app-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipmonger-windows-x86_64-${{ github.sha }}
+          path: |
+            target/release/clipmonger.exe
+            target/release/clipmonger-daemon.exe
+            target/release/clipmonger-cli.exe
+          retention-days: 14

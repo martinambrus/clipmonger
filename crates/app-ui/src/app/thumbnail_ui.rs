@@ -3,6 +3,10 @@ use crate::thumbnail_worker::{Admission, Cache, CacheState, Key, Worker};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+/// Longest side in pixels of the enlarged image in a row's hover tooltip
+/// (the largest thumbnail the daemon makes).
+const PREVIEW_PX: u32 = 256;
+
 pub(super) struct Thumbnails {
     worker: Worker,
     cache: Cache,
@@ -93,34 +97,81 @@ impl Thumbnails {
             placeholder(ui, rect);
             return;
         };
-        let Some(pixels) = self.cache.pixels(&key) else {
+        if self.cache.pixels(&key).is_none() {
             self.textures.remove(&key);
             placeholder(ui, rect);
             return;
-        };
-        if !self.textures.contains_key(&key) {
-            let color = egui::ColorImage::from_rgba_unmultiplied(
-                [pixels.width as usize, pixels.height as usize],
-                &pixels.rgba,
-            );
-            let texture = ui
-                .ctx()
-                .load_texture("thumbnail", color, egui::TextureOptions::LINEAR);
-            self.textures.insert(key.clone(), texture);
         }
-        if let Some(texture) = self.textures.get(&key) {
+        if let Some(texture) = self.texture(ui.ctx(), &key) {
             let source = texture.size_vec2();
             let scale = (rect.width() / source.x).min(rect.height() / source.y);
             let target = egui::Rect::from_center_size(rect.center(), source * scale);
-            ui.painter().image(
-                texture.id(),
-                target,
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+            paint(ui, &texture, target);
         } else {
             placeholder(ui, rect);
         }
+    }
+    /// The enlarged image for a row's hover tooltip. It asks for a
+    /// `PREVIEW_PX` thumbnail while shown and, until that arrives, scales up
+    /// the row's small thumbnail. Large images fit `PREVIEW_PX` points (or
+    /// `room`, the space the tooltip has, if smaller); small ones show at
+    /// twice their size.
+    pub fn preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: uuid::Uuid,
+        hash: Option<&str>,
+        room: egui::Vec2,
+        demand: &mut Vec<Key>,
+    ) {
+        let Some(small) = self.key(id, hash) else {
+            return;
+        };
+        let large = Key {
+            max_px: PREVIEW_PX,
+            ..small.clone()
+        };
+        demand.push(large.clone());
+        #[allow(clippy::cast_precision_loss)]
+        let limit = (PREVIEW_PX as f32).min(room.x).min(room.y).max(40.0);
+        let shown = self
+            .texture(ui.ctx(), &large)
+            .map(|texture| (texture, PREVIEW_PX))
+            .or_else(|| {
+                self.texture(ui.ctx(), &small)
+                    .map(|texture| (texture, small.max_px))
+            });
+        let Some((texture, key_px)) = shown else {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(limit, limit), egui::Sense::hover());
+            placeholder(ui, rect);
+            ui.ctx().request_repaint();
+            return;
+        };
+        let source = texture.size_vec2();
+        let longest = source.x.max(source.y).max(1.0);
+        // A side at the key's limit means the image was scaled down to it.
+        #[allow(clippy::cast_precision_loss)]
+        let scale = if longest >= key_px as f32 {
+            limit / longest
+        } else {
+            (2.0f32).min(limit / longest)
+        };
+        let (rect, _) = ui.allocate_exact_size(source * scale, egui::Sense::hover());
+        paint(ui, &texture, rect);
+    }
+    /// The texture for a cached thumbnail, uploaded on first use.
+    fn texture(&mut self, ctx: &egui::Context, key: &Key) -> Option<egui::TextureHandle> {
+        if let Some(texture) = self.textures.get(key) {
+            return Some(texture.clone());
+        }
+        let pixels = self.cache.pixels(key)?;
+        let color = egui::ColorImage::from_rgba_unmultiplied(
+            [pixels.width as usize, pixels.height as usize],
+            &pixels.rgba,
+        );
+        let texture = ctx.load_texture("thumbnail", color, egui::TextureOptions::LINEAR);
+        self.textures.insert(key.clone(), texture.clone());
+        Some(texture)
     }
     pub fn update(&mut self, ctx: &egui::Context, demand: Vec<Key>) {
         let mut unique = HashSet::new();
@@ -169,6 +220,14 @@ impl Thumbnails {
             ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
         }
     }
+}
+fn paint(ui: &egui::Ui, texture: &egui::TextureHandle, rect: egui::Rect) {
+    ui.painter().image(
+        texture.id(),
+        rect,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
 }
 pub(super) fn placeholder(ui: &egui::Ui, rect: egui::Rect) {
     ui.painter()

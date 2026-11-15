@@ -40,6 +40,10 @@ weekly/RC cadence per §2, finding 48).
   (v2)→sync (v3)) on each OS, scripted via CLI + simulated input.
 - T-1105 `[integration]` fuzz macro Stage-1 + IPC parser (toolchain
   fuzzing; VERIFY harness at implementation) — 1 M cases, zero panics.
+  Harness (2026-11-13): deterministic stable-Rust mutation fuzzers,
+  `crates/ipc/tests/fuzz_t1105.rs` (1 M lines) and
+  `crates/daemon/tests/fuzz_handlers_t1105.rs` (200 k handler calls in the
+  release gate); macro Stage-1 is v2.
 - T-1106 `[integration]` backup-ZIP cross-version restore matrix.
 - T-1117 `[manual-qa]` evidence-bundle audit: every release claims a
   FINITE, reviewable bundle — each manual script ran inside its
@@ -115,7 +119,9 @@ noisy-neighbor CI gets generous + documented margins (review M-02).
 
 - Toolchain source-based coverage (VERIFY flags at implementation);
   floor 80% on core/platform/ipc in v1 (+ macrolib from v2 — f49),
-enforced after v1 calibration.
+enforced after v1 calibration. Calibrated 2026-11-13 with cargo-llvm-cov:
+89.2 % lines, 87.5 % regions; enforced by `scripts/check-coverage.sh`
+(release gate and the Linux CI `coverage` job).
 - `cargo fmt --check` + `cargo clippy --workspace --all-targets --all-features -- -D warnings` (matrix-adjusted per target) gate every PR
   (toolchain components, no extra deps).
 - Flakes: quarantine label + tracking issue + fix-or-delete within one

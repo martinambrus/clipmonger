@@ -83,7 +83,9 @@ boxes, idle CPU/RAM budgets or the 24-hour soak.
 ## Remaining recovered tasks
 
 All twelve remain unfinished until their actual acceptance conditions pass.
-A delivered source change does not close a native gate.
+A delivered source change does not close a native gate. See
+[v1 gap closure (2026-11-13)](#v1-gap-closure-2026-11-13) for the latest
+results per ID.
 
 | ID | Remaining acceptance |
 | --- | --- |
@@ -99,6 +101,99 @@ A delivered source change does not close a native gate.
 | #71 | Oversized captures produce the correct user-visible stub on the actual backend/UI. Linux (GNOME 46 Xorg, 2026-11-06): oversized text and images give one "Too large" stub; a stub reported by both the X11 watcher and the extension within 2 s is stored once. Known limit: when the copying app quits, GNOME's clipboard manager re-owns the selection and a second stub can follow. Windows remains. |
 | #72 | Real privacy-marker/fingerprint behavior and bounded wide-image handling. Linux (2026-11-06): a 20000x40 image is stored intact and shown in the popup; large X11 images (browser copies) no longer store an empty or tail-only PNG (INCR end detection fixed, PNG signature checked), and a browser image plus its HTML is one row. GNOME Wayland (2026-11-06): a browser image copy is one row, images over 512 KB paste through the extension (pulled in 256 KB chunks), the image is pasted rather than its HTML, and a paste no longer adds a duplicate row (Photopea briefly shows its previous paste first, its own behaviour also without Clipmonger). Windows remains. |
 | #74 | Same-user UAC registration, cancellation/alternate-account refusal, ACL/pinning/task readback, cleanup and logon/helper lifecycle. |
+
+## v1 gap closure (2026-11-13)
+
+Work-tree build after 0.4.0 (uncommitted on main at the time of writing),
+tested on cm-win11 (Windows 11, UAC admin), cm-win10 (built-in Administrator),
+cm-gnome51 (Ubuntu 26.10, GNOME 51 Wayland) and private Xvfb/headless sway.
+
+| ID | Result on 2026-11-13 | Still open |
+| --- | --- | --- |
+| #19, #49 | Not re-run. | DPI and monitor plug/unplug on a physical Windows display; two-monitor plug/unplug on Linux. Needs the user's hardware. |
+| #22 | Done earlier: T-410 passed 2026-11-04; KVM runs of 0.2.0-0.4.0 passed autostart across reboot. On 2026-11-13 Win11 reboot started the app and, through the logon task, the admin helper (helper route alive, no prompt). | — |
+| #26 | Install/uninstall/reinstall with history kept passed for 0.2.0-0.4.0 on Win10/11. | Formal recovery/interoperability record only. |
+| #41 | Done: Xfce, Cinnamon, KDE (T-508), Sway, Hyprland, COSMIC (T-606/607), GNOME 46-51 (T-704), portal rebind on KDE. | — |
+| #59, #67 | Windows: a paste whose target window closed while the popup was open shows "paste target window is gone" in the popup and leaves the clipboard unchanged (Win11). Daemon and UI logs and the audit log are written (metadata only). | — |
+| #62 | Windows: the `ExcludeClipboardContentFromMonitorProcessing` marker skips the copy; a 20000x40 image is captured to a stored PNG (Win11). | Capture-pump recovery has no external trigger; covered only by unit tests. |
+| #70 | Windows: started while another process held Ctrl+Alt+H, caps showed the conflict (hotkey Degraded); after that process released it the hotkey recovered to Full without a restart (Win11). | — |
+| #71 | Windows: a 20 MiB text copy gives one "Too large — not saved (16 MiB limit)" stub (Win11). | — |
+| #72 | Windows: 20000x40 image stored and listed (Win11). Known limit: its thumbnail and hover preview are a hairline (the long side is scaled to the thumbnail size). | Better thumbnails for extreme aspect ratios. |
+| #74 | T-409 leg 10 (logon start), 11/17 forged task (wrong command: never run; replaced by a protected task after consent; fixed a registrar bug where an updated task kept the old descriptor and consent failed at every start), 12 (audit metadata only), 14 (task action/principal/trigger/settings and protected SDDL read back; a medium-integrity delete is refused), 16 (profile `C:\Users\Martin\Prøfil & ü x\` registered and read back exactly, helper connected, no XML file written). Helper pipe now has an explicit owner-only DACL; helper connects and pastes into an elevated Notepad. | Leg 13 (alternate-account credentials) and leg 15 (synthetic requester-owned file/ACL/reparse fixtures). |
+
+Release gates run the same day: T-1105 fuzz (1,000,000 IPC parser cases,
+200,000 daemon handler cases, zero panics), coverage 89.2 % lines on core,
+platform and ipc (floor 80 %, `scripts/check-coverage.sh`), T-1106 restore
+matrix (backups from 0.2.0, 0.3.0, 0.4.0 and the new build all restore into
+the new build: texts incl. Unicode, image, pin, permanent clip, integrity
+ok; `tests/release/t1106_restore_matrix.py`), per-box caps goldens for
+Xvfb X11 (with and without XTEST), GNOME 51 Wayland, Windows 10 and
+Windows 11 (`tests/golden/boxes/`, `tests/release/caps_box_golden.py`),
+T-605 (`crates/daemon/tests/dual_backend_t605.rs`). The T-1103 24-hour soak
+(`tests/soak/soak.py`) ran 2026-11-13 23:19 to 2026-11-15 and PASSED every check: 24 h load
+plus 10 min idle, 2877 samples, idle CPU 0.185 % (< 1 %), max RSS 28.8 MB
+(< 120 MB), capture→stored p95 17.3 ms (< 50 ms), 719 of 719 probes found,
+zero log errors, integrity ok, daemon alive. Report:
+`~/clipmonger-soak/evidence-2026-11-13/report.{json,md}`.
+
+### VM matrix on the gap-closure build (2026-11-15)
+
+Every test VM, one at a time, with the uncommitted tree: Linux from the
+Debian-12 container release build, macOS from a native x86_64 build on the
+Tahoe VM (minos 10.15), Windows from the rebuilt `x86_64-pc-windows-gnu`
+binaries. On each box: the core suite (`tests/vm/host/linux-suite.sh`
+or the Mac/Windows equivalents), the four popup changes (hover preview shows
+and hides on leave, single click pastes the clicked row, row padding, grey
+light theme where checked), the update notice, `db-info --check`, and 60 s
+idle CPU. Per-box notes and screenshots:
+`~/clipmonger-soak/vm-matrix-2026-11-15/` (`results.md`).
+
+| Box | Result | Idle daemon / UI |
+| --- | --- | --- |
+| Xubuntu 26.10, Xfce 4.20 (X11) | Pass; also light theme, Databases tab (integrity, compact, open folder -> Thunar) | 0.20 % / 0 % |
+| Mint 22.3, Cinnamon 6.6 (X11) | Pass | 0.20 % / 0.02 % |
+| Ubuntu 24.04, GNOME 46, Wayland and Xorg | Pass in both sessions | 0.32 % and 0.25 % / 0 % |
+| Ubuntu 24.10 GNOME 47, 25.10 GNOME 49 | Pass | 0.32 %, 0.33 % / ≤ 0.02 % |
+| Ubuntu 26.04 GNOME 50, 26.10 GNOME 51 | Pass (Ptyxis and `sudo -S` run by hand: the suite assumes gnome-terminal and passwordless sudo) | 0.33 % / 0 % |
+| Debian 13, GNOME 48 | Pass | 0.28 % / 0.02 % |
+| Debian 12, Plasma 5.27 X11 | Pass | 0.22 % / 0.02 % |
+| Debian 12, Plasma 5.27 Wayland | Pass (rerun 2026-11-15 with this build in `/opt/clipmonger`, started by autostart, suite in wl-copy mode): capture incl. a focused Xwayland copy, popup text/image, permanent hotkey, Konsole, root editor, hover preview, single click. The first run's auto-paste failure was the test setup, see below. | 0.27 % / 0 % |
+| Fedora 45, Plasma 6.8 Wayland | Pass (first permanent-hotkey press right after creating the clip missed; repeats work) | 0.18 % / 0 % |
+| Arch, Hyprland 0.57 and Sway 1.12 | Pass (VM binds pointed at an old permanent-clip id; fixed in the VM configs) | 0.18 %, 0.15 % / 0 % |
+| Pop!_OS 24.04, COSMIC 1.0 | Pass (same stale bind, fixed) | 0.23 % / 0 % |
+| macOS 26.7 Tahoe, 15.8 Sequoia, 13.7 Ventura, 10.15 Catalina | Pass. Auto-paste by single click verified on Sequoia and Ventura after re-granting Accessibility to the new signature; Tahoe and Catalina without the grant show the expected Accessibility message and leave the text on the clipboard | ~0 % / ~0 % (ps) |
+| Windows 10 22H2 (built-in Administrator) | Pass; Databases tab incl. Explorer for the profile folder | 0.34 % / 0 % |
+| Windows 11 (UAC admin) | Single-click paste into an elevated editor through the helper with the rebuilt daemon | — |
+
+Found while testing:
+
+- **Gesture lifetime vs. lingering in the popup (Windows).** A paste into an
+  elevated window more than 30 s after the hotkey press was refused
+  (`paste_gesture` denied, T-413 TTL), whether by click or Enter. Fixed: the
+  TTL is now 5 minutes (user decision 2026-11-15; daemon and helper
+  `GESTURE_TTL_MS`); the token stays single-use and bound to the press's
+  target window.
+- **Plasma 5.27 Wayland auto-paste "failure" was the test setup.** The VM has
+  the 0.4.0 `.deb`, whose `/usr/share/applications` daemon entry grants
+  `org_kde_kwin_fake_input` to `/opt/clipmonger/clipmonger-daemon` only; the
+  daemon then (correctly) writes no user entry, so test binaries run from
+  `~/clipmonger-test` or `~/cm040` were refused fake input by KWin. With this
+  build in `/opt/clipmonger` everything passes. Two more harness traps on that
+  VM: KWin 5 passes an Xwayland selection on only from a focused X window
+  (unfocused `cmcopy.py` copies are never seen; a focused Ctrl+C is captured),
+  and Debian 12's wl-clipboard 2.1 garbles the MIME type `wl-copy` guesses
+  (the suite now passes `-t text/plain`). Edge case left as is: a portable
+  build run next to an installed package gets no fake input on Plasma 5.
+- **macOS test helper bug, fixed.** `tests/vm/guest/macos/cmcopy.js` cleared
+  the pasteboard before its slow pixel loop; `setDataForType` does not bump
+  `changeCount`, so images above ~100x100 were never seen by any build
+  (0.4.0 too). It now declares the types once the data is ready.
+- **Same text from Wayland and from Xorg is two rows** (different format
+  sets hash differently). Pre-existing.
+- **KDE harness note.** Started over SSH instead of by autostart, the app has
+  no portal app id on Plasma 5.27 (xdg-desktop-portal 1.16); KDE then opens
+  the Shortcuts page and the hotkey does not fire. Plasma 5.27 also opens the
+  Shortcuts page for the app at every start. Both also with 0.4.0.
 
 ## Resume point and possible reboot
 
@@ -585,8 +680,7 @@ check, so later runs cover them.
   [licenses/wayland/](../licenses/wayland/README.md); Linux packages must ship them.
   The published 0.1.0 `.deb` predates the notice, so the next Linux package must
   carry it. Re-check on winit or wayland-protocols-plasma updates.
-- T-1103's 24-hour daemon/monitor/retention soak has no current completion receipt.
-  A search microbenchmark is not that soak.
+- T-1103's 24-hour soak: done 2026-11-15, PASS (see "v1 gap closure").
 - T-1105's specified million-case toolchain fuzz run and source-based coverage
   calibration have no completion receipts. The 80% floor is specified after v1
   calibration; neither ordinary tests nor a deferred floor proves calibration.

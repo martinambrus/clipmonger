@@ -641,6 +641,7 @@ version = "0.4.0"
 dependencies = [
  "clipmonger-core",
  "clipmonger-platform",
+ "libc",
  "serde",
  "serde_json",
  "uuid",
@@ -685,6 +686,8 @@ dependencies = [
  "tokio",
  "uuid",
  "windows-sys 0.61.2",
+ "wl-clipboard-rs",
+ "x11rb 0.14.0",
 ]
 
 [[package]]

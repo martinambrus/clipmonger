@@ -27,7 +27,7 @@ run_step() {
 }
 gate() { GATE_LINES+=("$1"); }
 
-FMT_OK=0; CLIPPY_OK=0; TESTS_OK=0; X11LIB_OK=0; XVFB_OK=0; WIN_OK=0; WIN_CLIPPY_OK=0; GNOME_OK=0; CAPS_OK=0; DENY_STATE="SKIP"
+FUZZ_OK=0; COV_OK=0; FMT_OK=0; CLIPPY_OK=0; TESTS_OK=0; X11LIB_OK=0; XVFB_OK=0; WIN_OK=0; WIN_CLIPPY_OK=0; GNOME_OK=0; CAPS_OK=0; DENY_STATE="SKIP"
 
 run_step "fmt" 60 cargo fmt --all --check && FMT_OK=1
 run_step "clippy" 600 cargo clippy --workspace --all-targets --all-features -- -D warnings && CLIPPY_OK=1
@@ -44,6 +44,16 @@ if run_step "gnome-ext-build" 300 bash -c 'cd gnome-ext && npm run build'; then
     run_step "gnome-ext-test" 300 bash -c 'cd gnome-ext && npm test' && GNOME_OK=1
 fi
 run_step "caps-golden" 120 cargo test -p clipmonger-daemon --test caps_golden && CAPS_OK=1
+# T-1105: 1 M IPC parser cases and 200 k daemon handler cases, zero panics.
+if run_step "fuzz-ipc-1m" 900 env FUZZ_CASES=1000000 cargo test -p clipmonger-ipc --test fuzz_t1105 -- --nocapture; then
+    run_step "fuzz-daemon-200k" 1200 env FUZZ_CASES=200000 cargo test -p clipmonger-daemon --test fuzz_handlers_t1105 -- --nocapture && FUZZ_OK=1
+fi
+if command -v cargo-llvm-cov >/dev/null 2>&1; then
+    run_step "coverage-floor" 1800 scripts/check-coverage.sh && COV_OK=1
+else
+    note "FAIL coverage-floor: cargo-llvm-cov is not installed (see scripts/check-coverage.sh)"
+    FAILURES=$((FAILURES + 1))
+fi
 
 if command -v cargo-deny >/dev/null 2>&1; then
     if run_step "cargo-deny" 300 cargo deny check; then DENY_STATE="PASS"; else DENY_STATE="FAIL"; fi
@@ -71,7 +81,12 @@ else
 fi
 gate "SKIP-MANUAL gate2-per-box-goldens: Win/GNOME validation-box goldens not capturable here"
 gate "SKIP-MANUAL gate3 manual-qa-signed: scripts in tests/manual/ await user execution + signoff"
-gate "SKIP-MANUAL gate4 perf+coverage: perf snapshot in evidence/perf.txt (calibration); coverage floor deferred per seg-11 §9"
+if [ "$COV_OK" = 1 ] && [ "$FUZZ_OK" = 1 ]; then
+    gate "GATE 4 coverage-floor+fuzz: PASS (lines >= 80% on core/platform/ipc; T-1105 zero panics)"
+else
+    gate "GATE 4 coverage-floor+fuzz: FAIL"
+fi
+gate "SKIP-MANUAL gate4 perf: T-1103 soak report (tests/soak/) holds the measured budgets"
 if [ -f CHANGELOG.md ] && [ -f docs/release-notes-0.1.0.md ]; then
     gate "GATE 5 changelog+upgrade-notes: PASS (drafted; signoff record is user-filed)"
 else

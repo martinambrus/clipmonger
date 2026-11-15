@@ -1,0 +1,61 @@
+{
+  "autostart": true,
+  "backends": {
+    "x11": {
+      "autostart": true,
+      "extension_connected": false,
+      "hotkey": {
+        "level": "full",
+        "reason": ""
+      },
+      "monitor": {
+        "level": "full",
+        "reason": ""
+      },
+      "notes": [
+        "tray hosted by app-ui via KSNI"
+      ],
+      "paste": {
+        "level": "full",
+        "reason": "",
+        "strategy": "clipboard_restore"
+      },
+      "primary_selection": true,
+      "transfer": {
+        "level": "full",
+        "reason": ""
+      },
+      "tray": {
+        "level": "unavailable",
+        "reason": "tray hosted by app-ui via KSNI"
+      }
+    }
+  },
+  "extension_connected": false,
+  "hotkey": {
+    "level": "full",
+    "reason": ""
+  },
+  "monitor": {
+    "level": "full",
+    "reason": ""
+  },
+  "notes": [
+    "[x11] tray hosted by app-ui via KSNI"
+  ],
+  "paste": {
+    "level": "full",
+    "reason": "",
+    "strategy": "clipboard_restore"
+  },
+  "popup_hotkey_conflict": null,
+  "primary_selection": true,
+  "transfer": {
+    "level": "full",
+    "reason": ""
+  },
+  "tray": {
+    "level": "unavailable",
+    "reason": "[x11] tray hosted by app-ui via KSNI"
+  }
+}

@@ -20,6 +20,33 @@ use crate::mime;
 pub(crate) const TRANSFER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Sleep backing a bounded poll only.
 const POLL_STEP: Duration = Duration::from_millis(5);
+
+/// Block until the X server sends something on `conn` or `timeout` passes.
+/// Call it only after `poll_for_event` returned `None`: that read the socket
+/// dry, so a buffered event cannot be left waiting. Idle loops wait here
+/// instead of sleeping, which keeps an idle daemon near 0 % CPU.
+pub(crate) fn wait_readable(conn: &RustConnection, timeout: Duration) {
+    use std::os::fd::AsRawFd as _;
+    wait_fd(conn.stream().as_raw_fd(), timeout);
+}
+
+/// [`wait_readable`] on a raw descriptor, for a connection behind a lock
+/// that must not be held while waiting.
+pub(crate) fn wait_fd(raw: std::os::fd::RawFd, timeout: Duration) {
+    let mut fd = libc::pollfd {
+        fd: raw,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // Round up: a sub-millisecond rest rounded down to 0 would spin until
+    // the caller's deadline passes.
+    let millis = i32::try_from(timeout.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
+    // Safety: one valid pollfd for a socket `conn` keeps open for the call.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::poll(&raw mut fd, 1, millis);
+    }
+}
 /// Scratch property name for requestor conversions.
 pub(crate) const TMP_PROP: &[u8] = b"CLIPMONGER_TMP";
 

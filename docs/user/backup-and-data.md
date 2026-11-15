@@ -58,8 +58,9 @@ clipmonger --profile-dir ~/clipmonger-work
 
 ## History depth and retention
 
-History is trimmed automatically each time a new entry is stored. The
-oldest entries go first. Three limits apply, set on the **History** tab of
+History is trimmed automatically each time a new entry is stored, and once
+an hour (so the age limit also applies while you copy nothing). The oldest
+entries go first; the age counts from when an entry was last used. Three limits apply, set on the **History** tab of
 Settings:
 
 | Limit | Default |

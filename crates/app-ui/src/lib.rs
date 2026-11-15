@@ -9,6 +9,7 @@ pub mod ipc_bridge;
 pub mod keymap;
 pub mod lifecycle;
 pub mod linux_tray;
+pub mod opener;
 pub mod permanents;
 pub mod placement;
 pub mod popup;
@@ -25,3 +26,4 @@ pub mod thumbnail_transport;
 #[cfg(feature = "gui")]
 pub mod thumbnail_worker;
 pub mod tray_logic;
+pub mod update_check;

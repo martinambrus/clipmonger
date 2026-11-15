@@ -261,8 +261,9 @@ from [Sway and Hyprland](#sway-and-hyprland) instead.
 
 ## Updating
 
-There is no automatic update check yet, and no package repository. Download
-new releases by hand.
+Clipmonger tells you at the bottom of the popup when a new version is out
+(see [Privacy](privacy.md)). There is no package repository: download new
+releases by hand.
 
 1. Quit Clipmonger (tray icon, **Quit**).
 2. Install the new version the same way you installed the old one:

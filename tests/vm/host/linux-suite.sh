@@ -3,7 +3,10 @@
 # R-02 to R-09) on a desktop whose popup hotkey is Ctrl+Alt+H; prints one line per check.
 # SUITE_TERM: terminal launcher taking a command (default 'gnome-terminal --wait --';
 # e.g. 'xfce4-terminal -x', 'konsole -e', 'cosmic-term -e', 'foot').
-# SUITE_COPY=wl: copy through wl-copy (Sway, Hyprland, COSMIC); the password-hint
+# SUITE_COPY=wl: copy through wl-copy (Sway, Hyprland, COSMIC, Plasma 5 Wayland:
+# KWin 5 passes an Xwayland selection on only from a focused X window; text
+# gets an explicit -t, since wl-clipboard 2.1 (Debian 12) garbles the type it
+# guesses); the password-hint
 # check then needs a focused GTK window and is skipped.
 # Uses whichever clipmonger-cli is installed (package, ~/.local/bin, or the dev
 # deployment in ~/clipmonger-test/bin).
@@ -15,7 +18,7 @@ r() { ssh "$A" ". ~/clipmonger-test/env.sh; export PATH=\$HOME/.local/bin:\$HOME
 if [ "${SUITE_COPY:-x11}" = wl ]; then
     # wlroots compositors pass an Xwayland selection on only from a focused
     # X window; copy through Wayland (data-control) instead.
-    r 'cd ~/clipmonger-test; echo -n "suite-text-'$A'" | wl-copy >/dev/null 2>&1; sleep 1.5; python3 mkpng.py 120x80 /tmp/suite.png && wl-copy -t image/png < /tmp/suite.png >/dev/null 2>&1; sleep 1.5'
+    r 'cd ~/clipmonger-test; echo -n "suite-text-'$A'" | wl-copy -t text/plain >/dev/null 2>&1; sleep 1.5; python3 mkpng.py 120x80 /tmp/suite.png && wl-copy -t image/png < /tmp/suite.png >/dev/null 2>&1; sleep 1.5'
 else
     r 'cd ~/clipmonger-test; (GDK_BACKEND=x11 timeout 8 python3 cmcopy.py text "suite-text-'$A'" >/dev/null 2>&1 &); sleep 2; (GDK_BACKEND=x11 timeout 8 python3 cmcopy.py image 120x80 >/dev/null 2>&1 &); sleep 2'
 fi

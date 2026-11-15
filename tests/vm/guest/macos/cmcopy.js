@@ -24,8 +24,14 @@ function run(argv) {
       null, w, h, 8, 3, false, false, $.NSDeviceRGBColorSpace, w * 3, 24);
     for (var y = 0; y < h; y++) for (var x = 0; x < w; x++)
       rep.setColorAtXY($.NSColor.colorWithDeviceRedGreenBlueAlpha(x / w, y / h, 0.5, 1), x, y);
-    pb.setDataForType(rep.representationUsingTypeProperties($.NSPNGFileType, $({})), $.NSPasteboardTypePNG);
-    pb.setDataForType(rep.TIFFRepresentation, $.NSPasteboardTypeTIFF);
+    var png = rep.representationUsingTypeProperties($.NSPNGFileType, $({})), tiff = rep.TIFFRepresentation;
+    // The pixel loop takes seconds for larger images, and setDataForType
+    // does not bump changeCount: a monitor polling changeCount would only
+    // see the empty pasteboard cleared above. Declare the types (a new
+    // change) once the data is ready.
+    pb.declareTypesOwner($([$.NSPasteboardTypePNG, $.NSPasteboardTypeTIFF]), $());
+    pb.setDataForType(png, $.NSPasteboardTypePNG);
+    pb.setDataForType(tiff, $.NSPasteboardTypeTIFF);
   } else if (kind === 'file') {
     // Build the NSArray explicitly: $() of a JS array of ObjC objects
     // bridged only the first URL.

@@ -1,0 +1,96 @@
+{
+  "autostart": true,
+  "backends": {
+    "wayland": {
+      "autostart": true,
+      "extension_connected": true,
+      "hotkey": {
+        "level": "unavailable",
+        "reason": "no data-control: capture unavailable; hotkey Unavailable: use compositor-native recipes; monitor Degraded: session clipboard unavailable"
+      },
+      "monitor": {
+        "level": "degraded",
+        "reason": "no data-control: capture unavailable; hotkey Unavailable: use compositor-native recipes; monitor Degraded: session clipboard unavailable"
+      },
+      "notes": [
+        "no data-control: capture unavailable",
+        "hotkey Unavailable: use compositor-native recipes",
+        "monitor Degraded: session clipboard unavailable"
+      ],
+      "paste": {
+        "level": "full",
+        "reason": "via GNOME extension: Ctrl+V pressed into the window focused at the popup press, else a toast",
+        "strategy": "write_and_toast"
+      },
+      "primary_selection": false,
+      "transfer": {
+        "level": "unavailable",
+        "reason": "no data-control: capture unavailable; hotkey Unavailable: use compositor-native recipes; monitor Degraded: session clipboard unavailable"
+      },
+      "tray": {
+        "level": "unavailable",
+        "reason": "no data-control: capture unavailable; hotkey Unavailable: use compositor-native recipes; monitor Degraded: session clipboard unavailable"
+      }
+    },
+    "x11": {
+      "autostart": true,
+      "extension_connected": true,
+      "hotkey": {
+        "level": "full",
+        "reason": ""
+      },
+      "monitor": {
+        "level": "full",
+        "reason": ""
+      },
+      "notes": [
+        "tray hosted by app-ui via KSNI"
+      ],
+      "paste": {
+        "level": "full",
+        "reason": "",
+        "strategy": "clipboard_restore"
+      },
+      "primary_selection": true,
+      "transfer": {
+        "level": "full",
+        "reason": ""
+      },
+      "tray": {
+        "level": "unavailable",
+        "reason": "tray hosted by app-ui via KSNI"
+      }
+    }
+  },
+  "extension_connected": true,
+  "hotkey": {
+    "level": "full",
+    "reason": ""
+  },
+  "monitor": {
+    "level": "full",
+    "reason": ""
+  },
+  "notes": [
+    "[wayland] no data-control: capture unavailable",
+    "[wayland] hotkey Unavailable: use compositor-native recipes",
+    "[wayland] monitor Degraded: session clipboard unavailable",
+    "[x11] tray hosted by app-ui via KSNI",
+    "capture by the GNOME extension (the X11 watcher stays off on Wayland)"
+  ],
+  "paste": {
+    "level": "full",
+    "reason": "via GNOME extension: Ctrl+V pressed into the window focused at the popup press, else a toast",
+    "strategy": "write_and_toast"
+  },
+  "popup_hotkey_conflict": null,
+  "primary_selection": true,
+  "transfer": {
+    "level": "full",
+    "reason": ""
+  },
+  "tray": {
+    "level": "unavailable",
+    "reason": "[wayland] no data-control: capture unavailable; [wayland] hotkey Unavailable: use compositor-native recipes; [wayland] monitor Degraded: session clipboard unavailable; [x11] tray hosted by app-ui via KSNI"
+  }
+}

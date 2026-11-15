@@ -402,7 +402,15 @@ impl HotkeyManager for X11Hotkeys {
                     }
                 }
                 Some(_) => {}
-                None => std::thread::sleep(Duration::from_millis(5)),
+                // Socket dry: sleep in the kernel until an event or the deadline.
+                None => {
+                    if let Some(conn) = self.conn.as_ref() {
+                        crate::session::wait_readable(
+                            conn,
+                            deadline.saturating_duration_since(Instant::now()),
+                        );
+                    }
+                }
             }
             if !fired.is_empty() {
                 // Report the press now, not at the deadline.

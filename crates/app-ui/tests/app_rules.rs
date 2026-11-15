@@ -1375,6 +1375,44 @@ fn rule_paste_done_does_nothing() {
     assert_none(&rig.trace(), "rig.trace()");
 }
 
+// The Databases tab shows the db.info reply, a compaction's sizes and an
+// error, and asks for fresh numbers after compacting.
+#[test]
+fn databases_tab_replies_fill_the_settings_state() {
+    let mut rig = Rig::closed();
+    rig.tray(&[TrayAction::OpenConfig]);
+    rig.tick();
+    let _ = rig.cmds();
+    rig.push(UiEvent::DbInfo(json!({"clips": 4, "schema": 3})));
+    rig.tick();
+    assert_eq!(
+        rig.app.config().lock().expect("settings").db_info,
+        Some(json!({"clips": 4, "schema": 3}))
+    );
+    // A plain refresh keeps the last integrity check's result.
+    rig.push(UiEvent::DbInfo(
+        json!({"clips": 4, "health": "ok", "health_detail": ""}),
+    ));
+    rig.push(UiEvent::DbInfo(json!({"clips": 5})));
+    rig.tick();
+    assert_eq!(
+        rig.app.config().lock().expect("settings").db_info,
+        Some(json!({"clips": 5, "health": "ok", "health_detail": ""}))
+    );
+    rig.push(UiEvent::DbCompacted(3 * 1024 * 1024, 1024 * 1024));
+    rig.tick();
+    assert_eq!(
+        rig.app.config().lock().expect("settings").error,
+        "Compacted: 3.0 MiB → 1.0 MiB"
+    );
+    assert_eq!(rig.cmds(), vec![UiCmd::DbInfo(false)]);
+    rig.push(UiEvent::DbError("database is locked".to_string()));
+    rig.tick();
+    let config = rig.app.config().lock().expect("settings");
+    assert_eq!(config.error, "database is locked");
+    assert!(config.db_info.is_some(), "an error never leaves it loading");
+}
+
 // rule 4: the replies that fill the Settings state
 #[test]
 fn rule_replies_fill_the_settings_state() {
@@ -1392,6 +1430,14 @@ fn rule_replies_fill_the_settings_state() {
         lines: vec!["one".into(), "two".into()],
         sink_error: None,
     });
+    // A purge reports its count and refreshes the Databases tab numbers.
+    rig.push(UiEvent::Purged(3));
+    rig.tick();
+    assert_eq!(
+        rig.app.config().lock().expect("settings").error,
+        "Purged 3 removed clips."
+    );
+    assert_eq!(rig.cmds(), vec![UiCmd::DbInfo(false)]);
     rig.push(UiEvent::ConfigError("bad config".to_string()));
     rig.push(UiEvent::PermGroups(
         json!({"groups": [{"name": "Work", "system": false, "count": 1}]}),
@@ -1399,7 +1445,6 @@ fn rule_replies_fill_the_settings_state() {
     rig.push(UiEvent::Permanents(
         json!({"permanents": [permanent_json(7, "Work", "Sig")]}),
     ));
-    rig.push(UiEvent::Purged(3));
     rig.tick();
     let config = rig.app.config().lock().expect("settings");
     assert_eq!(config.caps_text, json!({"clipboard": "ok"}).to_string());
@@ -2381,12 +2426,34 @@ fn rule_tray_pause_for_1h_toggles_once_until_the_flag_clears() {
     );
 }
 
+// The config request sent at start fails while the daemon is not up yet:
+// status replies ask again until a config reply arrives, so the popup gets
+// the configured theme without opening Settings.
+#[test]
+fn status_replies_ask_for_the_config_until_one_arrives() {
+    let mut rig = Rig::closed();
+    rig.push(status(false, "1"));
+    rig.tick();
+    assert_eq!(rig.cmds(), vec![UiCmd::ConfigGet]);
+    rig.push(config_reply(&json!({"ui": {"theme": {"mode": "light"}}})));
+    rig.tick();
+    let _ = rig.cmds();
+    rig.push(status(false, "1"));
+    rig.tick();
+    assert_eq!(rig.cmds(), vec![], "a loaded config is not asked for again");
+}
+
 // rule 10: a paused Status reply counts as paused for PauseFor1h
 #[test]
 fn rule_tray_pause_for_1h_does_nothing_when_a_status_says_paused() {
     let mut rig = Rig::closed();
     rig.push(status(true, "1"));
     rig.tick();
+    assert_eq!(
+        rig.cmds(),
+        vec![UiCmd::ConfigGet],
+        "no config yet: asks again"
+    );
     rig.tray(&[TrayAction::PauseFor1h]);
     rig.tick();
     assert_eq!(rig.cmds(), vec![]);
@@ -2394,7 +2461,7 @@ fn rule_tray_pause_for_1h_does_nothing_when_a_status_says_paused() {
     rig.tick();
     rig.tray(&[TrayAction::PauseFor1h]);
     rig.tick();
-    assert_eq!(rig.cmds(), vec![UiCmd::MonitorToggle]);
+    assert_eq!(rig.cmds(), vec![UiCmd::ConfigGet, UiCmd::MonitorToggle]);
 }
 
 // rule 10: Quit sends Stop once
@@ -2518,8 +2585,15 @@ fn fix_x2_hidden_theme_wins_over_the_visible_system_theme() {
                     visuals.dark_mode,
                     "{kind:?}: configured {mode} with system {system_theme:?}"
                 );
+                // The light popup has the Windows menu colour, so it
+                // stands apart from white windows.
+                let panel = if mode == "light" && kind == WindowKind::Popup {
+                    egui::Color32::from_rgb(240, 240, 240)
+                } else {
+                    visuals.panel_fill
+                };
                 assert!(
-                    pass.fills.contains(&visuals.panel_fill),
+                    pass.fills.contains(&panel),
                     "{kind:?} must paint the configured {mode} panel: {:?}",
                     pass.fills
                 );
@@ -2722,6 +2796,7 @@ fn rule_status_popup_hotkey_conflict_shows_and_clears_the_banner() {
     rig.tick();
     assert_eq!(rig.app.vm().banner(), "");
     assert!(!rig.app.vm().banner_alert());
+    let _ = rig.cmds();
     rig.push(UiEvent::CapsChanged);
     rig.tick();
     assert_eq!(
@@ -4928,11 +5003,12 @@ fn popup_widget(rig: &mut Rig, label: &str) -> egui::Response {
         .find(|(text, _, _)| text == label)
         .unwrap_or_else(|| panic!("missing {label:?}: {:?}", pass.texts));
     let text = *text;
-    let clip = *clip;
     assert!(
         clip.contains_rect(text),
         "{label:?} text {text:?} outside scroll clip {clip:?}"
     );
+    // Row text is clipped 6 points inside the row's sides (its padding).
+    let clip = clip.expand2(egui::vec2(6.0, 0.0));
     assert!(rig.popup.ctx.viewport_rect().contains_rect(text));
     rig.input(egui::Event::PointerMoved(text.center()));
     rig.show();
@@ -5051,15 +5127,14 @@ fn rule_list_rows_are_hovered_and_picked_across_their_width() {
                 .any(|r| r.rect.contains(row_end) && r.rect.contains(text.center())),
             "{prefix}: one clickable row spans its text and its end: {hovered:?}"
         );
-        // The first click selects the row, the second picks it.
+        // One click on an unselected row selects and picks it.
         click_popup_at(&mut rig, row_end);
         let selected = if permanent {
             rig.app.config().lock().expect("config").perm_vm.selected
         } else {
             rig.app.vm().selected
         };
-        assert_eq!(selected, 1, "{prefix}: the first click selects the row");
-        click_popup_at(&mut rig, row_end);
+        assert_eq!(selected, 1, "{prefix}: the click selects the row");
         finish_popup_pick(&mut rig);
         let commands = rig.cmds();
         if permanent {
@@ -5136,8 +5211,6 @@ fn rule_image_rows_are_picked_through_the_thumbnail() {
             text_row.rect.left() + x_offset,
             text_row.rect.bottom() + 20.0 + rig.popup.ctx.global_style().spacing.item_spacing.y,
         );
-        click_popup_at(&mut rig, pos);
-        assert_eq!(rig.app.vm().selected, 1, "click at x+{x_offset} selects");
         click_popup_at(&mut rig, pos);
         assert_eq!(picked_clip(&mut rig), vec![id(2)], "click at x+{x_offset}");
     }

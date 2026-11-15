@@ -1,5 +1,36 @@
 # Docs status
 
+## v1 gap closure (2026-11-13, unreleased work tree)
+
+Closed the code gaps left in the v1 scope and ran the open release gates; see
+[the continuation](v1-continuation.md#v1-gap-closure-2026-11-13) for per-task
+results and [CHANGELOG](../CHANGELOG.md) (Unreleased).
+
+- Code: hourly retention, Databases-tab diagnostics/compact/open-folder,
+  update check (T-1202), owner-only helper pipe DACL, Linux and Windows CI,
+  T-605 test, popup UI changes (light theme in the Windows menu colour, row padding, one-click
+  paste, enlarged image preview), X11 idle CPU 1.6 % → 0.15 %.
+- Gates: T-1105 fuzz (zero panics), coverage 89.2 % lines (floor 80 %),
+  T-1106 restore matrix 0.2.0-0.4.0 → new (pass), per-box caps goldens
+  (5 boxes incl. a negative XTEST case), T-1103 24 h soak PASS (2026-11-13 23:19 → 2026-11-15: 24 h load + 10 min idle; idle CPU 0.185 %, max RSS 28.8 MB, capture→stored p95 17.3 ms, 719/719 probes found, zero log errors, integrity ok).
+- Still open: DPI/monitor changes on physical displays (#19, #49), T-409
+  legs 13 and 15, capture-pump recovery on Windows (no external trigger),
+  thumbnails of extreme aspect ratios, signed manual-QA records and the
+  T-1117 evidence-bundle audit (user sign-off).
+- 2026-11-15 follow-ups: Windows admin-window paste window 30 s → 5 min;
+  light popup background now the Windows menu colour #F0F0F0 (as ArsClip);
+  Plasma 5.27 Wayland passes in full (the earlier auto-paste failure was the
+  VM's package entry granting fake input to /opt only).
+- VM matrix on this build (2026-11-15): all 18 VMs (Xfce, Cinnamon, GNOME
+  46-51 incl. Xorg, Debian 12/13, Plasma 5/6, Sway, Hyprland, COSMIC, macOS
+  10.15-26, Windows 10/11) pass the core suite and the popup changes; see
+  [the continuation](v1-continuation.md#vm-matrix-on-the-gap-closure-build-2026-11-15).
+- Known: on a Wayland session the daemon ignores X11 captures by design
+  (seg-06 §8 rewritten); `t500_caps_probe_xtest` flaked 2 of 12 runs.
+- Stale lines below are kept as history: the "remain open" desktop matrix,
+  ADR-004 Linux items, cargo-packager installers and the blur-protocol
+  licence were all settled before 0.4.0.
+
 ## 0.4.0 (2026-11-09)
 
 Own icons on every platform, tray state on Windows and macOS, popup search over

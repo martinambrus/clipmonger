@@ -162,7 +162,8 @@ pausing and what is recorded: [Privacy](privacy.md).
 
 ## Updating
 
-There is no automatic update check yet. To update:
+Clipmonger tells you at the bottom of the popup when a new version is out
+(see [Privacy](privacy.md)); **Download** opens the release page. To update:
 
 ### Installer
 

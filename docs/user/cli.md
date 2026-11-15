@@ -71,6 +71,8 @@ Windows Command Prompt:
 | `permanent-create <GROUP> <NAME> <BODY> [--hotkey <HOTKEY>]` | Creates a permanent clip. |
 | `permanent-delete <ID>` | Deletes a permanent clip by id. Its hotkey is released. |
 | `purge-removed` | Permanently deletes the history entries you deleted in the popup. |
+| `db-info [--check]` | Prints the database size, schema version and clip counts as JSON; `--check` also runs the full integrity check (`health`: `ok` or `corrupt`). |
+| `db-compact` | Compacts the database and prints its size before and after. |
 | `stop` | Stops the background service. |
 | `uninstall [--delete-history]` | macOS only: stops Clipmonger and removes its login agent; with `--delete-history` also deletes the profile. |
 | `help` | Prints the command list. |
@@ -156,6 +158,16 @@ clipmonger-cli --profile-dir ~/.local/share/clipmonger purge-removed
 ```
 
 The same as **Purge removed clips** on the Databases tab of Settings.
+
+### db-info and db-compact
+
+```sh
+clipmonger-cli --profile-dir ~/.local/share/clipmonger db-info --check
+clipmonger-cli --profile-dir ~/.local/share/clipmonger db-compact
+```
+
+The same as **Check integrity** and **Compact** on the Databases tab of
+Settings.
 
 ### stop
 

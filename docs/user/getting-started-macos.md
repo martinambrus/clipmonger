@@ -171,7 +171,8 @@ exact path under **Profile path**. Backups: see
 
 ## Updating
 
-There is no automatic update check yet. To update:
+Clipmonger tells you at the bottom of the popup when a new version is out
+(see [Privacy](privacy.md)); **Download** opens the release page. To update:
 
 1. Quit Clipmonger (menu bar icon, **Quit**).
 2. Download the new version and drag **Clipmonger** into **Applications**.

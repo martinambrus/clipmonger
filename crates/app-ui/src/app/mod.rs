@@ -38,6 +38,22 @@ pub const PAUSE_PERIOD: Duration = Duration::from_secs(3600);
 pub const ERROR_ON_DARK: egui::Color32 = egui::Color32::from_rgb(255, 120, 120);
 pub const ERROR_ON_LIGHT: egui::Color32 = egui::Color32::from_rgb(190, 0, 0);
 
+/// The light popup's background: the Windows menu colour (#F0F0F0), as in
+/// the popup menu of `ArsClip`, so the popup stands apart from white windows.
+const POPUP_LIGHT_BG: egui::Color32 = egui::Color32::from_rgb(240, 240, 240);
+
+/// Light visuals for the popup: grey panel, and text dark enough to stay
+/// readable on it. The search field keeps its white background.
+fn popup_light_visuals(visuals: &mut egui::Visuals) {
+    visuals.panel_fill = POPUP_LIGHT_BG;
+    visuals.window_fill = POPUP_LIGHT_BG;
+    visuals.faint_bg_color = egui::Color32::from_gray(228);
+    visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_gray(10);
+    visuals.widgets.inactive.fg_stroke.color = egui::Color32::from_gray(10);
+    visuals.weak_text_color = Some(egui::Color32::from_gray(60));
+    visuals.error_fg_color = egui::Color32::from_rgb(150, 0, 0);
+}
+
 /// Unix milliseconds now (the pick time of a paste).
 #[must_use]
 pub fn now_ms() -> i64 {
@@ -153,6 +169,19 @@ pub struct PopupApp {
     focus_search: bool,
     /// Theme last applied to the contexts: popup, settings (dark, font scale bits).
     theme_applied: [Option<(bool, u32)>; 2],
+    /// A config reply has arrived. Until one does, each status reply asks
+    /// again: the request sent at start fails when the daemon is not up yet,
+    /// and the popup would keep the default theme and keys.
+    config_loaded: bool,
+    /// Update check (seg-12 §4): the newer release found, the check running
+    /// in the background, when the last one started, and the first-run
+    /// notice shown in this run.
+    update: Option<crate::update_check::Release>,
+    update_job: Option<mpsc::Receiver<crate::update_check::Outcome>>,
+    update_started: Option<Instant>,
+    update_notice_seen: bool,
+    /// The feed to check; `None` (tests) never checks or shows the notice.
+    update_feed: Option<String>,
     preview_width: u32,
     preview_lines: u32,
     pending_activation: bool,
@@ -215,6 +244,12 @@ impl PopupApp {
             last_ppp: None,
             focus_search: open,
             theme_applied: [None, None],
+            config_loaded: false,
+            update: None,
+            update_job: None,
+            update_started: None,
+            update_notice_seen: false,
+            update_feed: None,
             preview_width: 80,
             preview_lines: 3,
             pending_activation: false,
@@ -592,6 +627,9 @@ impl PopupApp {
                         .map(ToString::to_string);
                 }
                 self.feed(Event::Bridge(UiEvent::Status(body)));
+                if !self.config_loaded {
+                    self.send(UiCmd::ConfigGet);
+                }
                 if recovering && self.shell.desired().popup_open {
                     self.reset_compact(false);
                     self.refresh_current();
@@ -674,7 +712,50 @@ impl PopupApp {
                 self.vm.apply_pin(id, pinned);
                 self.compact.pin_result(id, pinned);
             }
-            UiEvent::CompactCancelled | UiEvent::PasteDone(_) | UiEvent::Purged(_) => {}
+            UiEvent::CompactCancelled | UiEvent::PasteDone(_) => {}
+            UiEvent::Purged(count) => {
+                if self.shell.desired().settings_open {
+                    if let Ok(mut config) = self.config.lock() {
+                        config.error = strings::text("config.db_purged")
+                            .replace("{count}", &count.to_string());
+                    }
+                    self.send(UiCmd::DbInfo(false));
+                }
+            }
+            UiEvent::DbInfo(mut body) => {
+                if let Ok(mut config) = self.config.lock() {
+                    // A plain refresh keeps the last integrity check's result.
+                    if body.get("health").is_none() {
+                        if let Some(last) = &config.last_health {
+                            body["health"] = last.0.clone();
+                            body["health_detail"] = last.1.clone();
+                        }
+                    } else {
+                        config.last_health = Some((
+                            body["health"].clone(),
+                            body.get("health_detail").cloned().unwrap_or(Value::Null),
+                        ));
+                    }
+                    config.db_info = Some(body);
+                }
+            }
+            UiEvent::DbCompacted(before, after) => {
+                if let Ok(mut config) = self.config.lock() {
+                    config.error = strings::text("config.db_compacted")
+                        .replace("{before}", &crate::opener::human_bytes(before))
+                        .replace("{after}", &crate::opener::human_bytes(after));
+                }
+                self.send(UiCmd::DbInfo(false));
+            }
+            UiEvent::DbError(message) => {
+                if let Ok(mut config) = self.config.lock() {
+                    config.error = message;
+                    // Show the last numbers again instead of "loading".
+                    if config.db_info.is_none() {
+                        config.db_info = Some(serde_json::json!({}));
+                    }
+                }
+            }
             UiEvent::HistoryClip(body) => {
                 let clip = body.get("clip").and_then(|value| {
                     serde_json::from_value::<clipmonger_core::model::Clip>(value.clone()).ok()
@@ -874,6 +955,7 @@ impl PopupApp {
                 }
             }
             UiEvent::Config(body) => {
+                self.config_loaded = true;
                 if self
                     .config
                     .lock()
@@ -1056,8 +1138,100 @@ impl PopupApp {
             egui::Visuals::light()
         };
         visuals.error_fg_color = if dark { ERROR_ON_DARK } else { ERROR_ON_LIGHT };
+        if !dark && matches!(kind, WindowKind::Popup) {
+            popup_light_visuals(&mut visuals);
+        }
         ctx.set_visuals(visuals);
         ctx.set_zoom_factor(scale);
+    }
+
+    /// Turn the update check on, reading `feed` (seg-12 §4).
+    pub fn enable_update_check(&mut self, feed: String) {
+        self.update_feed = Some(feed);
+    }
+
+    /// The `updates.*` settings: (check on, first-run notice acknowledged).
+    /// Unknown until a config reply has arrived.
+    pub(super) fn update_settings(&self) -> Option<(bool, bool)> {
+        if !self.config_loaded || self.update_feed.is_none() {
+            return None;
+        }
+        let config = self.config.lock().ok()?;
+        let doc = config.doc.as_ref()?;
+        let flag =
+            |key: &str, default: bool| doc.get(key).and_then(Value::as_bool).unwrap_or(default);
+        Some((
+            flag("updates.check", true),
+            flag("updates.notice_shown", false),
+        ))
+    }
+
+    /// Start a check when one is due and collect a finished one. A check
+    /// starts only once the first-run notice was shown (in this run or an
+    /// earlier one), then every `update_check::PERIOD`.
+    fn poll_update_check(&mut self) {
+        if let Some(job) = &self.update_job {
+            match job.try_recv() {
+                Ok(outcome) => {
+                    self.update_job = None;
+                    match outcome {
+                        crate::update_check::Outcome::Newer(release) => self.update = Some(release),
+                        crate::update_check::Outcome::Current => self.update = None,
+                        // Offline: keep what an earlier check found.
+                        crate::update_check::Outcome::Unreachable => {}
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => self.update_job = None,
+            }
+        }
+        let Some((enabled, acknowledged)) = self.update_settings() else {
+            return;
+        };
+        if !enabled {
+            self.update = None;
+            return;
+        }
+        let due = self
+            .update_started
+            .is_none_or(|at| at.elapsed() >= crate::update_check::PERIOD);
+        if !due || !(acknowledged || self.update_notice_seen) {
+            return;
+        }
+        self.update_started = Some(Instant::now());
+        let (tx, rx) = mpsc::channel();
+        let Some(feed) = self.update_feed.clone() else {
+            return;
+        };
+        let spawned = std::thread::Builder::new()
+            .name("update-check".into())
+            .spawn(move || {
+                let _ = tx.send(crate::update_check::check(env!("CARGO_PKG_VERSION"), &feed));
+            });
+        if spawned.is_ok() {
+            self.update_job = Some(rx);
+        }
+    }
+
+    /// Footer buttons of the update notice: `off` turns the check off; both
+    /// acknowledge the first-run notice.
+    pub(super) fn acknowledge_update_notice(&mut self, off: bool) {
+        if off {
+            self.send(UiCmd::ConfigSet("updates.check".into(), Value::Bool(false)));
+            self.update = None;
+        }
+        self.send(UiCmd::ConfigSet(
+            "updates.notice_shown".into(),
+            Value::Bool(true),
+        ));
+        if let Ok(mut config) = self.config.lock() {
+            if let Some(doc) = &mut config.doc {
+                if off {
+                    doc.set_saved("updates.check", Value::Bool(false));
+                }
+                doc.set_saved("updates.notice_shown", Value::Bool(true));
+            }
+        }
     }
 
     /// Ask the runner for one pass at the earliest deadline: the status
@@ -1323,6 +1497,7 @@ impl runner::App for PopupApp {
                     thumbs.drain();
                 }
                 self.vm.set_offline(self.shell.offline());
+                self.poll_update_check();
                 self.apply_theme(ctx, kind);
                 self.handle_pending_placement(ctx);
                 self.schedule_wake(ctx);

@@ -16,8 +16,11 @@ flock "$HOME/.cache/clipmonger-build.lock" nice -n 10 cargo build -j 4 \
 [ -e "$APP.release" ] || cp -a "$APP" "$APP.release"
 
 "$APP/clipmonger-cli" --profile-dir "$PROFILE" stop >/dev/null 2>&1 || true
+# Only this install's processes: test daemons (soak, VM tooling) keep running.
 for pid in $(pgrep -x clipmonger; pgrep -x clipmonger-daem); do
-    timeout 10 tail --pid="$pid" -f /dev/null || kill "$pid" 2>/dev/null || true
+    case "$(readlink "/proc/$pid/exe" 2>/dev/null)" in
+        "$APP"/*) timeout 10 tail --pid="$pid" -f /dev/null || kill "$pid" 2>/dev/null || true ;;
+    esac
 done
 
 for name in $BIN; do
@@ -34,6 +37,7 @@ if [ -d "$EXT" ]; then
     glib-compile-schemas "$EXT/schemas" 2>/dev/null || true
 fi
 
-setsid -f "$APP/clipmonger" >/dev/null 2>&1 </dev/null
+# Minimized: an install must not pop the popup up over the user's work.
+setsid -f "$APP/clipmonger" --minimized >/dev/null 2>&1 </dev/null
 echo "installed debug build $(git rev-parse --short HEAD)$(git diff --quiet || echo +dirty)"
 [ -z "$reload" ] || echo "GNOME extension changed: log out and back in to load it"

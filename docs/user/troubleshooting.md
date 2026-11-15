@@ -276,5 +276,5 @@ These are known in 0.4.0 and not bugs in your setup:
 - The macOS app is signed ad hoc and not notarized; Accessibility access
   must be granted again after each update.
 - macOS 10.14 and older are not supported.
-- There is no automatic update check yet. **Check for updates** in
-  Settings has no effect.
+- The update check only tells you about a new version; updating is still
+  done by hand (see the getting-started guide for your system).

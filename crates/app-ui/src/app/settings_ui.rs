@@ -24,6 +24,10 @@ pub struct ConfigWindowState {
     pub profile: PathBuf,
     pub backup_path: String,
     pub log_lines: Vec<String>,
+    /// Last `db.info` reply for the Databases tab; `None` while loading.
+    pub db_info: Option<Value>,
+    /// The last integrity check's `health` and `health_detail`.
+    pub last_health: Option<(Value, Value)>,
     pub log_source: String,
     pub log_error: String,
     pub dark: bool,
@@ -77,6 +81,8 @@ impl ConfigWindowState {
             profile,
             backup_path,
             log_lines: Vec::new(),
+            db_info: None,
+            last_health: None,
             log_source: "audit".to_string(),
             log_error: String::new(),
             dark: DEFAULT_DARK,
@@ -151,6 +157,7 @@ pub fn render_config_viewport(
     let mut do_revert = false;
     let mut do_purge = false;
     let mut do_backup = false;
+    let mut db_cmd: Option<ipc_bridge::UiCmd> = None;
     let mut do_restore = false;
     let mut do_logs = false;
     let mut stage_edits: Vec<(String, Value)> = Vec::new();
@@ -196,6 +203,9 @@ pub fn render_config_viewport(
                     .clicked()
                 {
                     config.tab = (*name).to_string();
+                    if *name == "databases" {
+                        db_cmd = Some(ipc_bridge::UiCmd::DbInfo(false));
+                    }
                     config.filter.clear();
                 }
             }
@@ -207,6 +217,12 @@ pub fn render_config_viewport(
         if config.tab == "databases" && !filtering {
             ui.label(strings::text("config.profile_path"));
             ui.label(config.profile.display().to_string());
+            ui.separator();
+            ui.strong(strings::text("config.db_title"));
+            if let Some(cmd) = database_info(ui, &mut config) {
+                db_cmd = Some(cmd);
+            }
+            ui.separator();
             if ui.button(strings::text("config.purge_removed")).clicked() {
                 do_purge = true;
             }
@@ -644,6 +660,12 @@ pub fn render_config_viewport(
     if do_purge {
         send(ipc_bridge::UiCmd::PurgeRemoved);
     }
+    if let Some(cmd) = db_cmd {
+        if matches!(cmd, ipc_bridge::UiCmd::DbInfo(_)) {
+            config.db_info = None;
+        }
+        send(cmd);
+    }
     if do_backup {
         send(ipc_bridge::UiCmd::BackupCreate(config.backup_path.clone()));
     }
@@ -713,6 +735,98 @@ fn manual_hotkey_hint(ui: &mut egui::Ui, note: &str, command: &str) {
 /// The shortcut command for one permanent clip, from the popup command.
 fn permanent_command(popup_command: &str, id: uuid::Uuid) -> String {
     popup_command.replace(" show-popup", &format!(" exec-permanent {id}"))
+}
+
+/// The Databases tab's diagnostics and their buttons. Returns the request a
+/// button asks for; "Open profile folder" is handled here.
+fn database_info(ui: &mut egui::Ui, config: &mut ConfigWindowState) -> Option<ipc_bridge::UiCmd> {
+    use crate::opener::human_bytes;
+    let size = |key: &str| {
+        human_bytes(
+            config
+                .db_info
+                .as_ref()
+                .and_then(|info| info.get(key))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        )
+    };
+    match &config.db_info {
+        None => {
+            ui.label(strings::text("config.db_loading"));
+        }
+        Some(info) => {
+            let number = |key: &str| info.get(key).and_then(Value::as_u64).unwrap_or(0);
+            ui.label(
+                strings::text("config.db_size")
+                    .replace("{db}", &size("db_bytes"))
+                    .replace("{wal}", &size("wal_bytes"))
+                    .replace("{blobs}", &size("blob_bytes")),
+            );
+            ui.label(strings::text("config.db_free").replace("{free}", &size("free_bytes")));
+            ui.label(
+                strings::text("config.db_schema")
+                    .replace("{schema}", &number("schema").to_string()),
+            );
+            ui.label(
+                strings::text("config.db_clips")
+                    .replace("{clips}", &number("clips").to_string())
+                    .replace("{removed}", &number("removed").to_string()),
+            );
+            if info.get("read_only").and_then(Value::as_bool) == Some(true) {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    strings::text("config.db_read_only"),
+                );
+            }
+            match info.get("health").and_then(Value::as_str) {
+                Some("ok") => {
+                    ui.label(strings::text("config.db_health_ok"));
+                }
+                Some(_) => {
+                    let detail = info
+                        .get("health_detail")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        strings::text("config.db_health_corrupt").replace("{detail}", detail),
+                    );
+                }
+                None => {
+                    ui.label(strings::text("config.db_health_unknown"));
+                }
+            }
+        }
+    }
+    let mut cmd = None;
+    ui.horizontal_wrapped(|ui| {
+        let idle = config.db_info.is_some();
+        if ui
+            .add_enabled(idle, egui::Button::new(strings::text("config.db_refresh")))
+            .clicked()
+        {
+            cmd = Some(ipc_bridge::UiCmd::DbInfo(false));
+        }
+        if ui
+            .add_enabled(idle, egui::Button::new(strings::text("config.db_check")))
+            .clicked()
+        {
+            cmd = Some(ipc_bridge::UiCmd::DbInfo(true));
+        }
+        if ui
+            .add_enabled(idle, egui::Button::new(strings::text("config.db_compact")))
+            .clicked()
+        {
+            cmd = Some(ipc_bridge::UiCmd::DbCompact);
+        }
+        if ui.button(strings::text("config.db_open_folder")).clicked() {
+            if let Err(error) = crate::opener::open(&config.profile.display().to_string()) {
+                config.error = strings::text("config.db_open_failed").replace("{error}", &error);
+            }
+        }
+    });
+    cmd
 }
 
 #[cfg(test)]

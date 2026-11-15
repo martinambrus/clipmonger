@@ -1051,6 +1051,12 @@ impl<A: App> Runner<A> {
                 host.visibility.show(&*host.window);
             } else {
                 host.visibility.hide(&*host.window);
+                // Forget the pointer: the next show must not hover (and so
+                // open a tooltip for) the row under its last position.
+                host.state
+                    .egui_input_mut()
+                    .events
+                    .push(egui::Event::PointerGone);
                 // macOS: hiding the app gives the focus back to the app used
                 // before the popup (the paste target); a background process
                 // may not activate it on macOS 14+.

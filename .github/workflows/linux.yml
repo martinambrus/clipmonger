@@ -1,0 +1,105 @@
+name: Linux
+
+# Lints and tests Clipmonger on Linux (the X11 backend against Xvfb), tests
+# the GNOME Shell extension, and builds the release binaries in the Debian 12
+# container so they keep the glibc 2.36 floor (seg-12 §2, T-1203).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: check (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xvfb and GLib tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb libglib2.0-bin
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked --no-fail-fast
+      - name: Xvfb tests ran (not skipped)
+        run: |
+          cargo test --locked -p clipmonger-backend-x11 --test xvfb_acceptance -- --nocapture 2>&1 | tee xvfb.log
+          if grep -q 'SKIP ALL' xvfb.log; then echo "::error::Xvfb acceptance tests were skipped"; exit 1; fi
+
+  coverage:
+    name: coverage floor (core, platform, ipc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml) and llvm-tools
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Line coverage >= 80%
+        env:
+          JOBS: "4"
+        run: scripts/check-coverage.sh
+
+  gnome-extension:
+    name: GNOME extension
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: gnome-ext
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Committed dist/ matches the sources
+        run: git diff --exit-code -- dist
+
+  release-build:
+    name: release build (Debian 12, glibc floor)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in the Debian 12 container and check the glibc floor
+        env:
+          JOBS: "4"
+        run: scripts/build-linux-release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipmonger-linux-x86_64-${{ github.sha }}
+          path: |
+            target/linux-release/release/clipmonger
+            target/linux-release/release/clipmonger-daemon
+            target/linux-release/release/clipmonger-cli
+          retention-days: 14

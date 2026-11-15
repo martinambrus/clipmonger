@@ -69,4 +69,21 @@ All rows remain PARTIAL at release-acceptance level until their applicable nativ
 6. **Index ambiguity:** older `ui_acceptance.rs` names use `t901_*` for strings, `t902_*` for search and `t903_*` for keymap, while seg-09 assigns T-901 search, T-902 keymap, T-903 placement, T-910 strings. `ui_v1_acceptance.rs` carries correctly named counterparts. Use case/assertion semantics and paths, not numeric grep counts, for receipts.
 7. **Separate cross-cutting obligations:** T-1103 24h soak, memory/CPU/search budgets, T-1105 parser/macro fuzzing, coverage-floor enforcement, T-1106 cross-version restore matrix, T-1117 release evidence-bundle audit and T-1101/1201 artifact installation remain separate unproved obligations in this report. No full-suite count substitutes for them. v2 macro/JS/plugin/locale tests and v3 sync/shared DB/Jumplist features are not missing v1 implementation.
 
+### Update 2026-11-13
+
+- Gap 3 closed: `crates/daemon/tests/dual_backend_t605.rs::t605_dual_backend_merge_xvfb_and_nested_sway`
+  (Xvfb + headless sway, both monitors Full; on a Wayland session X11 captures
+  are dropped by design, seg-06 §8).
+- Gap 5, F-404: `crates/daemon/src/lib.rs::scheduled_retention_expires_old_clips_without_a_capture`
+  (hourly job, age cap without a capture); `crates/core/src/store.rs::diagnostics_report_counts_and_compact_returns_free_pages`.
+- Gap 5, F-601: `db_info_and_compact_over_ipc` (daemon), `databases_tab_replies_fill_the_settings_state`
+  (app-ui), VM-checked on GNOME 51 (size/schema/health, check, compact, open folder).
+- Gap 7: T-1105 `crates/ipc/tests/fuzz_t1105.rs`, `crates/daemon/tests/fuzz_handlers_t1105.rs`;
+  coverage floor `scripts/check-coverage.sh` (89.2 % lines); T-1106
+  `tests/release/t1106_restore_matrix.py` (pass); per-box caps goldens
+  `tests/golden/boxes/`; T-1103 `tests/soak/soak.py`: 24 h run PASS
+  2026-11-15 (all seven budget checks; report in `~/clipmonger-soak/evidence-2026-11-13/`). T-1117 audit and signed manuals remain user sign-off.
+- F-105: 0.4.0 shows the monitoring state in the tray on every platform.
+- T-1202 update check: `crates/app-ui/src/update_check.rs::check_against_a_mock_feed`.
+
 Next step: reconcile these rows with exact current-source receipts, then execute only uncovered source controls and the authorized native/manual matrix; retain historical receipts as historical evidence.

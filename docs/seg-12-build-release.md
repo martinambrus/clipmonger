@@ -29,6 +29,10 @@ Ubuntu 24.04 verified shipping 2.39). The floor is Debian 12's glibc 2.36:
 `scripts/build-linux-release.sh` builds in a Debian 12 container
 (`packaging/linux/build/Dockerfile`) and `scripts/check-glibc-floor.py`
 fails any binary that needs a newer glibc (T-1203).
+CI (2026-11-13): `.github/workflows/linux.yml` (fmt, clippy, tests with
+Xvfb, coverage floor, GNOME extension tests, Debian 12 release build with the
+glibc floor check) and `windows.yml` (fmt, clippy, tests, release build) join
+`macos.yml`.
 Linux→Windows cross = optional later (verify toolchain if pursued);
 Linux→macOS cross explicitly OUT (SDK pain).
 
@@ -66,6 +70,14 @@ compares semver, notifies + opens the browser. No download/execute.
 Default ON (review M-10/L-02: security updates must reach users who
 never open Settings); first-run notice + one-tap off + offline-safe
 silent skip.
+Implemented 2026-11-13 (`crates/app-ui/src/update_check.rs`): the UI reads
+GitHub's `releases/latest` once a day through the system `curl` (Windows 10
+1803+, macOS) or `wget` (stock Ubuntu), so no TLS stack ships; the first
+check waits until the popup has shown the notice once (**OK** / **Turn off**,
+stored as `updates.notice_shown` / `updates.check`). **Download** only opens
+the release page, and only a `github.com/martinambrus/clipmonger/releases`
+link from the feed is opened. T-1202 is `check_against_a_mock_feed`
+(newer/same/older/unreachable via `file://` feeds).
 
 ## 5. Unsigned consequences (D-018 — document, don't pay... yet)
 

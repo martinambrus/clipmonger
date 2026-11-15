@@ -2,7 +2,8 @@
 
 Status: Final (design user-approved 2026-10-30 with the Windows v1
 completion plan; focus gate passed on the Windows host; hands-on Windows
-checklist passed 2026-10-31). Pending: the Linux open items below.
+checklist passed 2026-10-31). The Linux open items passed on 2026-11-04
+(items 1, 3, 4) and on KDE (item 2, portal rebind).
 Decision: D-026 (supersedes the ADR-003 / D-025 lines on the popup-hotkey
 owner and on gesture minting; amends seg-02 §1/§6/§9, seg-04 §3/§5/§11,
 seg-05 §3, seg-06 §4, seg-07 §3, seg-09 §3).
@@ -22,7 +23,7 @@ Popup hotkey and trigger path:
   - a press captures the paste target (Windows foreground window, X11
     active window, none on Wayland); on Windows a press while the UI's
     popup is the foreground window hides it instead (`toggle`);
-  - a press mints a single-use gesture token bound to that target (30 s);
+  - a press mints a single-use gesture token bound to that target (5 min; 30 s until 2026-11-15);
     `popup.open` mints nothing; with `capture_target: true`
     (`clipmonger-cli show-popup`) it captures the target like a press but
     never toggles, without it (second launch) it captures nothing, and the

@@ -107,13 +107,22 @@ Results land in this segment + seg-11 QA scripts.
 
 ## 8. XWayland coexistence (dual-backend merge; T-605)
 
-When `DISPLAY` and `WAYLAND_DISPLAY` both work: run `backend-x11` AND
-`backend-wayland` monitors concurrently; daemon merges by dedupe key
-(seg-03 §8) with origin tags (`x11`/`wayland`). Rationale: each backend primarily sees its own clients — but compositors
-MAY bridge X↔Wayland selections, so both monitors can observe bridged
-copies; dedupe + suppression absorb the duplicates, ordering/fidelity
-may differ (documented, review M-13). GNOME 50+ ships no X session
-(Register-verified), so backend-x11 there covers XWayland apps only.
+When `DISPLAY` and `WAYLAND_DISPLAY` both work: the daemon starts the
+`backend-x11` AND `backend-wayland` monitors, but on a Wayland session the
+Wayland side is authoritative. The X11 monitor there only watches XWayland,
+whose selection the compositor already bridges to Wayland, so its captures
+are dropped before any read (`skip_x11_capture`, since 0452f30: it caused
+duplicate image and file rows on GNOME). Every stored clip on a Wayland
+session therefore has origin `wayland` (or `gnome` from the extension);
+the `x11`/`wayland` merge window in `backend-wayland::merge` remains as a
+guard but only sees Wayland captures. The X11 hotkey and paste paths stay
+active for XWayland windows.
+
+Known limit (2026-11-13): the rule keys on the Wayland backend being
+registered, which happens whenever `WAYLAND_DISPLAY` is set, also when its
+monitor is unavailable. On a compositor with neither data-control nor the
+GNOME extension, X11 apps are then not captured either. GNOME relies on this
+(its extension captures everything), so the rule is kept.
 Tested by T-605.
 
 ## 9. Caps mapping
@@ -133,7 +142,10 @@ or honest note (other).
   password-hint skip + nil/clear-as-empty honored (H-03);
   kill-owner persistence.
 - T-605 `[integration]` dual-BACKEND merge (Xvfb + nested Wayland;
-  renamed from dual-monitor, review M-13).
+  renamed from dual-monitor, review M-13):
+  `crates/daemon/tests/dual_backend_t605.rs` — both monitors Full, X11-only
+  copy dropped before any read, Wayland copy stored once, the same text on
+  both sides stored once with origin `wayland`.
 - T-606 `[manual-qa]` per-compositor matrix (KDE, Sway, Hyprland, GNOME
   48+ VM): portal dialog UX, bind persistence across reboot, caps golden
   files. QA-LEAD signoff.

@@ -7,3 +7,4 @@ dist-release/
 *.log
 /dist-linux/
 __pycache__/
+*.profraw

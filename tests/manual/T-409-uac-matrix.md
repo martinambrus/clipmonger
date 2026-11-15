@@ -76,13 +76,35 @@ Registration hardening (pending interactive Windows acceptance):
       valid other-profile tasks and unknown query/protection results are preserved,
       with unknown results reported separately.
 
-These new legs are **NOT RUN**. The dated verdicts below retain their original
+Legs 10, 11/17 (forged wrong-command task), 12, 14 and 16 ran on 2026-11-13
+(see the verdict below). Legs 13 and 15 are **NOT RUN**. The dated verdicts below retain their original
 scope and do not validate the registration hardening or native ACL/UAC boundary.
 
 
 ## Evidence to attach
 
 Caps dumps before/after each leg, audit.log excerpt, screenshots of the UAC prompt and Degraded caps state. Redact paths/window titles/tokens (finding 52).
+
+## Verdict (2026-11-13, work tree after 0.4.0, installed, cm-win11)
+
+- Verdict: **PASS** for legs 10, 11/17 (forged task), 12, 14, 16 and the
+  helper pipe with its explicit owner-only DACL.
+- Notes: Windows 11, user Martin (admin with UAC). Consent + UAC registered
+  `ClipmongerHelper`; helper connected; one-click paste into an elevated
+  Notepad through the helper (`job` 1 ms). Task readback: exact protected
+  command and quoted profile, empty working directory, Interactive/Highest
+  principal, one logon trigger, PT0S, IgnoreNew, no battery stop, priority 5,
+  SDDL `D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;<user SID>)`; a
+  medium-integrity `schtasks /delete` got "Access is denied". Unicode profile
+  `C:\Users\Martin\Prøfil & ü x\`: arguments read back exactly, helper
+  connected, no task XML written. A forged `ClipmongerHelper` (cmd.exe action,
+  inherited descriptor) never ran; consent replaced it. Found and fixed: the
+  registrar updated the forged task in place, which kept its descriptor, so
+  the readback check failed at every start (exit 101); it now deletes the old
+  task first. After a reboot the logon task started the helper with no
+  prompt. Observation: right after the very first consent, the hotkey over the
+  elevated window did not open the popup until the app was restarted; not
+  reproduced afterwards.
 
 ## Verdict (2026-11-04, 527ad07 portable, leg 5 rerun)
 

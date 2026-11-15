@@ -595,6 +595,12 @@ impl ConfigDoc {
         self.staged.clear();
     }
 
+    /// Record a value the app saved outside the Settings rows (for example
+    /// `updates.notice_shown`), so it reads back before the next reply.
+    pub fn set_saved(&mut self, key: &str, value: Value) {
+        set_dotted(&mut self.saved, key, value);
+    }
+
     /// Mark one key clean after a successful Apply step.
     pub fn mark_applied(&mut self, key: &str) {
         if let Some(value) = self.staged.remove(key) {

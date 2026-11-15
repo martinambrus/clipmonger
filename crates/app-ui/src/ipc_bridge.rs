@@ -88,6 +88,10 @@ pub enum UiCmd {
     PermGroupDelete(String),
     /// Execute one permanent.
     ExecPermanent(Uuid),
+    /// Fetch database diagnostics; `true` also runs the integrity check.
+    DbInfo(bool),
+    /// Compact the database.
+    DbCompact,
     /// Create a backup ZIP at the given dest path.
     BackupCreate(String),
     /// Restore a backup ZIP over the profile.
@@ -152,6 +156,12 @@ pub enum UiEvent {
     PermGroups(Value),
     /// Permanent group set changed.
     PermGroupsChanged,
+    /// Database diagnostics reply body.
+    DbInfo(Value),
+    /// Database compacted: sizes before and after.
+    DbCompacted(u64, u64),
+    /// A database diagnostics or compact request failed.
+    DbError(String),
     /// Backup created at the given path.
     BackupDone(String),
     /// Restore completed; history now serves restored clips.
@@ -289,6 +299,8 @@ pub fn method_for(cmd: &UiCmd) -> &'static str {
         UiCmd::PermGroupCreate(_) => "permanent.group_create",
         UiCmd::PermGroupDelete(_) => "permanent.group_delete",
         UiCmd::ExecPermanent(_) => "permanent.exec",
+        UiCmd::DbInfo(_) => "db.info",
+        UiCmd::DbCompact => "db.compact",
         UiCmd::BackupCreate(_) => "backup.create",
         UiCmd::BackupRestore(_) => "backup.restore",
         UiCmd::LogsTail(_) | UiCmd::LogsTailSource { .. } => "logs.tail",
@@ -306,8 +318,10 @@ pub fn params_for(cmd: &UiCmd) -> Value {
         | UiCmd::ConfigGetAfterRestore
         | UiCmd::CapsGet
         | UiCmd::PurgeRemoved
+        | UiCmd::DbCompact
         | UiCmd::ListPermanents
         | UiCmd::PermGroups => serde_json::json!({}),
+        UiCmd::DbInfo(check) => serde_json::json!({ "check": check }),
         UiCmd::CompactHistory(request) => {
             serde_json::to_value(&request.params).unwrap_or(Value::Null)
         }
@@ -438,6 +452,17 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
         (UiCmd::PurgeRemoved, Ok(body)) => {
             UiEvent::Purged(body.get("purged").and_then(Value::as_u64).unwrap_or(0))
         }
+        (UiCmd::DbInfo(_), Ok(body)) => UiEvent::DbInfo(body),
+        (UiCmd::DbCompact, Ok(body)) => {
+            match (
+                body.get("before").and_then(Value::as_u64),
+                body.get("after").and_then(Value::as_u64),
+            ) {
+                (Some(before), Some(after)) => UiEvent::DbCompacted(before, after),
+                _ => UiEvent::DbError("unconfirmed db.compact".to_string()),
+            }
+        }
+        (UiCmd::DbInfo(_) | UiCmd::DbCompact, Err(error)) => UiEvent::DbError(error.message),
         (UiCmd::BackupCreate(_), Ok(body)) => {
             if let Some(path) = body.get("path").and_then(Value::as_str) {
                 UiEvent::BackupDone(path.to_string())
@@ -477,6 +502,11 @@ fn handle(cmd: UiCmd, outcome: Result<Value, IpcError>) -> UiEvent {
                 source: src,
                 message: error.message,
             }
+        }
+        // The config request at start fails while the daemon is still
+        // starting: offline, not an error line (status replies retry it).
+        (UiCmd::ConfigGet, Err(error)) if is_transport_error(&error) => {
+            UiEvent::Offline(error.message)
         }
         (
             UiCmd::ConfigGet

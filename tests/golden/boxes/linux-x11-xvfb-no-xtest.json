@@ -1,0 +1,63 @@
+{
+  "autostart": true,
+  "backends": {
+    "x11": {
+      "autostart": true,
+      "extension_connected": false,
+      "hotkey": {
+        "level": "full",
+        "reason": ""
+      },
+      "monitor": {
+        "level": "full",
+        "reason": ""
+      },
+      "notes": [
+        "tray hosted by app-ui via KSNI",
+        "paste Degraded: XTest missing, no synthetic input"
+      ],
+      "paste": {
+        "level": "degraded",
+        "reason": "XTest missing: no synthetic input",
+        "strategy": "clipboard_restore"
+      },
+      "primary_selection": true,
+      "transfer": {
+        "level": "full",
+        "reason": ""
+      },
+      "tray": {
+        "level": "unavailable",
+        "reason": "tray hosted by app-ui via KSNI; paste Degraded: XTest missing, no synthetic input"
+      }
+    }
+  },
+  "extension_connected": false,
+  "hotkey": {
+    "level": "full",
+    "reason": ""
+  },
+  "monitor": {
+    "level": "full",
+    "reason": ""
+  },
+  "notes": [
+    "[x11] tray hosted by app-ui via KSNI",
+    "[x11] paste Degraded: XTest missing, no synthetic input"
+  ],
+  "paste": {
+    "level": "degraded",
+    "reason": "XTest missing: no synthetic input",
+    "strategy": "clipboard_restore"
+  },
+  "popup_hotkey_conflict": null,
+  "primary_selection": true,
+  "transfer": {
+    "level": "full",
+    "reason": ""
+  },
+  "tray": {
+    "level": "unavailable",
+    "reason": "[x11] tray hosted by app-ui via KSNI; [x11] paste Degraded: XTest missing, no synthetic input"
+  }
+}

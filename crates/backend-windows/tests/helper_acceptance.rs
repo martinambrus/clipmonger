@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use clipmonger_backend_windows::helper::{
     decide_route, decode_job, encode_job, protected_path_ok, GestureTokens, HelperAction,
-    HelperState, Job, JobOp, JobResult, Route,
+    HelperState, Job, JobOp, JobResult, Route, GESTURE_TTL_MS,
 };
 use clipmonger_backend_windows::Integrity;
 
@@ -178,15 +178,15 @@ fn t413_unit_token_expired_unknown() {
     let mut tokens = GestureTokens::new();
     let tok = tokens.mint(0).expect("mint");
     assert!(
-        tokens.consume(tok, 30_000),
+        tokens.consume(tok, GESTURE_TTL_MS),
         "{T}: consume at exactly TTL must still succeed"
     );
 
     let mut tokens = GestureTokens::new();
     let tok = tokens.mint(0).expect("mint");
     assert!(
-        !tokens.consume(tok, 30_001),
-        "{T}: consume past TTL (30_000 ms) must be false"
+        !tokens.consume(tok, GESTURE_TTL_MS + 1),
+        "{T}: consume past TTL ({GESTURE_TTL_MS} ms) must be false"
     );
 
     let mut tokens = GestureTokens::new();

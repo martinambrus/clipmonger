@@ -39,6 +39,9 @@ Helper and channel:
   their own (pipe client/server process id + image path); the daemon also
   requires an elevated helper token; the helper opens the pipe with
   identification-only security so the server can never impersonate it.
+  The pipe has an explicit protected DACL (2026-11-13): only SYSTEM and the
+  daemon's own user SID may open it (the helper runs as the same user);
+  one instance, remote clients rejected.
 - Strict request/response on one helper thread; no heartbeat. Liveness is
   the pipe itself (process exit closes it). While no verified helper is
   connected, jobs fail at once ("admin helper is not running").

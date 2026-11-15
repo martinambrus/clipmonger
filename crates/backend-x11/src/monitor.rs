@@ -7,7 +7,7 @@
 //! dying-owner `SAVE_TARGETS` handoffs. `poll` only drains the event queue.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -48,9 +48,30 @@ pub struct MonitorOpts {
 
 /// X11 clipboard monitor.
 pub struct X11Monitor {
-    shared: Arc<Mutex<MonitorShared>>,
+    shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+}
+
+/// The worker's event queue and the condition the poller waits on, so a
+/// capture wakes it at once instead of on a timer.
+#[derive(Debug, Default)]
+struct Shared {
+    state: Mutex<MonitorShared>,
+    ready: Condvar,
+}
+
+impl Shared {
+    fn new(state: MonitorShared) -> Self {
+        Self {
+            state: Mutex::new(state),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, MonitorShared>> {
+        self.state.lock()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -76,7 +97,7 @@ impl X11Monitor {
         #[cfg(unix)]
         {
             let display_name = session::display_name(display);
-            let shared = Arc::new(Mutex::new(MonitorShared::default()));
+            let shared = Arc::new(Shared::new(MonitorShared::default()));
             let stop = Arc::new(AtomicBool::new(false));
             let worker_shared = Arc::clone(&shared);
             let worker_stop = Arc::clone(&stop);
@@ -115,27 +136,42 @@ impl ClipboardMonitor for X11Monitor {
 
     fn poll(&mut self, timeout: Duration) -> Result<Vec<CaptureEvent>> {
         let deadline = Instant::now() + timeout;
+        let (mut shared, mut poisoned) = match self.shared.lock() {
+            Ok(shared) => (shared, false),
+            Err(error) => (error.into_inner(), true),
+        };
         loop {
-            {
-                let (mut shared, poisoned) = match self.shared.lock() {
-                    Ok(shared) => (shared, false),
-                    Err(error) => (error.into_inner(), true),
-                };
-                if !shared.queue.is_empty() {
-                    return Ok(std::mem::take(&mut shared.queue));
-                }
-                let dead = self.worker.as_ref().is_none_or(JoinHandle::is_finished);
-                if poisoned || dead {
-                    return Err(Error::Unavailable("x11 monitor worker exited".to_string()));
-                }
+            if !shared.queue.is_empty() {
+                return Ok(std::mem::take(&mut shared.queue));
             }
-            if Instant::now() >= deadline {
+            let dead = self.worker.as_ref().is_none_or(JoinHandle::is_finished);
+            if poisoned || dead {
+                return Err(Error::Unavailable("x11 monitor worker exited".to_string()));
+            }
+            let now = Instant::now();
+            if now >= deadline {
                 return Ok(Vec::new());
             }
-            std::thread::sleep(Duration::from_millis(20));
+            // A push wakes the wait; the bound keeps a dead worker noticed.
+            let wait = (deadline - now).min(IDLE_WAIT);
+            shared = match self.shared.ready.wait_timeout(shared, wait) {
+                Ok((shared, _)) => shared,
+                Err(error) => {
+                    poisoned = true;
+                    error.into_inner().0
+                }
+            };
         }
     }
 }
+
+/// Longest idle wait of the monitor worker: bounds how long `Drop` waits for
+/// it to see the stop flag.
+const IDLE_WAIT: Duration = Duration::from_millis(250);
+
+/// How often the worker checks whether the clipboard-manager selection
+/// became free.
+const MANAGER_CHECK: Duration = Duration::from_secs(1);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -143,10 +179,11 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-fn push_event(shared: &Arc<Mutex<MonitorShared>>, event: CaptureEvent) {
+fn push_event(shared: &Arc<Shared>, event: CaptureEvent) {
     if let Ok(mut guard) = shared.lock() {
         guard.queue.push(event);
     }
+    shared.ready.notify_all();
 }
 
 fn worker_event<T>(
@@ -201,7 +238,7 @@ struct Worker {
     win: Window,
     atoms: Atoms,
     opts: MonitorOpts,
-    shared: Arc<Mutex<MonitorShared>>,
+    shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
     server: ServerState,
     role: ManagerState,
@@ -217,7 +254,7 @@ struct Worker {
 fn run_worker(
     display: Option<&str>,
     opts: MonitorOpts,
-    shared: Arc<Mutex<MonitorShared>>,
+    shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
 ) {
     let Ok((conn, screen)) = session::connect(display) else {
@@ -267,18 +304,32 @@ fn run_worker(
         prop,
         prop_generation: 0,
     };
+    let mut manager_checked = Instant::now();
     while !worker.stop.load(Ordering::Relaxed) {
-        if worker.pump_events().is_err() {
-            break;
-        }
         if worker.snapshot_new_kinds().is_err() {
             break;
         }
-        worker.manager_watch();
+        // A rival clipboard manager leaving is rare: one round trip a
+        // second, not one per pass.
+        if manager_checked.elapsed() >= MANAGER_CHECK {
+            manager_checked = Instant::now();
+            worker.manager_watch();
+        }
         if worker.eval_primary().is_err() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        // Drain last, so the socket is dry when the wait below starts.
+        if worker.pump_events().is_err() {
+            break;
+        }
+        // Wake on the next X event; a pending primary debounce or the stop
+        // flag still gets a short timeout.
+        let timeout = if worker.primary_armed {
+            Duration::from_millis(10)
+        } else {
+            IDLE_WAIT
+        };
+        session::wait_readable(&worker.conn, timeout);
     }
 }
 
@@ -729,7 +780,7 @@ mod lifecycle_tests {
     #[test]
     fn exited_or_panicked_worker_delivers_queue_then_unavailable() {
         for panic in [false, true] {
-            let shared = Arc::new(Mutex::new(MonitorShared {
+            let shared = Arc::new(Shared::new(MonitorShared {
                 queue: vec![CaptureEvent {
                     native_sequence: None,
                     offers: Vec::new(),
@@ -757,7 +808,7 @@ mod lifecycle_tests {
 
     #[test]
     fn panicked_producer_preserves_poisoned_queue_before_terminal_error() {
-        let shared = Arc::new(Mutex::new(MonitorShared::default()));
+        let shared = Arc::new(Shared::new(MonitorShared::default()));
         let producer = Arc::clone(&shared);
         let handle = finish_worker(move || {
             let mut queue = producer.lock().unwrap();
@@ -783,7 +834,7 @@ mod lifecycle_tests {
 
     #[test]
     fn alive_idle_is_empty_and_stopped_worker_is_unavailable() {
-        let shared = Arc::new(Mutex::new(MonitorShared::default()));
+        let shared = Arc::new(Shared::new(MonitorShared::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let (release_tx, release_rx) = mpsc::channel();
         let handle = std::thread::spawn(move || {

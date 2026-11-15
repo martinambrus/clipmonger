@@ -135,9 +135,10 @@ Notes:
 ## Using the mouse
 
 - Hover over a row to highlight it.
-- Click a row to select it. Click the selected row again to paste it.
+- Click a row to paste it.
 - If a preview is shortened (it ends with "…"), hover over it to see the
   longer text in a tooltip.
+- Hover over an image row to see the image enlarged in a tooltip.
 - Right-click a history row for **Pin entry** (or **Unpin entry**) and
   **Delete entry**. Permanent clips have no right-click menu.
 - Click a tab to switch between **History** and a permanent group.

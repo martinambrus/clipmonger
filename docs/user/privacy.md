@@ -5,8 +5,8 @@ to stop it recording, and where your data goes.
 
 ## Your data stays on your computer
 
-Clipmonger has no network code. It does not send clips, settings or usage data
-anywhere, and it does not check for updates.
+Clipmonger does not send clips, settings or usage data anywhere. The only
+network request it makes is the update check described below.
 
 - History, permanent clips and settings are stored in a local SQLite database
   and files in your profile folder.
@@ -27,8 +27,16 @@ The profile folder is:
 Anyone who can read this folder can read your history. Backups you create
 contain your history too. See [Backup and data](backup-and-data.md).
 
-Settings has a **Check for updates** option, but no update check exists yet;
-it has no effect. Syncing between devices is not available.
+**Update check.** Once a day the Clipmonger UI asks GitHub for the latest
+release (`api.github.com/repos/martinambrus/clipmonger/releases/latest`), using
+the system `curl` (or `wget` where `curl` is missing). The request carries no clips, settings or identifiers
+beyond what any web request carries (your IP address and a
+`clipmonger-update-check` user agent). The first check waits until the popup
+has shown a notice about it once. Turn it off with **Turn off** on that
+notice, or untick **Check for updates** in Settings, **General**. Offline or
+without `curl` or `wget` the check is skipped silently.
+
+Syncing between devices is not available.
 
 ## Signals from other applications
 

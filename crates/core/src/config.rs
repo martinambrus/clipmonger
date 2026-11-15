@@ -255,6 +255,29 @@ impl Default for AutostartConfig {
     }
 }
 
+/// `[updates]` section (seg-12 §4): the update check, on by default, and
+/// whether its first-run notice was acknowledged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpdatesConfig {
+    #[serde(default = "default_true")]
+    pub check: bool,
+    #[serde(default)]
+    pub notice_shown: bool,
+    /// Unknown keys preserved for forward compatibility.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            notice_shown: false,
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
 /// `[windows]` section (Windows-only, ignored elsewhere).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowsConfig {
@@ -296,6 +319,8 @@ pub struct Config {
     pub autostart: AutostartConfig,
     #[serde(default)]
     pub windows: WindowsConfig,
+    #[serde(default)]
+    pub updates: UpdatesConfig,
     /// Unknown root-level keys preserved for forward compatibility.
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
@@ -318,6 +343,7 @@ impl Default for Config {
             privacy: PrivacyConfig::default(),
             autostart: AutostartConfig::default(),
             windows: WindowsConfig::default(),
+            updates: UpdatesConfig::default(),
             extra: BTreeMap::new(),
             warned_newer_version: false,
         }
