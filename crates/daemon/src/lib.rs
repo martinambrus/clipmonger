@@ -5122,6 +5122,22 @@ impl DaemonState {
         {
             use clipmonger_backend_windows::Integrity;
             use clipmonger_platform::traits::PasteEngine as _;
+            // Only a daemon running the live Windows backend pastes: a state
+            // without it (tests, headless) must never type into a desktop.
+            if !self.caps.has_backend("windows") {
+                daemon_runtime_emit(
+                    clipmonger_core::runtime_log::Severity::Warn,
+                    "paste.failed",
+                    &[
+                        ("operation", "paste_delivery"),
+                        ("class", "backend_unavailable"),
+                    ],
+                );
+                return Err(IpcError::new(
+                    "unavailable",
+                    format!("paste unavailable: {SKELETON_NOTE}"),
+                ));
+            }
             let settings @ (unicode_limit, dwell_ms, delivery, restore) = self.paste_budget();
             let paste = clipmonger_backend_windows::WinPaste::new(
                 usize::try_from(unicode_limit).unwrap_or(65536),

@@ -471,20 +471,16 @@ fn check_managed_not_symlink(path: &Path) -> Result<(), CoreError> {
     }
 }
 
+/// Whether two paths name the same file: the same canonical path, or the
+/// same file identity (device and inode on Unix, volume serial and file
+/// index on Windows), which also catches hard links.
 fn same_file(left: &Path, right: &Path) -> bool {
     if let (Ok(left), Ok(right)) = (left.canonicalize(), right.canonicalize()) {
         if left == right {
             return true;
         }
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) {
-            return left.dev() == right.dev() && left.ino() == right.ino();
-        }
-    }
-    false
+    same_file::is_same_file(left, right).unwrap_or(false)
 }
 
 fn is_ancestor_managed(src: &Path, profile: &Path, config: bool) -> Result<bool, CoreError> {

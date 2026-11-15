@@ -17,6 +17,7 @@ directories.workspace = true
 rusqlite.workspace = true
 zip.workspace = true
 getrandom.workspace = true
+same-file = "1.0.6"
 
 [lints]
 workspace = true

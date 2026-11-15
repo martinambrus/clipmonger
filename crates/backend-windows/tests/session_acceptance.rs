@@ -693,7 +693,7 @@ fn t_show_owned_window_restores_minimized() {
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, GetForegroundWindow, IsIconic, IsWindowVisible, ShowWindow,
-        SW_HIDE, SW_SHOWMINNOACTIVE, WS_OVERLAPPEDWINDOW,
+        SW_HIDE, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, WS_OVERLAPPEDWINDOW,
     };
     const T: &str = "t_show_owned_window_restores_minimized";
 
@@ -734,6 +734,14 @@ fn t_show_owned_window_restores_minimized() {
         // The launcher's startup info may override the first ShowWindow of a
         // process; spend that call on the hidden window.
         ShowWindow(hwnd, SW_HIDE);
+        // Probe: some sessions (CI runners, services) never hand this
+        // process the foreground. Bring the plain shown window to the front
+        // first; if even that fails, the session cannot grant it.
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        if !show_owned_window(hwnd as i64, std::process::id()) || GetForegroundWindow() != hwnd {
+            println!("SKIP {T}: session does not grant this process the foreground");
+            return;
+        }
         for hidden in [false, true] {
             ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
             if hidden {

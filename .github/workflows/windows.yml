@@ -41,7 +41,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
-        run: cargo test --workspace --locked --no-fail-fast
+        run: cargo test --workspace --locked --no-fail-fast --exclude clipmonger-backend-windows
+      # The backend's session tests share the one system clipboard (and the
+      # foreground): run them one at a time, as the X11 suite does.
+      - name: Windows backend tests (serial)
+        run: cargo test -p clipmonger-backend-windows --locked --no-fail-fast -- --test-threads=1
       - name: Release build
         run: cargo build --release --locked -p clipmonger-daemon -p clipmonger-app-ui -p clipmonger-app-cli
       - uses: actions/upload-artifact@v4

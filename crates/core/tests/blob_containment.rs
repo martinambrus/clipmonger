@@ -211,7 +211,10 @@ fn check_hostile_manifest_key(hostile_key: &str) {
     let manifest_path = extract.join("manifest.toml");
     let text = std::fs::read_to_string(&manifest_path).unwrap();
     // Replace good key with hostile key; ensure hostile key's declared size matches sentinel (which equals good size) so bypass would not fail on size
-    let new_text = text.replace(&good_key, hostile_key);
+    // The manifest is TOML: escape a Windows path's backslashes so the
+    // parsed key is the raw absolute path (otherwise `C:\Users` reads as a
+    // bad `\U` escape and the refusal is a parse error, not the key check).
+    let new_text = text.replace(&good_key, &hostile_key.replace('\\', "\\\\"));
     std::fs::write(&manifest_path, &new_text).unwrap();
 
     // If hostile is traversal like ../evil, create file at expected bypass location with matching bytes/hash
@@ -319,7 +322,7 @@ fn check_hostile_manifest_key_owned(hostile_key: &str, sentinel_file: &Path) {
     }
     let manifest_path = extract.join("manifest.toml");
     let text = std::fs::read_to_string(&manifest_path).unwrap();
-    let new_text = text.replace(&good_key, hostile_key);
+    let new_text = text.replace(&good_key, &hostile_key.replace('\\', "\\\\"));
     std::fs::write(&manifest_path, &new_text).unwrap();
     // Ensure sentinel file exists with data that would make bypass succeed if key not checked
     // The sentinel already exists at absolute path; we need to ensure its bytes are not used unless bypass

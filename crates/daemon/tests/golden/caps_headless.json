@@ -10,8 +10,7 @@
     "reason": "no backends in foundation skeleton"
   },
   "notes": [
-    "no backends in foundation skeleton",
-    "gnome extension disconnected: paste unavailable"
+    "no backends in foundation skeleton"
   ],
   "paste": {
     "level": "unavailable",

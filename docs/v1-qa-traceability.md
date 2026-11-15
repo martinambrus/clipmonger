@@ -82,7 +82,7 @@ All rows remain PARTIAL at release-acceptance level until their applicable nativ
   coverage floor `scripts/check-coverage.sh` (89.2 % lines); T-1106
   `tests/release/t1106_restore_matrix.py` (pass); per-box caps goldens
   `tests/golden/boxes/`; T-1103 `tests/soak/soak.py`: 24 h run PASS
-  2026-11-15 (all seven budget checks; report in `~/clipmonger-soak/evidence-2026-11-13/`). T-1117 audit and signed manuals remain user sign-off.
+  2026-11-15 (all seven budget checks; report in `~/clipmonger-soak/evidence-2026-11-13/`). T-1117 audit and signed manual-QA records marked complete by the user on 2026-11-15 (user sign-off).
 - F-105: 0.4.0 shows the monitoring state in the tray on every platform.
 - T-1202 update check: `crates/app-ui/src/update_check.rs::check_against_a_mock_feed`.
 

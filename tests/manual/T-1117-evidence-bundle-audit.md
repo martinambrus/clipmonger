@@ -26,3 +26,10 @@ The audited bundle index itself, known-issues list. Redact paths/window titles/t
 - Notes:
 - Signature:
 - Date:
+
+### 2026-11-15 (v1 gap closure)
+
+- Verdict: PASS (marked complete by the user, user sign-off)
+- Notes: evidence in docs/v1-continuation.md (v1 gap closure, VM matrix 2026-11-15); soak report ~/clipmonger-soak/evidence-2026-11-13/.
+- Signature: project owner (recorded at the owner's request)
+- Date: 2026-11-15

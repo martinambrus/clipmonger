@@ -48,6 +48,31 @@ fn normalize(value: &Value) -> Value {
 
 #[test]
 fn caps_headless_matches_golden() {
+    // Caps depend on the desktop session (a GNOME session adds the
+    // extension note, a Wayland one the shortcut recipe); the golden is the
+    // headless truth, so inside a session re-run this test in a child
+    // without the session variables.
+    const SESSION_VARS: [&str; 5] = [
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_TYPE",
+        "WAYLAND_DISPLAY",
+        "DISPLAY",
+        "DESKTOP_SESSION",
+    ];
+    if SESSION_VARS.iter().any(|v| std::env::var_os(v).is_some())
+        && std::env::var_os("CLIPMONGER_CAPS_GOLDEN_CHILD").is_none()
+    {
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test exe"));
+        child
+            .args(["caps_headless_matches_golden", "--exact", "--nocapture"])
+            .env("CLIPMONGER_CAPS_GOLDEN_CHILD", "1");
+        for var in SESSION_VARS {
+            child.env_remove(var);
+        }
+        let status = child.status().expect("re-run without the session");
+        assert!(status.success(), "headless caps child run failed");
+        return;
+    }
     let n = CTR.fetch_add(1, Ordering::SeqCst);
     let profile =
         std::env::temp_dir().join(format!("clipmonger-caps-golden-{}-{n}", std::process::id()));

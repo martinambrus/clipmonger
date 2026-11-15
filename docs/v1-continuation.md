@@ -110,7 +110,7 @@ cm-gnome51 (Ubuntu 26.10, GNOME 51 Wayland) and private Xvfb/headless sway.
 
 | ID | Result on 2026-11-13 | Still open |
 | --- | --- | --- |
-| #19, #49 | Not re-run. | DPI and monitor plug/unplug on a physical Windows display; two-monitor plug/unplug on Linux. Needs the user's hardware. |
+| #19, #49 | DPI and monitor plug/unplug on physical displays marked complete by the user on 2026-11-15 (user sign-off). | — |
 | #22 | Done earlier: T-410 passed 2026-11-04; KVM runs of 0.2.0-0.4.0 passed autostart across reboot. On 2026-11-13 Win11 reboot started the app and, through the logon task, the admin helper (helper route alive, no prompt). | — |
 | #26 | Install/uninstall/reinstall with history kept passed for 0.2.0-0.4.0 on Win10/11. | Formal recovery/interoperability record only. |
 | #41 | Done: Xfce, Cinnamon, KDE (T-508), Sway, Hyprland, COSMIC (T-606/607), GNOME 46-51 (T-704), portal rebind on KDE. | — |

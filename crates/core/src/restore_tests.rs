@@ -241,10 +241,16 @@ fn actual_rollback_remove_and_rename_failures_are_reported_without_draining() {
     let scratch = Scratch::new();
     let file = scratch.0.join("component");
     fs::write(&file, b"file ancestor").unwrap();
-    let mut installed = vec![file.join("child")];
-    let mut moved = Vec::new();
-    assert!(PreparedRestore::rollback_moves(&mut moved, &mut installed).is_err());
-    assert_eq!(installed.len(), 1);
+    // A path under a regular file reads as "not a directory" on Unix (an
+    // error to report); Windows calls it "not found", which rollback rightly
+    // treats as already removed, so the remove failure is Unix-only here.
+    #[cfg(unix)]
+    {
+        let mut installed = vec![file.join("child")];
+        let mut moved = Vec::new();
+        assert!(PreparedRestore::rollback_moves(&mut moved, &mut installed).is_err());
+        assert_eq!(installed.len(), 1);
+    }
     let backup = scratch.0.join("backup");
     fs::write(&backup, b"original").unwrap();
     let mut moved = vec![(backup.clone(), file.join("child"))];

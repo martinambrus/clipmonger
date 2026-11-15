@@ -77,7 +77,7 @@ Registration hardening (pending interactive Windows acceptance):
       with unknown results reported separately.
 
 Legs 10, 11/17 (forged wrong-command task), 12, 14 and 16 ran on 2026-11-13
-(see the verdict below). Legs 13 and 15 are **NOT RUN**. The dated verdicts below retain their original
+(see the verdict below). Legs 13 and 15 were marked complete by the user on 2026-11-15 (user sign-off). The dated verdicts below retain their original
 scope and do not validate the registration hardening or native ACL/UAC boundary.
 
 

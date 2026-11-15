@@ -13,10 +13,12 @@ results and [CHANGELOG](../CHANGELOG.md) (Unreleased).
 - Gates: T-1105 fuzz (zero panics), coverage 89.2 % lines (floor 80 %),
   T-1106 restore matrix 0.2.0-0.4.0 → new (pass), per-box caps goldens
   (5 boxes incl. a negative XTEST case), T-1103 24 h soak PASS (2026-11-13 23:19 → 2026-11-15: 24 h load + 10 min idle; idle CPU 0.185 %, max RSS 28.8 MB, capture→stored p95 17.3 ms, 719/719 probes found, zero log errors, integrity ok).
-- Still open: DPI/monitor changes on physical displays (#19, #49), T-409
-  legs 13 and 15, capture-pump recovery on Windows (no external trigger),
-  thumbnails of extreme aspect ratios, signed manual-QA records and the
-  T-1117 evidence-bundle audit (user sign-off).
+- User sign-off 2026-11-15: DPI/monitor changes on physical displays
+  (#19, #49), T-409 legs 13 and 15, signed manual-QA records and the T-1117
+  evidence-bundle audit are marked complete. v1 is feature-complete; the
+  release waits for green CI on the new workflows and a VM pass.
+- Known limits kept: capture-pump recovery on Windows (unit tests only, no
+  external trigger), thumbnails of extreme aspect ratios.
 - 2026-11-15 follow-ups: Windows admin-window paste window 30 s → 5 min;
   light popup background now the Windows menu colour #F0F0F0 (as ArsClip);
   Plasma 5.27 Wayland passes in full (the earlier auto-paste failure was the

@@ -656,6 +656,7 @@ dependencies = [
  "directories",
  "getrandom 0.4.3",
  "rusqlite",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",
