@@ -1,5 +1,15 @@
 # Docs status
 
+## 0.5.0 (2026-11-15)
+
+v1 feature-complete release ([release notes](release-notes-0.5.0.md)). The
+release run on every test VM found and fixed: the SQLite CVE-2026-119375, a
+30-55 % CPU spin with the popup open on KDE Plasma 5 Wayland, stale KDE
+shortcuts blocking a reused permanent-clip key, a Linux Start on login entry
+left after package removal, a Windows-only gap in restore's same-file check,
+and missing version/publisher in Windows Apps. Results per desktop:
+[the continuation](v1-continuation.md#release-run-050-2026-11-15).
+
 ## v1 gap closure (2026-11-13, unreleased work tree)
 
 Closed the code gaps left in the v1 scope and ran the open release gates; see

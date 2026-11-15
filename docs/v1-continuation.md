@@ -195,6 +195,29 @@ Found while testing:
   the Shortcuts page and the hotkey does not fire. Plasma 5.27 also opens the
   Shortcuts page for the app at every start. Both also with 0.4.0.
 
+## Release run 0.5.0 (2026-11-15)
+
+Branch `release/0.5.0`; the procedure in
+[release-regression.md](../tests/manual/release-regression.md). Release gate:
+all automatic steps PASS (after rusqlite 0.41 for RUSTSEC-2026-0459). Every
+row of the matrix passed on the published artifacts (Linux packages from the
+Debian 12 container, Windows installer and ZIP, macOS universal app from
+GitHub Actions repackaged with the notices):
+
+| Box | Artifact | Result |
+| --- | --- | --- |
+| Xfce, Cinnamon, GNOME 46/47/49/51, Debian 13 GNOME 48 | `.deb` | pass |
+| GNOME 50 | `install.sh` (wget) | pass |
+| Debian 12 Plasma 5.27 Wayland + X11 | `.deb` | pass after 336a98b (popup-open CPU) and 5d928a1/f7e194e (stale KDE shortcuts) |
+| Fedora 45 Plasma 6.8 | `.rpm` | pass after f7e194e |
+| Arch Hyprland, Sway | `install.sh` (curl) | pass |
+| Pop!_OS COSMIC | `.deb` | pass |
+| Windows 10, 11 | installer, ZIP | pass (admin helper via UAC on 11; Defender clean); Apps metadata 869a5b0 |
+| macOS 10.15, 13, 15, 26 | `.dmg` | R-70 to R-75 pass, automatic paste included |
+
+Also fixed during the run: Linux Start on login entry inert after package
+removal (00e44a2). Per-box notes: `~/clipmonger-soak/release-0.5.0/results.md`.
+
 ## Resume point and possible reboot
 
 Alt+Tab from the focused popup lands on the most recent ordinary window (B), not

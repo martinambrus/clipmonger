@@ -5,6 +5,8 @@ reserved for the release that passes all seg-11 §5 gates.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-11-15
+
 ### Added
 
 - Hovering an image in the popup shows it enlarged in a tooltip.
@@ -41,6 +43,21 @@ reserved for the release that passes all seg-11 §5 gates.
 - Windows: when a task named `ClipmongerHelper` with another definition
   existed, enabling the admin helper failed at every start; the registrar
   now replaces it.
+- Security: the bundled SQLite is updated (rusqlite 0.41, libsqlite3-sys 0.39)
+  for CVE-2026-119375 (RUSTSEC-2026-0459): a database opened with a crafted
+  `-wal` file of another page size could return stale memory. A crafted
+  backup ZIP could carry such a pair.
+- KDE Plasma 5 on Wayland: with the popup open the UI used 30-55 % CPU; it
+  now idles near 0 %.
+- KDE: a permanent clip created on the key of a deleted one (or after a
+  chord change) never fired, because KDE kept the old shortcut holding the
+  key. Clipmonger now removes its own stale shortcuts before binding.
+- Linux: after `apt remove` or `dnf remove` the per-user Start on login entry
+  stayed and pointed at the removed program; it now carries `TryExec`, so the
+  desktop skips it once the program is gone.
+- Windows: a restore did not refuse a backup file that was also hard-linked
+  inside the profile; the same-file check now works on Windows too.
+- Windows: Apps and Features shows Clipmonger's version and publisher.
 
 ## [0.4.0] — 2026-11-09
 

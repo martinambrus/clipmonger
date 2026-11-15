@@ -90,6 +90,8 @@ Watch for: every second popup opening without focus (Cinnamon); a stale
 first popup after login without focus or a GNOME "Set shortcut" dialog for
 the popup hotkey (run this right after a fresh login too); a popup left
 behind another window that the hotkey does not bring forward (Wayland).
+Also measure the UI's CPU for 20 s with the popup open and idle: it must stay
+near 0 % (KDE Plasma 5 Wayland once spun at 30-55 %).
 
 **R-05 Popup paste into a GTK editor.** Pick a text row, then an image row.
 Expected: the text and the image land in the editor; history gains no row.
@@ -270,3 +272,9 @@ for every new one.
 | 2026-11-07 | Windows | Uninstaller left `licenses` (new licence folder not listed) | 0.2.0 | R-52 |
 | 2026-11-07 | Windows | Defender quarantined an NSIS 3.08 build | 0.2.0 | section 1, R-53 |
 | 2026-11-09 | Ubuntu GNOME | Degraded tray icon stayed normal: `NeedsAttention` without an attention image | 0.4.0 | R-10 |
+| 2026-11-15 | KDE Plasma 5.27 Wayland | UI used 30-55 % CPU while the popup sat open (frame callback and KWin IME echoes each asked for a new pass) | 336a98b | R-04 (idle CPU with the popup open) |
+| 2026-11-15 | KDE Plasma 5.27 and 6 | A permanent clip on the key of a deleted one never fired: KDE kept the stale global shortcut holding the key | 5d928a1, f7e194e | R-30 |
+| 2026-11-15 | Linux (all packages) | Per-user autostart entry survived `apt remove`/`dnf remove` and pointed at the removed program | 00e44a2 (TryExec) | R-61 |
+| 2026-11-15 | Windows 10/11 | Apps and Features showed no version or publisher | 869a5b0 | R-52 |
+| 2026-11-15 | Windows | Restore did not refuse a backup hard-linked inside the profile (Unix-only same-file check) | 4b11efb | `restore_safety::source_hardlink_to_managed_blob_is_refused_without_changes` (Windows CI) |
+| 2026-11-15 | all | Bundled SQLite affected by CVE-2026-119375 (RUSTSEC-2026-0459) | 5bc1a82 | section 1 (`cargo deny` in `scripts/release-gate.sh`) |
