@@ -149,9 +149,12 @@ popup has an **Open settings window** button.
 
 On Plasma on Wayland, Clipmonger registers its hotkey through the desktop's
 shortcut service. The first time, Plasma shows a dialog that asks you to
-confirm the shortcut. Accept it. Plasma may ask again when you change the
-popup hotkey or give a permanent clip its own hotkey; Settings says **Your
-desktop asks you to confirm a new shortcut** when that happens.
+confirm the shortcut. Accept it. Plasma asks again when you change the
+popup hotkey and for every permanent clip you give its own hotkey; Settings
+says **Your desktop asks you to confirm a new shortcut** when that happens.
+Until you click **OK** in Plasma's **Global Shortcuts Requested** dialog, that
+shortcut does nothing. The dialog can open behind other windows; look for it
+in the taskbar.
 
 On Plasma on X11 there is no dialog.
 

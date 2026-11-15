@@ -26,10 +26,17 @@ clipmonger-cli --profile-dir ~/.local/share/clipmonger status
 `daemon not running` means the background service is down. Start
 Clipmonger from the applications menu; the UI starts the service.
 
-**KDE Plasma.** Plasma asks you to confirm a new global shortcut the first
-time, and again after you change the hotkey. Settings shows "Your desktop
-asks you to confirm a new shortcut" in that case. Approve it in Plasma's
-dialog. <!-- TODO verify: how to re-approve after the Plasma dialog was dismissed or denied (System Settings, Shortcuts?) -->
+**KDE Plasma.** On Wayland, Plasma asks you to confirm every new global
+shortcut: the popup hotkey the first time and after you change it, and each
+permanent clip's hotkey. Settings shows "Your desktop asks you to confirm a
+new shortcut" in that case. Click **OK** in Plasma's **Global Shortcuts
+Requested** dialog; until then the shortcut does nothing. The dialog can open
+behind other windows, so check the taskbar.
+
+If you closed or cancelled the dialog, open System Settings, **Keyboard**,
+**Shortcuts** (Plasma 5: **Shortcuts** at the top of the list), select **Clipmonger** (listed under its app id,
+`com.martinambrus.clipmonger`) and assign the key to the shortcut there
+(**Clipmonger popup** or **Clipmonger: paste** followed by the clip's name).
 
 **GNOME.** On GNOME the bundled Clipmonger Shell extension handles the
 hotkey. Log out and back in once after installing, then enable it:

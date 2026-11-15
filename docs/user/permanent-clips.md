@@ -112,8 +112,9 @@ A hotkey works as soon as the clip is saved:
 - **Windows, macOS and X11 desktops:** Clipmonger registers the hotkey
   itself.
 - **GNOME (Wayland):** the Clipmonger GNOME Shell extension registers it.
-- **KDE Plasma and other Wayland desktops with a shortcut service:** the
-  desktop may ask you once to allow the new shortcut.
+- **KDE Plasma (Wayland) and other desktops with a shortcut service:** the
+  desktop asks you to allow each new shortcut. On Plasma, click **OK** in the
+  **Global Shortcuts Requested** dialog; until then the hotkey does nothing.
 - **Sway, Hyprland and COSMIC:** see the next section.
 
 <!-- TODO verify: behaviour when a per-clip hotkey is already held by another application (no UI message found for permanent hotkeys; the popup hotkey has one). -->

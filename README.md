@@ -169,8 +169,9 @@ release.
 
 Then start **Clipmonger** from the applications menu, or run `clipmonger`.
 The UI starts its background daemon. Press **Ctrl+Alt+H** to open the popup.
-On KDE Plasma, approve the shortcut in the dialog Plasma shows the first
-time.
+On KDE Plasma (Wayland), approve the shortcut in the dialog Plasma shows the
+first time. Plasma asks again for every permanent clip you give a hotkey; a
+shortcut does nothing until you click **OK** there.
 
 **GNOME:** the bundled GNOME Shell extension handles capture, the hotkey and
 paste on Wayland (on Xorg it is optional). After installing, log out and back
