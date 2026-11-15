@@ -157,6 +157,57 @@ pub(crate) async fn close_session(conn: &zbus::Connection, session: &OwnedObject
     }
 }
 
+/// KDE only: remove this app's shortcuts that are no longer in `keep`.
+///
+/// The portal has no call to drop a shortcut, and KDE keeps every one a
+/// session ever bound, with its key. A deleted permanent clip, or a changed
+/// chord (the chord is part of the id), would otherwise hold its key for
+/// good: a new clip on that key gets no active key in KDE and never fires.
+/// The components are found through `kglobalaccel`; only those whose unique
+/// name starts with `app_id` are touched. Elsewhere `kglobalaccel` is absent
+/// and this does nothing. Failures are ignored (best effort).
+pub(crate) async fn kde_release_stale(conn: &zbus::Connection, app_id: &str, keep: &[&str]) {
+    const ACCEL: &str = "org.kde.kglobalaccel";
+    let Ok(accel) = zbus::Proxy::new(conn, ACCEL, "/kglobalaccel", "org.kde.KGlobalAccel").await
+    else {
+        return;
+    };
+    let components: Vec<OwnedObjectPath> = match accel.call("allComponents", &()).await {
+        Ok(paths) => paths,
+        Err(_) => return,
+    };
+    for path in components {
+        let Ok(component) =
+            zbus::Proxy::new(conn, ACCEL, path.as_ref(), "org.kde.kglobalaccel.Component").await
+        else {
+            continue;
+        };
+        let Ok(unique) = component.get_property::<String>("uniqueName").await else {
+            continue;
+        };
+        if !unique.starts_with(app_id) {
+            continue;
+        }
+        let names: Vec<String> = component
+            .call("shortcutNames", &("default",))
+            .await
+            .unwrap_or_default();
+        for name in stale_shortcuts(&names, keep) {
+            let _: zbus::Result<bool> = accel.call("unregister", &(unique.as_str(), name)).await;
+        }
+    }
+}
+
+/// The shortcut names of our component that the current binding set no
+/// longer holds.
+fn stale_shortcuts<'a>(names: &'a [String], keep: &[&str]) -> Vec<&'a str> {
+    names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !keep.contains(name))
+        .collect()
+}
+
 /// Why a held session may be gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Lost {
@@ -285,6 +336,26 @@ mod tests {
         assert!(!Lost::Session(other).ends(Some(&ours)));
         assert!(Lost::Portal.ends(Some(&ours)));
         assert!(Lost::Portal.ends(None));
+    }
+
+    #[test]
+    fn only_shortcuts_outside_the_set_are_stale() {
+        let names = vec![
+            "ctrl-alt-h".to_string(),
+            "permanent-aaa-ctrl-alt-k".to_string(),
+            "permanent-bbb-ctrl-alt-k".to_string(),
+        ];
+        let keep = ["ctrl-alt-h", "permanent-bbb-ctrl-alt-k"];
+        assert_eq!(
+            stale_shortcuts(&names, &keep),
+            vec!["permanent-aaa-ctrl-alt-k"]
+        );
+        let all = [
+            "ctrl-alt-h",
+            "permanent-aaa-ctrl-alt-k",
+            "permanent-bbb-ctrl-alt-k",
+        ];
+        assert_eq!(stale_shortcuts(&names, &all), Vec::<&str>::new());
     }
 
     #[test]

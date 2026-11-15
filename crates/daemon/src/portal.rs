@@ -373,6 +373,8 @@ async fn bind_set(
         return None;
     }
     note_bound(state);
+    let keep: Vec<&str> = set.iter().map(|b| b.id.as_str()).collect();
+    crate::portal_raw::kde_release_stale(conn, APP_ID, &keep).await;
     Some(session)
 }
 
