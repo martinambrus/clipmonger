@@ -233,6 +233,30 @@ pub fn run<A: App + 'static>(
 }
 
 /// The OS window of a slot and everything bound to it.
+/// Whether an IME event must reach egui, and whether a composition is in
+/// progress afterwards (`composing` is the state before the event).
+///
+/// `Enabled`/`Disabled` are dropped: egui-winit ignores them but still asks
+/// for a pass. An empty preedit outside a composition is dropped too: egui
+/// turns it into an input event, and a pass with input events re-sends the
+/// IME cursor area. `KWin` 5.27 answers every cursor-area update with
+/// `Disabled`, `Enabled` and an empty preedit, so forwarding those echoes
+/// kept an open popup with a focused search field repainting about 800
+/// times a second. Real input (a non-empty preedit, the empty preedit that
+/// ends it, a commit) always gets through.
+fn ime_forward(ime: &winit::event::Ime, composing: bool) -> (bool, bool) {
+    use winit::event::Ime;
+    match ime {
+        Ime::Enabled | Ime::Disabled => (false, composing),
+        Ime::Preedit(text, _) if text.is_empty() => (composing, false),
+        Ime::Preedit(..) => (true, true),
+        Ime::Commit(_) => (true, false),
+    }
+}
+
+// Independent per-window flags (present-error latch, frame throttle and the
+// frame-callback handshake), not a state machine in disguise.
+#[allow(clippy::struct_excessive_bools)]
 struct Host {
     window: Arc<Window>,
     state: egui_winit::State,
@@ -247,10 +271,18 @@ struct Host {
     /// softbuffer then blocks the whole UI thread waiting for one; so passes
     /// run the UI logic but do not paint until `RedrawRequested`.
     awaiting_frame: bool,
+    /// Something wanted a pass while a frame was out (a deferred logic-only
+    /// pass, or an immediate repaint request): run one when the frame
+    /// callback arrives. Without anything pending the callback runs no pass,
+    /// so an unchanged window does not repaint at the compositor's rate.
+    redraw_after_frame: bool,
     /// Keyboard focus as last reported. A covered Wayland window still gets
     /// frame callbacks from `KWin` but not its buffers back, so a window that
     /// lost focus paints once more and then waits for focus.
     focus: Focus,
+    /// An IME composition is in progress (a non-empty preedit arrived and
+    /// no commit or empty preedit has ended it yet). See [`ime_forward`].
+    ime_composing: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -265,6 +297,17 @@ enum Focus {
 }
 
 impl Host {
+    /// Whether `event` goes on to egui: every non-IME event, and the IME
+    /// events [`ime_forward`] keeps (tracking the composition state).
+    fn forward_ime(&mut self, event: &WindowEvent) -> bool {
+        let WindowEvent::Ime(ime) = event else {
+            return true;
+        };
+        let (forward, composing) = ime_forward(ime, self.ime_composing);
+        self.ime_composing = composing;
+        forward
+    }
+
     /// Present one frame. The first error of this window is printed, later
     /// ones are dropped.
     fn present(
@@ -569,8 +612,21 @@ impl<A: App> Runner<A> {
             }
             UserEvent::Repaint { kind, delay, pass } => {
                 if let Some(slot) = self.slot_mut(kind) {
-                    let current = slot.ctx.cumulative_pass_nr_for(ViewportId::ROOT);
-                    slot.deadline.request(now, delay, pass, current);
+                    // While a frame is out, an immediate request only marks
+                    // the window: a logic-only pass keeps its input for the
+                    // painted one, and egui asks for an immediate repaint
+                    // while input is pending, so running passes now would
+                    // spin until the frame callback.
+                    let deferred = slot
+                        .host
+                        .as_mut()
+                        .filter(|host| host.awaiting_frame && delay.is_zero())
+                        .map(|host| host.redraw_after_frame = true)
+                        .is_some();
+                    if !deferred {
+                        let current = slot.ctx.cumulative_pass_nr_for(ViewportId::ROOT);
+                        slot.deadline.request(now, delay, pass, current);
+                    }
                 }
             }
         }
@@ -733,7 +789,9 @@ impl<A: App> Runner<A> {
                 visibility,
                 frame_throttle,
                 awaiting_frame: false,
+                redraw_after_frame: false,
                 focus: Focus::Never,
+                ime_composing: false,
             })
         })();
         match host_res {
@@ -868,6 +926,9 @@ impl<A: App> Runner<A> {
                 let mut output = ctx.run_logic(&raw, |ctx| app.logic(ctx, kind));
                 slot.pending_raw = raw;
                 if let Some(host) = slot.host.as_mut() {
+                    if host.awaiting_frame {
+                        host.redraw_after_frame = true;
+                    }
                     host.state
                         .handle_platform_output(&host.window, output.platform_output);
                 }
@@ -1408,9 +1469,18 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
                     if close {
                         host.info.events.push(ViewportEvent::Close);
                     }
-                    if matches!(event, WindowEvent::RedrawRequested) && host.awaiting_frame {
+                    // The frame callback of a frame this window sent: only
+                    // permission to draw again, not a reason to (egui-winit
+                    // answers every RedrawRequested with "repaint", which
+                    // kept an unchanged Wayland window repainting at the
+                    // compositor's callback rate).
+                    let frame_callback =
+                        matches!(event, WindowEvent::RedrawRequested) && host.awaiting_frame;
+                    if frame_callback {
                         host.awaiting_frame = false;
-                        slot.deadline.at(now);
+                        if std::mem::take(&mut host.redraw_after_frame) {
+                            slot.deadline.at(now);
+                        }
                     }
                     if let WindowEvent::Focused(focused) = event {
                         if focused {
@@ -1420,33 +1490,38 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
                             host.focus = Focus::Lost { paints: 0 };
                         }
                     }
-                    let start = host.state.egui_input_mut().events.len();
-                    if preserve_super {
-                        slot.native_input.observe(&event, slot.ctx.os().is_mac());
-                    }
-                    let response = host.state.on_window_event(&host.window, &event);
-                    if preserve_super {
-                        let input = host.state.egui_input_mut();
-                        let override_key = app.and_then(|app| {
-                            let WindowEvent::KeyboardInput {
-                                event,
-                                is_synthetic: false,
-                                ..
-                            } = &event
-                            else {
-                                return None;
-                            };
-                            slot.native_input.clipboard_override(
-                                app,
-                                kind,
-                                &event.logical_key,
-                                event.state.is_pressed(),
-                                &input.events[start..],
-                            )
-                        });
-                        slot.native_input.finish(input, start, override_key);
-                    }
-                    if response.repaint || close {
+                    let forward = host.forward_ime(&event);
+                    if forward {
+                        let start = host.state.egui_input_mut().events.len();
+                        if preserve_super {
+                            slot.native_input.observe(&event, slot.ctx.os().is_mac());
+                        }
+                        let response = host.state.on_window_event(&host.window, &event);
+                        if preserve_super {
+                            let input = host.state.egui_input_mut();
+                            let override_key = app.and_then(|app| {
+                                let WindowEvent::KeyboardInput {
+                                    event,
+                                    is_synthetic: false,
+                                    ..
+                                } = &event
+                                else {
+                                    return None;
+                                };
+                                slot.native_input.clipboard_override(
+                                    app,
+                                    kind,
+                                    &event.logical_key,
+                                    event.state.is_pressed(),
+                                    &input.events[start..],
+                                )
+                            });
+                            slot.native_input.finish(input, start, override_key);
+                        }
+                        if (response.repaint && !frame_callback) || close {
+                            slot.deadline.at(now);
+                        }
+                    } else if close {
                         slot.deadline.at(now);
                     }
                 }
@@ -1458,6 +1533,36 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<A> {
     /// Run tick on wait.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.tick(event_loop);
+    }
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::ime_forward;
+    use winit::event::Ime;
+
+    #[test]
+    fn kwin_echoes_are_dropped_and_real_composition_passes() {
+        // The KWin 5.27 echo of a cursor-area update: nothing reaches egui.
+        let mut composing = false;
+        for ime in [
+            Ime::Disabled,
+            Ime::Enabled,
+            Ime::Preedit(String::new(), None),
+        ] {
+            let (forward, next) = ime_forward(&ime, composing);
+            assert!(!forward, "{ime:?} must not reach egui");
+            composing = next;
+        }
+        // A composition: preedits and the empty preedit that ends it pass.
+        let (forward, composing) = ime_forward(&Ime::Preedit("ni".into(), Some((2, 2))), false);
+        assert!(forward && composing);
+        let (forward, composing) = ime_forward(&Ime::Preedit(String::new(), None), composing);
+        assert!(forward, "the empty preedit that ends a composition passes");
+        assert!(!composing);
+        // A commit always passes and ends the composition.
+        assert_eq!(ime_forward(&Ime::Commit("你".into()), true), (true, false));
+        assert_eq!(ime_forward(&Ime::Commit("a".into()), false), (true, false));
     }
 }
 
