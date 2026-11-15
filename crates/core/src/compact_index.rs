@@ -146,7 +146,7 @@ impl Store {
         } else {
             OpenFlags::SQLITE_OPEN_READ_WRITE
         };
-        let conn = match Connection::open_with_flags(&self.db_path, flags) {
+        let mut conn = match Connection::open_with_flags(&self.db_path, flags) {
             Ok(c) => c,
             Err(e) => return classify(&e),
         };

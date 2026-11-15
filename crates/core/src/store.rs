@@ -5229,7 +5229,11 @@ mod tests {
         let count = Rc::clone(&observed);
         let nested_profile = unique_dir("observer-reentrant");
         let _guard = OpenControlGuard::install(super::OpenTestControl {
-            budget: Some(Duration::from_millis(700)),
+            // Generous: the callback's nested open of a fresh profile does
+            // real I/O, and under coverage instrumentation it used up a
+            // 700 ms budget before the retry. The test needs one retry, not
+            // a tight deadline.
+            budget: Some(Duration::from_secs(5)),
             busy: Some(Box::new(move |stage, error| {
                 assert_eq!(stage, super::OpenStage::Wal);
                 assert!(super::is_sqlite_busy(error));
