@@ -250,6 +250,7 @@ mod tests {
 Type=Application
 Name=Clipmonger
 Exec="/opt/My Apps/clipmonger" --minimized --profile-dir "/home/alice/profiles/foo%%bar\\$baz\\\\qux\\`tick\\"quote"
+TryExec=/opt/My Apps/clipmonger
 Hidden=false
 Terminal=false
 "#

@@ -53,7 +53,8 @@ fn legacy_manager_writes_exact_descriptors_and_roundtrips() {
             .join("autostart")
             .join(clipmonger_backend_x11::autostart::AUTOSTART_FILE);
         let text = std::fs::read_to_string(&file).expect("read descriptor");
-        let expected = format!("[Desktop Entry]\nType=Application\nName=Clipmonger\nExec={expected_exec}\nHidden=false\nTerminal=false\n");
+        let try_exec = exe.replace('\\', "\\\\");
+        let expected = format!("[Desktop Entry]\nType=Application\nName=Clipmonger\nExec={expected_exec}\nTryExec={try_exec}\nHidden=false\nTerminal=false\n");
         assert_eq!(text, expected, "executable {exe:?}");
         let entry = parse_desktop(&text).expect("parse descriptor");
         assert_eq!(entry.exec, exe);

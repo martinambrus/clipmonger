@@ -42,9 +42,18 @@ pub fn render_desktop(exe: &str, minimized: bool, hidden: bool) -> String {
         exec.push_str(" --minimized");
     }
     format!(
-        "[Desktop Entry]\nType=Application\nName=Clipmonger\nExec={exec}\nHidden={hidden}\nTerminal=false\n",
+        "[Desktop Entry]\nType=Application\nName=Clipmonger\nExec={exec}\nTryExec={try_exec}\nHidden={hidden}\nTerminal=false\n",
+        try_exec = try_exec_value(exe),
         hidden = if hidden { "true" } else { "false" }
     )
+}
+
+/// `TryExec=` value for `exe` (desktop entry string: backslashes escaped).
+/// Autostart skips an entry whose `TryExec` program is gone, so an entry
+/// left behind after the program was removed (a package uninstall cannot
+/// reach per-user files) stays inert instead of failing at every login.
+fn try_exec_value(exe: &str) -> String {
+    exe.replace('\\', "\\\\")
 }
 
 fn validate_desktop_path(path: &str) -> Result<(), Error> {
@@ -120,7 +129,8 @@ pub fn try_render_desktop(
         exec.push_str(&encode_exec_arg(p)?);
     }
     Ok(format!(
-        "[Desktop Entry]\nType=Application\nName=Clipmonger\nExec={exec}\nHidden={hidden}\nTerminal=false\n",
+        "[Desktop Entry]\nType=Application\nName=Clipmonger\nExec={exec}\nTryExec={try_exec}\nHidden={hidden}\nTerminal=false\n",
+        try_exec = try_exec_value(exe),
         hidden = if hidden { "true" } else { "false" }
     ))
 }
@@ -456,6 +466,7 @@ mod tests {
 Type=Application
 Name=Clipmonger
 Exec="/opt/My Apps/clipmonger" --minimized --profile-dir "/home/alice/profiles/foo%%bar\\$baz\\\\qux\\`tick\\"quote"
+TryExec=/opt/My Apps/clipmonger
 Hidden=false
 Terminal=false
 "#
@@ -484,6 +495,7 @@ Terminal=false
 Type=Application
 Name=Clipmonger
 Exec="/usr/bin/clipmonger" --minimized --profile-dir "/home/alice/profiles/work\\\\"
+TryExec=/usr/bin/clipmonger
 Hidden=false
 Terminal=false
 "#
