@@ -157,6 +157,11 @@ Expected: the old daemon has exited; one daemon with the new session's caps.
   hotkey works.
 - R-23 New GNOME major version: the extension's virtual keyboard still works
   (auto-paste, not the "press Ctrl+V" notification).
+- R-24 Wayland: copy two files in Files, open another folder, pick the file
+  row in the popup. Expected: the files are pasted there. The same row picked
+  in a text editor pastes the paths as text, and neither paste adds a history
+  row. Watch for: nothing pasted in Files (only the paths' text reached the
+  clipboard).
 
 **KDE.**
 - R-30 First popup hotkey and a permanent hotkey through the portal dialog;

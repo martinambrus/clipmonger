@@ -8,7 +8,7 @@ import Clutter from 'gi://Clutter';
 import { notify } from 'resource:///org/gnome/shell/ui/main.js';
 import { base64Decode } from './codec.js';
 import { POPUP_TITLE } from './config.js';
-import { parseAssist, isTextMime, assistStep, pasteNeedsShift, joinChunks, injectSettleMs } from './pasteplan.js';
+import { parseAssist, isTextMime, assistStep, pasteNeedsShift, pasteWantsFiles, copiedFiles, COPIED_FILES_MIME, joinChunks, injectSettleMs } from './pasteplan.js';
 import { windowAppIds } from './capture.js';
 /** Pause between the focus settling and the injected Ctrl+V. */
 const POLL_MS = 25;
@@ -36,7 +36,8 @@ export class PasteAssist {
     capture;
     keyboard = null;
     focusHandler = null;
-    /** Last focused window that is not the popup: stable sequence and time. */
+    /** Last focused window that is not the popup: stable sequence, time and
+     * app identities. */
     lastFocus = null;
     /** `lastFocus` when the popup took the focus: this popup's paste target. */
     popupTarget = null;
@@ -54,7 +55,7 @@ export class PasteAssist {
         if (!focus || focus.get_title?.() === POPUP_TITLE)
             return;
         try {
-            this.popupTarget = { id: focus.get_stable_sequence(), at: Date.now() };
+            this.popupTarget = { id: focus.get_stable_sequence(), at: Date.now(), ids: windowAppIds(focus) };
         }
         catch { /* toast */ }
     }
@@ -67,7 +68,7 @@ export class PasteAssist {
                 this.popupTarget = this.lastFocus;
             }
             else {
-                this.lastFocus = { id: focus.get_stable_sequence(), at: Date.now() };
+                this.lastFocus = { id: focus.get_stable_sequence(), at: Date.now(), ids: windowAppIds(focus) };
             }
         }
         catch { /* no focus info: the paste toasts */ }
@@ -99,8 +100,15 @@ export class PasteAssist {
                 return { id, ok: false, injected: false, error: 'paste data incomplete' };
             bytes = joined;
         }
+        // A file list pastes into a file manager as files: Shell's clipboard
+        // holds one format, and the paths as text paste nothing there.
+        const files = req.files_b64 && this.popupTarget && pasteWantsFiles(this.popupTarget.ids)
+            ? copiedFiles(new TextDecoder().decode(base64Decode(req.files_b64))) : null;
         try {
-            this.write(req.mime, bytes);
+            if (files !== null)
+                this.write(COPIED_FILES_MIME, new TextEncoder().encode(files));
+            else
+                this.write(req.mime, bytes);
         }
         catch (e) {
             return { id, ok: false, injected: false, error: `clipboard write failed: ${e instanceof Error ? e.message : String(e)}` };

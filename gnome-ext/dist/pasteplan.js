@@ -36,7 +36,10 @@ export function parseAssist(params) {
     const p = params;
     if (!Number.isSafeInteger(p.id) || typeof p.mime !== 'string' || !p.mime)
         return null;
-    const base = { id: p.id, mime: p.mime, inject: p.inject === true };
+    const base = {
+        id: p.id, mime: p.mime, inject: p.inject === true,
+        ...(typeof p.files_b64 === 'string' && p.files_b64 ? { files_b64: p.files_b64 } : {}),
+    };
     if (typeof p.data_b64 === 'string')
         return { ...base, data_b64: p.data_b64 };
     const size = p.size;
@@ -77,4 +80,23 @@ const SHIFT_PASTE_APPS = new Set([
 /** Whether a paste into a window with these identities needs Ctrl+Shift+V. */
 export function pasteNeedsShift(ids) {
     return ids.some((id) => SHIFT_PASTE_APPS.has(id.trim().toLowerCase().replace(/\.desktop$/, '')));
+}
+/** File managers by any window identity: a clip's file list pastes into
+ * them as files, not as the paths' text. GTK file managers that read
+ * GNOME's copied-files list (`COPIED_FILES_MIME`). */
+const FILE_MANAGER_APPS = new Set([
+    'nautilus', 'org.gnome.nautilus', 'nemo', 'caja', 'thunar', 'pcmanfm',
+]);
+/** Whether a paste into a window with these identities wants the files. */
+export function pasteWantsFiles(ids) {
+    return ids.some((id) => FILE_MANAGER_APPS.has(id.trim().toLowerCase().replace(/\.desktop$/, '')));
+}
+/** The clipboard format file managers paste from (Nautilus, Nemo, Caja,
+ * Thunar): GNOME's copied-files list. */
+export const COPIED_FILES_MIME = 'x-special/gnome-copied-files';
+/** `text/uri-list` (CRLF-separated, `#` comments) as GNOME's copied-files
+ * list: `copy` and one URI per line; `null` when it holds no URI. */
+export function copiedFiles(uriList) {
+    const uris = uriList.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
+    return uris.length ? ['copy', ...uris].join('\n') : null;
 }

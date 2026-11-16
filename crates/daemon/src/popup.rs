@@ -45,6 +45,11 @@ const ASSIST_WAIT: Duration = Duration::from_secs(3);
 /// one IPC frame); larger ones are pulled with `paste.assist_chunk`.
 #[cfg(linux_wayland)]
 const ASSIST_INLINE_BYTES: usize = 512 * 1024;
+/// Largest file list sent next to the payload (`files_b64`): with an
+/// inline payload at [`ASSIST_INLINE_BYTES`], both in base64 still fit one
+/// IPC line.
+#[cfg(linux_wayland)]
+const ASSIST_FILES_BYTES: usize = 64 * 1024;
 /// Raw bytes per `paste.assist_chunk` reply (base64 fits one frame).
 #[cfg(linux_wayland)]
 pub(crate) const ASSIST_CHUNK_BYTES: usize = 256 * 1024;
@@ -61,10 +66,11 @@ pub(crate) struct PopupTrigger {
     last_spawn: Option<Instant>,
     /// Extension pastes waiting for `paste.assist_done`, by request id.
     assists: std::collections::HashMap<u64, std::sync::mpsc::Sender<serde_json::Value>>,
-    /// Content hash, as the extension reports it, of the last clip it
-    /// pasted, and when: its capture of that write is not a new copy.
+    /// Content hashes, as the extension reports them, of the last clip it
+    /// pasted (the payload, and its file list when the extension may write
+    /// that instead), and when: its capture of that write is not a new copy.
     #[cfg(linux_wayland)]
-    last_assist: Option<(String, Instant)>,
+    last_assist: Option<(Vec<String>, Instant)>,
     /// Bytes of a chunked extension paste, served by `paste.assist_chunk`.
     #[cfg(linux_wayland)]
     assist_data: std::collections::HashMap<u64, std::sync::Arc<Vec<u8>>>,
@@ -124,6 +130,7 @@ impl DaemonState {
             return None;
         }
         let (mime, bytes) = assist_payload(payloads)?;
+        let files = assist_files(payloads, mime);
         let chunked = bytes.len() > ASSIST_INLINE_BYTES;
         let (tx, rx) = std::sync::mpsc::channel();
         let id = {
@@ -144,6 +151,9 @@ impl DaemonState {
             params["chunks"] = serde_json::Value::from(bytes.len().div_ceil(ASSIST_CHUNK_BYTES));
         } else {
             params["data_b64"] = serde_json::Value::from(crate::encode_thumbnail_png(bytes));
+        }
+        if let Some(files) = files {
+            params["files_b64"] = serde_json::Value::from(crate::encode_thumbnail_png(files));
         }
         let delivered = hub.publish(PASTE_ASSIST_TOPIC, params) > 0;
         let answer = delivered
@@ -174,7 +184,9 @@ impl DaemonState {
             )));
         }
         if let Ok(mut trigger) = self.popup.lock() {
-            trigger.last_assist = Some((assist_report_hash(mime, bytes), Instant::now()));
+            let mut hashes = vec![assist_report_hash(mime, bytes)];
+            hashes.extend(files.map(|files| assist_report_hash("text/uri-list", files)));
+            trigger.last_assist = Some((hashes, Instant::now()));
         }
         let injected = answer
             .get("injected")
@@ -222,9 +234,9 @@ impl DaemonState {
         let Ok(mut trigger) = self.popup.lock() else {
             return false;
         };
-        let echo = trigger.last_assist.as_ref().is_some_and(|(hash, at)| {
+        let echo = trigger.last_assist.as_ref().is_some_and(|(hashes, at)| {
             at.elapsed() < ASSIST_ECHO_WINDOW
-                && *hash == clipmonger_core::hash::content_hash(payloads)
+                && hashes.contains(&clipmonger_core::hash::content_hash(payloads))
         });
         if echo {
             trigger.last_assist = None;
@@ -1070,6 +1082,22 @@ fn assist_payload(payloads: &[(String, Vec<u8>)]) -> Option<(&str, &[u8])> {
         .map(|(mime, bytes)| (mime.as_str(), bytes.as_slice()))
 }
 
+/// The clip's file list (`text/uri-list`), sent next to a different
+/// payload so the extension can paste files into a file manager: Shell's
+/// clipboard holds one format, and a file manager cannot paste the paths
+/// as text. Only lists up to [`ASSIST_FILES_BYTES`].
+#[cfg(linux_wayland)]
+fn assist_files<'a>(payloads: &'a [(String, Vec<u8>)], chosen: &str) -> Option<&'a [u8]> {
+    if chosen.split(';').next().map(str::trim) == Some("text/uri-list") {
+        return None;
+    }
+    payloads
+        .iter()
+        .find(|(mime, _)| mime.split(';').next().map(str::trim) == Some("text/uri-list"))
+        .map(|(_, bytes)| bytes.as_slice())
+        .filter(|bytes| !bytes.is_empty() && bytes.len() <= ASSIST_FILES_BYTES)
+}
+
 /// Elsewhere the UI raises its own window when the push arrives.
 #[cfg(not(all(windows, feature = "backend-windows")))]
 fn activate_popup(_ui: Option<&SubscriberInfo>, _pressed: bool) {}
@@ -1373,7 +1401,7 @@ mod tests {
         let state = DaemonState::new(clipmonger_core::Store::open(&dir).expect("store"));
         let pasted = |mime: &str, bytes: &[u8]| {
             state.popup.lock().unwrap().last_assist =
-                Some((super::assist_report_hash(mime, bytes), Instant::now()));
+                Some((vec![super::assist_report_hash(mime, bytes)], Instant::now()));
         };
         let png = (String::from("image/png"), b"\x89PNGdata".to_vec());
         pasted("image/png", &png.1);
@@ -1387,12 +1415,57 @@ mod tests {
         pasted("image/png", &png.1);
         assert!(!state.assist_echo(&[("image/png".to_string(), b"other".to_vec())]));
         state.popup.lock().unwrap().last_assist = Some((
-            super::assist_report_hash("image/png", &png.1),
+            vec![super::assist_report_hash("image/png", &png.1)],
             Instant::now()
                 .checked_sub(super::ASSIST_ECHO_WINDOW)
                 .unwrap(),
         ));
         assert!(!state.assist_echo(std::slice::from_ref(&png)), "too late");
+        state.popup.lock().unwrap().last_assist = Some((
+            vec![
+                super::assist_report_hash("text/plain", b"/a.png"),
+                super::assist_report_hash("text/uri-list", b"file:///a.png\r\n"),
+            ],
+            Instant::now(),
+        ));
+        assert!(
+            state.assist_echo(&[("text/uri-list".to_string(), b"file:///a.png\r\n".to_vec())]),
+            "the file list the extension wrote instead"
+        );
+    }
+
+    #[cfg(linux_wayland)]
+    #[test]
+    fn a_file_list_travels_next_to_its_text_payload() {
+        let clip = vec![
+            ("text/plain".to_string(), b"/a.png".to_vec()),
+            ("text/uri-list".to_string(), b"file:///a.png\r\n".to_vec()),
+        ];
+        let (mime, _) = super::assist_payload(&clip).expect("payload");
+        assert_eq!(mime, "text/plain");
+        assert_eq!(
+            super::assist_files(&clip, mime),
+            Some(&b"file:///a.png\r\n"[..])
+        );
+        assert_eq!(
+            super::assist_files(&clip, "text/uri-list"),
+            None,
+            "already the payload"
+        );
+        assert_eq!(
+            super::assist_files(&clip[..1], "text/plain"),
+            None,
+            "no file list"
+        );
+        let huge = vec![(
+            "text/uri-list".to_string(),
+            vec![b'x'; super::ASSIST_FILES_BYTES + 1],
+        )];
+        assert_eq!(
+            super::assist_files(&huge, "text/plain"),
+            None,
+            "too large to send along"
+        );
     }
 
     #[cfg(linux_wayland)]

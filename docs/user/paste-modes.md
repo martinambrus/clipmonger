@@ -19,6 +19,12 @@ This is the default and works for every kind of clip.
 3. It presses the paste key for you: Ctrl+V on Windows and Linux, Cmd+V on
    macOS, and Ctrl+Shift+V in Linux terminals.
 
+On GNOME Wayland the clipboard holds one format at a time, so Clipmonger
+picks one: the text when the clip has text, otherwise the image or file
+list. A file list pasted into a file manager (Files, Nemo, Caja, Thunar or
+PCManFM) arrives as the files; pasted anywhere else it arrives as the file
+paths' text.
+
 Afterwards the clip stays on the clipboard, so you can paste it again with
 Ctrl+V yourself.
 

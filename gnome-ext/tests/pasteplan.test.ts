@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseAssist, isTextMime, assistStep, pasteNeedsShift, joinChunks, injectSettleMs, SMALL_TEXT_BYTES, FOCUS_WAIT_MS, PRESS_TARGET_MAX_AGE_MS, MAX_ASSIST_CHUNKS } from '../src/pasteplan.js';
+import { parseAssist, isTextMime, assistStep, pasteNeedsShift, pasteWantsFiles, copiedFiles, joinChunks, injectSettleMs, SMALL_TEXT_BYTES, FOCUS_WAIT_MS, PRESS_TARGET_MAX_AGE_MS, MAX_ASSIST_CHUNKS } from '../src/pasteplan.js';
 
 test('parseAssist validates the daemon request', () => {
   assert.deepEqual(parseAssist({ id: 3, mime: 'text/plain', data_b64: 'aGk=', inject: true }),
@@ -61,4 +61,24 @@ test('short text pastes quickly; images and large clips wait for the app', () =>
   assert.equal(injectSettleMs('text/plain', SMALL_TEXT_BYTES), 200);
   assert.equal(injectSettleMs('image/png', 10), 200);
   assert.equal(injectSettleMs('text/html', 10), 200);
+});
+
+test('a file list rides along with the text payload', () => {
+  assert.equal(parseAssist({ id: 4, mime: 'text/plain', data_b64: 'L2E=', inject: true, files_b64: 'ZmlsZTovLy9h' })?.files_b64, 'ZmlsZTovLy9h');
+  assert.equal(parseAssist({ id: 4, mime: 'text/plain', data_b64: 'L2E=', files_b64: '' })?.files_b64, undefined);
+  assert.equal(parseAssist({ id: 4, mime: 'text/plain', data_b64: 'L2E=', files_b64: 7 })?.files_b64, undefined);
+});
+
+test('file managers get the files, other windows the text', () => {
+  assert.equal(pasteWantsFiles(['org.gnome.Nautilus', 'nautilus']), true);
+  assert.equal(pasteWantsFiles(['nemo.desktop']), true);
+  assert.equal(pasteWantsFiles(['Thunar']), true);
+  assert.equal(pasteWantsFiles(['org.gnome.TextEditor', 'gnome-text-editor']), false);
+  assert.equal(pasteWantsFiles([]), false);
+});
+
+test('a uri-list becomes GNOME\'s copied-files list', () => {
+  assert.equal(copiedFiles('file:///a/b.png\r\nfile:///a/c%20d.pdf\r\n'), 'copy\nfile:///a/b.png\nfile:///a/c%20d.pdf');
+  assert.equal(copiedFiles('# comment\nfile:///x\n'), 'copy\nfile:///x');
+  assert.equal(copiedFiles('\r\n'), null);
 });

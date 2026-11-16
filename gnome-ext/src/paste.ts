@@ -9,7 +9,7 @@ import { notify } from 'resource:///org/gnome/shell/ui/main.js';
 import type { CaptureRelay } from './capture.js';
 import { base64Decode } from './codec.js';
 import { POPUP_TITLE } from './config.js';
-import { parseAssist, isTextMime, assistStep, pasteNeedsShift, joinChunks, injectSettleMs, type AssistDone } from './pasteplan.js';
+import { parseAssist, isTextMime, assistStep, pasteNeedsShift, pasteWantsFiles, copiedFiles, COPIED_FILES_MIME, joinChunks, injectSettleMs, type AssistDone } from './pasteplan.js';
 import { windowAppIds } from './capture.js';
 
 /** Pause between the focus settling and the injected Ctrl+V. */
@@ -37,10 +37,11 @@ export class PasteAssist {
   private capture: CaptureRelay | null;
   private keyboard: any = null;
   private focusHandler: number | null = null;
-  /** Last focused window that is not the popup: stable sequence and time. */
-  private lastFocus: { id: number; at: number } | null = null;
+  /** Last focused window that is not the popup: stable sequence, time and
+   * app identities. */
+  private lastFocus: { id: number; at: number; ids: string[] } | null = null;
   /** `lastFocus` when the popup took the focus: this popup's paste target. */
-  private popupTarget: { id: number; at: number } | null = null;
+  private popupTarget: { id: number; at: number; ids: string[] } | null = null;
   constructor(capture: CaptureRelay | null = null) { this.capture = capture; }
 
   /** Track the focus so each popup knows the window it was opened over
@@ -55,7 +56,7 @@ export class PasteAssist {
   targetFocused(): void {
     const focus = (globalThis as any).global?.display?.get_focus_window?.();
     if (!focus || focus.get_title?.() === POPUP_TITLE) return;
-    try { this.popupTarget = { id: focus.get_stable_sequence(), at: Date.now() }; } catch { /* toast */ }
+    try { this.popupTarget = { id: focus.get_stable_sequence(), at: Date.now(), ids: windowAppIds(focus) }; } catch { /* toast */ }
   }
 
   private onFocus(): void {
@@ -65,7 +66,7 @@ export class PasteAssist {
       if (focus.get_title?.() === POPUP_TITLE) {
         this.popupTarget = this.lastFocus;
       } else {
-        this.lastFocus = { id: focus.get_stable_sequence(), at: Date.now() };
+        this.lastFocus = { id: focus.get_stable_sequence(), at: Date.now(), ids: windowAppIds(focus) };
       }
     } catch { /* no focus info: the paste toasts */ }
   }
@@ -91,8 +92,13 @@ export class PasteAssist {
       if (!joined) return { id, ok: false, injected: false, error: 'paste data incomplete' };
       bytes = joined;
     }
+    // A file list pastes into a file manager as files: Shell's clipboard
+    // holds one format, and the paths as text paste nothing there.
+    const files = req.files_b64 && this.popupTarget && pasteWantsFiles(this.popupTarget.ids)
+      ? copiedFiles(new TextDecoder().decode(base64Decode(req.files_b64))) : null;
     try {
-      this.write(req.mime, bytes);
+      if (files !== null) this.write(COPIED_FILES_MIME, new TextEncoder().encode(files));
+      else this.write(req.mime, bytes);
     } catch (e) {
       return { id, ok: false, injected: false, error: `clipboard write failed: ${e instanceof Error ? e.message : String(e)}` };
     }

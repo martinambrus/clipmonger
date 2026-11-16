@@ -5,6 +5,13 @@ reserved for the release that passes all seg-11 §5 gates.
 
 ## [Unreleased]
 
+### Fixed
+
+- GNOME Wayland: a copied file list pasted from the popup into a file
+  manager (Files, Nemo, Caja, Thunar, PCManFM) now pastes the files. It used to
+  paste nothing there, because only the paths' text reached the clipboard.
+  Pasted into other windows it still gives the paths as text.
+
 ## [0.5.0] — 2026-11-15
 
 ### Added
