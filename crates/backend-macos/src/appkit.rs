@@ -285,6 +285,21 @@ pub(crate) fn app_for_pid(pid: i32) -> Option<RunningApp> {
     autoreleasepool(|_| live_app(pid).map(|app| running_app(&app)))
 }
 
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
+
+/// Whether process `pid` exists (signal 0 only checks; `EPERM` means it
+/// exists but belongs to someone else).
+pub(crate) fn process_exists(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // Safety: signal 0 sends nothing; it only reports whether `pid` exists.
+    let result = unsafe { kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
+
 pub(crate) fn activate(pid: i32) -> bool {
     autoreleasepool(|_| {
         let Some(app) = live_app(pid) else {

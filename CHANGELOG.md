@@ -11,6 +11,11 @@ reserved for the release that passes all seg-11 §5 gates.
   manager (Files, Nemo, Caja, Thunar, PCManFM) now pastes the files. It used to
   paste nothing there, because only the paths' text reached the clipboard.
   Pasted into other windows it still gives the paths as text.
+- macOS: a popup paste could fail with "paste target dead" although the
+  target app was in front (seen on macOS 13, mostly on a second paste in a
+  row). The daemon's app lookup sometimes misses a running app for a moment;
+  it now checks that the process still exists and asks again on the main
+  thread before giving up.
 
 ## [0.5.0] — 2026-11-15
 

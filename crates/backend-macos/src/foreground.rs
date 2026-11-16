@@ -65,6 +65,51 @@ fn now_ms() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
+/// Lookups [`resolve_live`] makes before it gives up on a live process.
+const RESOLVE_TRIES: u32 = 4;
+/// Pause between those lookups.
+const RESOLVE_PAUSE: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// `pid` as a running application. `NSRunningApplication` can miss a live
+/// app for a moment when asked off the main thread (seen in the daemon on
+/// macOS 13: `TextEdit` in front and focused, yet no app for its pid), which
+/// failed popup pastes with "paste target dead". A miss counts only once
+/// the process is really gone (`alive`); while it lives the lookup is asked
+/// again on the main thread (`lookup_main`, `None` there when it cannot
+/// run) and after a short `pause`, up to [`RESOLVE_TRIES`] times.
+fn resolve_live(
+    pid: i32,
+    lookup: impl Fn(i32) -> Option<RunningApp>,
+    lookup_main: impl Fn(i32) -> Option<RunningApp>,
+    alive: impl Fn(i32) -> bool,
+    pause: impl Fn(),
+) -> Option<RunningApp> {
+    for attempt in 0..RESOLVE_TRIES {
+        if let Some(app) = lookup(pid) {
+            return Some(app);
+        }
+        if !alive(pid) {
+            return None;
+        }
+        if let Some(app) = lookup_main(pid) {
+            return Some(app);
+        }
+        if attempt + 1 < RESOLVE_TRIES {
+            pause();
+        }
+    }
+    None
+}
+
+/// [`os::app_for_pid`] on the main thread, when the `AppKit` loop serves it
+/// and this is another thread.
+fn app_for_pid_on_main(pid: i32) -> Option<RunningApp> {
+    if crate::main_loop::is_main_thread() || !crate::main_loop::is_running() {
+        return None;
+    }
+    crate::main_loop::on_main(move || os::app_for_pid(pid))
+}
+
 fn target_of(app: &RunningApp) -> PasteTarget {
     PasteTarget {
         app: AppId {
@@ -133,9 +178,15 @@ impl MacForeground {
     ///
     /// [`Error::Unavailable`] when the process is gone.
     pub fn target_for_pid(&self, pid: i32) -> Result<PasteTarget> {
-        os::app_for_pid(pid)
-            .map(|app| target_of(&app))
-            .ok_or_else(|| Error::Unavailable("paste target dead".to_string()))
+        resolve_live(
+            pid,
+            os::app_for_pid,
+            app_for_pid_on_main,
+            os::process_exists,
+            || std::thread::sleep(RESOLVE_PAUSE),
+        )
+        .map(|app| target_of(&app))
+        .ok_or_else(|| Error::Unavailable("paste target dead".to_string()))
     }
 
     /// Bring `pid` to the front (`activateWithOptions:`).
@@ -182,6 +233,70 @@ mod tests {
         assert_eq!(pid_of(&other), None);
         other.handle = PlatformHandle::Opaque("pid:x".into());
         assert_eq!(pid_of(&other), None);
+    }
+
+    #[test]
+    fn a_live_app_missed_by_the_lookup_is_asked_again_not_called_dead() {
+        use std::cell::Cell;
+        let app = || RunningApp {
+            pid: 357,
+            bundle_id: Some("com.apple.TextEdit".into()),
+            name: Some("TextEdit".into()),
+        };
+        // Found at once.
+        assert_eq!(
+            resolve_live(357, |_| Some(app()), |_| None, |_| true, || {}),
+            Some(app())
+        );
+        // Missed off the main thread, found on it.
+        assert_eq!(
+            resolve_live(357, |_| None, |_| Some(app()), |_| true, || {}),
+            Some(app())
+        );
+        // Missed twice, then found after a pause.
+        let calls = Cell::new(0);
+        let flaky = |_| {
+            calls.set(calls.get() + 1);
+            (calls.get() > 2).then(app)
+        };
+        let pauses = Cell::new(0);
+        assert_eq!(
+            resolve_live(
+                357,
+                flaky,
+                |_| None,
+                |_| true,
+                || pauses.set(pauses.get() + 1)
+            ),
+            Some(app())
+        );
+        assert_eq!(pauses.get(), 2);
+        // A process that is gone is dead at once, without retries.
+        let pauses = Cell::new(0);
+        assert_eq!(
+            resolve_live(
+                357,
+                |_| None,
+                |_| None,
+                |_| false,
+                || pauses.set(pauses.get() + 1)
+            ),
+            None
+        );
+        assert_eq!(pauses.get(), 0);
+        // A live process the lookup never finds: bounded retries, then none.
+        let pauses = Cell::new(0);
+        assert_eq!(
+            resolve_live(
+                357,
+                |_| None,
+                |_| None,
+                |_| true,
+                || pauses.set(pauses.get() + 1)
+            ),
+            None
+        );
+        assert_eq!(pauses.get(), RESOLVE_TRIES - 1);
     }
 
     #[test]

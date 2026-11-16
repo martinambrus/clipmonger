@@ -220,7 +220,8 @@ Mac VM at a time (guest helpers in `tests/vm/guest/macos`: `cmcopy.js`,
   (`cmcopy.js file PATH`); `cmcopy.js secret` and `transient` leave no row.
 - R-72 Ctrl+Option+H opens the popup at the pointer over TextEdit; Enter
   pastes text (several times in a row) and the image; a permanent clip's
-  hotkey pastes without an extra history row.
+  hotkey pastes without an extra history row. Watch for: a paste refused
+  with "paste target dead" while the target app is in front.
 - R-73 CLI: 50 `list` calls in a row all succeed (IPC reliability; 10.12
   failed this), `paste ID` pastes into the frontmost app.
 - R-74 Settings opens, Start on login writes

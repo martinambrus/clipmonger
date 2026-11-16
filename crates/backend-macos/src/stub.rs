@@ -53,6 +53,9 @@ pub(crate) fn frontmost() -> Option<RunningApp> {
 pub(crate) fn app_for_pid(_pid: i32) -> Option<RunningApp> {
     None
 }
+pub(crate) fn process_exists(_pid: i32) -> bool {
+    false
+}
 pub(crate) fn activate(_pid: i32) -> bool {
     false
 }
