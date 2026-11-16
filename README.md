@@ -19,8 +19,8 @@ used).
 > [Known limitations](#known-limitations).
 
 <p align="center">
-  <a href="https://youtu.be/zPFvhNsRecU" target="_blank" rel="noopener"><img src="docs/media/clipmonger-demo-poster.webp" alt="Clipmonger demo video: press the hotkey, filter, paste; on macOS, Windows and Linux" width="720"></a>
-  <br><sub>Demo video (40 s) on YouTube: <a href="https://youtu.be/zPFvhNsRecU" target="_blank" rel="noopener">youtu.be/zPFvhNsRecU</a></sub>
+  <a href="https://www.youtube.com/watch?v=DAav-oOdr3A" target="_blank" rel="noopener"><img src="docs/media/clipmonger-showcase-poster.webp" alt="Clipmonger showcase video: copy text, images and files, open the popup with Ctrl+Alt+H, search and paste; on Windows, macOS and eight Linux desktops" width="720"></a>
+  <br><sub>Showcase video (1:31) on YouTube: <a href="https://www.youtube.com/watch?v=DAav-oOdr3A" target="_blank" rel="noopener">youtube.com/watch?v=DAav-oOdr3A</a></sub>
 </p>
 
 | macOS (Ventura) | Windows 11 | Ubuntu GNOME |
