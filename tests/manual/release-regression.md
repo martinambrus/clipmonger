@@ -283,3 +283,4 @@ for every new one.
 | 2026-11-15 | Windows 10/11 | Apps and Features showed no version or publisher | 869a5b0 | R-52 |
 | 2026-11-15 | Windows | Restore did not refuse a backup hard-linked inside the profile (Unix-only same-file check) | 4b11efb | `restore_safety::source_hardlink_to_managed_blob_is_refused_without_changes` (Windows CI) |
 | 2026-11-15 | all | Bundled SQLite affected by CVE-2026-119375 (RUSTSEC-2026-0459) | 5bc1a82 | section 1 (`cargo deny` in `scripts/release-gate.sh`) |
+| 2026-11-16 | GNOME Wayland | A file list picked in the popup pasted nothing into Files: only the paths' text reached the one-format Shell clipboard | 23aa30f | R-24 |
